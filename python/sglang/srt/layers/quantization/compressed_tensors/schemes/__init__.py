@@ -20,6 +20,7 @@ from .compressed_tensors_w8a8_int8 import (
 )
 from .compressed_tensors_w8a8_int8_moe import (
     CompressedTensorsW8A8Int8MoE,
+    CompressedTensorsW8A8Int8DynamicMoE,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from .compressed_tensors_w8a16_fp8 import CompressedTensorsW8A16Fp8
@@ -39,6 +40,7 @@ __all__ = [
     "CompressedTensorsW8A8Int8",
     "CompressedTensorsW8A8Int8MoE",
     "NPUCompressedTensorsW8A8Int8",
+    "CompressedTensorsW8A8Int8DynamicMoE",
     "NPUCompressedTensorsW8A8Int8DynamicMoE",
     "CompressedTensorsWNA16",
     "CompressedTensorsWNA16MoE",

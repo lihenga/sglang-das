@@ -1665,6 +1665,12 @@ class Envs:
 
 
 envs = Envs()
+if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+    # TokenFlow 0.2.2b0 accesses the pre-rename Python attribute. Point it at
+    # the canonical descriptor so get/set/is_set all share one DSA value.
+    envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = (
+        envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD
+    )
 EnvField._allow_set_name = False
 
 

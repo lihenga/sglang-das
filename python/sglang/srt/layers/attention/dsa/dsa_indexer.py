@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -92,6 +93,10 @@ if _is_hcu:
         from fast_hadamard_transform import (
             hadamard_transform as hcu_fast_hadamard_transform,
         )
+_tokenflow_legacy_compat = os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1"
+_legacy_hcu_hadamard_cache: Dict[
+    Tuple[int, torch.device, torch.dtype], torch.Tensor
+] = {}
 
 if not _is_npu:
     from sglang.kernels.ops.attention.dsa import (
@@ -246,7 +251,41 @@ def _hcu_mqa_logits(
     )
 
 
+def _legacy_hcu_hadamard_transform(
+    x: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Torch equivalent of the legacy HCU indexer's cached Hadamard GEMM."""
+    hidden_size = x.shape[-1]
+    cache_key = (hidden_size, x.device, x.dtype)
+    matrix = _legacy_hcu_hadamard_cache.get(cache_key)
+    if matrix is None:
+        matrix = torch.ones((1, 1), device=x.device, dtype=x.dtype)
+        while matrix.shape[0] < hidden_size:
+            matrix = torch.cat(
+                (
+                    torch.cat((matrix, matrix), dim=1),
+                    torch.cat((matrix, -matrix), dim=1),
+                ),
+                dim=0,
+            )
+        _legacy_hcu_hadamard_cache[cache_key] = matrix
+
+    x_shape = x.shape
+    output = torch.nn.functional.linear(x.reshape(-1, hidden_size), matrix)
+    if scale != 1.0:
+        output = output * scale
+    return output.reshape(x_shape)
+
+
 def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor:
+    if _is_hcu and _tokenflow_legacy_compat:
+        hidden_size = x.size(-1)
+        assert (
+            hidden_size & (hidden_size - 1)
+        ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+        scale = hidden_size**-0.5 if apply_scale else 1.0
+        return _legacy_hcu_hadamard_transform(x, scale=scale)
+
     # from sgl_kernel import hadamard_transform
     if _is_hip and not _is_hcu:
         from fast_hadamard_transform import hadamard_transform
@@ -516,6 +555,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
+            # The legacy SparkV1 HCU path used a fused gate-scale kernel with
+            # fp32 output.  Preserve that precision when the base Torch path
+            # replaces the fused kernel; otherwise the first scalar multiply
+            # below would round in bf16 before q_scale promotes the result.
+            if (
+                _tokenflow_legacy_compat
+                and is_hcu()
+                and type(self).__module__
+                == "tokenflow.models.sparkv1.layers.attention"
+                and type(self).__name__ == "SparkV1Indexer"
+            ):
+                return weights.float()
             # Return bf16; multiplying with q_scale promotes back to fp32.
             return weights
         return weights.float()
@@ -733,7 +784,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        q_rope, k_rope = self._apply_indexer_rope(positions, q_rope, k_rope)
 
         self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
@@ -800,17 +851,38 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        # Rotary may update both inputs in place, so the K-only path must not
-        # alias its dummy query with the key.
-        if _is_cuda or _is_hip or _is_xpu:
-            dummy_q_rope = torch.empty_like(k_rope)
-        else:
-            dummy_q_rope = k_rope
-        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
+        _, k_rope = self._apply_indexer_rope(positions, k_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
         return key
+
+    def _apply_indexer_rope(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Adapt flattened indexer tensors to legacy TokenFlow's HCU RoPE shape."""
+        num_tokens = query.shape[0]
+        if (
+            _tokenflow_legacy_compat
+            and is_hcu()
+            and positions.numel() == num_tokens
+            and key.shape[0] == num_tokens
+            and query.shape[-1] == self.rope_head_dim
+            and key.shape[-1] == self.rope_head_dim
+        ):
+            query_shape = query.shape
+            key_shape = key.shape
+            query = query.reshape(1, num_tokens, -1, query.shape[-1])
+            key = key.reshape(1, num_tokens, -1, key.shape[-1])
+            query, key = self.rotary_emb.forward_native(
+                positions.reshape(-1), query, key
+            )
+            return query.reshape(query_shape), key.reshape(key_shape)
+
+        return self.rotary_emb(positions, query, key)
 
     def _fused_k_prepare_and_store(
         self,

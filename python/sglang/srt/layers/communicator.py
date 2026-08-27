@@ -15,6 +15,7 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -103,6 +104,19 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+# TokenFlow 0.2.2b0 imports this accessor from communicator, matching SGLang
+# 0.5.12.  Main moved the definition to server_args and removed the re-export.
+# Keep the import lazy to avoid reintroducing the old module-import cycle.
+if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+
+    def get_global_server_args():
+        from sglang.srt.server_args import (
+            get_global_server_args as _get_global_server_args,
+        )
+
+        return _get_global_server_args()
 
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
@@ -1036,6 +1050,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
     1. All reduce in tp_attn_group on hidden_states
     2. Apply layer norm
     """
+
+    if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+
+        @staticmethod
+        def _skip_layernorm(forward_batch: ForwardBatch) -> bool:
+            """Legacy TokenFlow hook surface for the unfused accuracy path.
+
+            The old helper returned true only for optional fused RMS-quant
+            kernels.  Those kernels are disabled in this Torch/Triton baseline,
+            while current communicator always applies the layer norm here.
+            """
+
+            return False
 
     @staticmethod
     def get_fn(

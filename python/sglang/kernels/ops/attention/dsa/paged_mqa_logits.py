@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
+from functools import lru_cache
 
 import torch
 
@@ -92,6 +94,71 @@ def deepgemm_paged_mqa_logits_split(
     return _restore_row_stride(logits)
 
 
+@lru_cache(maxsize=1)
+def _use_gfx936_torch_fallback() -> bool:
+    if os.environ.get("SGLANG_TOKENFLOW_LEGACY_COMPAT") != "1":
+        return False
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx() == "gfx936"
+
+
+def _torch_fp8_paged_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Accuracy-first fallback for HCU, whose Triton cannot dot FP8 inputs."""
+    rows, num_heads, head_dim = q_fp8.shape
+    block_size = kv_cache_fp8.shape[1]
+    assert head_dim == 128
+    assert kv_cache_fp8.shape[2:] == (1, head_dim + 4)
+    assert weights.shape == (rows, num_heads)
+    assert seq_lens.numel() >= rows
+    assert block_tables.shape[0] >= rows
+
+    logits = torch.full(
+        (rows, max_seq_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
+    cache_bytes = kv_cache_fp8.view(torch.uint8).reshape(
+        kv_cache_fp8.shape[0], block_size * (head_dim + 4)
+    )
+    scale_offset = block_size * head_dim
+    flat_seq_lens = seq_lens.reshape(-1)
+
+    for row in range(rows):
+        seq_len = int(flat_seq_lens[row].item())
+        if seq_len == 0:
+            continue
+        assert seq_len <= max_seq_len
+        num_pages = (seq_len + block_size - 1) // block_size
+        page_ids = block_tables[row, :num_pages].long()
+        pages = cache_bytes.index_select(0, page_ids)
+        k_values = (
+            pages[:, :scale_offset]
+            .contiguous()
+            .view(q_fp8.dtype)
+            .reshape(-1, head_dim)[:seq_len]
+            .float()
+        )
+        k_scales = (
+            pages[:, scale_offset:]
+            .contiguous()
+            .view(torch.float32)
+            .reshape(-1)[:seq_len]
+        )
+        scores = torch.nn.functional.linear(k_values, q_fp8[row].float()).relu_()
+        scores.mul_(weights[row].float().unsqueeze(0))
+        logits[row, :seq_len] = scores.sum(dim=1).mul_(k_scales)
+    return logits
+
+
 def aiter_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -103,7 +170,30 @@ def aiter_paged_mqa_logits(
     preshuffle: bool,
     kv_block_size: int,
 ) -> torch.Tensor:
-    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+    if _use_gfx936_torch_fallback():
+        assert not preshuffle
+        assert kv_block_size == 1
+        return _torch_fp8_paged_mqa_logits(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            seq_lens,
+            block_tables,
+            max_seq_len,
+        )
+
+    try:
+        from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+    except ModuleNotFoundError as exc:
+        # Newer AITER releases moved this Triton kernel under attention/ while
+        # keeping the callable contract unchanged.
+        if exc.name != "aiter.ops.triton.pa_mqa_logits":
+            raise
+        import aiter.ops.triton.attention.pa_mqa_logits as pa_mqa_logits
+
+        deepgemm_fp8_paged_mqa_logits = (
+            pa_mqa_logits.deepgemm_fp8_paged_mqa_logits
+        )
 
     q_fp8 = q_fp8.unsqueeze(1)
     batch_size, next_n, _, _ = q_fp8.shape

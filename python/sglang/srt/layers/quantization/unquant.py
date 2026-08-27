@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -54,6 +55,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_npu,
     set_weight_attrs,
@@ -90,9 +92,11 @@ if _use_aiter_w16a16_moe:
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_tokenflow_legacy_compat = os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1"
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight

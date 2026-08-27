@@ -114,7 +114,7 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
-def is_deepseek_dsa(config) -> bool:
+def _is_deepseek_dsa_native(config) -> bool:
     return (
         _hf_arch(config)
         in (
@@ -132,6 +132,31 @@ def is_deepseek_dsa(config) -> bool:
         )
         and _hf_attr(config, "index_topk") is not None
     )
+
+
+def _is_tokenflow_spark_v1(config) -> bool:
+    return _hf_arch(config) in (
+        "SparkV1ForCausalLM",
+        "SparkV1ForCausalLMNextN",
+    )
+
+
+def is_deepseek_dsa(config) -> bool:
+    if (
+        os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1"
+        and _is_tokenflow_spark_v1(config)
+    ):
+        # TokenFlow 0.2.2b0 hooks the pre-rename NSA entry point. Dispatch
+        # SparkV1 through that dynamically wrapped function while retaining
+        # the native DSA behavior for every upstream architecture.
+        return is_deepseek_nsa(config)
+    return _is_deepseek_dsa_native(config)
+
+
+if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+
+    def is_deepseek_nsa(config) -> bool:
+        return _is_deepseek_dsa_native(config)
 
 
 def is_kimi_k3(config) -> bool:
@@ -159,9 +184,24 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
-def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
+def _get_dsa_index_head_dim_native(config: PretrainedConfig) -> int:
+    assert _is_deepseek_dsa_native(config) or is_deepseek_v4(config)
     return config.index_head_dim
+
+
+def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
+    if (
+        os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1"
+        and _is_tokenflow_spark_v1(config)
+    ):
+        return get_nsa_index_head_dim(config)
+    return _get_dsa_index_head_dim_native(config)
+
+
+if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+
+    def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
+        return _get_dsa_index_head_dim_native(config)
 
 
 def is_minimax_sparse(config: PretrainedConfig) -> bool:
@@ -209,9 +249,24 @@ def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
     return score_type
 
 
-def get_dsa_index_topk(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config)
+def _get_dsa_index_topk_native(config: PretrainedConfig) -> int:
+    assert _is_deepseek_dsa_native(config)
     return config.index_topk
+
+
+def get_dsa_index_topk(config: PretrainedConfig) -> int:
+    if (
+        os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1"
+        and _is_tokenflow_spark_v1(config)
+    ):
+        return get_nsa_index_topk(config)
+    return _get_dsa_index_topk_native(config)
+
+
+if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+
+    def get_nsa_index_topk(config: PretrainedConfig) -> int:
+        return _get_dsa_index_topk_native(config)
 
 
 def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
@@ -263,9 +318,24 @@ def get_dsa_full_indexer_layer_ids(
     ]
 
 
-def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config)
+def _get_dsa_index_n_heads_native(config: PretrainedConfig) -> int:
+    assert _is_deepseek_dsa_native(config)
     return config.index_n_heads
+
+
+def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
+    if (
+        os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1"
+        and _is_tokenflow_spark_v1(config)
+    ):
+        return get_nsa_index_n_heads(config)
+    return _get_dsa_index_n_heads_native(config)
+
+
+if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+
+    def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
+        return _get_dsa_index_n_heads_native(config)
 
 
 REQUANTIZATION_METHODS = ["quark_mxfp4"]
@@ -790,10 +860,17 @@ class ModelConfig:
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
-        self.is_hybrid_swa = (
-            is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
-            and not self.disable_hybrid_swa_memory
-        )
+        # TokenFlow 0.2.2b0 wraps is_hybrid_swa_model with the SGLang 0.5.12
+        # one-argument ABI. Keep the current two-argument behavior by default,
+        # and opt into the legacy call only for the SparkV1 compatibility run.
+        if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+            is_hybrid_swa = is_hybrid_swa_model(self.hf_config.architectures)
+        else:
+            is_hybrid_swa = is_hybrid_swa_model(
+                self.hf_config.architectures,
+                self.hf_text_config,
+            )
+        self.is_hybrid_swa = is_hybrid_swa and not self.disable_hybrid_swa_memory
 
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")

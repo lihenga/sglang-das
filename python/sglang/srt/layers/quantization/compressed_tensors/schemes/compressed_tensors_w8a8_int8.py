@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hcu, is_hip
 
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
@@ -35,6 +35,7 @@ __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
 _is_hcu = is_hcu()
+_is_hip = is_hip()
 if _is_hcu:
     from lightop.quant import per_token_quant_int8
 
@@ -309,6 +310,25 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
             x_q, x_scale = silu_quant_args
         else:
             x_q, x_scale = per_token_quant_int8(x)
+
+        if _is_hip and os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT", "0") == "1":
+            x_q_2d = x_q.reshape(-1, x_q.shape[-1])
+            x_scale_2d = x_scale.reshape(-1, 1)
+            num_rows = x_q_2d.shape[0]
+            if num_rows <= 16:
+                padding = x_q_2d.new_zeros((17 - num_rows, x_q_2d.shape[1]))
+                x_q_for_mm = torch.cat((x_q_2d, padding), dim=0)
+            else:
+                x_q_for_mm = x_q_2d
+
+            output = torch._int_mm(x_q_for_mm, layer.weight)[:num_rows].float()
+            output.mul_(x_scale_2d.float())
+            output.mul_(layer.weight_scale.reshape(1, -1).float())
+            if bias is not None:
+                output.add_(bias.float())
+
+            output_shape = (*x_q.shape[:-1], layer.weight.shape[1])
+            return output.to(dtype=x.dtype).reshape(output_shape)
 
         # return quant_ops.custom_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias)
 

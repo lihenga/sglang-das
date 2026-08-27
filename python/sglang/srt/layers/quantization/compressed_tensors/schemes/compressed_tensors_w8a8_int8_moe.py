@@ -29,6 +29,10 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
+from sglang.srt.layers.quantization.w8a8_int8 import (
+    W8A8Int8Config,
+    W8A8Int8MoEMethod,
+)
 from sglang.srt.utils import get_bool_env_var, is_hcu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -39,6 +43,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CompressedTensorsW8A8Int8MoE",
+    "CompressedTensorsW8A8Int8DynamicMoE",
     "NPUCompressedTensorsW8A8Int8DynamicMoE",
 ]
 
@@ -49,6 +54,47 @@ _is_hcu = is_hcu()
 _use_aiter_moe = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_USE_AITER_MOE", default="true"
 )
+
+
+class CompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
+    """Channel-weight, dynamic-token INT8 MoE using the upstream Triton runner."""
+
+    def __init__(self, weight_quant, input_quant):
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        if not (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+            and self.input_quant.dynamic
+        ):
+            raise ValueError(
+                "For INT8 Fused MoE layers, channelwise weights and dynamic "
+                f"per-token activations are required. Found {weight_quant}, "
+                f"{input_quant}"
+            )
+        self._method = W8A8Int8MoEMethod(W8A8Int8Config())
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 80
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs):
+        return self._method.create_weights(layer, *args, **kwargs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        return self._method.process_weights_after_loading(layer)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        return self._method.create_moe_runner(layer, moe_runner_config)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        return self._method.apply(layer, dispatch_output)
 
 
 class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):

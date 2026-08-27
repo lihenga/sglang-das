@@ -31,6 +31,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import os
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -212,6 +213,12 @@ class ForwardMode(IntEnum):
 
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
+
+
+if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT", "0") == "1":
+    # TokenFlow 0.2.2b0 was built against the pre-v2 draft-extend name.
+    # The enum value and predicate semantics are unchanged in current SGLang.
+    setattr(ForwardMode, "is_draft_extend", ForwardMode.is_draft_extend_v2)
 
 
 @total_ordering

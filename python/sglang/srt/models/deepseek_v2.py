@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -250,6 +251,35 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
     fused_a_gemm_weight_eligible,
     linear_with_fused_a_gemm,
 )
+
+if os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1":
+    # TokenFlow 0.2.2b0 imports these names from this model module. They were
+    # renamed or stopped being re-exported by deepseek_v2 on SGLang main.
+    from sglang.srt.distributed import (
+        get_attn_context_model_parallel_rank as get_attention_cp_rank,
+        get_attn_context_model_parallel_world_size as get_attention_cp_size,
+        get_attn_tensor_model_parallel_rank as get_attention_tp_rank,
+        get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
+        get_attn_tp_group as get_attention_tp_group,
+        get_tensor_model_parallel_world_size,
+    )
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+    from sglang.srt.server_args import ServerArgs, get_global_server_args
+    from sglang.srt.utils import is_npu
+
+    get_nsa_index_head_dim = get_dsa_index_head_dim
+    get_nsa_index_n_heads = get_dsa_index_n_heads
+    get_nsa_index_topk = get_dsa_index_topk
+    is_deepseek_nsa = is_deepseek_dsa
+    can_nsa_cp_split = can_dsa_cp_split
+    is_nsa_enable_prefill_cp = is_dsa_enable_prefill_cp
+    nsa_use_prefill_cp = dsa_use_prefill_cp
+    NSACPLayerCommunicator = DSACPLayerCommunicator
+
+    # The legacy field is read-only in TokenFlow's decoder path. SGLang
+    # 0.5.12 forced it true on HIP, and this baseline disables all graphs.
+    ServerArgs.disable_piecewise_cuda_graph = True
+
 
 logger = logging.getLogger(__name__)
 
