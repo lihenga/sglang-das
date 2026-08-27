@@ -268,7 +268,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # avoid silently changing the CUDA decode path for DSA models (e.g.
         # DeepSeek-V3.2). CUDA can opt in later once validated there.
         self.dsa_dual_graph = False
-        self.dsa_dense_only_graph = False
         self.dsa_index_topk: Optional[int] = None
         from sglang.srt.configs.model_config import (
             get_dsa_index_topk,
@@ -279,23 +278,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if is_hip() and is_deepseek_dsa(hf_config):
             self.dsa_index_topk = get_dsa_index_topk(hf_config)
             self.dsa_dual_graph = True
-            self.dsa_dense_only_graph = (
-                os.environ.get("SGLANG_HIP_DSA_DENSE_ONLY_CUDA_GRAPH") == "1"
+            logger.info(
+                "[dense-decode] DSA dual-graph enabled: capturing "
+                "dense (k-only) + sparse (full indexer) decode graphs; "
+                "dispatch on max_kv_len vs index_topk=%d.",
+                self.dsa_index_topk,
             )
-            if self.dsa_dense_only_graph:
-                logger.warning(
-                    "[dense-decode] HIP DSA dense-only CUDA Graph enabled: "
-                    "capturing only the k-only graph; batches with "
-                    "max_kv_len > index_topk=%d fall back to eager.",
-                    self.dsa_index_topk,
-                )
-            else:
-                logger.info(
-                    "[dense-decode] DSA dual-graph enabled: capturing "
-                    "dense (k-only) + sparse (full indexer) decode graphs; "
-                    "dispatch on max_kv_len vs index_topk=%d.",
-                    self.dsa_index_topk,
-                )
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -666,15 +654,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
-            return False
-
-        # The gfx936 accuracy-first paged-MQA fallback is intentionally eager:
-        # it reads dynamic sequence lengths on the host and therefore cannot be
-        # captured safely. In the opt-in dense-only experiment, use a graph only
-        # while every request is in the k-only (<= index_topk) DSA region.
-        if getattr(self, "dsa_dense_only_graph", False) and (
-            self._resolve_dsa_variant(forward_batch) != "dense"
-        ):
             return False
 
         ragged_layout = (
@@ -1119,12 +1098,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # set dsa_dual_graph) and override capture_one_shape with a signature that
         # has no dsa_variant. Default to no dual-graph and, for the None variant,
         # call capture_one_shape without the extra arg so those overrides work.
-        if getattr(self, "dsa_dense_only_graph", False):
-            dsa_variants = ["dense"]
-        elif getattr(self, "dsa_dual_graph", False):
-            dsa_variants = ["dense", "sparse"]
-        else:
-            dsa_variants = [None]
+        dsa_variants = (
+            ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
+        )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(

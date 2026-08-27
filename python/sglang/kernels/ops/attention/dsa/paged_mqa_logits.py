@@ -7,6 +7,8 @@ from collections.abc import Callable
 from functools import lru_cache
 
 import torch
+import triton
+import triton.language as tl
 
 
 def _restore_row_stride(logits: torch.Tensor) -> torch.Tensor:
@@ -95,7 +97,7 @@ def deepgemm_paged_mqa_logits_split(
 
 
 @lru_cache(maxsize=1)
-def _use_gfx936_torch_fallback() -> bool:
+def _use_gfx936_accuracy_fallback() -> bool:
     if os.environ.get("SGLANG_TOKENFLOW_LEGACY_COMPAT") != "1":
         return False
     from aiter.jit.utils.chip_info import get_gfx
@@ -103,7 +105,95 @@ def _use_gfx936_torch_fallback() -> bool:
     return get_gfx() == "gfx936"
 
 
-def _torch_fp8_paged_mqa_logits(
+@triton.jit
+def _fp8e4m3_to_f32(value, EXPONENT_BIAS: tl.constexpr):
+    value = value.to(tl.uint8)
+    sign = (value & 0x80) != 0
+    magnitude = value & 0x7F
+    exponent = (magnitude >> 3).to(tl.int32)
+    mantissa = (magnitude & 0x7).to(tl.float32)
+    decoded = tl.where(
+        exponent == 0,
+        mantissa * tl.exp2(-EXPONENT_BIAS - 2.0),
+        (1.0 + mantissa * 0.125)
+        * tl.exp2(exponent.to(tl.float32) - EXPONENT_BIAS),
+    )
+    return tl.where(sign, -decoded, decoded)
+
+
+@triton.jit
+def _fp8_paged_mqa_logits_gfx936_kernel(
+    q_u8,
+    cache_u8,
+    weights,
+    seq_lens,
+    block_tables,
+    logits,
+    q_row_stride: tl.constexpr,
+    q_head_stride: tl.constexpr,
+    cache_stride: tl.constexpr,
+    weight_stride: tl.constexpr,
+    table_stride: tl.constexpr,
+    logits_stride: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    EXPONENT_BIAS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    NUM_TOKEN_PROGRAMS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    seq_len = tl.load(seq_lens + row)
+    tile = tl.program_id(1)
+    dim = tl.arange(0, HEAD_DIM)
+
+    while tile * BLOCK_T < seq_len:
+        positions = tile * BLOCK_T + tl.arange(0, BLOCK_T)
+        valid = positions < seq_len
+        pages = tl.load(
+            block_tables + row * table_stride + positions,
+            mask=valid,
+            other=0,
+        )
+        k = _fp8e4m3_to_f32(
+            tl.load(
+                cache_u8 + pages[:, None] * cache_stride + dim[None, :],
+                mask=valid[:, None],
+                other=0,
+            ),
+            EXPONENT_BIAS,
+        )
+        score = tl.zeros((BLOCK_T,), tl.float32)
+
+        for head in tl.static_range(NUM_HEADS):
+            q = _fp8e4m3_to_f32(
+                tl.load(
+                    q_u8
+                    + row * q_row_stride
+                    + head * q_head_stride
+                    + dim
+                ),
+                EXPONENT_BIAS,
+            )
+            dot = tl.sum(k * q[None, :], axis=1)
+            weight = tl.load(weights + row * weight_stride + head)
+            score += tl.maximum(dot, 0.0) * weight
+
+        scale_base = cache_u8 + pages * cache_stride + HEAD_DIM
+        s0 = tl.load(scale_base, mask=valid, other=0).to(tl.uint32)
+        s1 = tl.load(scale_base + 1, mask=valid, other=0).to(tl.uint32)
+        s2 = tl.load(scale_base + 2, mask=valid, other=0).to(tl.uint32)
+        s3 = tl.load(scale_base + 3, mask=valid, other=0).to(tl.uint32)
+        scale_bits = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24)
+        scale = scale_bits.to(tl.float32, bitcast=True)
+        tl.store(
+            logits + row * logits_stride + positions,
+            score * scale,
+            mask=valid,
+        )
+        tile += NUM_TOKEN_PROGRAMS
+
+
+def _triton_fp8_paged_mqa_logits_gfx936(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -111,13 +201,17 @@ def _torch_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     max_seq_len: int,
 ) -> torch.Tensor:
-    """Accuracy-first fallback for HCU, whose Triton cannot dot FP8 inputs."""
+    """Graph-safe FP32 fallback for gfx936, which cannot dot FP8 inputs."""
     rows, num_heads, head_dim = q_fp8.shape
     block_size = kv_cache_fp8.shape[1]
+    assert q_fp8.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    assert q_fp8.is_contiguous()
+    assert block_size == 1
     assert head_dim == 128
     assert kv_cache_fp8.shape[2:] == (1, head_dim + 4)
     assert weights.shape == (rows, num_heads)
     assert seq_lens.numel() >= rows
+    assert seq_lens.is_contiguous()
     assert block_tables.shape[0] >= rows
 
     logits = torch.full(
@@ -127,35 +221,31 @@ def _torch_fp8_paged_mqa_logits(
         device=q_fp8.device,
     )
     cache_bytes = kv_cache_fp8.view(torch.uint8).reshape(
-        kv_cache_fp8.shape[0], block_size * (head_dim + 4)
+        kv_cache_fp8.shape[0], head_dim + 4
     )
-    scale_offset = block_size * head_dim
-    flat_seq_lens = seq_lens.reshape(-1)
-
-    for row in range(rows):
-        seq_len = int(flat_seq_lens[row].item())
-        if seq_len == 0:
-            continue
-        assert seq_len <= max_seq_len
-        num_pages = (seq_len + block_size - 1) // block_size
-        page_ids = block_tables[row, :num_pages].long()
-        pages = cache_bytes.index_select(0, page_ids)
-        k_values = (
-            pages[:, :scale_offset]
-            .contiguous()
-            .view(q_fp8.dtype)
-            .reshape(-1, head_dim)[:seq_len]
-            .float()
-        )
-        k_scales = (
-            pages[:, scale_offset:]
-            .contiguous()
-            .view(torch.float32)
-            .reshape(-1)[:seq_len]
-        )
-        scores = torch.nn.functional.linear(k_values, q_fp8[row].float()).relu_()
-        scores.mul_(weights[row].float().unsqueeze(0))
-        logits[row, :seq_len] = scores.sum(dim=1).mul_(k_scales)
+    weights = weights.float().contiguous()
+    block_t = 16
+    num_token_programs = min(256, triton.cdiv(max_seq_len, block_t))
+    _fp8_paged_mqa_logits_gfx936_kernel[(rows, num_token_programs)](
+        q_fp8.view(torch.uint8),
+        cache_bytes,
+        weights,
+        seq_lens.reshape(-1),
+        block_tables,
+        logits,
+        q_fp8.stride(0),
+        q_fp8.stride(1),
+        cache_bytes.stride(0),
+        weights.stride(0),
+        block_tables.stride(0),
+        logits.stride(0),
+        NUM_HEADS=num_heads,
+        HEAD_DIM=head_dim,
+        EXPONENT_BIAS=8 if q_fp8.dtype == torch.float8_e4m3fnuz else 7,
+        BLOCK_T=block_t,
+        NUM_TOKEN_PROGRAMS=num_token_programs,
+        num_warps=4,
+    )
     return logits
 
 
@@ -227,7 +317,7 @@ def aiter_fp8_mqa_logits(
     clean_logits: bool,
 ) -> torch.Tensor:
     """Call the installed AITER ragged-MQA API across package layouts."""
-    if _use_gfx936_torch_fallback():
+    if _use_gfx936_accuracy_fallback():
         return _torch_fp8_mqa_logits(
             q_fp8, kv_fp8, kv_scales, weights, cu_starts, cu_ends
         )
@@ -266,10 +356,10 @@ def aiter_paged_mqa_logits(
     preshuffle: bool,
     kv_block_size: int,
 ) -> torch.Tensor:
-    if _use_gfx936_torch_fallback():
+    if _use_gfx936_accuracy_fallback():
         assert not preshuffle
         assert kv_block_size == 1
-        return _torch_fp8_paged_mqa_logits(
+        return _triton_fp8_paged_mqa_logits_gfx936(
             q_fp8,
             kv_cache_fp8,
             weights,
