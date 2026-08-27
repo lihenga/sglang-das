@@ -100,12 +100,14 @@ _legacy_hcu_hadamard_cache: Dict[
 
 if not _is_npu:
     from sglang.kernels.ops.attention.dsa import (
+        aiter_fp8_mqa_logits,
         aiter_paged_mqa_logits,
         cutedsl_paged_mqa_logits,
         deepgemm_paged_mqa_logits_native,
         deepgemm_paged_mqa_logits_split,
     )
 else:
+    aiter_fp8_mqa_logits = None
     aiter_paged_mqa_logits = None
     cutedsl_paged_mqa_logits = None
     deepgemm_paged_mqa_logits_native = None
@@ -1633,14 +1635,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         kv_scale=scale,
                     )
                 elif _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
                     kv, scale = kv_fp8
                     # Match the CUDA deep_gemm path (clean_logits=False): the topk
                     # transform masks invalid positions via ks/ke/lengths, so the
                     # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
                     # redundant and grows quadratically with context length.
-                    logits = fp8_mqa_logits(
+                    logits = aiter_fp8_mqa_logits(
                         q_fp8[:q_offset],
                         kv,
                         scale,
@@ -1711,11 +1711,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         kv_scale=scale,
                     )
                 elif _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
-                    logits_chunk = fp8_mqa_logits(
+                    logits_chunk = aiter_fp8_mqa_logits(
                         q_fp8[start:end],
                         kv,
                         scale,

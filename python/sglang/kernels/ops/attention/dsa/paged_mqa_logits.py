@@ -159,6 +159,102 @@ def _torch_fp8_paged_mqa_logits(
     return logits
 
 
+def _torch_fp8_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+) -> torch.Tensor:
+    """Accuracy-first ragged MQA fallback for gfx936.
+
+    gfx936 cannot compile AITER's Triton FP8 dot kernel. Convert the already
+    quantized FP8 values to FP32 and process query rows in bounded chunks so
+    the temporary ``[rows, heads, kv_tokens]`` scores stay below 128 MiB.
+    """
+    rows, num_heads, head_dim = q_fp8.shape
+    kv_tokens = kv_fp8.shape[0]
+    assert kv_fp8.shape == (kv_tokens, head_dim)
+    assert kv_scales.numel() == kv_tokens
+    assert weights.shape == (rows, num_heads)
+    assert cu_starts.numel() >= rows and cu_ends.numel() >= rows
+
+    logits = torch.empty(
+        (rows, kv_tokens), dtype=torch.float32, device=q_fp8.device
+    )
+    if rows == 0 or kv_tokens == 0:
+        return logits
+
+    # Bound the largest temporary. Each score is FP32; Q/K conversions and the
+    # final logits are much smaller than the per-head score tensor.
+    score_budget_bytes = 128 * 1024 * 1024
+    bytes_per_query_row = num_heads * kv_tokens * torch.float32.itemsize
+    rows_per_chunk = max(1, score_budget_bytes // max(bytes_per_query_row, 1))
+    rows_per_chunk = min(rows, rows_per_chunk)
+
+    kv_f32_t = kv_fp8.float().transpose(0, 1)
+    scales_f32 = kv_scales.reshape(-1).float().view(1, 1, kv_tokens)
+    column_ids = torch.arange(kv_tokens, device=q_fp8.device).view(1, kv_tokens)
+
+    for start in range(0, rows, rows_per_chunk):
+        end = min(start + rows_per_chunk, rows)
+        chunk_rows = end - start
+        scores = torch.matmul(
+            q_fp8[start:end].float().reshape(chunk_rows * num_heads, head_dim),
+            kv_f32_t,
+        ).view(chunk_rows, num_heads, kv_tokens)
+        scores.mul_(scales_f32).relu_()
+        scores.mul_(weights[start:end].float().unsqueeze(-1))
+        reduced = scores.sum(dim=1)
+
+        valid = (column_ids >= cu_starts[start:end].reshape(-1, 1)) & (
+            column_ids < cu_ends[start:end].reshape(-1, 1)
+        )
+        logits[start:end] = reduced.masked_fill(~valid, float("-inf"))
+
+    return logits
+
+
+def aiter_fp8_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    *,
+    clean_logits: bool,
+) -> torch.Tensor:
+    """Call the installed AITER ragged-MQA API across package layouts."""
+    if _use_gfx936_torch_fallback():
+        return _torch_fp8_mqa_logits(
+            q_fp8, kv_fp8, kv_scales, weights, cu_starts, cu_ends
+        )
+
+    try:
+        from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+    except ModuleNotFoundError as exc:
+        if exc.name != "aiter.ops.triton.fp8_mqa_logits":
+            raise
+        # Newer AITER packages moved the wrapper and always clean invalid logits.
+        from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
+
+        return fp8_mqa_logits(
+            q_fp8, kv_fp8, kv_scales, weights, cu_starts, cu_ends
+        )
+
+    return fp8_mqa_logits(
+        q_fp8,
+        kv_fp8,
+        kv_scales,
+        weights,
+        cu_starts,
+        cu_ends,
+        clean_logits=clean_logits,
+    )
+
+
 def aiter_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
