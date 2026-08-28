@@ -83,6 +83,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
+    get_bool_env_var,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
     is_hip,
@@ -103,6 +104,9 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
 
 
 _is_hip = is_hip()
+_hcu_fp8_kv_dequant_bf16 = _is_hip and get_bool_env_var(
+    "SGLANG_HCU_FP8_KV_DEQUANT_BF16"
+)
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -2237,11 +2241,18 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
-    # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
-    # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
+    # On HIP, TileLang and AITER DSA kernels normally consume the raw MLA KV
+    # layout: nope(512 fp8) + rope(64 fp8), without extra per-block scales.
+    # The opt-in accuracy path stores the scaled 656-byte layout and dequantizes
+    # selected KV rows before calling the existing BF16 TileLang kernel.
     if _is_hip and (
         get_exec().kernel.dsa_prefill_backend in ("tilelang", "aiter")
         or get_exec().kernel.dsa_decode_backend in ("tilelang", "aiter")
+    ) and not (
+        _hcu_fp8_kv_dequant_bf16
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and get_exec().kernel.dsa_prefill_backend == "tilelang"
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
     ):
         return kv_cache_dim
 

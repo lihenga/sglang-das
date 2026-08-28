@@ -150,6 +150,9 @@ def materialize_full_kv_cp(
 
 
 _is_hip = is_hip()
+_hcu_fp8_kv_dequant_bf16 = _is_hip and get_bool_env_var(
+    "SGLANG_HCU_FP8_KV_DEQUANT_BF16"
+)
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -348,6 +351,24 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self.hcu_fp8_kv_dequant_bf16 = _hcu_fp8_kv_dequant_bf16
+        if self.hcu_fp8_kv_dequant_bf16:
+            if not self.dsa_kv_cache_store_fp8 or self.kv_cache_dim != 656:
+                raise ValueError(
+                    "SGLANG_HCU_FP8_KV_DEQUANT_BF16 requires the 656-byte "
+                    "scaled FP8 latent + BF16 RoPE KV layout."
+                )
+            if (
+                self.dsa_prefill_impl != "tilelang"
+                or self.dsa_decode_impl != "tilelang"
+            ):
+                raise ValueError(
+                    "SGLANG_HCU_FP8_KV_DEQUANT_BF16 requires TileLang for both "
+                    "DSA prefill and decode."
+                )
+            logger.info(
+                "HCU mixed FP8 KV enabled: 656-byte cache -> selected BF16 TileLang."
+            )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -405,6 +426,10 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
+        if self.hcu_fp8_kv_dequant_bf16 and self.use_fused_topk:
+            raise ValueError(
+                "SGLANG_HCU_FP8_KV_DEQUANT_BF16 requires unfused DSA top-k."
+            )
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -2115,6 +2140,26 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self._translate_main_kv_loc_to_compact(page_table_1)
 
         if dsa_impl == "tilelang":
+            if self.hcu_fp8_kv_dequant_bf16:
+                if topk_transform_method == TopkTransformMethod.RAGGED:
+                    page_table_1 = topk_indices
+                    if any(forward_batch.extend_prefix_lens_cpu):
+                        page_table_1_flattened = (
+                            self.forward_metadata.page_table_1_flattened
+                        )
+                        assert page_table_1_flattened is not None
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
+                    else:
+                        assert k is not None and k_rope is not None
+                        kv_cache = _cat([k, k_rope], dim=-1)
+                else:
+                    kv_cache, page_table_1 = (
+                        self._prepare_scaled_fp8_kv_for_tilelang(
+                            kv_cache, page_table_1
+                        )
+                    )
             if q_rope is not None:
                 # Triton prefill kernel reads q_nope/q_rope directly, skipping
                 # the concat (it splits q into main/tail internally anyway).
@@ -2429,6 +2474,12 @@ class DeepseekSparseAttnBackend(
                 forward_batch=forward_batch,
             )
         elif self.dsa_decode_impl == "tilelang":
+            if self.hcu_fp8_kv_dequant_bf16:
+                kv_cache, page_table_1 = (
+                    self._prepare_scaled_fp8_kv_for_tilelang(
+                        kv_cache, page_table_1
+                    )
+                )
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
             # has already been set to a zero-copy view of q in the else branch
             # above and we can reuse it directly. The `not _is_hip` clause keeps
@@ -3112,6 +3163,26 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
         )
 
+    def _prepare_scaled_fp8_kv_for_tilelang(
+        self,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather mixed-layout FP8 KV, dequantize it, and use compact indices."""
+        valid = page_table_1 >= 0
+        safe_page_table = torch.where(
+            valid, page_table_1, torch.zeros_like(page_table_1)
+        )
+        flat_page_table = safe_page_table.reshape(-1)
+        kv_cache = dequantize_k_cache_paged(kv_cache, flat_page_table)
+
+        compact_indices = self.get_device_int32_arange(flat_page_table.numel())
+        compact_indices = compact_indices.view_as(page_table_1)
+        compact_indices = torch.where(
+            valid, compact_indices, torch.full_like(compact_indices, -1)
+        )
+        return kv_cache, compact_indices
+
     def _forward_aiter(
         self,
         q_all: torch.Tensor,
@@ -3554,6 +3625,12 @@ class DeepseekSparseAttnBackend(
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
             # fp8 KV ("kv must have dtype kBFloat16").
             and self.dsa_prefill_impl in ("flashmla_sparse", "flashmla_sparse_q8")
+            and forward_mode == ForwardMode.EXTEND
+        ):
+            topk_transform_method = TopkTransformMethod.RAGGED
+        elif (
+            self.hcu_fp8_kv_dequant_bf16
+            and self.dsa_prefill_impl == "tilelang"
             and forward_mode == ForwardMode.EXTEND
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
