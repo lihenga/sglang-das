@@ -121,7 +121,9 @@ def _fp8e4m3_to_f32(value, EXPONENT_BIAS: tl.constexpr):
     return tl.where(sign, -decoded, decoded)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["table_stride", "logits_stride", "NUM_TOKEN_PROGRAMS"]
+)
 def _fp8_paged_mqa_logits_gfx936_kernel(
     q_u8,
     cache_u8,
@@ -133,13 +135,13 @@ def _fp8_paged_mqa_logits_gfx936_kernel(
     q_head_stride: tl.constexpr,
     cache_stride: tl.constexpr,
     weight_stride: tl.constexpr,
-    table_stride: tl.constexpr,
-    logits_stride: tl.constexpr,
+    table_stride,
+    logits_stride,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     EXPONENT_BIAS: tl.constexpr,
     BLOCK_T: tl.constexpr,
-    NUM_TOKEN_PROGRAMS: tl.constexpr,
+    NUM_TOKEN_PROGRAMS,
 ):
     row = tl.program_id(0)
     seq_len = tl.load(seq_lens + row)

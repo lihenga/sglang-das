@@ -351,7 +351,9 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
-        self.hcu_fp8_kv_dequant_bf16 = _hcu_fp8_kv_dequant_bf16
+        self.hcu_fp8_kv_dequant_bf16 = (
+            _hcu_fp8_kv_dequant_bf16 and self.dsa_kv_cache_store_fp8
+        )
         if self.hcu_fp8_kv_dequant_bf16:
             if not self.dsa_kv_cache_store_fp8 or self.kv_cache_dim != 656:
                 raise ValueError(
@@ -381,7 +383,9 @@ class DeepseekSparseAttnBackend(
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
 
-        self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
+        self._arange_buf = torch.arange(
+            16384, device=self.device, dtype=torch.int32
+        )
 
         if _is_hip:
             max_bs = model_runner.req_to_token_pool.size
@@ -1246,6 +1250,13 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if self.hcu_fp8_kv_dequant_bf16:
+            required = max_num_tokens * self.dsa_index_topk
+            if required > self._arange_buf.numel():
+                self._arange_buf = torch.arange(
+                    required, device=self.device, dtype=torch.int32
+                )
+
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
