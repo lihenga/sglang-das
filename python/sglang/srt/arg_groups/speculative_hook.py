@@ -70,6 +70,21 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
+def _call_speculative_algorithm_resolver(
+    server_args: ServerArgs,
+    resolver: Callable[..., Optional[str]],
+    config_kwargs: dict,
+) -> Optional[str]:
+    resolver_kwargs = {"trust_remote_code": server_args.trust_remote_code}
+    if config_kwargs:
+        resolver_kwargs["kwargs"] = config_kwargs
+    return resolver(
+        server_args.speculative_algorithm,
+        server_args.speculative_draft_model_path,
+        **resolver_kwargs,
+    )
+
+
 def handle_speculative_decoding(
     server_args: ServerArgs,
     resolve_speculative_algorithm_alias: Callable[..., Optional[str]] | None = None,
@@ -121,11 +136,10 @@ def handle_speculative_decoding(
     declare_resolution(
         server_args,
         "handle_speculative_decoding",
-        speculative_algorithm=resolve_speculative_algorithm_alias(
-            server_args.speculative_algorithm,
-            server_args.speculative_draft_model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            kwargs=kwargs,
+        speculative_algorithm=_call_speculative_algorithm_resolver(
+            server_args,
+            resolve_speculative_algorithm_alias,
+            kwargs,
         ),
     )
 

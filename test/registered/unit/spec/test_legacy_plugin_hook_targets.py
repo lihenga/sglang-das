@@ -1,13 +1,32 @@
 import pkgutil
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups.speculative_hook import (
+    _call_speculative_algorithm_resolver,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
 
 class TestLegacyPluginHookTargets(unittest.TestCase):
+    def test_empty_config_kwargs_preserve_the_legacy_resolver_signature(self):
+        server_args = SimpleNamespace(
+            speculative_algorithm="EAGLE",
+            speculative_draft_model_path="draft-model",
+            trust_remote_code=True,
+        )
+        resolver = Mock(return_value="EAGLE")
+
+        result = _call_speculative_algorithm_resolver(server_args, resolver, {})
+
+        self.assertEqual(result, "EAGLE")
+        resolver.assert_called_once_with(
+            "EAGLE", "draft-model", trust_remote_code=True
+        )
+
     def test_legacy_targets_resolve_to_live_entry_points(self):
         self.assertIs(
             pkgutil.resolve_name(
