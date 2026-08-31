@@ -50,6 +50,12 @@ from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolved_view,
 )
+from sglang.srt.arg_groups.speculative_hook import (
+    _resolve_speculative_algorithm_alias as _resolve_speculative_algorithm_alias_impl,
+)
+from sglang.srt.arg_groups.speculative_hook import (
+    handle_speculative_decoding as _handle_speculative_decoding_impl,
+)
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -110,6 +116,11 @@ from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_speculative_algorithm_alias(*args, **kwargs):
+    """Compatibility entry point for out-of-tree speculative plugins."""
+    return _resolve_speculative_algorithm_alias_impl(*args, **kwargs)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -3989,10 +4000,8 @@ class ServerArgs:
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
 
-        # Handle speculative decoding logic.
-        from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-
-        handle_speculative_decoding(self)
+        # Handle speculative decoding logic through the plugin-compatible entry point.
+        self._handle_speculative_decoding()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -7409,6 +7418,13 @@ class ServerArgs:
                 f"{required_per_rank}` or lower the relevant limit "
                 f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
             )
+
+    def _handle_speculative_decoding(self):
+        """Compatibility entry point for out-of-tree speculative plugins."""
+        _handle_speculative_decoding_impl(
+            self,
+            resolve_speculative_algorithm_alias=_resolve_speculative_algorithm_alias,
+        )
 
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to

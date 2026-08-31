@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from sglang.srt.arg_groups.overrides import (
     declare_direct_writes,
@@ -70,7 +70,13 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
-def handle_speculative_decoding(server_args: ServerArgs) -> None:
+def handle_speculative_decoding(
+    server_args: ServerArgs,
+    resolve_speculative_algorithm_alias: Callable[..., Optional[str]] | None = None,
+) -> None:
+    if resolve_speculative_algorithm_alias is None:
+        resolve_speculative_algorithm_alias = _resolve_speculative_algorithm_alias
+
     if (
         server_args.speculative_draft_model_path is not None
         and server_args.speculative_draft_model_revision is None
@@ -115,7 +121,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     declare_resolution(
         server_args,
         "handle_speculative_decoding",
-        speculative_algorithm=_resolve_speculative_algorithm_alias(
+        speculative_algorithm=resolve_speculative_algorithm_alias(
             server_args.speculative_algorithm,
             server_args.speculative_draft_model_path,
             trust_remote_code=server_args.trust_remote_code,
