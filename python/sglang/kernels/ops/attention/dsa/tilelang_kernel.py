@@ -851,8 +851,14 @@ def sparse_mla_fwd_decode_partial(
 
     head_kv = heads // kv_group
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
-    REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    if _is_hip and not _is_gfx95_supported:
+        # gfx936 has 64 KiB shared memory per block. Keep the BF16 head tile
+        # small enough when DP attention gives each rank the full head set.
+        H_per_block = min(padded_H, 16)
+        REPLICATE_H = (head_kv + H_per_block - 1) // H_per_block
+    else:
+        REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
+        H_per_block = padded_H if REPLICATE_H == 1 else 64
     N_GROUPS = topk // (block_I * inner_iter)
     BI = block_I
     D = dim
@@ -905,7 +911,7 @@ def sparse_mla_fwd_decode_partial(
             b_i, g_i = 0, 0
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
             group_i = by
-            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
+            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_buf)

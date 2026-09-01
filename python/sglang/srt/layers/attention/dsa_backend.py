@@ -1101,6 +1101,20 @@ class DeepseekSparseAttnBackend(
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
+        if topk_indices_offset is not None:
+            pad_len = (
+                dsa_cache_seqlens_int32.shape[0] - topk_indices_offset.shape[0]
+            )
+            assert pad_len >= 0
+            if pad_len:
+                topk_indices_offset = torch.cat(
+                    [
+                        topk_indices_offset,
+                        topk_indices_offset.new_zeros(
+                            pad_len, *topk_indices_offset.shape[1:]
+                        ),
+                    ]
+                )
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
