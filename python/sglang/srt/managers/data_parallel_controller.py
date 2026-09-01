@@ -14,6 +14,7 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import inspect
 import logging
 import multiprocessing as mp
 import signal
@@ -712,23 +713,35 @@ class DataParallelController:
                 display_dp_rank = dp_rank + offset if dp_rank is not None else None
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                    scheduler_args = (
+                        server_args,
+                        rank_port_args,
+                        gpu_id,
+                        tp_rank,
+                        attn_cp_rank,
+                        moe_dp_rank,
+                        moe_ep_rank,
+                        pp_rank,
+                        dp_rank,
+                        writer,
+                        display_tp_rank,
+                        display_dp_rank,
+                        display_moe_ep_rank,
+                    )
+                    entry_signature = inspect.signature(
+                        self.run_scheduler_process_func
+                    )
+                    try:
+                        entry_signature.bind(*scheduler_args)
+                    except TypeError:
+                        # Older plugin entrypoints predate the three display-rank
+                        # arguments; the scheduler itself keeps them optional.
+                        scheduler_args = scheduler_args[:10]
+                        entry_signature.bind(*scheduler_args)
+
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
-                        args=(
-                            server_args,
-                            rank_port_args,
-                            gpu_id,
-                            tp_rank,
-                            attn_cp_rank,
-                            moe_dp_rank,
-                            moe_ep_rank,
-                            pp_rank,
-                            dp_rank,
-                            writer,
-                            display_tp_rank,
-                            display_dp_rank,
-                            display_moe_ep_rank,
-                        ),
+                        args=scheduler_args,
                     )
                     with (
                         memory_saver_adapter.configure_subprocess(),
