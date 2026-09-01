@@ -737,6 +737,11 @@ class DeepEPMoE(FusedMoE):
         )
         if is_humming:
             self.deprecate_flag = True
+        elif (
+            get_moe_a2a_backend().is_deepep()
+            and get_moe_runner_backend().is_triton()
+        ):
+            self.deprecate_flag = True
         elif _is_hcu and _use_aiter:
             self.deprecate_flag = False
         elif _use_aiter:
@@ -943,7 +948,10 @@ class DeepEPMoE(FusedMoE):
         i_s: Optional[torch.Tensor] = None,
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
-        if is_in_breakable_cuda_graph():
+        if (
+            is_in_breakable_cuda_graph()
+            and get_deepep_mode().resolve(get_is_extend_in_batch()).is_normal()
+        ):
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for breakable cuda graph"
@@ -1006,11 +1014,17 @@ class DeepEPMoE(FusedMoE):
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
+        bias: Optional[torch.Tensor] = None,
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
     ):
 
         if self.deprecate_flag:
             return super().run_moe_core(
                 dispatch_output,
+                bias=bias,
+                i_q=i_q,
+                i_s=i_s,
             )
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

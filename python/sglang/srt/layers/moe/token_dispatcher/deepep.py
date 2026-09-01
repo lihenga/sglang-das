@@ -898,22 +898,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        input_global_scale = self.quant_config.get("input_global_scale", None)
-
-        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
-        # to return int32-packed UE8M0 scales that don't feed the flashinfer
-        # cutedsl kernel.
-        fp8_deepgemm_scale_opts = (
-            dict(
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-            )
-            if self.use_fp8
-            else dict()
-        )
-
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         if use_groupgemm:
@@ -960,27 +944,27 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     )
                 )
         else:
+            quant_type = {
+                DispatcherOutputDtype.BF16: 0,
+                DispatcherOutputDtype.INT8: 1,
+                DispatcherOutputDtype.FP8: 2,
+            }.get(self.deepep_output_dtype)
+            if quant_type is None:
+                raise NotImplementedError(
+                    "DeepEP low-latency dispatch does not support "
+                    f"{self.deepep_output_dtype.value} output"
+                )
             packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                 buffer.low_latency_dispatch(
                     hidden_states,
                     topk_ids,
+                    topk_weights,
                     self.num_max_dispatch_tokens_per_rank,
                     self.num_experts,
-                    use_fp8=self.use_fp8,
-                    **(
-                        dict(topk_weights=topk_weights)
-                        if _is_npu and not _use_zbal
-                        else dict()
-                    ),
-                    **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
-                    **(
-                        dict(x_global_scale=input_global_scale)
-                        if input_global_scale is not None
-                        else dict()
-                    ),
+                    quant_type=quant_type,
+                    fp8_round_scale=False,
                     async_finish=not self.return_recv_hook,
                     return_recv_hook=self.return_recv_hook,
-                    **fp8_deepgemm_scale_opts,
                 )
             )
         return packed_recv_hidden, self.packed_recv_count, event, hook
