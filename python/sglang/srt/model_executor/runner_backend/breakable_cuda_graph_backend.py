@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -26,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -145,16 +147,24 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs[shape_key] = capture_inputs
 
     def _output_rows(self, output: Any, cap: int) -> int:
-        """Leading-dim row count actually produced by the body, clamped to ``cap``.
+        """Return the leading-dimension row count produced by the graph body.
 
-        A body that shards or prunes its output along dim 0 returns fewer than
-        ``cap`` rows; everything else returns exactly ``cap``.
+        Structured speculative outputs can have one row per candidate token,
+        so their row count can exceed the request-batch ``cap``.
         """
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
+        if isinstance(output, LogitsProcessorOutput):
+            rows = [
+                getattr(output, field.name).shape[0]
+                for field in dataclasses.fields(output)
+                if torch.is_tensor(getattr(output, field.name))
+                and getattr(output, field.name).ndim > 0
+            ]
+            return min(rows) if rows else cap
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
         return cap
@@ -172,6 +182,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     for key, t in output.tensors.items()
                 }
             )
+        if isinstance(output, LogitsProcessorOutput):
+            return dataclasses.replace(
+                output,
+                **{
+                    field.name: torch.empty_like(getattr(output, field.name))
+                    for field in dataclasses.fields(output)
+                    if torch.is_tensor(getattr(output, field.name))
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -185,6 +204,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return dataclasses.replace(
+                output,
+                **{
+                    field.name: self._slice_output(
+                        getattr(output, field.name), num_tokens
+                    )
+                    for field in dataclasses.fields(output)
+                    if torch.is_tensor(getattr(output, field.name))
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
@@ -216,6 +246,18 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
                 )
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for field in dataclasses.fields(output):
+                item = getattr(output, field.name)
+                if item is None or torch.is_tensor(item):
+                    self._copy_output_to_buffer(
+                        item,
+                        getattr(output_buffer, field.name),
+                        num_tokens,
+                    )
             return
         if isinstance(output, (list, tuple)) and isinstance(
             output_buffer, type(output)

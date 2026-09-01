@@ -216,6 +216,15 @@ def _update_gather_batch(
     skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
+    if skip_all_gather:
+        batch.global_num_tokens_all_dp = None
+        batch.global_num_tokens_for_logprob_all_dp = None
+    else:
+        batch.global_num_tokens_all_dp = mlp_sync_info.global_num_tokens
+        batch.global_num_tokens_for_logprob_all_dp = (
+            mlp_sync_info.global_num_tokens_for_logprob
+        )
+
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
