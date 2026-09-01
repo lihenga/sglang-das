@@ -101,6 +101,11 @@ def get_pp_indices(
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    # A single PP stage owns the complete layer stack.  Ignore a stale
+    # multi-stage partition hint so TP/EP/CP configurations with pp_size=1
+    # remain valid (for example the PP1 debug launcher sets 32,28 by default).
+    if pp_size == 1:
+        return (0, num_hidden_layers)
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]
