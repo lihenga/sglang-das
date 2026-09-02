@@ -61,6 +61,7 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_tokenflow_legacy_compat = get_bool_env_var("SGLANG_TOKENFLOW_LEGACY_COMPAT")
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
@@ -173,6 +174,7 @@ def inplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
+    activation_smooth_scale: Optional[torch.Tensor] = None,
 ) -> None:
     if isinstance(activation, int):
         if activation == 0:
@@ -217,6 +219,7 @@ def inplace_fused_experts(
         a1_q=a1_q,
         use_int4_w4a8=use_int4_w4a8,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        activation_smooth_scale=activation_smooth_scale,
     )
 
 
@@ -252,6 +255,9 @@ def inplace_fused_experts_fake(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
+    fuse_swiglu_interleaved: bool = False,
+    activation_smooth_scale: Optional[torch.Tensor] = None,
 ) -> None:
     pass
 
@@ -300,6 +306,7 @@ def outplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
+    activation_smooth_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if isinstance(activation, int):
         if activation == 0:
@@ -344,6 +351,7 @@ def outplace_fused_experts(
         a1_q=a1_q,
         use_int4_w4a8=use_int4_w4a8,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        activation_smooth_scale=activation_smooth_scale,
     )
 
 
@@ -380,6 +388,9 @@ def outplace_fused_experts_fake(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_int4_w4a8: bool = False,
+    fuse_swiglu_interleaved: bool = False,
+    activation_smooth_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -417,6 +428,7 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
+    activation_smooth_scale: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -472,6 +484,7 @@ def fused_experts(
             a1_q=a1_q,
             use_int4_w4a8=use_int4_w4a8,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            activation_smooth_scale=activation_smooth_scale,
         )
         return hidden_states
     else:
@@ -510,6 +523,7 @@ def fused_experts(
             a1_q=a1_q,
             use_int4_w4a8=use_int4_w4a8,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            activation_smooth_scale=activation_smooth_scale,
         )
 
 
@@ -879,6 +893,7 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    activation_smooth_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -1149,7 +1164,13 @@ def _fused_moe_kernel_sequence(
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-        if _is_cuda or _is_hip:
+        if _is_hip and _use_tokenflow_legacy_compat:
+            x = intermediate_cache1.view(-1, N)
+            d = N // 2
+            intermediate_cache2.copy_(
+                F.gelu(x[..., :d], approximate="none") * x[..., d:]
+            )
+        elif _is_cuda or _is_hip:
             if filter_expert and _is_cuda:
                 gelu_and_mul(
                     intermediate_cache1.view(-1, N),
@@ -1169,6 +1190,15 @@ def _fused_moe_kernel_sequence(
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
+        if activation_smooth_scale is not None:
+            assert _use_tokenflow_legacy_compat
+            assert activation_smooth_scale.numel() == intermediate_cache2.shape[-1]
+            intermediate_cache2.clamp_(min=-8.0, max=8.0)
+            intermediate_cache2.mul_(
+                activation_smooth_scale.to(dtype=intermediate_cache2.dtype).view(
+                    1, -1
+                )
+            )
     # Activation function without multiplication
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
@@ -1277,7 +1307,9 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_hip:
-        if _use_aiter:
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+            pass  # we wrote directly into out_hidden_states
+        elif _use_aiter:
             moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states,
@@ -1360,6 +1392,7 @@ def fused_experts_impl(
     a1_q: Optional[torch.Tensor] = None,
     use_int4_w4a8: bool = False,
     fuse_swiglu_interleaved: bool = False,
+    activation_smooth_scale: Optional[torch.Tensor] = None,
 ):
     if (
         _use_aiter_moe
@@ -1500,6 +1533,7 @@ def fused_experts_impl(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        activation_smooth_scale=activation_smooth_scale,
     )
 
 

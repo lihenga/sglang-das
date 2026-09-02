@@ -60,6 +60,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_hcu
+_use_tokenflow_legacy_compat = get_bool_env_var("SGLANG_TOKENFLOW_LEGACY_COMPAT")
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul as _sgl_gelu_and_mul
@@ -260,6 +261,8 @@ class GeluAndMul(BaseFusedOp):
             return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_hip and _use_tokenflow_legacy_compat:
+            return self.forward_native(x)
         return self._forward_impl(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:

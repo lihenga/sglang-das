@@ -7472,8 +7472,20 @@ class ServerArgs:
                         "--deepep-mode low_latency or auto."
                     )
             if self.deepep_mode == "normal":
-                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                if self.cuda_graph_config.decode.backend == Backend.BREAKABLE:
+                    logger.warning(
+                        "Keeping breakable decode CUDA graph with "
+                        "deepep_mode=`normal`; DeepEP communication runs as "
+                        "eager graph nodes."
+                    )
+                else:
+                    logger.warning(
+                        "Decode CUDA graph is disabled because "
+                        "deepep_mode=`normal` requires the breakable backend."
+                    )
+                    self.cuda_graph_config.decode.backend = Backend.DISABLED
+                # DeepEP normal prefill is kept eager; only decode uses the
+                # segmented breakable graph path above.
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         # The resolving view, not the field: `_a2a_backend_overrides` may have

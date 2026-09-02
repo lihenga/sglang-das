@@ -370,6 +370,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
 
+        moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
@@ -402,14 +403,12 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
+            x = dispatch_output.hidden_states
+            topk_output = dispatch_output.topk_output
             topk_weights, topk_ids, _ = topk_output
             topk_ids = topk_ids.int()
             x, topk_weights = apply_topk_weights_cpu(
@@ -454,7 +453,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
         combine_input = self.runner.run(dispatch_output, quant_info)
         if bias is not None:
-            return StandardCombineInput(
-                hidden_states=combine_input.hidden_states + bias
+            return combine_input._replace(
+                hidden_states=combine_input.hidden_states + bias,
             )
         return combine_input

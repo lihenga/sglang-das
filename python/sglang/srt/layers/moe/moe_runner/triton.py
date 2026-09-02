@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
@@ -75,6 +75,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     # w13 rows were permuted to interleave gate/up at load, so the activation
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
+    activation_smooth_scale: Optional[torch.Tensor] = None
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -174,6 +175,7 @@ class TritonRunnerCore(MoeRunnerCore):
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            activation_smooth_scale=quant_info.activation_smooth_scale,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -262,10 +264,101 @@ def fused_experts_none_to_triton(
             block_shape=quant_info.block_shape,
             a1_q=a1_q,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            activation_smooth_scale=quant_info.activation_smooth_scale,
         )
 
     return StandardCombineInput(
         hidden_states=output,
+    )
+
+
+@register_fused_func("deepep", "triton")
+def fused_experts_deepep_to_triton(
+    dispatch_output,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    """Run locally received DeepEP routes with the Triton W8A8 MoE."""
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPNormalCombineInput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardDispatchOutput,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    is_normal = dispatch_output.format.is_deepep_normal()
+    if not (is_normal or dispatch_output.format.is_deepep_ll()):
+        raise NotImplementedError(
+            f"Unsupported DeepEP format: {dispatch_output.format}"
+        )
+    if dispatch_output.hidden_states_scale is not None:
+        raise NotImplementedError("DeepEP + Triton requires BF16 dispatch")
+    if dispatch_output.hidden_states.dtype != torch.bfloat16:
+        raise TypeError(
+            "DeepEP + Triton expects BF16 hidden states, got "
+            f"{dispatch_output.hidden_states.dtype}"
+        )
+    if not (quant_info.use_int8_w8a8 and quant_info.per_channel_quant):
+        raise NotImplementedError("DeepEP + Triton currently supports W8A8 INT8")
+
+    smooth_scale = getattr(
+        runner_config.layer, "routed_down_input_smooth_scale", None
+    )
+    if runner_config.activation == "gelu" and smooth_scale is not None:
+        quant_info = replace(
+            quant_info,
+            activation_smooth_scale=smooth_scale,
+        )
+
+    hidden_states = dispatch_output.hidden_states
+    if is_normal:
+        local_topk_ids = dispatch_output.topk_ids.to(torch.int32)
+        local_topk_weights = dispatch_output.topk_weights
+    else:
+        num_experts, capacity, hidden_size = hidden_states.shape
+        token_ids = torch.arange(
+            capacity,
+            device=hidden_states.device,
+            dtype=dispatch_output.masked_m.dtype,
+        )
+        expert_ids = torch.arange(
+            num_experts, device=hidden_states.device, dtype=torch.int32
+        ).unsqueeze(1)
+        local_topk_ids = torch.where(
+            token_ids.unsqueeze(0) < dispatch_output.masked_m.unsqueeze(1),
+            expert_ids,
+            -1,
+        ).reshape(-1, 1)
+        local_topk_weights = torch.ones(
+            (num_experts * capacity, 1),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        hidden_states = hidden_states.reshape(-1, hidden_size)
+
+    output = hidden_states
+    if output.shape[0] > 0:
+        output = fused_experts_none_to_triton(
+            StandardDispatchOutput(
+                hidden_states=output,
+                hidden_states_scale=None,
+                topk_output=StandardTopKOutput(
+                    local_topk_weights, local_topk_ids, None
+                ),
+                hidden_states_pre_quant=None,
+            ),
+            quant_info,
+            # Spark's router already folded routed_scaling_factor into weights.
+            replace(runner_config, routed_scaling_factor=1.0),
+        ).hidden_states
+
+    combine_cls = DeepEPNormalCombineInput if is_normal else DeepEPLLCombineInput
+    return combine_cls(
+        output.reshape(dispatch_output.hidden_states.shape),
+        dispatch_output.topk_ids,
+        dispatch_output.topk_weights,
     )
 
 
