@@ -31,9 +31,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
@@ -403,6 +403,24 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    spec_info = local_batch.spec_info if local_batch is not None else None
+    hf_config = model_runner.model_config.hf_config
+    needs_dsa_seed = (
+        local_batch is not None
+        and local_batch.forward_mode.is_decode()
+        and spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT
+        and getattr(hf_config, "index_share_for_mtp_iteration", False)
+        and get_spec().speculative_eagle_topk == 1
+        and getattr(hf_config, "index_topk", None) is not None
+    )
+    if needs_dsa_seed:
+        dsa_seed_ready = (
+            spec_info.future_dsa_topk_indices_available
+            if spec_info.future_indices is not None
+            else spec_info.dsa_topk_indices is not None
+        )
+        can_run_decode_cuda_graph &= dsa_seed_ready
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if breakable_prefill else None
