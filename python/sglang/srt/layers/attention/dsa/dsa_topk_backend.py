@@ -264,6 +264,16 @@ def _topk_unfused(
     )
     topk_indices[:, :valid_topk] = topk_local_indices
 
+    if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        # Match the k-only/select-all path for each short row even when a
+        # longer companion makes the whole batch execute the full indexer.
+        canonical = torch.arange(topk, dtype=torch.int32, device=score.device)
+        canonical = canonical.unsqueeze(0).expand(batch_size, -1)
+        canonical = canonical.masked_fill(canonical >= lengths.unsqueeze(1), -1)
+        topk_indices = torch.where(
+            (lengths <= topk).unsqueeze(1), canonical, topk_indices
+        )
+
     return topk_indices
 
 
