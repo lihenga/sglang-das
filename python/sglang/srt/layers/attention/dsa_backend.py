@@ -1162,7 +1162,7 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
-            dsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            dsa_extend_seq_lens_list=list(extend_seq_lens_cpu),
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
@@ -2113,6 +2113,11 @@ class DeepseekSparseAttnBackend(
         topk_was_padded = (
             topk_indices is not None and topk_indices.shape[0] != q_nope.shape[0]
         )
+        num_valid_rows = (
+            get_flashmla_kv_valid_rows(forward_batch, q_nope.shape[0])
+            if _is_hcu
+            else None
+        )
 
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(forward_mode)
@@ -2165,6 +2170,13 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self._translate_main_kv_loc_to_compact(page_table_1)
 
         if dsa_impl == "tilelang":
+            needs_repad = num_valid_rows is not None
+            if needs_repad:
+                if num_valid_rows == 0:
+                    return q_nope.new_zeros(
+                        (1, q_nope.shape[0], q_nope.shape[1], layer.v_head_dim)
+                    )
+                page_table_1 = page_table_1[:num_valid_rows]
             if self.hcu_fp8_kv_dequant_bf16:
                 if topk_transform_method == TopkTransformMethod.RAGGED:
                     page_table_1 = topk_indices
@@ -2193,6 +2205,7 @@ class DeepseekSparseAttnBackend(
                 if (
                     _DSA_TRITON_PREFILL
                     and _IS_GFX95
+                    and not needs_repad
                     and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
                     and layer.tp_q_head_num == 16
                     and layer.v_head_dim == 512
@@ -2213,13 +2226,22 @@ class DeepseekSparseAttnBackend(
                         d_v=layer.v_head_dim,
                     )
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_tilelang(
+            if needs_repad:
+                q_all = q_all[:num_valid_rows]
+            output = self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+            if needs_repad:
+                padded_output = output.new_zeros(
+                    (output.shape[0], q_nope.shape[0], *output.shape[2:])
+                )
+                padded_output[:, :num_valid_rows] = output
+                return padded_output
+            return output
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
@@ -2442,6 +2464,12 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        num_valid_rows = (
+            get_flashmla_kv_valid_rows(forward_batch, q_nope.shape[0])
+            if _is_hcu
+            else None
+        )
+
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
@@ -2456,11 +2484,26 @@ class DeepseekSparseAttnBackend(
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
-            page_table_1 = transform_index_page_table_decode(
-                page_table=metadata.page_table_1,
-                topk_indices=topk_indices,
-                page_size=1,
-            )
+            if (
+                num_valid_rows is not None
+                and metadata.page_table_1.shape[0] == num_valid_rows
+            ):
+                page_table_1 = torch.full_like(
+                    topk_indices, -1, dtype=torch.int32
+                )
+                if num_valid_rows > 0:
+                    transform_index_page_table_decode(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices[:num_valid_rows],
+                        result=page_table_1[:num_valid_rows],
+                        page_size=1,
+                    )
+            else:
+                page_table_1 = transform_index_page_table_decode(
+                    page_table=metadata.page_table_1,
+                    topk_indices=topk_indices,
+                    page_size=1,
+                )
 
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -2499,6 +2542,13 @@ class DeepseekSparseAttnBackend(
                 forward_batch=forward_batch,
             )
         elif self.dsa_decode_impl == "tilelang":
+            needs_repad = num_valid_rows is not None
+            if needs_repad:
+                if num_valid_rows == 0:
+                    return q_nope.new_zeros(
+                        (1, q_nope.shape[0], q_nope.shape[1], layer.v_head_dim)
+                    )
+                page_table_1 = page_table_1[:num_valid_rows]
             if self.hcu_fp8_kv_dequant_bf16:
                 kv_cache, page_table_1 = (
                     self._prepare_scaled_fp8_kv_for_tilelang(
@@ -2511,13 +2561,22 @@ class DeepseekSparseAttnBackend(
             # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_tilelang(
+            if needs_repad:
+                q_all = q_all[:num_valid_rows]
+            output = self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+            if needs_repad:
+                padded_output = output.new_zeros(
+                    (output.shape[0], q_nope.shape[0], *output.shape[2:])
+                )
+                padded_output[:, :num_valid_rows] = output
+                return padded_output
+            return output
         elif self.dsa_decode_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
