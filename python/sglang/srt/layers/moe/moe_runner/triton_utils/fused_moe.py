@@ -1164,7 +1164,11 @@ def _fused_moe_kernel_sequence(
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-        if _is_hip and _use_tokenflow_legacy_compat:
+        if (
+            _is_hip
+            and _use_tokenflow_legacy_compat
+            and activation_smooth_scale is not None
+        ):
             x = intermediate_cache1.view(-1, N)
             d = N // 2
             intermediate_cache2.copy_(
