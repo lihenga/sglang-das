@@ -142,16 +142,13 @@ class DSATopKBackend(Enum):
         assert attn_metadata.page_table_1 is not None
 
         if self.is_sgl_kernel():
-            if _is_hcu:
-                from lightop import (
-                    fast_topk_transform_fused,
-                    fast_topk_transform_ragged_fused,
-                )
-            else:
-                from sgl_kernel import (
-                    fast_topk_transform_fused,
-                    fast_topk_transform_ragged_fused,
-                )
+            # Honor the selected backend on HCU as well.  The old HCU-only
+            # override silently routed the legacy fused transforms to LightOp
+            # even when --dsa-topk-backend=sgl-kernel was requested.
+            from sgl_kernel import (
+                fast_topk_transform_fused,
+                fast_topk_transform_ragged_fused,
+            )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
                 page_table_size_1 = (

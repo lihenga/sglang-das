@@ -311,7 +311,15 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         else:
             x_q, x_scale = per_token_quant_int8(x)
 
-        if _is_hip and os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT", "0") == "1":
+        # Strategy 3 keeps the HCU hipBLASLt NT weight layout [N, K].  The
+        # legacy Torch fallback below expects [K, N], so it must not consume
+        # strategy-3 weights.  Keep the fallback for the original strategy-1
+        # accuracy path and let strategy 3 reach blaslt_scaled_mm below.
+        if (
+            _is_hip
+            and os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT", "0") == "1"
+            and self.w8a8_strategy != 3
+        ):
             x_q_2d = x_q.reshape(-1, x_q.shape[-1])
             x_scale_2d = x_scale.reshape(-1, 1)
             num_rows = x_q_2d.shape[0]

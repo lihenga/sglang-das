@@ -79,7 +79,9 @@ if _is_cuda:
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
+        out = torch.mm(x, weight.t())
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights

@@ -404,7 +404,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.hidden_size,
                 self.n_heads,
                 bias=False,
-                params_dtype=torch.bfloat16,
+                params_dtype=torch.float32,
                 prefix=add_prefix("weights_proj", prefix),
             )
         if (
@@ -552,8 +552,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
+        if x.dtype != self.weights_proj.weight.dtype:
+            x = x.to(self.weights_proj.weight.dtype)
         if _is_cuda:
-            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
+            return torch.mm(x, self.weights_proj.weight.t())
 
         weights, _ = self.weights_proj(x)
         if _is_hip:

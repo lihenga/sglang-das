@@ -162,6 +162,14 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
             cu_topk_indices_offset = self.attn_metadata.topk_indices_offset
+        # CP/DP padding extends the cached per-row metadata to the padded MLP
+        # token count, while ragged MQA logits contain only the real local query
+        # rows.  Top-k transforms require exactly one offset per logits row.
+        if (
+            cu_topk_indices_offset is not None
+            and cu_topk_indices_offset.shape[0] > logits.shape[0]
+        ):
+            cu_topk_indices_offset = cu_topk_indices_offset[: logits.shape[0]]
         if ke_offset is not None:
             seq_lens_topk = ke_offset
         else:
