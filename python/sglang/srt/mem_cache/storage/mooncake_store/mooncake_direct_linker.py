@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import struct
 import threading
 import time
 from concurrent.futures import Future
@@ -33,6 +35,15 @@ from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+def _hash_strings(values: list[str]) -> str:
+    hasher = hashlib.sha256()
+    for value in values:
+        encoded = value.encode("utf-8")
+        hasher.update(struct.pack("<Q", len(encoded)))
+        hasher.update(encoded)
+    return hasher.hexdigest()
 
 
 def _get_mooncake_storage_metrics_dp_rank(server_args, params) -> int:
@@ -229,6 +240,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = {}
         self.pending_load_metrics: dict[str, tuple[int, dict[str, int], float]] = {}
         self.request_time_stats: dict[str, object] = {}
+        self.lookup_finish_times: dict[str, float] = {}
+        self.lookup_key_hashes: dict[str, str] = {}
+        self.pending_load_key_hashes: dict[str, str] = {}
+        self.load_get_start_logged: set[str] = set()
         self.session_lock = threading.Lock()
         self.gc_frozen = False
         self.load_queue: Queue[
@@ -278,17 +293,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not page_keys:
             return []
         result = self.storage.batch_exists_v2(page_keys, expanded)
+        lookup_finished = time.perf_counter()
         restorable = result.restorable_prefix_pages or []
+        key_hash = _hash_strings(page_keys)
+        self.lookup_finish_times[rid] = lookup_finished
+        self.lookup_key_hashes[rid] = key_hash
         self.stats["lookup"] += 1
-        if restorable:
-            logger.info(
-                "Mooncake direct linker lookup hit: rid=%s pages=%d "
-                "candidates=%d duration=%.2fms",
-                rid,
-                restorable[-1],
-                len(restorable),
-                (time.perf_counter() - started) * 1000,
-            )
+        logger.info(
+            "Mooncake direct linker lookup: rid=%s page_count=%d key_hash=%s "
+            "hit_pages=%d candidate_count=%d duration=%.2fms",
+            rid,
+            len(page_keys),
+            key_hash,
+            restorable[-1] if restorable else 0,
+            len(restorable),
+            (lookup_finished - started) * 1000,
+        )
         return restorable
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -308,6 +328,33 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
+        load_enqueued = time.perf_counter()
+        lookup_finished = self.lookup_finish_times.get(rid)
+        lookup_to_load_enqueue_ms = (
+            (load_enqueued - lookup_finished) * 1000
+            if lookup_finished is not None
+            else None
+        )
+        key_hash = _hash_strings(
+            list(
+                next(
+                    transfer
+                    for transfer in transfers
+                    if transfer.name == PoolName.KV
+                ).keys
+            )
+        )
+        self.pending_load_key_hashes[rid] = key_hash
+        logger.info(
+            "Mooncake direct linker load enqueue: rid=%s key_hash=%s "
+            "lookup_to_enqueue_ms=%s queue_size=%d",
+            rid,
+            key_hash,
+            f"{lookup_to_load_enqueue_ms:.2f}"
+            if lookup_to_load_enqueue_ms is not None
+            else "NA",
+            self.load_queue.qsize(),
+        )
         prepared_page_sources = getattr(self, "prepared_load_page_sources", {}).get(
             rid, {}
         )
@@ -608,6 +655,35 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         continue
                     ptrs, sizes, offsets = meta
                     rids = batch_rids.get(name, [None] * len(keys))
+                    for request_rid in set(rids):
+                        if request_rid is None or request_rid in self.load_get_start_logged:
+                            continue
+                        get_started = time.perf_counter()
+                        lookup_finished = self.lookup_finish_times.get(request_rid)
+                        lookup_to_get_start_ms = (
+                            (get_started - lookup_finished) * 1000
+                            if lookup_finished is not None
+                            else None
+                        )
+                        request_keys = [
+                            key for key, key_rid in zip(keys, rids) if key_rid == request_rid
+                        ]
+                        logger.info(
+                            "Mooncake direct linker get start: rid=%s pool=%s "
+                            "physical_key_count=%d physical_key_hash=%s logical_key_hash=%s "
+                            "lookup_to_get_start_ms=%s",
+                            request_rid,
+                            name,
+                            len(request_keys),
+                            _hash_strings(request_keys),
+                            self.pending_load_key_hashes.get(request_rid, "NA"),
+                            (
+                                f"{lookup_to_get_start_ms:.2f}"
+                                if lookup_to_get_start_ms is not None
+                                else "NA"
+                            ),
+                        )
+                        self.load_get_start_logged.add(request_rid)
                     logger.debug(
                         "00 Mooncake range get start: counter=%d rids=%s rids_size=%d pool=%s "
                         "layer=%d objects=%d",
@@ -810,6 +886,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             str(name): len(keys) for name, (keys, _) in batches.items()
         }
         unique_rids = sorted({rid for rid in all_rids if rid is not None})
+        get_started = time.perf_counter()
+        for request_rid in unique_rids:
+            request_keys = [
+                key for key, key_rid in zip(all_keys, all_rids) if key_rid == request_rid
+            ]
+            lookup_finished = self.lookup_finish_times.get(request_rid)
+            lookup_to_get_start_ms = (
+                (get_started - lookup_finished) * 1000
+                if lookup_finished is not None
+                else None
+            )
+            logger.info(
+                "Mooncake direct linker get start: rid=%s pool=aggregated "
+                "physical_key_count=%d physical_key_hash=%s logical_key_hash=%s "
+                "lookup_to_get_start_ms=%s",
+                request_rid,
+                len(request_keys),
+                _hash_strings(request_keys),
+                self.pending_load_key_hashes.get(request_rid, "NA"),
+                (
+                    f"{lookup_to_get_start_ms:.2f}"
+                    if lookup_to_get_start_ms is not None
+                    else "NA"
+                ),
+            )
+            self.load_get_start_logged.add(request_rid)
         logger.debug(
             "01 Mooncake range get start: counter=%d rids=%s rids_size=%d "
             "pools=%s complete_page objects=%d",

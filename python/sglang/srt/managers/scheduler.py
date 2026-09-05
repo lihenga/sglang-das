@@ -18,9 +18,11 @@
 
 import dataclasses
 import faulthandler
+import hashlib
 import logging
 import os
 import signal
+import struct
 import sys
 import time
 from array import array
@@ -204,6 +206,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
+    split_cached_prefix_by_tier,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -347,6 +350,13 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _hash_token_ids(token_ids) -> str:
+    hasher = hashlib.sha256()
+    for token_id in token_ids:
+        hasher.update(struct.pack("<q", int(token_id)))
+    return hasher.hexdigest()
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -3607,6 +3617,25 @@ class Scheduler(
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        # Log the final per-request cache-hit breakdown after admission and load-back.
+        for req in can_run_list:
+            if req.already_computed != 0:
+                continue
+            l1_hit_tokens, _, l3_hit_tokens = split_cached_prefix_by_tier(
+                prefix_len=len(req.prefix_indices),
+                host_hit_len=req.host_hit_length,
+                storage_hit_len=req.storage_hit_length,
+            )
+            logger.info(
+                "Scheduler cache hit breakdown: rid=%s input_tokens=%d "
+                "input_token_hash=%s l1_hit_tokens=%d l3_hit_tokens=%d",
+                req.rid,
+                len(req.origin_input_ids),
+                _hash_token_ids(req.origin_input_ids),
+                l1_hit_tokens,
+                l3_hit_tokens,
+            )
+
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -3631,6 +3660,25 @@ class Scheduler(
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
+            )
+
+        # Log the final per-request cache-hit breakdown after admission and load-back.
+        for req in can_run_list:
+            if req.already_computed != 0:
+                continue
+            l1_hit_tokens, _, l3_hit_tokens = split_cached_prefix_by_tier(
+                prefix_len=len(req.prefix_indices),
+                host_hit_len=req.host_hit_length,
+                storage_hit_len=req.storage_hit_length,
+            )
+            logger.info(
+                "Scheduler cache hit breakdown: rid=%s input_tokens=%d "
+                "input_token_hash=%s l1_hit_tokens=%d l3_hit_tokens=%d",
+                req.rid,
+                len(req.origin_input_ids),
+                _hash_token_ids(req.origin_input_ids),
+                l1_hit_tokens,
+                l3_hit_tokens,
             )
 
         new_batch.prepare_for_extend()
