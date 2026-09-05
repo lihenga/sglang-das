@@ -95,12 +95,27 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
-    return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
-        and get_disagg().disaggregation_mode == "null"
-    )
+    if (
+        memory_config.enable_hisparse
+        or is_draft_worker
+        or memory_config.enable_hierarchical_cache
+    ):
+        return False
+
+    disagg_config = get_disagg()
+    if disagg_config.disaggregation_mode == "null":
+        return True
+    if not envs.SGLANG_DSA_COMPACT_INDEX_K_CACHE_PD.get():
+        return False
+    if disagg_config.disaggregation_transfer_backend not in (
+        "mooncake",
+        "mooncake_tcp",
+    ):
+        raise ValueError(
+            "SGLANG_DSA_COMPACT_INDEX_K_CACHE_PD=1 requires the Mooncake "
+            "PD transfer backend"
+        )
+    return True
 
 
 _is_hip = is_hip()
