@@ -1259,24 +1259,38 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     # per speculative token, so use the matching expanded lengths.
                     seqlens_32,
                 )
+
+            flat_seqlens = seqlens_32.reshape(-1)
+            available_rows = {
+                "q": q_fp8.shape[0],
+                "weights": weights.shape[0],
+                "context_lens": flat_seqlens.shape[0],
+                "block_table": block_tables.shape[0],
+            }
+            if any(rows < q_offset for rows in available_rows.values()):
+                raise RuntimeError(
+                    "LightOp paged_mqa_logits inputs have fewer rows than the "
+                    f"active query count ({q_offset}): {available_rows}; "
+                    f"forward_mode={forward_mode}."
+                )
+            paged_seqlens = (
+                flat_seqlens[:q_offset].to(torch.int32).contiguous()
+            )
+            paged_block_tables = (
+                block_tables[:q_offset].to(torch.int32).contiguous()
+            )
             if use_int8_index_cache:
                 paged_q, active_weights = self._prepare_hcu_int8_paged_query(
                     q_fp8[:q_offset], weights[:q_offset]
                 )
-                paged_seqlens = seqlens_32.reshape(-1).to(torch.int32).contiguous()
-                paged_block_tables = block_tables.to(torch.int32).contiguous()
                 paged_schedule_metadata = None
             elif use_bf16_index_cache:
                 paged_q = q_fp8[:q_offset]
                 active_weights = weights[:q_offset].to(torch.float32)
-                paged_seqlens = seqlens_32
-                paged_block_tables = block_tables
                 paged_schedule_metadata = schedule_metadata
             else:
                 paged_q = q_fp8[:q_offset]
                 active_weights = weights[:q_offset]
-                paged_seqlens = seqlens_32
-                paged_block_tables = block_tables
                 paged_schedule_metadata = schedule_metadata
             active_q = paged_q.unsqueeze(1)
             use_mask_topk = envs.SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK.get()
@@ -1302,8 +1316,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q=active_q,
                 fused_kv_cache=kv_cache,
                 weights=active_weights,
-                context_lens=seqlens_32,
-                block_table=block_tables,
+                context_lens=paged_seqlens,
+                block_table=paged_block_tables,
                 max_context_len=max_seq_len,
                 batch_size=forward_batch.batch_size,
                 is_target_verify=forward_mode.is_target_verify(),
@@ -1336,8 +1350,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     active_q,
                     kv_cache,
                     active_weights,
-                    seqlens_32,
-                    block_tables,
+                    paged_seqlens,
+                    paged_block_tables,
                     None,
                     max_seq_len,
                     clean_logits=True,
@@ -1350,8 +1364,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     active_q,
                     kv_cache,
                     active_weights,
-                    seqlens_32,
-                    block_tables,
+                    paged_seqlens,
+                    paged_block_tables,
                     None,
                     max_seq_len,
                     clean_logits=True,
