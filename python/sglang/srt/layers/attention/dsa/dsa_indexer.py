@@ -1277,36 +1277,43 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
 
             flat_seqlens = seqlens_32.reshape(-1)
+            # q_offset comes from attention metadata. During DP MLP-sync /
+            # breakable graph replay, IDLE/DRAFT_EXTEND_V2 may keep a
+            # graph-sized metadata batch while q/weights contain only the real
+            # query prefix. Python slicing already treated the shorter q tensor as
+            # authoritative before the shape checks were added; make that
+            # contract explicit and slice every Page-MQA row tensor equally.
+            paged_row_count = min(q_offset, q_fp8.shape[0])
             available_rows = {
                 "q": q_fp8.shape[0],
                 "weights": weights.shape[0],
                 "context_lens": flat_seqlens.shape[0],
                 "block_table": block_tables.shape[0],
             }
-            if any(rows < q_offset for rows in available_rows.values()):
+            if any(rows < paged_row_count for rows in available_rows.values()):
                 raise RuntimeError(
                     "LightOp paged_mqa_logits inputs have fewer rows than the "
-                    f"active query count ({q_offset}): {available_rows}; "
+                    f"active query count ({paged_row_count}): {available_rows}; "
                     f"forward_mode={forward_mode}."
                 )
             paged_seqlens = (
-                flat_seqlens[:q_offset].to(torch.int32).contiguous()
+                flat_seqlens[:paged_row_count].to(torch.int32).contiguous()
             )
             paged_block_tables = (
-                block_tables[:q_offset].to(torch.int32).contiguous()
+                block_tables[:paged_row_count].to(torch.int32).contiguous()
             )
             if use_int8_index_cache:
                 paged_q, active_weights = self._prepare_hcu_int8_paged_query(
-                    q_fp8[:q_offset], weights[:q_offset]
+                    q_fp8[:paged_row_count], weights[:paged_row_count]
                 )
                 paged_schedule_metadata = None
             elif use_bf16_index_cache:
-                paged_q = q_fp8[:q_offset]
-                active_weights = weights[:q_offset].to(torch.float32)
+                paged_q = q_fp8[:paged_row_count]
+                active_weights = weights[:paged_row_count].to(torch.float32)
                 paged_schedule_metadata = schedule_metadata
             else:
-                paged_q = q_fp8[:q_offset]
-                active_weights = weights[:q_offset]
+                paged_q = q_fp8[:paged_row_count]
+                active_weights = weights[:paged_row_count]
                 paged_schedule_metadata = schedule_metadata
             active_q = paged_q.unsqueeze(1)
             use_mask_topk = envs.SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK.get()
@@ -1464,8 +1471,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if sparse_mask is None:
             # NOTE(dark): logits should be cleaned in topk_transform.
-            self._mask_init_and_local_tokens(logits, seqlens_32)
-            topk_result = metadata.topk_transform(logits, self.index_topk)
+            self._mask_init_and_local_tokens(
+                logits,
+                paged_seqlens
+                if self.paged_mqa_logits_backend.is_lightop()
+                else seqlens_32,
+            )
+            if self.paged_mqa_logits_backend.is_lightop():
+                topk_result = metadata.topk_transform(
+                    logits, self.index_topk, ke_offset=paged_seqlens
+                )
+            else:
+                topk_result = metadata.topk_transform(logits, self.index_topk)
         else:
             topk_result = metadata.topk_transform_sparse_mask(
                 logits, sparse_mask, self.index_topk
