@@ -172,6 +172,67 @@ def install_deepep_prepare() -> bool:
     return True
 
 
+def install_smooth_quant() -> bool:
+    if not (is_hcu() and get_bool_env_var("SGLANG_USE_LIGHTOP") and
+            get_bool_env_var("SGLANG_USE_LIGHTOP_FUSE_SMOOTH_PER_TOKEN_QUANT", "false")):
+        return False
+    from lightop.quant import per_token_dynamic_quant_int8
+    import tokenflow.models.sparkv1.layers.attention as attention
+    import tokenflow.models.sparkv1.layers.input_smooth as input_smooth
+    from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import CompressedTensorsW8A8Int8
+    params = inspect.signature(per_token_dynamic_quant_int8).parameters
+    if not {'round_after_smooth', 'limit'}.issubset(params):
+        raise RuntimeError('LightOp smooth quant lacks BF16 rounding/limit support')
+
+    def quantize(layer, x, limit=-1.):
+        scale = getattr(layer, 'input_smooth_scale', None)
+        weight = getattr(layer, 'weight', None)
+        scheme = getattr(layer, 'scheme', None)
+        if not (isinstance(scheme, CompressedTensorsW8A8Int8)
+                and isinstance(x, torch.Tensor) and x.ndim == 2
+                and x.shape[0] > 0 and x.is_cuda and x.is_contiguous()
+                and x.dtype in (torch.bfloat16, torch.float16)
+                and isinstance(scale, torch.Tensor) and scale.ndim == 1
+                and scale.device == x.device and scale.dtype == torch.float32
+                and scale.numel() == x.shape[-1] and scale.is_contiguous()
+                and isinstance(weight, torch.Tensor) and weight.dtype == torch.int8):
+            return None
+        q, s = per_token_dynamic_quant_int8(x, scale, round_after_smooth=True, limit=float(limit))
+        if s.ndim == 1:
+            s = s.unsqueeze(-1)
+        return [q, s]
+
+    row_cls = attention.SparkV1ClampedRowParallelLinear
+    rep_cls = input_smooth.InputSmoothReplicatedLinear
+    if getattr(row_cls.forward, '_sglang_0512_smooth', False):
+        return True
+    row_original, rep_original = row_cls.forward, rep_cls.forward
+
+    def row(self, input_, skip_all_reduce=False, forward_batch=None, **kwargs):
+        limit = getattr(self, 'clamp_value', getattr(self, 'limit', None))
+        if kwargs or not self.input_is_parallel or not isinstance(limit, (int, float)) or limit < 0:
+            return row_original(self, input_, skip_all_reduce=skip_all_reduce, forward_batch=forward_batch, **kwargs)
+        quant = quantize(self, input_, limit)
+        if quant is None:
+            return row_original(self, input_, skip_all_reduce=skip_all_reduce, forward_batch=forward_batch)
+        return RowParallelLinear.forward(self, input_, skip_all_reduce=skip_all_reduce,
+                                         forward_batch=forward_batch, silu_quant_args=quant)
+
+    def replicated(self, x, *args, **kwargs):
+        quant = quantize(self, x) if not args and not kwargs else None
+        if quant is None:
+            return rep_original(self, x, *args, **kwargs)
+        return ReplicatedLinear.forward(self, x, quant_args=quant)
+
+    row._sglang_0512_smooth = replicated._sglang_0512_smooth = True
+    row._sglang_original, replicated._sglang_original = row_original, rep_original
+    row_cls.forward, rep_cls.forward = row, replicated
+    logger.info('Installed 0512 local smooth/per-token quant (separate Torch norms)')
+    return True
+
+
 def install_spark_v1_0512_adapters(config):
     return {"grouped_topk": install_grouped_topk(config),
-            "deepep_prepare": install_deepep_prepare()}
+            "deepep_prepare": install_deepep_prepare(),
+            "smooth_quant": install_smooth_quant()}
