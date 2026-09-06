@@ -77,6 +77,9 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.unified_cache_linker import (
+    UnifiedCacheLinkerWrapper,
+)
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
@@ -261,6 +264,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_sum_rate_all": 0.0,
             "l3_sum_rate_main_weighted": 0.0,
         }
+        self.linker: Optional[UnifiedCacheLinkerWrapper] = None
 
         self.reset()
         logger.info(
@@ -334,7 +338,15 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.work_list.append(send_work)
 
+    def init_cache_linker(
+        self, server_args: ServerArgs, params: CacheInitParams
+    ) -> None:
+        """Attach an external KV store directly to the device pools (direct L3)."""
+        self.linker = UnifiedCacheLinkerWrapper(self, server_args, params)
+
     def reset(self) -> None:
+        if self.linker is not None:
+            self.linker.reset()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -488,6 +500,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.register_sidecar_pool(spec)
 
     def release_host_resources(self) -> None:
+        if self.linker is not None:
+            self.linker.close()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -509,6 +523,8 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        if self.linker is not None and params.req is not None:
+            result = self.linker.match(params.key, params.req, result)
         return result
 
     def is_chunk_cache(self) -> bool:
@@ -992,7 +1008,10 @@ class UnifiedRadixCache(BasePrefixCache):
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
-            self._execute_and_commit_kv_backup(action)
+            if self.linker is not None:
+                self.linker.offload_nodes(action.node_ids)
+            else:
+                self._execute_and_commit_kv_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1950,6 +1969,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if (
             self.buffer_pipeline is not None
@@ -2571,6 +2592,8 @@ class UnifiedRadixCache(BasePrefixCache):
         mem_quota = params.mem_quota
         req = params.req
         assert req is not None
+        if self.linker is not None and self.linker.has_hit(req.rid):
+            return self.linker.load_back(req)
         last_best_match_device_node_id = req.last_node
 
         if (
@@ -2605,6 +2628,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.linker is not None:
+            finish_count = torch.tensor(
+                self.linker.num_completed_offloads(), dtype=torch.int, device="cpu"
+            )
+            self._all_reduce_attn_groups(finish_count, torch.distributed.ReduceOp.MIN)
+            self.linker.drain_offloads(int(finish_count.item()))
+            return
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
@@ -2665,6 +2695,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
+        if self.linker is not None:
+            return self.linker.start_layer_wise_loading()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0

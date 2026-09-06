@@ -193,6 +193,12 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
+    elif server_args.enable_unified_cache_external_linker:
+        cache.init_cache_linker(server_args, params)
+        counter = cache.linker.layer_done_counter
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        kvcache.register_layer_transfer_counter(counter)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 
 
