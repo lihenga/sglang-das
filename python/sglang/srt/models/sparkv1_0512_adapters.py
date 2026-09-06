@@ -232,7 +232,112 @@ def install_smooth_quant() -> bool:
     return True
 
 
+def _local_smooth_scale(layer, width):
+    """Match TokenFlow's full-input/local-input selection, without recasting."""
+    scale = getattr(layer, "input_smooth_scale", None)
+    if not isinstance(scale, torch.Tensor) or scale.ndim != 1:
+        return None
+    meta = getattr(layer, "_tokenflow_input_smooth_meta", {})
+    spec = meta.get("input_smooth_scale") if isinstance(meta, dict) else None
+    if spec is None:
+        return scale if scale.numel() == width else None
+    if not isinstance(spec, (tuple, list)) or len(spec) != 3:
+        return None
+    full, rank, parts = spec
+    if (not all(isinstance(v, int) for v in spec) or parts <= 0
+            or full <= 0 or full % parts or not 0 <= rank < parts
+            or scale.numel() != full):
+        return None
+    if width == full:
+        return scale
+    shard = full // parts
+    return scale.narrow(0, rank * shard, shard) if width == shard else None
+
+
+def install_dense_quant() -> bool:
+    """Port both Dense/shared INT8 input chains, leaving collectives to 0518."""
+    if not (is_hcu() and get_bool_env_var("SGLANG_USE_LIGHTOP") and
+            get_bool_env_var("SGLANG_USE_LIGHTOP_FUSE_DENSE_GELU_CLAMP_SMOOTH_QUANT", "false")):
+        return False
+    from lightop import fuse_silu_mul_clamp_quant
+    from lightop.quant import per_token_dynamic_quant_int8
+    import tokenflow.models.sparkv1.layers.moe as spark_moe
+    from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import CompressedTensorsW8A8Int8
+    if "smooth_scale" not in inspect.signature(fuse_silu_mul_clamp_quant).parameters:
+        raise RuntimeError("Dense Spark fusion requires smooth-aware GELU quant")
+    original = spark_moe.SparkV1DenseMLP.forward
+    if getattr(original, "_sglang_0512_dense", False):
+        return True
+    installed_signature = inspect.signature(original)
+    expected = {"hidden_states", "forward_batch", "should_allreduce_fusion",
+                "use_reduce_scatter", "gemm_output_zero_allocator"}
+    if not expected.issubset(installed_signature.parameters):
+        raise RuntimeError(f"Unsupported TokenFlow DenseMLP ABI: {installed_signature}")
+    logged = False
+
+    def forward(self, hidden_states, forward_batch=None,
+                should_allreduce_fusion=False, use_reduce_scatter=False,
+                gemm_output_zero_allocator=None):
+        nonlocal logged
+        def fallback():
+            return original(self, hidden_states, forward_batch=forward_batch,
+                            should_allreduce_fusion=should_allreduce_fusion,
+                            use_reduce_scatter=use_reduce_scatter,
+                            gemm_output_zero_allocator=gemm_output_zero_allocator)
+
+        limit = getattr(self, "clamp_value", None)
+        if (gemm_output_zero_allocator is not None
+                or not isinstance(hidden_states, torch.Tensor)
+                or hidden_states.ndim != 2 or hidden_states.shape[0] == 0
+                or not hidden_states.is_cuda or not hidden_states.is_contiguous()
+                or hidden_states.dtype not in (torch.float16, torch.bfloat16)
+                or not isinstance(limit, (int, float)) or limit <= 0
+                or not getattr(self.fc2, "input_is_parallel", False)
+                or getattr(self.fc1, "gather_output", False)):
+            return fallback()
+        width = getattr(self.fc2, "input_size_per_partition", None)
+        s1 = _local_smooth_scale(self.fc1, hidden_states.shape[-1])
+        s2 = _local_smooth_scale(self.fc2, width)
+        for layer, scale in ((self.fc1, s1), (self.fc2, s2)):
+            if (not isinstance(getattr(layer, "scheme", None), CompressedTensorsW8A8Int8)
+                    or not isinstance(scale, torch.Tensor)
+                    or scale.dtype != torch.float32 or scale.device != hidden_states.device
+                    or not scale.is_contiguous()
+                    or getattr(getattr(layer, "weight", None), "dtype", None) != torch.int8
+                    or getattr(layer, "skip_bias_add", False)):
+                return fallback()
+        if getattr(self.fc1, "output_size_per_partition", None) != 2 * width:
+            return fallback()
+        q1, a1 = per_token_dynamic_quant_int8(hidden_states, s1,
+                                            round_after_smooth=True, limit=float(limit))
+        gate_up, _ = ColumnParallelLinear.forward(
+            self.fc1, hidden_states, input_quant_args=[q1, a1.reshape(-1, 1)])
+        if gate_up.shape != (hidden_states.shape[0], 2 * width):
+            raise RuntimeError("Unexpected Dense/shared local gate/up output shape")
+        q2, a2 = fuse_silu_mul_clamp_quant(
+            gate_up, float(limit), use_gelu=True, smooth_scale=s2)
+        # The input view supplies shape/dtype only; the scheme consumes q2/a2.
+        # Native RowParallelLinear still owns symmetric memory, bias and
+        # should_skip_mlp_all_reduce()/ForwardFlags decisions in 0518.
+        output, _ = RowParallelLinear.forward(
+            self.fc2, gate_up[:, :width],
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            forward_batch=forward_batch, silu_quant_args=[q2, a2.reshape(-1, 1)])
+        if not logged:
+            logger.info("0512 Dense/shared fusion active: clamp/smooth/quant + GELU/mul/clamp/smooth/quant; native 0518 collectives")
+            logged = True
+        return output
+
+    forward._sglang_0512_dense = True
+    forward._sglang_original = original
+    spark_moe.SparkV1DenseMLP.forward = forward
+    logger.info("Installed 0512 Dense/shared INT8 fusion adapter")
+    return True
+
+
 def install_spark_v1_0512_adapters(config):
     return {"grouped_topk": install_grouped_topk(config),
             "deepep_prepare": install_deepep_prepare(),
-            "smooth_quant": install_smooth_quant()}
+            "smooth_quant": install_smooth_quant(),
+            "dense_quant": install_dense_quant()}
