@@ -710,21 +710,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if key.ndim == 2:
                 key = key.view(key.shape[0], -1, self.head_dim)
 
-            lightop_attention.fuse_layernorm_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_dim,
-                self._indexer_cos_sin_cache,
-                False,
-                None,
-                None,
-                self.k_norm.weight,
-                getattr(self.k_norm, "bias", None),
-                None,
-                None,
-                self.k_norm.variance_epsilon,
-            )
+            if envs.SGLANG_DSA_HCU_FUSE_LN_ROPE.get():
+                lightop_attention.fuse_layernorm_rotary_embedding(
+                    positions,
+                    query,
+                    key,
+                    self.head_dim,
+                    self._indexer_cos_sin_cache,
+                    False,
+                    None,
+                    None,
+                    self.k_norm.weight,
+                    getattr(self.k_norm, "bias", None),
+                    None,
+                    None,
+                    self.k_norm.variance_epsilon,
+                )
+            else:
+                # Keep the normalization output's BF16 rounding before RoPE.
+                key = self.k_norm.forward_native(key)
+                q_rope, k_rope = self._apply_indexer_rope(
+                    positions,
+                    query[..., : self.rope_head_dim],
+                    key[..., : self.rope_head_dim],
+                )
+                self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
+                self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
             query = rotate_activation(query, apply_scale=apply_hadamard_scale)
             key = rotate_activation(key, apply_scale=apply_hadamard_scale)
 
@@ -850,7 +861,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ):
         # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
-        key = self.k_norm(key)
+        if _is_hcu and not envs.SGLANG_DSA_HCU_FUSE_LN_ROPE.get():
+            key = self.k_norm.forward_native(key)
+        else:
+            key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
@@ -886,6 +900,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             return query.reshape(query_shape), key.reshape(key_shape)
 
+        if _is_hcu and not envs.SGLANG_DSA_HCU_FUSE_LN_ROPE.get():
+            return self.rotary_emb.forward_native(positions, query, key)
         return self.rotary_emb(positions, query, key)
 
     def _fused_k_prepare_and_store(

@@ -1518,6 +1518,9 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
     )
     SGLANG_DSA_COMPACT_INDEX_K_CACHE_PD = EnvBool(False)
+    # HCU Q/K preparation; independent of the CUDA DSA indexer fusion switch.
+    # Disable to run normalization (preserving input dtype) before separate RoPE.
+    SGLANG_DSA_HCU_FUSE_LN_ROPE = EnvBool(True)
     # Opt-in HCU AOT kernel for concatenating absorbed MLA Q components.
     SGLANG_ENABLE_HCU_CONCAT_MLA_ABSORB_Q = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
