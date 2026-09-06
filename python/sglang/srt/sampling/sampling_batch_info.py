@@ -72,6 +72,10 @@ class SamplingBatchInfo:
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
     acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
+    # Forward-only snapshots for the HIP top-1 exact penalty reference.
+    speculative_frequency_penalties: Optional[torch.Tensor] = None
+    speculative_presence_penalties: Optional[torch.Tensor] = None
+    speculative_presence_mask: Optional[torch.Tensor] = None
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )

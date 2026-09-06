@@ -689,6 +689,8 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
+    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
     if sampling_info.acc_additive_penalties is not None:
@@ -706,6 +708,12 @@ def eagle_sample(
                 sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
             ),
         )
+    if _is_hip and verify_input.tree_topk == 1:
+        from sglang.srt.speculative.eagle_torch_sampling import apply_top1_prefix_penalties
+
+        apply_top1_prefix_penalties(
+            next_token_logits, candidates, sampling_info, verify_input.draft_token_num
+        )
     if sampling_info.logit_bias is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
@@ -717,7 +725,6 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
-    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
     accept_index = torch.full(
@@ -728,7 +735,27 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        if _is_hip and not sampling_info.is_all_greedy:
+            from sglang.srt.speculative.eagle_torch_sampling import sample_target_ids
+
+            if verify_input.tree_topk != 1 or get_spec().speculative_use_rejection_sampling:
+                raise ValueError('HIP Torch target sampling currently requires topk=1 deterministic draft')
+            n = verify_input.draft_token_num
+            positions = (batch.seq_lens[:, None] + torch.arange(n, device=device)).reshape(-1)
+            target_predict = sample_target_ids(
+                next_token_logits,
+                sampling_info.temperatures.repeat_interleave(n, dim=0),
+                sampling_info.top_ks.repeat_interleave(n),
+                sampling_info.top_ps.repeat_interleave(n),
+                sampling_info.min_ps.repeat_interleave(n),
+                sampling_info.sampling_seed.repeat_interleave(n)
+                if sampling_info.sampling_seed is not None else None,
+                positions,
+            )
+        else:
+            target_predict = torch.argmax(
+                next_token_logits.float() if _is_hip else next_token_logits, dim=-1
+            )
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable

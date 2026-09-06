@@ -3824,6 +3824,21 @@ class Scheduler(
         # 2. sampling_info substitute
         if sched_sampling_info is not None:
             batch.sampling_info = sched_sampling_info.copy_for_forward()
+            if (
+                _is_hip
+                and batch.spec_algorithm.is_eagle()
+                and get_spec().speculative_eagle_topk == 1
+                and not get_spec().speculative_use_rejection_sampling
+            ):
+                from sglang.srt.speculative.eagle_torch_sampling import (
+                    refresh_exact_penalty_snapshot,
+                )
+
+                refresh_exact_penalty_snapshot(
+                    batch,
+                    sched_sampling_info.penalizer_orchestrator,
+                    self.result_queue if overlap else (),
+                )
 
         # 3. pin for 2-iter tensor lifetime (overlap path only)
         if overlap:

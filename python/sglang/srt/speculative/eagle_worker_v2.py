@@ -710,7 +710,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
-                elif self.topk == 1 and not _is_hip:
+                elif self.topk == 1:
                     if _is_cuda:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
@@ -720,7 +720,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         )
                     else:
                         topk_index = torch.argmax(
-                            logits_output.next_token_logits, dim=-1, keepdim=True
+                            logits_output.next_token_logits.float(), dim=-1, keepdim=True
                         )
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
@@ -1047,11 +1047,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
             )
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
+        elif self.topk == 1:
+            # Cast first so HIP does not reduce FP8 logits directly.
             ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                draft_logits_output.next_token_logits.float(), dim=-1, keepdim=True
             )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
