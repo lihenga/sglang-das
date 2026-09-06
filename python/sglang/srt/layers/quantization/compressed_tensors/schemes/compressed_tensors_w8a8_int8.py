@@ -303,10 +303,11 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         silu_quant_args: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
-        if _use_fused_rms_quant and input_quant_args is not None:
+        if input_quant_args is not None:
             assert len(input_quant_args) == 2
             x_q, x_scale = input_quant_args
-        elif _use_fused_silu_mul_quant and silu_quant_args is not None:
+        elif silu_quant_args is not None:
+            assert len(silu_quant_args) == 2
             x_q, x_scale = silu_quant_args
         else:
             x_q, x_scale = per_token_quant_int8(x)

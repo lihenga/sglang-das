@@ -325,7 +325,8 @@ class ReplicatedLinear(LinearBase):
         quant_args: Optional[list] = None,
         update_hd: Optional[bool] = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if _use_fused_rms_quant and rms_weight is not None:
+        input_quant_args = quant_args
+        if input_quant_args is None and _use_fused_rms_quant and rms_weight is not None:
             i_q, _scales = lm_faster_rmsquant(
                 input=x,
                 rms_weight=rms_weight,
@@ -337,6 +338,7 @@ class ReplicatedLinear(LinearBase):
 
             input_quant_args = [i_q, _scales]
 
+        if input_quant_args is not None:
             bias = self.bias if not self.skip_bias_add else None
             assert self.quant_method is not None
             output = self.quant_method.apply(self, x, bias, input_quant_args)
@@ -547,8 +549,8 @@ class ColumnParallelLinear(LinearBase):
         update_hd: Optional[bool] = True,
         input_quant_args=None,
     ):
-        if _use_fused_rms_quant and (
-            rms_weight is not None or input_quant_args is not None
+        if input_quant_args is not None or (
+            _use_fused_rms_quant and rms_weight is not None
         ):
             if input_quant_args is None:
                 i_q, _scales = lm_faster_rmsquant(
@@ -1736,6 +1738,7 @@ class RowParallelLinear(LinearBase):
         use_fused_silu_mul_quant: Optional[bool] = False,
         use_fused_silu_mul_fp8_quant: Optional[bool] = False,
         output_tensor=None,
+        silu_quant_args: Optional[list[torch.Tensor]] = None,
     ):
         if self.input_is_parallel:
             input_parallel = input_
@@ -1757,7 +1760,17 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
 
-        if use_fused_silu_mul_quant:
+        if silu_quant_args is not None:
+            if not self.input_is_parallel or output_tensor is not None:
+                raise ValueError("Prequantized row input requires local input and no output buffer")
+            assert len(silu_quant_args) == 2
+            with symm_ctx as sm:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_, silu_quant_args=silu_quant_args
+                )
+                if sm is not None:
+                    sm.tag(output_parallel)
+        elif use_fused_silu_mul_quant:
             xq, xs = lm_fuse_silu_mul_quant(input_parallel)
             silu_quant_args = [xq, xs]
             with symm_ctx as sm:
