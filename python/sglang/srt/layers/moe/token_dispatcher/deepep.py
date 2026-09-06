@@ -51,6 +51,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     is_blackwell,
+    is_hcu,
     is_flashinfer_available,
     is_hip,
     is_npu,
@@ -58,6 +59,7 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+_is_hcu = is_hcu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
@@ -563,7 +565,10 @@ class _DeepEPDispatcherImplBase:
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
         else:
-            if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
+            # HCU DeepEP supports quant_type=1 (INT8 payload plus one FP32
+            # scale per token). Other GPU backends retain the upstream FP8
+            # fallback until they provide the same contract.
+            if not _is_hcu and self.deepep_output_dtype == DispatcherOutputDtype.INT8:
                 logger.warning_once(
                     "GPU does not support int8 "
                     "deepep_dispatcher_output_dtype, switching to fp8..."
@@ -618,7 +623,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             need_bf16_dispatch = backend.is_cutlass() or (
                 backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
             )
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not need_bf16_dispatch:
+            if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
+                # Match low-latency DeepEP: INT8 payload plus one FP32 scale
+                # per token, consumed directly by the W8A8 DeepGEMM runner.
+                hidden_states = per_token_quant_int8(hidden_states)
+            elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not need_bf16_dispatch:
                 # TODO hard code 128 block quant,use fp8 communication
                 hidden_states = sglang_per_token_group_quant_fp8(
                     hidden_states,

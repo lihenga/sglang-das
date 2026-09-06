@@ -1695,7 +1695,10 @@ class DeepEPMoE(FusedMoE):
         ) = dispatch_output
 
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation == "silu" or (
+            self.moe_runner_config.activation == "gelu"
+            and getattr(self, "_spark_v1_contiguous_gateup_quant", None) is not None
+        ), "GELU requires the explicit Spark contiguous quant hook"
         if num_recv_tokens_per_expert is None:
             return hidden_states.bfloat16()
 
@@ -1779,7 +1782,11 @@ class DeepEPMoE(FusedMoE):
             shuffle_unique=shuffle_unique,
         )
 
-        q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+        spark_quant = getattr(self, "_spark_v1_contiguous_gateup_quant", None)
+        if spark_quant is None:
+            q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+        else:
+            q_a2_all, q_a2_scale = spark_quant(gateup_output)
         del gateup_output
 
         down_output = torch.empty(

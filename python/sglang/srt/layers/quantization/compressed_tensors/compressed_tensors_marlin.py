@@ -87,7 +87,9 @@ class SlimQuantCompressedTensorsMarlinConfig(CompressedTensorsConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
         # Check if the layer is skipped for quantization.
         if isinstance(layer, RadixAttention):
-            return CompressedTensorsKVCacheMethod(self)
+            # Reuse the 0.5.18 parent contract: checkpoints without calibrated
+            # KV scales keep using the runtime ``--kv-cache-dtype`` path.
+            return super().get_quant_method(layer, prefix)
         if should_ignore_layer(prefix,
                                ignore=self.ignore,
                                fused_mapping=self.packed_modules_mapping):

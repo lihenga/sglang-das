@@ -228,6 +228,12 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     elif not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
     model_cls, resolved_arch = ModelRegistry.resolve_model_cls(architectures)
+    if resolved_arch == "SparkV1ForCausalLM":
+        from sglang.srt.models.sparkv1_deepgemm_int8 import (
+            install_spark_v1_int8_deepgemm_adapter,
+        )
+
+        install_spark_v1_int8_deepgemm_adapter()
     setattr(model_config, "_resolved_model_arch", resolved_arch)
     setattr(
         model_config,
