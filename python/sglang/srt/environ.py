@@ -1513,6 +1513,10 @@ class Envs:
     SGLANG_DSA_HCU_REUSE_SORTED_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_REUSE_SORTED_TOPK"
     )
+    # HCU DSA decode-family path: gather the selected packed FP8 main KV with
+    # LightOp, up-convert it to BF16, then run BF16 sparse FlashMLA.
+    # Default off keeps the native FP8 flashmla_kv path unchanged.
+    SGLANG_DSA_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
     # gfx936-only: page-planar INT8 K plus one FP32 scale per token.
     SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
