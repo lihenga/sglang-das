@@ -4,6 +4,7 @@ Llama4Vision, DynamicNTK, DynamicNTKAlpha, DualChunkRotaryEmbedding."""
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -28,6 +29,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_native_bf16_rope_enabled = _is_hip and os.getenv("SGLANG_PERF_NATIVE_BF16_ROPE", "0") == "1"
 
 if _is_npu:
     import torch_npu
@@ -456,6 +458,12 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if _native_bf16_rope_enabled:
+            from sglang.srt.layers.rotary_embedding.native_bf16_rope import try_native_bf16_rope
+
+            fused = try_native_bf16_rope(self, positions, query, key, offsets)
+            if fused is not None:
+                return fused
         dtype = query.dtype
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
