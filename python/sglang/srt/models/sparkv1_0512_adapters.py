@@ -337,6 +337,8 @@ def install_dense_quant() -> bool:
 
 
 def install_spark_v1_0512_adapters(config):
+    from sglang.srt.models.sparkv1_shared_overlap import install_shared_expert_overlap
+    install_shared_expert_overlap()
     return {"grouped_topk": install_grouped_topk(config),
             "deepep_prepare": install_deepep_prepare(),
             "smooth_quant": install_smooth_quant(),
