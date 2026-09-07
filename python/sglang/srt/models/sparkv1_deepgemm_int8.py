@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from typing import Callable
 
 import torch
@@ -9,6 +10,29 @@ import torch
 from sglang.srt.utils import get_bool_env_var, is_hcu
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_dp_gemm_row_bound(capacity, local_rows, dp_size, request_cap, graph_bs, width):
+    """Use a configuration upper bound, never an average or current DP count.
+
+    Scheduler request capacity is divided by attention DP size. Include the
+    LARGEST graph bucket, even if it exceeds that capacity, and the entire MTP
+    tree width. Every token selects distinct experts, so one expert is bounded
+    by this worst-case number of tokens across ALL ranks, including idle/padded
+    rows. Caller restricts this to decode-family EAGLE415, pure DP/EP, no CP.
+    Unknown/oversized shapes fall back to the full receive-buffer capacity.
+    """
+    if (
+        type(local_rows) is int and local_rows >= 0
+        and type(dp_size) is int and dp_size > 1
+        and type(request_cap) is int and request_cap >= dp_size
+        and type(graph_bs) is int and graph_bs >= 0
+        and type(width) is int and width > 0
+    ):
+        local_limit = max(request_cap // dp_size, graph_bs) * width
+        if local_rows <= local_limit:
+            return min(capacity, local_limit * dp_size)
+    return capacity
 
 
 def install_spark_v1_int8_deepgemm_adapter() -> bool:
@@ -103,7 +127,11 @@ def install_spark_v1_int8_deepgemm_adapter() -> bool:
     if getattr(original, "_sglang_spark_int8_deepgemm_adapter", False):
         return True
 
-    state = {"logged": False}
+    use_dp_row_bound = get_bool_env_var("SGLANG_PERF_DEEPGEMM_DP_ROW_BOUND", "false")
+    activation_grid_min = int(os.getenv("SGLANG_PERF_ACTIVATION_GRID_MIN", "0"))
+    if activation_grid_min not in (0, 128):
+        raise ValueError("Activation grid experiment supports only 0 or 128")
+    state = {"logged": False, "bounds_logged": set()}
 
     def spark_forward_groupgemm_w8a8_marlin_masked(self, dispatch_output):
         limit = current_spark_v1_gelu_clamp()
@@ -162,6 +190,37 @@ def install_spark_v1_int8_deepgemm_adapter() -> bool:
         # the launch bound; masked_m still selects the real rows on device.
         # No host sync, DP metadata changes or graph-address changes.
         gemm_m_bound = max_tokens
+        if use_dp_row_bound:
+            from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+            from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec, get_disagg, get_exec
+
+            parallel = get_parallel()
+            spec = get_spec()
+            # No live token-count metadata is read or changed. The worst-case
+            # configured request/graph capacity applies to every rank, including
+            # uneven/idle replay. Prefill and mixed extend batches stay at 1024.
+            if (
+                parallel.attn_tp_size == 1 and parallel.attn_cp_size == 1
+                and parallel.attn_dp_size == parallel.moe_ep_size == parallel.tp_size
+                and get_disagg().disaggregation_mode == "decode"
+                and get_is_extend_in_batch() is False
+                and spec.speculative_algorithm == "EAGLE"
+                and spec.speculative_num_steps == 4
+                and spec.speculative_eagle_topk == 1
+                and spec.speculative_num_draft_tokens == 5
+                and _topk_ids.ndim == 2
+            ):
+                gemm_m_bound = _decode_dp_gemm_row_bound(
+                    max_tokens, _topk_ids.shape[0], parallel.attn_dp_size,
+                    get_schedule().max_running_requests,
+                    max(get_exec().graph.cuda_graph_config.decode.bs or [0]),
+                    spec.speculative_num_draft_tokens,
+                )
+            key = (int(_topk_ids.shape[0]), gemm_m_bound)
+            if key not in state["bounds_logged"]:
+                logger.info("Spark GEMM row-bound experiment: local_rows=%d bound=%d capacity=%d",
+                            key[0], gemm_m_bound, max_tokens)
+                state["bounds_logged"].add(key)
         w13_scales = self.w13_weight_scale
         w2_scales = self.w2_weight_scale
         gateup_hidden = w13_scales.size(1)
@@ -189,11 +248,17 @@ def install_spark_v1_int8_deepgemm_adapter() -> bool:
             gemm_m_bound,
         )
 
+        # This LightOp kernel loops through every masked_m row in strides of
+        # gridDim.y. Unlike masked GEMM, expect_m is scheduling, not coverage.
+        # More CTAs avoid serial hot-expert loops without touching arithmetic.
+        activation_grid = expected_m
+        if activation_grid_min:
+            activation_grid = min(max_tokens, max(expected_m, activation_grid_min))
         down_input, down_input_scale = fuse_silu_mul_clamp_quant_ep(
             gateup_output,
             float(limit),
             masked_m,
-            expect_m=expected_m,
+            expect_m=activation_grid,
             use_gelu=True,
             smooth_scale=smooth_scale,
         )
@@ -218,8 +283,9 @@ def install_spark_v1_int8_deepgemm_adapter() -> bool:
             logger.info(
                 "Spark low-latency MoE uses INT8 DeepEP -> DeepGEMM "
                 "with LightOp GELU/clamp/smooth quant; "
-                "masked GEMM launch bound=%d, dispatch average=%d",
+                "masked GEMM launch bound=%d, dispatch average=%d, activation grid=%d",
                 gemm_m_bound, expected_m,
+                activation_grid,
             )
             state["logged"] = True
         return down_output
