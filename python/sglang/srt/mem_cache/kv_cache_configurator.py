@@ -107,10 +107,9 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         return True
     if not envs.SGLANG_DSA_COMPACT_INDEX_K_CACHE_PD.get():
         return False
-    if disagg_config.disaggregation_transfer_backend not in (
-        "mooncake",
-        "mooncake_tcp",
-    ):
+    backend = disagg_config.disaggregation_transfer_backend
+    fake_decode = disagg_config.disaggregation_mode == "decode" and backend == "fake"
+    if backend not in ("mooncake", "mooncake_tcp") and not fake_decode:
         raise ValueError(
             "SGLANG_DSA_COMPACT_INDEX_K_CACHE_PD=1 requires the Mooncake "
             "PD transfer backend"
