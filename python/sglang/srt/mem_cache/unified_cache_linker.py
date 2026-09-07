@@ -426,6 +426,17 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
+        self.hit_markers.pop(req.rid, None)
+
+        known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
+        if known_hit_len is not None:
+            # PP0's absolute boundary also survives later local L1 rematches.
+            key = key[:known_hit_len]
+        elif cache.pp_size > 1:
+            req.external_cache_hit_length = 0
+            if cache.pp_rank != 0:
+                return result
+
         if device_hit_len >= len(key):
             return result
 
@@ -444,19 +455,24 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        lookup_started = time.perf_counter()
-        try:
-            restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
-        finally:
-            time_stats = getattr(req, "time_stats", None)
-            timing_adder = getattr(time_stats, "add_direct_lookup_duration", None)
-            if timing_adder is not None:
-                timing_adder(time.perf_counter() - lookup_started)
-        hit_pages = self._sync_restorable_prefix(
-            restorable,
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+        if known_hit_len is None:
+            lookup_started = time.perf_counter()
+            try:
+                restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+            finally:
+                time_stats = getattr(req, "time_stats", None)
+                timing_adder = getattr(time_stats, "add_direct_lookup_duration", None)
+                if timing_adder is not None:
+                    timing_adder(time.perf_counter() - lookup_started)
+            hit_pages = self._sync_restorable_prefix(
+                restorable,
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
+            if cache.pp_size > 1 and hit_pages:
+                req.external_cache_hit_length = device_hit_len + hit_pages * page
+        else:
+            hit_pages = len(tail_hashes)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -629,12 +645,45 @@ class UnifiedCacheLinkerWrapper:
             "l4_mooncake_local_disk": 0,
         }
 
-        self._update_load(
+        prepared_transfers = self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
             component_transfers,
             prefix_len,
         )
+
+        if cache.pp_size > 1:
+            # PP stages load into request-owned slots. The existing PP result
+            # ring performs the normal insert/dedup only after every stage has
+            # completed the prefill, so publishing these slots here is unsafe.
+            self._record_load_source_metrics(
+                req, prepared_transfers, prepared=prepared, fallback_source=source
+            )
+            try:
+                timing_setter = getattr(
+                    self.cache_linker, "set_request_time_stats", None
+                )
+                if timing_setter is not None and time_stats is not None:
+                    timing_setter(req.rid, time_stats)
+                if not prepared_transfers or not self.cache_linker.load(
+                    req.rid, prepared_transfers
+                ):
+                    raise RuntimeError(
+                        f"Failed to queue the linker load for {req.rid=}."
+                    )
+            except BaseException:
+                self.cache_linker.abort_prepared_load(req.rid)
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    component_transfers,
+                    prefix_len,
+                )
+                raise
+            finally:
+                if time_stats is not None:
+                    time_stats.set_direct_load_prepare_finish_time()
+            return full_transfer.device_indices, req.last_node
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
@@ -684,57 +733,9 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        counts_getter = getattr(
-            self.cache_linker, "get_prepared_load_source_counts", None
+        self._record_load_source_metrics(
+            req, load_transfers, prepared=prepared, fallback_source=source
         )
-        source_counts = (
-            counts_getter(req.rid, load_transfers)
-            if prepared and counts_getter
-            else {}
-        )
-        kv_load_tokens = sum(
-            len(transfer.keys or []) * cache.page_size
-            for transfer in load_transfers
-            if transfer.name == PoolName.KV
-        )
-        # The prepare phase describes all remotely restorable pages, while
-        # COMMIT may retain only the pages actually adopted by this request.
-        # Make scheduler accounting follow that final transfer set; otherwise
-        # pages adopted concurrently can be reported as Mooncake hits even
-        # though they are already resident in L1.
-        req.host_hit_length = kv_load_tokens
-        req.storage_hit_length = kv_load_tokens
-        req.cached_tokens_storage_source = None
-        if kv_load_tokens > 0:
-            sources = {
-                source_name
-                for source_name, tokens in source_counts.items()
-                if int(tokens) > 0
-            }
-            if len(sources) == 1:
-                req.cached_tokens_storage_source = f"mooncake_{next(iter(sources))}"
-            elif len(sources) > 1:
-                req.cached_tokens_storage_source = "mooncake_mixed"
-            elif source is not None:
-                # Keep the request-level source for older linker adapters that
-                # do not expose per-page source counts.
-                req.cached_tokens_storage_source = f"mooncake_{source}"
-        req.cached_tokens_by_source.update(
-            {
-                "l3_mooncake_memory": source_counts.get("memory", 0),
-                "l4_mooncake_dfs": source_counts.get("dfs", 0),
-                "l4_mooncake_local_disk": source_counts.get("local_disk", 0),
-            }
-        )
-        if _source_debug_enabled():
-            logger.info(
-                "Mooncake source debug scheduler rid=%s kv_load_tokens=%d "
-                "source_counts=%s cached_tokens_by_source=%s",
-                req.rid,
-                kv_load_tokens,
-                source_counts,
-                req.cached_tokens_by_source,
-            )
 
         if load_transfers:
             timing_setter = getattr(self.cache_linker, "set_request_time_stats", None)
@@ -755,6 +756,64 @@ class UnifiedCacheLinkerWrapper:
             node.external_cache_stored = True
             node = node.parent
         return canonical_tail, insert_result.last_device_node
+
+    def _record_load_source_metrics(
+        self,
+        req: Req,
+        load_transfers: list[PoolTransfer],
+        *,
+        prepared: bool,
+        fallback_source: str | None,
+    ) -> None:
+        counts_getter = getattr(
+            self.cache_linker, "get_prepared_load_source_counts", None
+        )
+        source_counts = (
+            counts_getter(req.rid, load_transfers)
+            if prepared and counts_getter
+            else {}
+        )
+        kv_load_tokens = sum(
+            len(transfer.keys or []) * self.cache.page_size
+            for transfer in load_transfers
+            if transfer.name == PoolName.KV
+        )
+        # The prepared/committed transfer set is the set this request will
+        # actually consume. In non-PP mode COMMIT may have removed pages
+        # adopted concurrently; in PP mode all prepared pages stay request-owned.
+        req.host_hit_length = kv_load_tokens
+        req.storage_hit_length = kv_load_tokens
+        req.cached_tokens_storage_source = None
+        if kv_load_tokens > 0:
+            sources = {
+                source_name
+                for source_name, tokens in source_counts.items()
+                if int(tokens) > 0
+            }
+            if len(sources) == 1:
+                req.cached_tokens_storage_source = f"mooncake_{next(iter(sources))}"
+            elif len(sources) > 1:
+                req.cached_tokens_storage_source = "mooncake_mixed"
+            elif fallback_source is not None:
+                # Keep the request-level source for older linker adapters that
+                # do not expose per-page source counts.
+                req.cached_tokens_storage_source = f"mooncake_{fallback_source}"
+        req.cached_tokens_by_source.update(
+            {
+                "l3_mooncake_memory": source_counts.get("memory", 0),
+                "l4_mooncake_dfs": source_counts.get("dfs", 0),
+                "l4_mooncake_local_disk": source_counts.get("local_disk", 0),
+            }
+        )
+        if _source_debug_enabled():
+            logger.info(
+                "Mooncake source debug scheduler rid=%s kv_load_tokens=%d "
+                "source_counts=%s cached_tokens_by_source=%s",
+                req.rid,
+                kv_load_tokens,
+                source_counts,
+                req.cached_tokens_by_source,
+            )
 
     def _update_load(
         self,

@@ -10,7 +10,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult, MatchResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1813,7 +1813,7 @@ def test_cp_lookup_request_owner_queries_all_keys(monkeypatch):
     linker.cp_control_group = object()
     linker.stats = {"lookup": 0}
     linker.storage = SimpleNamespace(
-        batch_exists_v2=lambda keys, transfers: (
+        batch_exists_v2=lambda keys, transfers, **_kwargs: (
             queried.append((list(keys), list(transfers)))
             or SimpleNamespace(restorable_prefix_pages=list(range(1, len(keys) + 1)))
         ),
@@ -1852,7 +1852,7 @@ def test_cp_lookup_non_owner_does_not_query_existence(monkeypatch):
     linker.attn_cp_size = 2
     linker.cp_control_group = object()
     linker.storage = SimpleNamespace(
-        batch_exists_v2=lambda *_args: pytest.fail(
+        batch_exists_v2=lambda *_args, **_kwargs: pytest.fail(
             "A non-owner rank must not query Mooncake."
         )
     )
@@ -2246,3 +2246,210 @@ def test_component_commit_filters_overlapping_full_and_swa_load_pages():
     mapped_full, mapped_swa = mapping.mapping[0]
     assert mapped_full.tolist() == [102, 103, 106, 107]
     assert mapped_swa.tolist() == [202, 203, 206, 207]
+
+
+def _make_pp_lookup_linker(existing, queried, *, pp_size=3):
+    entry = SimpleNamespace(
+        name=PoolName.DEEPSEEK_V4_C4,
+        indices_from_pool=PoolName.KV,
+        components=[[], []],
+    )
+    group = DevicePoolGroup([entry], num_layers=1, page_size=1)
+    storage = MooncakeStore.__new__(MooncakeStore)
+    storage.mem_pool_host = group
+    storage.registered_pools = group.entry_map
+    storage.pp_rank, storage.pp_size = 0, pp_size
+    storage.mla_suffix, storage.mha_suffix = "cp1_pp0", "tp2_cp1_pp0"
+    storage.config_prefix = "model_pp0_tag"
+    storage.is_mla_backend = True
+
+    def exists(keys):
+        queried.extend(keys)
+        return [int(key in existing) for key in keys]
+
+    storage._batch_exist = exists
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pool_group, linker.storage = group, storage
+    linker.stats = {"lookup": 0}
+    return linker
+
+
+def test_pp_lookup_requires_every_pipeline_stage_to_have_the_page():
+    keys = [f"page{i}" for i in range(6)]
+    existing = set()
+    queried = []
+    linker = _make_pp_lookup_linker(existing, queried)
+    for pp_rank, pages in enumerate((range(6), range(4), range(2))):
+        existing.update(
+            f"model_pp0_tag_{keys[page]}_cp1_pp{pp_rank}_deepseek_v4_c4"
+            for page in pages
+        )
+
+    result = linker.lookup(
+        "req", [PoolTransfer(PoolName.KV, keys=keys)]
+    )
+
+    assert result == [1, 2]
+    assert len(queried) == len(keys) * 3
+    # Query expansion must not mutate suffixes used by concurrent load/offload.
+    assert linker.storage.mla_suffix == "cp1_pp0"
+    assert linker.storage.mha_suffix == "tp2_cp1_pp0"
+
+
+@pytest.mark.parametrize("hit_pages", [0, 1, 2])
+@pytest.mark.parametrize("device_hit_len", [0, 2, 4])
+def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_len):
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOOKUP
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+    class _Backend:
+        def __init__(self, restorable):
+            self.restorable = restorable
+            self.lookup_calls = []
+
+        def lookup(self, rid, transfers):
+            self.lookup_calls.append((rid, list(transfers)))
+            return list(self.restorable)
+
+    def make_wrapper(pp_rank, backend):
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache = SimpleNamespace(
+            page_size=2,
+            pp_size=2,
+            pp_rank=pp_rank,
+            _components_tuple=(_Component(),),
+            _all_reduce_attn_groups=lambda tensor, op: None,
+            get_last_hash_value=lambda node: "ab" * 32,
+        )
+        wrapper.cache_linker = backend
+        wrapper.hit_markers = {}
+        return wrapper
+
+    key = RadixKey(array("q", [1, 2, 3, 4]))
+    empty_match = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+
+    pp0_backend = _Backend([hit_pages] if hit_pages else [])
+    pp0 = make_wrapper(0, pp0_backend)
+    pp0_req = SimpleNamespace(rid="rid", external_cache_hit_length=None)
+    pp0_result = pp0.match(key, pp0_req, empty_match)
+    assert pp0_req.external_cache_hit_length == hit_pages * 2
+    assert pp0_result.host_hit_length == hit_pages * 2
+    assert len(pp0_backend.lookup_calls) == 1
+
+    pp1_backend = _Backend([])
+    pp1 = make_wrapper(1, pp1_backend)
+    pp1_req = SimpleNamespace(
+        rid="rid", external_cache_hit_length=pp0_req.external_cache_hit_length
+    )
+    local_match = empty_match._replace(device_indices=torch.arange(device_hit_len))
+    pp1_result = pp1.match(key, pp1_req, local_match)
+    assert pp1_result.host_hit_length == max(0, hit_pages * 2 - device_hit_len)
+    assert pp1_backend.lookup_calls == []
+
+    # PP0 also reuses its own result, including a cached miss.
+    assert pp0.match(key, pp0_req, local_match).host_hit_length == (
+        pp1_result.host_hit_length
+    )
+    assert len(pp0_backend.lookup_calls) == 1
+    assert pp0.has_hit("rid") == (hit_pages * 2 > device_hit_len)
+
+
+@pytest.mark.parametrize("load_outcome", [True, False, "raise"])
+def test_pp_load_stays_request_owned_and_releases_slots_on_queue_failure(load_outcome):
+    aborted_components = []
+    aborted_sessions = []
+    queued = []
+
+    class _Component:
+        def __init__(self, name, slots):
+            self.component_type = (
+                ComponentType.FULL if name == PoolName.KV else ComponentType.SWA
+            )
+            self.name = name
+            self.slots = torch.tensor(slots, dtype=torch.int64)
+
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOAD
+            return PoolTransfer(
+                name=self.name,
+                keys=list(keys),
+                device_indices=self.slots.clone(),
+            )
+
+        def update_external_linker_load(
+            self, phase, req, full, transfer, prefix_len, **kwargs
+        ):
+            if phase == ExternalLinkerLoadPhase.ABORT:
+                aborted_components.append(transfer.name)
+                return None
+            return transfer
+
+    def load(rid, transfers):
+        queued.append((rid, list(transfers)))
+        if load_outcome == "raise":
+            raise RuntimeError("load failed")
+        return load_outcome
+
+    empty = torch.empty((0,), dtype=torch.int64)
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(
+        page_size=1,
+        pp_size=2,
+        _components_tuple=(
+            _Component(PoolName.KV, [11, 12]),
+            _Component(PoolName.SWA, [21, 22]),
+        ),
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(device_indices=empty)
+        ),
+        _all_reduce_attn_groups=lambda value, op: None,
+    )
+    wrapper.cache_linker = SimpleNamespace(
+        prepare_load=lambda rid, transfers: True,
+        get_prepared_load_source=lambda rid: "memory",
+        abort_prepared_load=aborted_sessions.append,
+        load=load,
+    )
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=RadixKey(array("q", [1, 2])),
+            tail_hashes=["page-a", "page-b"],
+            device_hit_len=0,
+        )
+    }
+    req = SimpleNamespace(
+        rid="rid",
+        last_node=0,
+        prefix_indices=empty,
+        host_hit_length=2,
+        swa_host_hit_length=2,
+        mamba_host_hit_length=0,
+        storage_hit_length=0,
+        cached_tokens_storage_source=None,
+        cached_tokens_device=0,
+        time_stats=None,
+    )
+
+    if load_outcome is True:
+        indices, node = wrapper.load_back(req)
+        assert indices.tolist() == [11, 12]
+        assert node == 0
+        assert [transfer.name for transfer in queued[0][1]] == [
+            PoolName.KV,
+            PoolName.SWA,
+        ]
+        assert aborted_components == []
+        assert aborted_sessions == []
+        assert req.cached_tokens_storage_source == "mooncake_memory"
+    else:
+        with pytest.raises(RuntimeError, match="load failed|Failed to queue"):
+            wrapper.load_back(req)
+        assert aborted_sessions == ["rid"]
+        assert aborted_components == [PoolName.SWA, PoolName.KV]
