@@ -416,7 +416,8 @@ def validate_hcu_int8_index_k_cache_server_args(server_args) -> None:
     disaggregation_mode = getattr(server_args, "disaggregation_mode", "null")
     if disaggregation_mode != "null":
         backend = getattr(server_args, "disaggregation_transfer_backend", "mooncake")
-        if backend not in ("mooncake", "mooncake_tcp"):
+        fake_decode = disaggregation_mode == "decode" and backend == "fake"
+        if backend not in ("mooncake", "mooncake_tcp") and not fake_decode:
             unsupported.append(f"--disaggregation-transfer-backend={backend}")
 
     if unsupported:
