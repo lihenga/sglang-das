@@ -497,6 +497,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
 
+    # Draft LM-head-only routing. These must be dataclass fields: the eager
+    # buffer registry reconstructs ForwardBatch with dataclasses.replace.
+    # Dynamic attributes would disappear on active ranks but survive on idle
+    # ranks, causing disagreement about node-local VP collectives.
+    draft_vp_enabled: bool = False
+    draft_vp_select_index: Optional[torch.Tensor] = None
+
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
     lora_ids: Optional[List[str]] = None

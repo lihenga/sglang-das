@@ -103,6 +103,9 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Draft-only compact greedy output; never consumed by the target sampler.
+    draft_top1_token_ids: Optional[torch.Tensor] = None
+    draft_top1_probs: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -192,6 +195,8 @@ class LogitsMetadata:
     # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
     # EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
+    draft_vp_select_index: Optional[torch.Tensor] = None
+    draft_vp_enabled: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -249,6 +254,8 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            draft_vp_select_index=getattr(forward_batch, "draft_vp_select_index", None),
+            draft_vp_enabled=getattr(forward_batch, "draft_vp_enabled", False),
         )
 
     def compute_dp_attention_metadata(self):
@@ -334,6 +341,7 @@ class LogitsProcessor(nn.Module):
         )
 
         self.input_logprob_processor = InputLogprobProcessor()
+        self.draft_lm_head_vp = None
 
     def forward(
         self,
@@ -398,6 +406,26 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if self.draft_lm_head_vp is not None and (
+                logits_metadata.draft_vp_enabled
+                or logits_metadata.draft_vp_select_index is not None
+            ):
+                # Select LM-head rows only AFTER saving hidden states. KV writes
+                # and recurrent hidden rows retain their original full layout.
+                vp_states = pruned_states
+                if logits_metadata.draft_vp_select_index is not None:
+                    vp_states = vp_states[logits_metadata.draft_vp_select_index]
+                scores, ids = self.draft_lm_head_vp.project_top1(
+                    vp_states, lm_head.weight, logit_scale=self.logit_scale,
+                    final_logit_softcapping=self.final_logit_softcapping,
+                )
+                return LogitsProcessorOutput(
+                    next_token_logits=scores.unsqueeze(-1),
+                    hidden_states=hidden_states_to_store,
+                    draft_top1_token_ids=ids.unsqueeze(-1),
+                    draft_top1_probs=torch.ones_like(ids.unsqueeze(-1), dtype=torch.float32),
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (

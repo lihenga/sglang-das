@@ -394,6 +394,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_tokens_per_req=self.captured_req_width,
         )
 
+        dp_padding_mode = DpPaddingMode.get_default_mode_in_cuda_graph()
+
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
             batch_size=bs,
@@ -411,7 +413,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            dp_padding_mode=dp_padding_mode,
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -425,6 +427,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            if self.model_runner.model.logits_processor.draft_lm_head_vp is not None:
+                # Compute from replay-updated acceptance counts INSIDE capture.
+                # No KV/page-table changes and no host read of acceptance state.
+                forward_batch.draft_vp_select_index = (
+                    torch.arange(bs, device=input_ids.device, dtype=torch.int64)
+                    * self.captured_req_width + num_accept_tokens - 1
+                )
 
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -447,6 +456,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            if ret.draft_top1_token_ids is not None:
+                # BCG copies/slices every output using one common row count.
+                # Keep full hidden rows and repeat only the tiny compact head
+                # result over each request's tree; never fabricate vocab logits.
+                # execute() removes this representation-only repetition.
+                ret.next_token_logits = ret.next_token_logits.repeat_interleave(self.captured_req_width, dim=0)
+                ret.draft_top1_token_ids = ret.draft_top1_token_ids.repeat_interleave(self.captured_req_width, dim=0)
+                ret.draft_top1_probs = ret.draft_top1_probs.repeat_interleave(self.captured_req_width, dim=0)
             return ret
 
         with forward_context(
@@ -619,7 +636,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out = self._replay_graph(shape_key, forward_batch)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:num_tokens],
+            next_token_logits=(out.next_token_logits[::self.captured_req_width][:raw_bs] if out.draft_top1_token_ids is not None else out.next_token_logits[:num_tokens]),
             hidden_states=out.hidden_states[:num_tokens],
+            draft_top1_token_ids=(out.draft_top1_token_ids[::self.captured_req_width][:raw_bs] if out.draft_top1_token_ids is not None else None),
+            draft_top1_probs=(out.draft_top1_probs[::self.captured_req_width][:raw_bs] if out.draft_top1_probs is not None else None),
         )
         return out

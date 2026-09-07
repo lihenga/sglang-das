@@ -351,6 +351,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
+        # Experimental draft-only VP. Target head/sampling remain untouched.
+        import os
+        vp_size = int(os.environ.get("SGLANG_PERF_DRAFT_LM_HEAD_VP_SIZE", "1"))
+        if vp_size != 1:
+            from sglang.srt.speculative.draft_lm_head_vp import DraftLMHeadVocabParallelTop1
+            lp = self.draft_runner.model.logits_processor
+            if not (
+                _is_hip and self.topk == 1
+                and not get_spec().speculative_use_rejection_sampling
+                and not self.speculative_algorithm.is_eagle3()
+                and self.hot_token_id is None
+                and get_parallel().attn_dp_size == get_parallel().tp_size
+                and get_parallel().enable_dp_lm_head
+                and not lp.use_fp32_lm_head
+                and not lp.final_logit_softcapping
+                and not getattr(self.server_args, "enable_lora", False)
+            ):
+                raise ValueError("Draft VP requires HIP greedy top1, full DP head, no RS/LoRA/softcap/FP32 head")
+            lp.draft_lm_head_vp = DraftLMHeadVocabParallelTop1(
+                full_weight=head, vocab_size=lp.vocab_size, vp_size=vp_size,
+                max_rows_per_rank=self.draft_runner.max_running_requests,
+            )
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
@@ -598,6 +621,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
+        # IDLE alone is ambiguous: a prefill's idle peers must NOT enter VP.
+        # Set this phase flag equally for active and idle draft-decode peers.
+        forward_batch.draft_vp_enabled = True
         spec_info: EagleDraftInput = forward_batch.spec_info
         if forward_batch.forward_mode.is_idle():
             return self._draft_forward_idle(forward_batch, spec_info)
@@ -703,7 +729,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if get_spec().speculative_use_rejection_sampling:
+                if logits_output.draft_top1_token_ids is not None:
+                    topk_index = logits_output.draft_top1_token_ids
+                    topk_p = logits_output.draft_top1_probs
+                    forward_batch.positions.add_(1)
+                elif get_spec().speculative_use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -735,7 +765,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
+                    self.draft_runner.model_config.vocab_size if logits_output.draft_top1_token_ids is not None else logits_output.next_token_logits.shape[-1],
                     f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
                 )
                 if self.hot_token_id is not None:
@@ -976,12 +1006,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.plan_stream
             )
 
+        if self.draft_runner.model.logits_processor.draft_lm_head_vp is not None:
+            forward_batch.draft_vp_select_index = select_index
+
         # Run draft extend batch in the main compute stream
         can_run_decode_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
-
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
         if self.seed_dsa_topk_from_draft_extend and not can_run_decode_cuda_graph:
@@ -1033,16 +1065,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
+        if draft_logits_output.draft_top1_token_ids is None:
+            draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+                select_index
+            ]
         if draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if get_spec().speculative_use_rejection_sampling:
+        if draft_logits_output.draft_top1_token_ids is not None:
+            ret_topk_p = draft_logits_output.draft_top1_probs
+            ret_topk_index = draft_logits_output.draft_top1_token_ids
+            ret_draft_probs = None
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
