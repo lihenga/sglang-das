@@ -1,7 +1,7 @@
 """Process-local 0.5.12 Spark adapters for 0.5.18; never patch TokenFlow files.
 
-Normalization/RoPE is deliberately not adapted here. Shared-expert physical
-weight remapping is also independent from ordinary gate fusion.
+Normalization has a separate opt-in native-rounding adapter. RoPE/cache-store
+and shared-expert physical weight remapping remain independent.
 """
 import logging
 import inspect
@@ -198,6 +198,10 @@ def install_smooth_quant() -> bool:
                 and scale.numel() == x.shape[-1] and scale.is_contiguous()
                 and isinstance(weight, torch.Tensor) and weight.dtype == torch.int8):
             return None
+        from sglang.srt.models.sparkv1_rms_quant import take_prequantized
+        pending = take_prequantized(layer, x)
+        if pending is not None:
+            return [pending[0], pending[1].reshape(-1, 1)]
         q, s = per_token_dynamic_quant_int8(x, scale, round_after_smooth=True, limit=float(limit))
         if s.ndim == 1:
             s = s.unsqueeze(-1)
@@ -309,8 +313,13 @@ def install_dense_quant() -> bool:
                 return fallback()
         if getattr(self.fc1, "output_size_per_partition", None) != 2 * width:
             return fallback()
-        q1, a1 = per_token_dynamic_quant_int8(hidden_states, s1,
-                                            round_after_smooth=True, limit=float(limit))
+        from sglang.srt.models.sparkv1_rms_quant import take_prequantized
+        pending = take_prequantized(self.fc1, hidden_states)
+        if pending is None:
+            q1, a1 = per_token_dynamic_quant_int8(hidden_states, s1,
+                                                round_after_smooth=True, limit=float(limit))
+        else:
+            q1, a1 = pending
         gate_up, _ = ColumnParallelLinear.forward(
             self.fc1, hidden_states, input_quant_args=[q1, a1.reshape(-1, 1)])
         if gate_up.shape != (hidden_states.shape[0], 2 * width):
@@ -339,7 +348,10 @@ def install_dense_quant() -> bool:
 def install_spark_v1_0512_adapters(config):
     from sglang.srt.models.sparkv1_shared_overlap import install_shared_expert_overlap
     install_shared_expert_overlap()
-    return {"grouped_topk": install_grouped_topk(config),
-            "deepep_prepare": install_deepep_prepare(),
-            "smooth_quant": install_smooth_quant(),
-            "dense_quant": install_dense_quant()}
+    result = {"grouped_topk": install_grouped_topk(config),
+              "deepep_prepare": install_deepep_prepare(),
+              "smooth_quant": install_smooth_quant(),
+              "dense_quant": install_dense_quant()}
+    from sglang.srt.models.sparkv1_rms_quant import install_rms_quant
+    result["rms_quant"] = install_rms_quant()
+    return result
