@@ -54,6 +54,8 @@ from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
+    cache_hit_rates_from_dict,
+    process_cache_hit_rates_from_ret,
     process_cached_tokens_details_from_ret,
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
@@ -1515,6 +1517,7 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        cache_hit_rates = {}
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
@@ -1545,6 +1548,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
+                )
+                cache_hit_rates[index] = content["meta_info"].get(
+                    "cache_hit_rates", None
                 )
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
@@ -1674,7 +1680,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            sglext_cache_hit_rates = None
+            if request.return_cache_hit_rates and cache_hit_rates:
+                first_rates = next(
+                    (v for v in cache_hit_rates.values() if v is not None), None
+                )
+                if first_rates is not None:
+                    sglext_cache_hit_rates = cache_hit_rates_from_dict(first_rates)
+
+            if (
+                sglext_routed is not None
+                or sglext_details is not None
+                or sglext_cache_hit_rates is not None
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1683,6 +1701,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        cache_hit_rates=sglext_cache_hit_rates,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1782,11 +1801,13 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        cache_hit_rates = process_cache_hit_rates_from_ret(first_ret, request)
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or cache_hit_rates:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                cache_hit_rates=cache_hit_rates,
             )
 
         for idx, ret_item in enumerate(ret):
