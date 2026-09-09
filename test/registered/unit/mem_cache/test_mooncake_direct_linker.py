@@ -127,6 +127,39 @@ def test_dsa_device_pool_group_preserves_sparse_indexer_layers():
     assert offsets == [[indexer_buffers[0][0].nbytes]]
 
 
+def test_dsa_device_pool_group_drops_layer_split_placeholders():
+    kv_buffers = [
+        torch.zeros((0, 2), dtype=torch.uint8),
+        torch.zeros((8, 2), dtype=torch.uint8),
+        torch.zeros((0, 2), dtype=torch.uint8),
+    ]
+    indexer_buffers = [
+        torch.zeros((0, 2), dtype=torch.uint8),
+        torch.zeros((4, 2), dtype=torch.uint8),
+    ]
+    kvcache = SimpleNamespace(
+        page_size=2,
+        layer_num=3,
+        start_layer=10,
+        kv_buffer=kv_buffers,
+        index_k_with_scale_buffer=indexer_buffers,
+        indexer_layer_id_to_index={10: 0, 11: 1},
+    )
+
+    group = _build_dsa_device_pool_group(kvcache, page_size=2)
+    kv = group.entry_map[PoolName.KV]
+    indexer = group.entry_map[PoolName.INDEXER]
+
+    assert kv.components == [[kv_buffers[1]]]
+    assert kv.layer_mapping == {1: 0}
+    assert indexer.components == [[indexer_buffers[1]]]
+    assert indexer.layer_mapping == {1: 0}
+
+    locations = kv.prepare_locations(torch.tensor([0, 1]))
+    assert kv.get_prepared_layer_range_meta(locations, 0) is None
+    assert indexer.get_prepared_layer_range_meta(locations, 0) is None
+
+
 def test_lookup_returns_sparse_mamba_boundaries():
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     pools = [

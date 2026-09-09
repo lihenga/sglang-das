@@ -236,13 +236,30 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             kvcache, "indexer_layer_id_to_index", identity
         ).items()
     }
+
+    def compact_nonempty_buffers(buffers, layer_mapping):
+        """Drop LayerSplit placeholders and remap logical layers to storage."""
+        compact_buffers = []
+        compact_mapping = {}
+        for layer_id, buffer_index in layer_mapping.items():
+            buffer = buffers[buffer_index]
+            if buffer.shape[0] == 0:
+                continue
+            compact_mapping[layer_id] = len(compact_buffers)
+            compact_buffers.append(buffer)
+        return compact_buffers, compact_mapping
+
+    kv_buffers, kv_mapping = compact_nonempty_buffers(kvcache.kv_buffer, identity)
+    indexer_buffers, indexer_mapping = compact_nonempty_buffers(
+        kvcache.index_k_with_scale_buffer, indexer_mapping
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.kv_buffer],
-            layer_mapping=identity,
+            components=[kv_buffers],
+            layer_mapping=kv_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
@@ -250,7 +267,7 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
+            components=[indexer_buffers],
             layer_mapping=indexer_mapping,
             page_size=page_size,
             rows_are_pages=True,
