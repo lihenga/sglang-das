@@ -48,7 +48,7 @@ def transform_index_page_table_decode_kernel(
     topk_indices_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
-    page_table_row_stride: tl.constexpr,
+    page_table_row_stride,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
@@ -70,7 +70,7 @@ def transform_index_page_table_prefill_kernel(
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    page_table_stride_0: tl.constexpr,
+    page_table_stride_0,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
