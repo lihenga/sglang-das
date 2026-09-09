@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_world_group
+from sglang.srt.distributed import get_tp_group, get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -149,12 +149,16 @@ def capture_cuda_graphs(
             set_masked_standard_layout_memory_budget,
         )
 
-        world_group = get_world_group()
+        memory_group = (
+            get_tp_group()
+            if model_runner.is_draft_worker and model_runner.ps.pp_size > 1
+            else get_world_group()
+        )
         available_memory_gb = get_available_gpu_memory(
             model_runner.device,
             model_runner.gpu_id,
-            distributed=world_group.world_size > 1,
-            cpu_group=world_group.cpu_group,
+            distributed=memory_group.world_size > 1,
+            cpu_group=memory_group.cpu_group,
         )
         budget_bytes = set_masked_standard_layout_memory_budget(
             int(available_memory_gb * (1 << 30))

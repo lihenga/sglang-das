@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.hidden_state import (
 )
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.utils import is_pp_mtp_prefill
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -64,7 +65,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -1075,6 +1076,11 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if is_pp_mtp_prefill(self.server_args) and result.next_draft_input is not None:
+            for name in ("topk_p", "topk_index", "hidden_states", "dsa_topk_indices"):
+                value = getattr(result.next_draft_input, name)
+                if value is not None:
+                    tensor_dict[f"mtp_{name}"] = value
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1253,6 +1259,8 @@ class SchedulerPPMixin:
             ),
             skipped_output_comm=True,
         )
+        if is_pp_mtp_prefill(self.server_args):
+            batch.spec_info = None
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
         return None, batch_result, d2h_event
@@ -1289,9 +1297,12 @@ class SchedulerPPMixin:
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
-        )
+        if not is_pp_mtp_prefill(self.server_args):
+            # Synchronous PP MTP prefill carries the full seed below, not a
+            # bonus-only relay (which cannot initialize a speculative FutureMap).
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+            )
         pd_aux_hidden = {
             key: value
             for key, value in pp_outputs.tensors.items()
@@ -1309,6 +1320,20 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+        if is_pp_mtp_prefill(self.server_args):
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            output_result.next_draft_input = EagleDraftInput(
+                topk_p=pp_outputs["mtp_topk_p"],
+                topk_index=pp_outputs["mtp_topk_index"],
+                hidden_states=pp_outputs["mtp_hidden_states"],
+                dsa_topk_indices=pp_outputs.tensors.get("mtp_dsa_topk_indices"),
+                bonus_tokens=next_token_ids,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+            # PD result processing requires the exact same seed object.
+            batch.spec_info = output_result.next_draft_input
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
 
@@ -1381,8 +1406,11 @@ class SchedulerPPMixin:
         # same time.
 
         # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # XPU / HIP PP MTP: even ranks send first, odd ranks recv first.
+        ordered_p2p = is_xpu() or (
+            is_hip() and is_pp_mtp_prefill(self.server_args)
+        )
+        send_first = not ordered_p2p or self.ps.pp_rank % 2 == 0
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
