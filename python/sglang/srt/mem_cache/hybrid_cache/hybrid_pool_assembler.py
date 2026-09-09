@@ -230,6 +230,12 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
         )
     num_layers = kvcache.layer_num
     identity = {layer: layer for layer in range(num_layers)}
+    indexer_mapping = {
+        layer_id - getattr(kvcache, "start_layer", 0): buffer_index
+        for layer_id, buffer_index in getattr(
+            kvcache, "indexer_layer_id_to_index", identity
+        ).items()
+    }
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -245,7 +251,7 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
             components=[kvcache.index_k_with_scale_buffer],
-            layer_mapping=identity,
+            layer_mapping=indexer_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),

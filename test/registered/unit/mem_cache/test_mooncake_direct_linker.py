@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _build_dsa_device_pool_group,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -100,6 +101,30 @@ def test_sparse_multi_component_layer_ranges():
     ]
     assert sizes == [[10], [22], [10], [22]]
     assert offsets == [[6], [14], [6], [14]]
+
+
+def test_dsa_device_pool_group_preserves_sparse_indexer_layers():
+    kv_buffers = [torch.zeros((8, 2), dtype=torch.uint8) for _ in range(3)]
+    indexer_buffers = [torch.zeros((4, 2), dtype=torch.uint8) for _ in range(2)]
+    kvcache = SimpleNamespace(
+        page_size=2,
+        layer_num=3,
+        start_layer=10,
+        kv_buffer=kv_buffers,
+        index_k_with_scale_buffer=indexer_buffers,
+        indexer_layer_id_to_index={10: 0, 12: 1},
+    )
+
+    group = _build_dsa_device_pool_group(kvcache, page_size=2)
+    indexer = group.entry_map[PoolName.INDEXER]
+    locations = indexer.prepare_locations(torch.tensor([0, 1]))
+
+    assert indexer.layer_mapping == {0: 0, 2: 1}
+    assert indexer.get_prepared_layer_range_meta(locations, 1) is None
+    pointers, sizes, offsets = indexer.get_prepared_layer_range_meta(locations, 2)
+    assert pointers == [[indexer_buffers[1][0].data_ptr()]]
+    assert sizes == [[indexer_buffers[1][0].nbytes]]
+    assert offsets == [[indexer_buffers[0][0].nbytes]]
 
 
 def test_lookup_returns_sparse_mamba_boundaries():
