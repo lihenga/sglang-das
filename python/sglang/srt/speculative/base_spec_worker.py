@@ -235,8 +235,10 @@ class BaseSpecWorker(ABC):
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
+        direct_linker = get_memory().enable_unified_cache_external_linker
         if not (
             get_memory().enable_hierarchical_cache
+            or direct_linker
             or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
         ):
             return HiCacheDraftPlan()
@@ -253,7 +255,18 @@ class BaseSpecWorker(ABC):
                 "HiCache does not support Inkling MTP draft state yet."
             )
 
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        can_pack = _can_pack_hicache_mtp(spec_algorithm, draft_runners)
+        if direct_linker:
+            from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+            if not can_pack or any(
+                not isinstance(pool, DSATokenToKVPool) or pool.layer_num != 1
+                for pool in draft_pools
+            ):
+                raise NotImplementedError(
+                    "Direct external linker requires single-layer DSA MTP draft pools."
+                )
+        if can_pack:
             target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,

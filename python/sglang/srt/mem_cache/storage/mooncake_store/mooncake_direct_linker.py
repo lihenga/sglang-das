@@ -70,6 +70,17 @@ class LayerWiseLoadCounter:
         self.futures.clear()
 
 
+class _DraftLayerLoadCounter:
+    """Translate draft-local layers into the target + MTP load sequence."""
+
+    def __init__(self, counter: LayerWiseLoadCounter, offset: int):
+        self.counter = counter
+        self.offset = offset
+
+    def wait_until(self, layer: int) -> None:
+        self.counter.wait_until(self.offset + layer)
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -125,6 +136,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         self.register_buffers()
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        draft_offset = kvcache.layer_num
+        for pool in params.mtp_draft_device_pools:
+            pool.register_layer_transfer_counter(
+                _DraftLayerLoadCounter(self.layer_done_counter, draft_offset)
+            )
+            draft_offset += pool.layer_num
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
@@ -151,6 +168,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             name=f"mooncake-offload-tp{tp_rank}",
         )
         self.offload_thread.start()
+        logger.info(
+            "Mooncake direct linker ready: rank=%s layers=%d draft_layers=%d pools=%s",
+            rank_suffix, self.num_layers, sum(p.layer_num for p in params.mtp_draft_device_pools),
+            {name.value: len(pool.kv_buffer) for name, pool in self.pools.items()},
+        )
 
     def register_buffers(self) -> None:
         seen = set()
@@ -292,6 +314,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             f"expected={expected}"
                         )
                 self.layer_done_counter.complete(counter_index, layer)
+            logger.info(
+                "Mooncake direct linker load completed: requests=%d layers=%d pools=%s",
+                len(request_transfers), self.num_layers,
+                {name.value: len(keys) for name, (keys, _) in batches.items()},
+            )
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")

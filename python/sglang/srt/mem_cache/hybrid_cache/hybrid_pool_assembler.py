@@ -222,57 +222,49 @@ def _build_deepseek_v4_device_pool_group(
     return DevicePoolGroup(entries, mappings.transfer_layer_num, page_size)
 
 
-def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGroup:
-    if kvcache.page_size != page_size:
-        raise ValueError(
-            "DSA KV page size must match the tree page size: "
-            f"{kvcache.page_size} != {page_size}."
-        )
-    num_layers = kvcache.layer_num
-    identity = {layer: layer for layer in range(num_layers)}
-    indexer_mapping = {
-        layer_id - getattr(kvcache, "start_layer", 0): buffer_index
-        for layer_id, buffer_index in getattr(
-            kvcache, "indexer_layer_id_to_index", identity
-        ).items()
-    }
-
-    def compact_nonempty_buffers(buffers, layer_mapping):
-        """Drop LayerSplit placeholders and remap logical layers to storage."""
-        compact_buffers = []
-        compact_mapping = {}
-        for layer_id, buffer_index in layer_mapping.items():
-            buffer = buffers[buffer_index]
-            if buffer.shape[0] == 0:
-                continue
-            compact_mapping[layer_id] = len(compact_buffers)
-            compact_buffers.append(buffer)
-        return compact_buffers, compact_mapping
-
-    kv_buffers, kv_mapping = compact_nonempty_buffers(kvcache.kv_buffer, identity)
-    indexer_buffers, indexer_mapping = compact_nonempty_buffers(
-        kvcache.index_k_with_scale_buffer, indexer_mapping
-    )
-    entries = [
-        DevicePoolEntry(
-            name=PoolName.KV,
-            indices_from_pool=PoolName.KV,
-            device_pool=kvcache,
-            components=[kv_buffers],
-            layer_mapping=kv_mapping,
-            page_size=page_size,
-            rows_are_pages=False,
-        ),
-        DevicePoolEntry(
-            name=PoolName.INDEXER,
-            indices_from_pool=PoolName.KV,
-            device_pool=kvcache,
-            components=[indexer_buffers],
-            layer_mapping=indexer_mapping,
-            page_size=page_size,
-            rows_are_pages=True,
-        ),
-    ]
+def _build_dsa_device_pool_group(
+    kvcache: Any, page_size: int, mtp_draft_device_pools: tuple[Any, ...] = ()
+) -> DevicePoolGroup:
+    pools = (kvcache, *mtp_draft_device_pools)
+    for pool in pools:
+        if pool.page_size != page_size:
+            raise ValueError(
+                "DSA KV page size must match the tree page size: "
+                f"{pool.page_size} != {page_size}."
+            )
+    num_layers = sum(pool.layer_num for pool in pools)
+    entries = []
+    for name in (PoolName.KV, PoolName.INDEXER):
+        buffers, layer_mapping = [], {}
+        layer_offset = 0
+        for pool in pools:
+            start = getattr(pool, "start_layer", 0)
+            mapping = {start + layer: layer for layer in range(pool.layer_num)}
+            source = pool.kv_buffer
+            if name == PoolName.INDEXER:
+                source = pool.index_k_with_scale_buffer
+                mapping = getattr(pool, "indexer_layer_id_to_index", mapping)
+            for layer_id, buffer_index in mapping.items():
+                buffer = source[buffer_index]
+                # LayerSplit non-owners have empty placeholders, not KV data.
+                if buffer.shape[0] == 0:
+                    continue
+                layer_mapping[layer_offset + layer_id - start] = len(buffers)
+                buffers.append(buffer)
+            layer_offset += pool.layer_num
+        # A PP/CP shard may own only shared-indexer layers.
+        if buffers:
+            entries.append(
+                DevicePoolEntry(
+                    name=name,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=kvcache,
+                    components=[buffers],
+                    layer_mapping=layer_mapping,
+                    page_size=page_size,
+                    rows_are_pages=name == PoolName.INDEXER,
+                )
+            )
     return DevicePoolGroup(entries, num_layers, page_size)
 
 
@@ -1700,7 +1692,9 @@ class _DsaStrategy(StackStrategy):
         }
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
-        return _build_dsa_device_pool_group(kvcache, page_size)
+        return _build_dsa_device_pool_group(
+            kvcache, page_size, getattr(params, "mtp_draft_device_pools", ())
+        )
 
     def build(
         self,
