@@ -98,7 +98,10 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     if (
         memory_config.enable_hisparse
         or is_draft_worker
-        or memory_config.enable_hierarchical_cache
+        or (
+            memory_config.enable_hierarchical_cache
+            and get_parallel().enable_dsa_cache_layer_split
+        )
     ):
         return False
 

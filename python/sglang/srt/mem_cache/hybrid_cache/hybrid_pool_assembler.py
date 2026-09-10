@@ -1111,8 +1111,15 @@ def build_anchor_sidecar_stack(
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
+    sidecar_layer_mapping = full_layer_mapping
     # Expose packed MTP tail layers to the controller's flat transfer builder.
     if mtp_draft_device_pools:
+        sidecar_layer_mapping = _with_mtp_layer_mapping(
+            sidecar_layer_mapping,
+            transfer_layer_start=transfer_layer_num,
+            target_host_layer_num=sidecar_host_pool.target_layer_num,
+            draft_layer_num=len(mtp_draft_device_pools),
+        )
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
             transfer_layer_start=transfer_layer_num,
@@ -1132,7 +1139,7 @@ def build_anchor_sidecar_stack(
             name=sidecar_pool_name,
             host_pool=sidecar_host_pool,
             device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
+            layer_mapping=sidecar_layer_mapping,
             transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
         ),
     ]

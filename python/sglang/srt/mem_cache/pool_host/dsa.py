@@ -73,7 +73,19 @@ class DSAIndexerPoolHost(HostKVCache):
         self.end_layer = device_pool.end_layer
         # FP8 and HCU INT8 share the packed uint8 K+scale storage ABI.
         self.use_scaled_index_cache = device_pool.use_scaled_index_k_cache
-        self.target_layer_num = self._effective_host_layer_num()
+        # Model-local layer IDs are not physical Index-K buffer indices when
+        # shared-indexer layers have been elided. Pack only the owned buffers.
+        self.indexer_host_layer_mapping = {
+            layer_id - self.start_layer: host_index
+            for host_index, layer_id in enumerate(
+                layer_id
+                for layer_id in device_pool.indexer_layer_ids
+                if self._is_device_layer_owned(
+                    device_pool, layer_id - self.start_layer
+                )
+            )
+        }
+        self.target_layer_num = len(self.indexer_host_layer_mapping)
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
@@ -242,6 +254,17 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         return host_page_indices, device_page_indices
 
+    def _indexer_transfer_layer_indices(self, device_pool, layer_id, is_draft):
+        if is_draft:
+            return layer_id, 0
+        host_layer_id = self.indexer_host_layer_mapping.get(layer_id)
+        if host_layer_id is None:
+            return None
+        device_layer_id = device_pool.indexer_layer_id_to_index[
+            device_pool.start_layer + layer_id
+        ]
+        return host_layer_id, device_layer_id
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -252,11 +275,11 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
+        indices = self._indexer_transfer_layer_indices(device_pool, layer_id, is_draft)
+        if indices is None:
             return
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        host_layer_id, device_layer_id = indices
         hcu_layer_split_kwargs = (
             {"num_warps_per_block": 4}
             if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
@@ -324,9 +347,10 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        indices = self._indexer_transfer_layer_indices(device_pool, layer_id, is_draft)
+        if indices is None:
+            return
+        host_layer_id, device_layer_id = indices
         hcu_layer_split_kwargs = (
             {"num_warps_per_block": 4}
             if _is_hcu and not is_draft and self._is_device_layer_sharded(device_pool)
