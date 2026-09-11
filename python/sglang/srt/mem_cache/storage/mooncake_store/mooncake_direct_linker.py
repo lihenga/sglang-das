@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -35,6 +36,26 @@ from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+_DEEPSEEK_V4_REPLICATED_POOLS = frozenset(
+    {
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    }
+)
+
+
+def _stable_cp_owner(identity: str, cp_size: int) -> int:
+    """Map a stable request/node identity to exactly one CP rank."""
+    if cp_size <= 0:
+        raise ValueError(f"CP size must be positive, got {cp_size}.")
+    digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False) % cp_size
 
 
 def _source_debug_enabled() -> bool:
@@ -159,6 +180,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
 
+        # DeepSeek-V4 materializes the global token order before populating the
+        # direct-linker pools, so these objects are replicas across attention CP
+        # ranks. Persist each radix node once, and query each request once.  KV
+        # data is still read independently into every rank's local buffers: in
+        # practice that is faster than one reader followed by CP replication.
+        self.cp_single_writer = params.attn_cp_size > 1 and bool(
+            set(self.pools) & _DEEPSEEK_V4_REPLICATED_POOLS
+        )
+        self.cp_single_lookup = self.cp_single_writer
+        self.attn_cp_rank = params.attn_cp_rank
+        self.attn_cp_size = params.attn_cp_size
+        self.cp_control_group = params.attn_cp_cache_group
+        if self.cp_single_lookup:
+            if self.cp_control_group is None:
+                raise RuntimeError(
+                    "Mooncake CP owner lookup requires an attention CP CPU group."
+                )
+
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
@@ -193,9 +232,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
-        rank_suffix = f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
+        # Replicated CP ranks must use one canonical namespace. Keep cp0 for
+        # compatibility with caches produced before CP rank was propagated into
+        # CacheInitParams; ownership, not the object key, identifies the writer.
+        key_cp_rank = 0 if self.cp_single_writer else params.attn_cp_rank
+        rank_suffix = f"tp{tp_rank}_cp{key_cp_rank}_pp{params.pp_rank}"
         self.storage.mla_suffix = rank_suffix
         self.storage.mha_suffix = rank_suffix
+        if self.cp_single_writer:
+            logger.info(
+                "Mooncake CP node-owner writer/request-owner lookup enabled: "
+                "rank=%d/%d namespace=%s writer_owner=node_hash "
+                "lookup_owner=request_id_hash data_reader=all_ranks",
+                self.attn_cp_rank,
+                self.attn_cp_size,
+                rank_suffix,
+            )
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
@@ -287,8 +339,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
-        result = self.storage.batch_exists_v2(page_keys, expanded)
-        restorable = result.restorable_prefix_pages or []
+        if getattr(self, "cp_single_lookup", False):
+            restorable = self._lookup_cp_request(rid, page_keys, expanded)
+        else:
+            result = self.storage.batch_exists_v2(page_keys, expanded)
+            restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
         if restorable:
             logger.info(
@@ -300,6 +355,35 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 (time.perf_counter() - started) * 1000,
             )
         return restorable
+
+    def _lookup_cp_request(
+        self, rid: str, page_keys: list[str], transfers: list[PoolTransfer]
+    ) -> list[int]:
+        """Let the request owner query all objects, then publish its hit mask."""
+        hit_mask = torch.zeros(len(page_keys) + 1, dtype=torch.int, device="cpu")
+        owner = _stable_cp_owner(rid, self.attn_cp_size)
+        if owner == self.attn_cp_rank:
+            try:
+                result = self.storage.batch_exists_v2(page_keys, transfers)
+                for pages in result.restorable_prefix_pages or ():
+                    hit_mask[pages] = 1
+            except BaseException:
+                # Every rank must still enter the merge collective. Treat an
+                # owner-side metadata error as a miss for the whole request.
+                logger.warning(
+                    "Mooncake CP request-owner lookup failed for rid=%s owner=%d; "
+                    "treating the request as a miss.",
+                    rid,
+                    owner,
+                    exc_info=True,
+                )
+
+        torch.distributed.all_reduce(
+            hit_mask,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.cp_control_group,
+        )
+        return hit_mask.nonzero().flatten().tolist()
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
@@ -633,18 +717,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             for rid, transfers in request_transfers:
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
-                    component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                        list(transfer.keys), transfer
+                    logical_keys = list(transfer.keys)
+                    all_locations = self.pools[transfer.name].prepare_locations(
+                        transfer.host_indices
                     )
-                    tagged_keys = self.storage._tag_keys(component_keys)
-                    keys.extend(tagged_keys)
-                    locations.extend(
-                        self.pools[transfer.name].prepare_locations(
-                            transfer.host_indices
+
+                    component_keys, key_multiplier = (
+                        self.storage._get_hybrid_page_component_keys(
+                            logical_keys, transfer
                         )
                     )
+                    tagged_keys = self.storage._tag_keys(component_keys)
+                    for position in range(len(logical_keys)):
+                        start = position * key_multiplier
+                        keys.extend(tagged_keys[start : start + key_multiplier])
+                        locations.append(all_locations[position])
                     batch_rids.setdefault(transfer.name, []).extend(
-                        [rid] * len(tagged_keys)
+                        [rid] * (len(logical_keys) * key_multiplier)
                     )
 
             if self.enable_page_wise_load and any(
@@ -662,75 +751,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return
 
             for layer in range(self.num_layers):
-                for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(
-                        locations, layer
-                    )
-                    if meta is None:
-                        continue
-                    ptrs, sizes, offsets = meta
-                    rids = batch_rids.get(name, [None] * len(keys))
-                    logger.debug(
-                        "00 Mooncake range get start: counter=%d rids=%s rids_size=%d pool=%s "
-                        "layer=%d objects=%d",
-                        counter_index,
-                        rids[0],
-                        len(rids),
-                        name,
-                        layer,
-                        len(keys),
-                    )
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
-                    expected = [sum(item) for item in sizes]
-                    transferred = (
-                        None
-                        if result is None or isinstance(result, int)
-                        else list(result)
-                    )
-                    if (
-                        result is None
-                        or isinstance(result, int)
-                        or transferred != expected
-                    ):
-                        failed_objects = []
-                        for index, key in enumerate(keys):
-                            actual = (
-                                result
-                                if result is None or isinstance(result, int)
-                                else (
-                                    transferred[index]
-                                    if index < len(transferred)
-                                    else None
-                                )
-                            )
-                            wanted = expected[index] if index < len(expected) else None
-                            if actual != wanted:
-                                rid = rids[index] if index < len(rids) else None
-                                failed_objects.append(
-                                    {
-                                        "key": key,
-                                        "rid": rid,
-                                        "transferred": actual,
-                                        "expected": wanted,
-                                    }
-                                )
-                        logger.error(
-                            "Mooncake lookup/session succeeded but range get failed: "
-                            "rids=%s pool=%s layer=%d failed_objects=%s",
-                            [rid for rid, _ in request_transfers],
-                            name,
-                            layer,
-                            failed_objects,
-                        )
-                        raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}, failed_objects={len(failed_objects)}."
-                        )
+                self._load_layer_ranges(
+                    counter_index,
+                    layer,
+                    request_transfers,
+                    batches,
+                    batch_rids,
+                )
                 self.layer_done_counter.complete(counter_index, layer)
             request_success = {rid: True for rid, _ in request_transfers}
         except BaseException as error:
@@ -743,6 +770,39 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     time_stats.set_direct_load_finish_time()
                 self._finish_l4_metric("prefetch", rid, request_success.get(rid, False))
                 self.abort_prepared_load(rid)
+
+    def _load_layer_ranges(
+        self,
+        counter_index: int,
+        layer: int,
+        request_transfers: list[tuple[str, list[PoolTransfer]]],
+        batches: dict[PoolName, tuple[list[str], list[int]]],
+        batch_rids: dict[PoolName, list[str]],
+    ) -> None:
+        for name, (keys, locations) in batches.items():
+            if not keys:
+                continue
+            meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+            if meta is None:
+                continue
+            ptrs, sizes, offsets = meta
+            rids = batch_rids.get(name, [None] * len(keys))
+            logger.debug(
+                "Mooncake range get start: counter=%d rids=%s rids_size=%d "
+                "pool=%s layer=%d objects=%d",
+                counter_index,
+                rids[0],
+                len(rids),
+                name,
+                layer,
+                len(keys),
+            )
+            result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                keys, ptrs, sizes, offsets
+            )
+            self._validate_range_get_result(
+                result, keys, sizes, request_transfers, name, layer
+            )
 
     def _finish_l4_metric(self, operation: str, rid: str, success: bool) -> None:
         metric = getattr(self, "pending_load_metrics", {}).pop(rid, None)
@@ -868,9 +928,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         # Mooncake's range API is key-major and does not take a pool argument,
         # so differently suffixed physical-pool objects can share one call.
-        pool_counts = {
-            str(name): len(keys) for name, (keys, _) in batches.items()
-        }
+        pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
         unique_rids = sorted({rid for rid in all_rids if rid is not None})
         logger.debug(
             "01 Mooncake range get start: counter=%d rids=%s rids_size=%d "
@@ -894,9 +952,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 actual = (
                     result
                     if result is None or isinstance(result, int)
-                    else transferred[index]
-                    if index < len(transferred)
-                    else None
+                    else transferred[index] if index < len(transferred) else None
                 )
                 wanted = expected[index] if index < len(expected) else None
                 if actual != wanted:
@@ -904,8 +960,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     pool = all_pools[index] if index < len(all_pools) else None
                     if rid is None:
                         request_success = {
-                            request_rid: False
-                            for request_rid, _ in request_transfers
+                            request_rid: False for request_rid, _ in request_transfers
                         }
                     else:
                         request_success[rid] = False
@@ -919,8 +974,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         }
                     )
             logger.error(
-                "Mooncake page-wise aggregated range get failed: "
-                "failed_objects=%s",
+                "Mooncake page-wise aggregated range get failed: " "failed_objects=%s",
                 failed_objects,
             )
 
@@ -959,9 +1013,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             actual = (
                 result
                 if result is None or isinstance(result, int)
-                else transferred[index]
-                if index < len(transferred)
-                else None
+                else transferred[index] if index < len(transferred) else None
             )
             wanted = expected[index] if index < len(expected) else None
             if actual != wanted:
@@ -988,7 +1040,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         self.freeze_gc_once()
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
-        tokens = len(kv.keys) * self.page_size
+        node_keys = list(kv.keys or ())
+        if not node_keys:
+            return False
+        # The final chained page hash is a stable content identity for the whole
+        # radix node. Keep every page and every physical pool of that node on
+        # the same writer rank.
+        node_key = node_keys[-1]
+        if (
+            getattr(self, "cp_single_writer", False)
+            and _stable_cp_owner(node_key, self.attn_cp_size) != self.attn_cp_rank
+        ):
+            expanded = []
+        tokens = len(node_keys) * self.page_size if expanded else 0
         # Replication and persistence are selected by Mooncake's own
         # configuration now that SGLang no longer overrides DFS replication.
         # The put API does not report the selected destination, so keep this
@@ -1010,12 +1074,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     return
                 expanded, tokens, source, started, ready_event = task
                 ready_event.synchronize()
-                results = self.storage.batch_set_v2(expanded)
+                # Queue no-op tasks as well, so completion order remains aligned
+                # with UnifiedCacheLinkerWrapper.pending_offloads on every rank.
+                results = self.storage.batch_set_v2(expanded) if expanded else {}
                 success = all(all(pool_results) for pool_results in results.values())
                 duration = time.perf_counter() - started
-                self._log_l4_metric("backup", source, tokens, duration, success)
+                if expanded:
+                    self._log_l4_metric("backup", source, tokens, duration, success)
                 metric_recorded = True
-                if success:
+                if success and expanded:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
                         logger.info("Mooncake direct linker offload: tokens=%d", tokens)

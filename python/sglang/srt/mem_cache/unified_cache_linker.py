@@ -449,9 +449,7 @@ class UnifiedCacheLinkerWrapper:
             restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
         finally:
             time_stats = getattr(req, "time_stats", None)
-            timing_adder = getattr(
-                time_stats, "add_direct_lookup_duration", None
-            )
+            timing_adder = getattr(time_stats, "add_direct_lookup_duration", None)
             if timing_adder is not None:
                 timing_adder(time.perf_counter() - lookup_started)
         hit_pages = self._sync_restorable_prefix(
@@ -739,9 +737,7 @@ class UnifiedCacheLinkerWrapper:
             )
 
         if load_transfers:
-            timing_setter = getattr(
-                self.cache_linker, "set_request_time_stats", None
-            )
+            timing_setter = getattr(self.cache_linker, "set_request_time_stats", None)
             if timing_setter is not None and time_stats is not None:
                 timing_setter(req.rid, time_stats)
             if not self.cache_linker.load(req.rid, load_transfers):
@@ -889,10 +885,27 @@ class UnifiedCacheLinkerWrapper:
 
     def drain_offloads(self, finish_count: int) -> None:
         assert finish_count <= len(self.pending_offloads)
-        for _ in range(finish_count):
+        if finish_count == 0:
+            return
+
+        completed = torch.tensor(
+            [
+                int(self.cache_linker.pop_completed_offload())
+                for _ in range(finish_count)
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        sync = getattr(self.cache, "_all_reduce_attn_groups", None)
+        if sync is not None:
+            # A node can contain pages owned by several CP ranks. It is globally
+            # stored only when every rank's owned subset completed successfully.
+            sync(completed, torch.distributed.ReduceOp.MIN)
+
+        for success in completed.tolist():
             node_id, lock_params = self.pending_offloads.pop(0)
             node = self.cache.resolve_node_handle(node_id)
-            node.external_cache_stored = self.cache_linker.pop_completed_offload()
+            node.external_cache_stored = bool(success)
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def start_layer_wise_loading(self) -> int:
