@@ -263,6 +263,13 @@ def _init_parallel_groups(
             and server_args.enable_two_batch_overlap
             and get_parallel().enable_dsa_prefill_context_parallel
         ),
+        duplicate_attn_cp_cache_group=(
+            getattr(server_args, "enable_unified_cache_external_linker", False)
+            and getattr(server_args, "unified_cache_external_linker_backend", None)
+            == "mooncake"
+            and getattr(server_args, "mooncake_enable_page_wise_load", False)
+            and attn_cp_size > 1
+        ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,

@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+    _cp_page_owner_map,
     _stable_cp_owner,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -1736,6 +1737,135 @@ def test_cp_all_ranks_fetch_complete_request_into_local_buffers():
     # a non-owner issue the complete data read into their own local KV slots.
     assert read_calls == [page_keys, page_keys]
     assert completed_layers == [0, 0]
+
+
+def test_cp_striped_page_reader_fetches_only_owned_pages(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    rank = 0
+    page_keys = [f"striped-page-{index}" for index in range(32)]
+    transfer = PoolTransfer(
+        name=PoolName.DEEPSEEK_V4_C4,
+        keys=page_keys,
+        host_indices=torch.arange(len(page_keys)),
+    )
+    page_owners = _cp_page_owner_map("rid", [transfer], 2)
+    owned_keys = [key for key in page_keys if page_owners[key] == rank]
+    assert owned_keys and len(owned_keys) < len(page_keys)
+    read_calls = []
+    gathered_batches = []
+
+    class _Store:
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            read_calls.append(list(keys))
+            return [sum(item) for item in sizes]
+
+    pool = SimpleNamespace(
+        prepare_locations=lambda indices: indices.tolist(),
+        get_prepared_layer_range_meta=lambda locations, layer: (
+            [[location] for location in locations],
+            [[1] for _ in locations],
+            [[0] for _ in locations],
+        ),
+    )
+    completed_layers = []
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.cp_striped_page_reader = True
+    linker.page_wise_load_threshold = 1
+    linker.cp_control_group = object()
+    linker.attn_cp_rank = rank
+    linker.attn_cp_size = 2
+    linker.num_layers = 1
+    linker.pools = {PoolName.DEEPSEEK_V4_C4: pool}
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.layer_done_counter = SimpleNamespace(
+        complete=lambda counter, layer: completed_layers.append(layer),
+        fail=lambda counter, error: pytest.fail(str(error)),
+    )
+    linker.request_time_stats = {}
+    linker._finish_l4_metric = lambda *args: None
+    linker.abort_prepared_load = lambda rid: None
+    linker._allgather_cp_pages = lambda batches: gathered_batches.append(batches)
+
+    linker.load_layer_wise(
+        0,
+        [
+            (
+                "rid",
+                [
+                    transfer
+                ],
+            )
+        ],
+    )
+
+    assert read_calls == [owned_keys]
+    assert completed_layers == [0]
+    assert len(gathered_batches) == 1
+    _, locations, owners = gathered_batches[0][PoolName.DEEPSEEK_V4_C4]
+    assert locations == list(range(len(page_keys)))
+    assert owners == [page_owners[key] for key in page_keys]
+
+
+def test_cp_striped_page_reader_fuses_layer_into_one_allgather(monkeypatch):
+    class _Event:
+        def record(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+    monkeypatch.setattr(mooncake_direct_linker.device_module, "Event", _Event)
+
+    buffer = torch.tensor([[10], [0], [30], [0]], dtype=torch.int32)
+    pool = DevicePoolEntry(
+        name=PoolName.DEEPSEEK_V4_C4,
+        indices_from_pool=PoolName.KV,
+        device_pool=None,
+        components=[[buffer]],
+        layer_mapping={0: 0},
+        page_size=1,
+        rows_are_pages=True,
+    )
+    calls = []
+
+    class _CPGroup:
+        def all_gather_into_tensor(self, output, input_):
+            calls.append(input_.clone())
+            width = input_.numel()
+            output[:width].copy_(input_)
+            peer = (
+                torch.tensor([20, 40], dtype=torch.int32)
+                .view(torch.uint8)
+                .reshape(-1)
+            )
+            output[width : 2 * width].copy_(peer)
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.attn_cp_rank = 0
+    linker.attn_cp_size = 2
+    linker.num_layers = 1
+    linker.cp_cache_group = _CPGroup()
+    linker.pools = {PoolName.DEEPSEEK_V4_C4: pool}
+    linker._cp_exchange_send = None
+    linker._cp_exchange_recv = None
+
+    linker._allgather_cp_pages(
+        {
+            PoolName.DEEPSEEK_V4_C4: (
+                ["page-0", "page-1", "page-2", "page-3"],
+                [0, 1, 2, 3],
+                [0, 1, 0, 1],
+            )
+        }
+    )
+
+    assert len(calls) == 1
+    assert calls[0].view(torch.int32).tolist() == [10, 30]
+    assert buffer.flatten().tolist() == [10, 20, 30, 40]
 
 
 def test_cp_non_lookup_owner_prepares_local_read_session():
