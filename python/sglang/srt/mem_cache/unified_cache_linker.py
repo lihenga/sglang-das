@@ -199,6 +199,28 @@ class DevicePoolEntry:
                 offsets.extend([[value] for value in row_offsets])
         return ptrs, sizes, offsets
 
+    def get_prepared_layer_tensors(
+        self, locations: list[int], layer: int
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Return each layer buffer and the rows occupied by logical pages."""
+        buffer_index = self.layer_mapping.get(layer)
+        if buffer_index is None or not locations:
+            return []
+
+        result = []
+        for component in self.components:
+            buffer = component[buffer_index]
+            starts = torch.tensor(locations, dtype=torch.long, device=buffer.device)
+            if self._row_span == 1:
+                rows = starts
+            else:
+                offsets = torch.arange(
+                    self._row_span, dtype=torch.long, device=buffer.device
+                )
+                rows = (starts[:, None] + offsets).reshape(-1)
+            result.append((buffer, rows))
+        return result
+
 
 class DevicePoolGroup:
     """Physical device pools sharing one logical linker layer range."""
@@ -793,10 +815,27 @@ class UnifiedCacheLinkerWrapper:
 
     def drain_offloads(self, finish_count: int) -> None:
         assert finish_count <= len(self.pending_offloads)
-        for _ in range(finish_count):
+        if finish_count == 0:
+            return
+
+        completed = torch.tensor(
+            [
+                int(self.cache_linker.pop_completed_offload())
+                for _ in range(finish_count)
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        sync = getattr(self.cache, "_all_reduce_attn_groups", None)
+        if sync is not None:
+            # A node can contain pages owned by several CP ranks. It is globally
+            # stored only when every rank's owned subset completed successfully.
+            sync(completed, torch.distributed.ReduceOp.MIN)
+
+        for success in completed.tolist():
             node_id, lock_params = self.pending_offloads.pop(0)
             node = self.cache.resolve_node_handle(node_id)
-            node.external_cache_stored = self.cache_linker.pop_completed_offload()
+            node.external_cache_stored = bool(success)
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def start_layer_wise_loading(self) -> int:
