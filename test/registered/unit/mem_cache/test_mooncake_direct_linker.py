@@ -1539,16 +1539,24 @@ def test_offload_runs_on_background_thread(monkeypatch):
     linker.offload_thread.join(timeout=5)
 
 
-def test_cp_single_writer_partitions_pages_and_all_physical_pools():
+def test_cp_single_writer_assigns_complete_node_and_all_physical_pools(monkeypatch):
+    monkeypatch.setattr(mooncake_direct_linker, "freeze_gc", lambda _: None)
+
+    class _Event:
+        def record(self):
+            pass
+
+    monkeypatch.setattr(mooncake_direct_linker.device_module, "Event", _Event)
+
     page_size = 2
     cp_size = 8
-    keys = [f"page-{index}" for index in range(256)]
-    transfers = [
-        PoolTransfer(
+    keys = ["node-page-0", "node-page-1", "node-page-2"]
+    node_owner = _stable_cp_owner(keys[-1], cp_size)
+    pools = [
+        SimpleNamespace(
             name=name,
-            keys=keys,
-            host_indices=torch.arange(len(keys) * page_size) + offset,
-            device_indices=torch.arange(len(keys) * page_size) + offset + 10_000,
+            indices_from_pool=PoolName.KV,
+            translate_indices=lambda indices, offset=offset: indices + offset,
         )
         for name, offset in (
             (PoolName.DEEPSEEK_V4_C4, 0),
@@ -1556,40 +1564,37 @@ def test_cp_single_writer_partitions_pages_and_all_physical_pools():
             (PoolName.DEEPSEEK_V4_C4_STATE, 2_000),
         )
     ]
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=keys,
+        device_indices=torch.arange(len(keys) * page_size),
+    )
 
-    owners = {}
-    owner_counts = []
+    writers = []
     for rank in range(cp_size):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.page_size = page_size
+        linker.pool_group = DevicePoolGroup(
+            pools, num_layers=1, page_size=page_size
+        )
+        linker.storage = SimpleNamespace(dfs_replica_num=0)
+        linker.gc_frozen = False
         linker.cp_single_writer = True
         linker.attn_cp_rank = rank
         linker.attn_cp_size = cp_size
-        selected = linker._select_owned_cp_transfers(transfers)
+        linker.offload_queue = Queue()
 
-        selected_keys = [transfer.keys for transfer in selected]
-        assert selected_keys and all(
-            pool_keys == selected_keys[0] for pool_keys in selected_keys
-        )
-        owner_counts.append(len(selected_keys[0]))
-        for key in selected_keys[0]:
-            assert key not in owners
-            owners[key] = rank
+        assert linker.offload([transfer])
+        expanded, tokens, _, _, _ = linker.offload_queue.get_nowait()
+        if expanded:
+            writers.append(rank)
+            assert [item.name for item in expanded] == [pool.name for pool in pools]
+            assert all(item.keys == keys for item in expanded)
+            assert tokens == len(keys) * page_size
+        else:
+            assert tokens == 0
 
-        for original, filtered in zip(transfers, selected):
-            original_pages = original.host_indices.reshape(-1, page_size)
-            expected_positions = [keys.index(key) for key in filtered.keys]
-            assert torch.equal(
-                filtered.host_indices.reshape(-1, page_size),
-                original_pages[expected_positions],
-            )
-            assert filtered.device_indices.numel() == len(filtered.keys) * page_size
-
-    assert set(owners) == set(keys)
-    assert all(owners[key] == _stable_cp_owner(key, cp_size) for key in keys)
-    # A stable hash spreads a realistic page set over all CP ranks instead of
-    # moving the duplicate-write hotspot from all ranks to fixed rank 0.
-    assert all(count > 0 for count in owner_counts)
+    assert writers == [node_owner]
 
 
 def test_cp_non_owner_noop_keeps_offload_completion_fifo(monkeypatch):
@@ -1666,7 +1671,7 @@ def test_cp_non_owner_noop_keeps_offload_completion_fifo(monkeypatch):
     linker.offload_thread.join(timeout=5)
 
 
-def test_cp_single_reader_broadcasts_owner_page_to_local_slot(monkeypatch):
+def test_cp_single_reader_broadcasts_request_owner_page_to_local_slot(monkeypatch):
     event_calls = []
 
     class _Event:
@@ -1678,8 +1683,9 @@ def test_cp_single_reader_broadcasts_owner_page_to_local_slot(monkeypatch):
 
     monkeypatch.setattr(mooncake_direct_linker.device_module, "Event", _Event)
 
-    key = "page-owned-by-peer"
-    owner = _stable_cp_owner(key, 8)
+    key = "request-page"
+    rid = "request-owned-by-peer"
+    owner = _stable_cp_owner(rid, 8)
     local_rank = (owner + 1) % 8
     buffer = torch.zeros((4, 3))
 
@@ -1707,7 +1713,7 @@ def test_cp_single_reader_broadcasts_owner_page_to_local_slot(monkeypatch):
     }
 
     linker._broadcast_cp_layer(
-        {PoolName.DEEPSEEK_V4_C4: ([key], [2])}, layer=0
+        {PoolName.DEEPSEEK_V4_C4: ([key], [2], [owner])}, layer=0
     )
 
     assert broadcasts == [owner]
@@ -1715,7 +1721,7 @@ def test_cp_single_reader_broadcasts_owner_page_to_local_slot(monkeypatch):
     assert event_calls == ["record", "synchronize"]
 
 
-def test_cp_single_reader_fetches_only_locally_owned_keys(monkeypatch):
+def test_cp_single_reader_fetches_complete_locally_owned_request(monkeypatch):
     class _Event:
         def record(self):
             pass
@@ -1727,16 +1733,12 @@ def test_cp_single_reader_fetches_only_locally_owned_keys(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
 
     rank = 0
-    owned_key = next(
-        key
-        for key in (f"page-{i}" for i in range(100))
-        if _stable_cp_owner(key, 2) == rank
+    rid = next(
+        candidate
+        for candidate in (f"rid-{i}" for i in range(100))
+        if _stable_cp_owner(candidate, 2) == rank
     )
-    peer_key = next(
-        key
-        for key in (f"page-{i}" for i in range(100))
-        if _stable_cp_owner(key, 2) != rank
-    )
+    page_keys = ["page-owned-by-other-key-hash", "another-page"]
     read_calls = []
 
     class _Store:
@@ -1781,11 +1783,11 @@ def test_cp_single_reader_fetches_only_locally_owned_keys(monkeypatch):
         0,
         [
             (
-                "rid",
+                rid,
                 [
                     PoolTransfer(
                         name=PoolName.DEEPSEEK_V4_C4,
-                        keys=[owned_key, peer_key],
+                        keys=page_keys,
                         host_indices=torch.tensor([0, 1]),
                     )
                 ],
@@ -1793,49 +1795,105 @@ def test_cp_single_reader_fetches_only_locally_owned_keys(monkeypatch):
         ],
     )
 
-    assert read_calls == [[owned_key]]
+    assert read_calls == [page_keys]
+    assert completed_layers == [0]
+
+    peer_rid = next(
+        candidate
+        for candidate in (f"peer-rid-{i}" for i in range(100))
+        if _stable_cp_owner(candidate, 2) != rank
+    )
+    read_calls.clear()
+    completed_layers.clear()
+    linker.load_layer_wise(
+        1,
+        [
+            (
+                peer_rid,
+                [
+                    PoolTransfer(
+                        name=PoolName.DEEPSEEK_V4_C4,
+                        keys=page_keys,
+                        host_indices=torch.tensor([0, 1]),
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert read_calls == []
     assert completed_layers == [0]
 
 
-def test_cp_single_reader_queries_existence_only_for_owned_keys(monkeypatch):
+def test_cp_single_reader_request_owner_queries_all_keys(monkeypatch):
     rank = 0
     page_keys = [f"page-{index}" for index in range(16)]
-    owned_keys = [key for key in page_keys if _stable_cp_owner(key, 2) == rank]
+    rid = next(
+        candidate
+        for candidate in (f"rid-{i}" for i in range(100))
+        if _stable_cp_owner(candidate, 2) == rank
+    )
     queried = []
 
-    def merge_peer_hits(tensor, op, group):
+    def publish_owner_hits(tensor, op, group):
         assert op == torch.distributed.ReduceOp.MAX
-        tensor.fill_(1)
 
-    monkeypatch.setattr(torch.distributed, "all_reduce", merge_peer_hits)
+    monkeypatch.setattr(torch.distributed, "all_reduce", publish_owner_hits)
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.cp_single_reader = True
     linker.attn_cp_rank = rank
     linker.attn_cp_size = 2
     linker.cp_control_group = object()
     linker.storage = SimpleNamespace(
-        _get_hybrid_page_component_keys=lambda keys, transfer: (
-            [f"{key}_{transfer.name}" for key in keys],
-            1,
+        batch_exists_v2=lambda keys, transfers: (
+            queried.append((list(keys), list(transfers)))
+            or SimpleNamespace(
+                restorable_prefix_pages=list(range(1, len(keys) + 1))
+            )
         ),
-        _tag_keys=lambda keys: keys,
-        _batch_exist=lambda keys: queried.append(list(keys)) or [1] * len(keys),
     )
     transfers = [
         PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, keys=page_keys),
         PoolTransfer(name=PoolName.DEEPSEEK_V4_C4_INDEXER, keys=page_keys),
     ]
 
-    restorable = linker._lookup_cp_owned_pages(page_keys, transfers)
+    restorable = linker._lookup_cp_request(rid, page_keys, transfers)
 
-    assert queried == [
-        [f"{key}_{pool}" for key in owned_keys]
-        for pool in (
-            PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-        )
-    ]
+    assert queried == [(page_keys, transfers)]
     assert restorable == list(range(1, len(page_keys) + 1))
+
+
+def test_cp_single_reader_non_owner_does_not_query_existence(monkeypatch):
+    rank = 0
+    rid = next(
+        candidate
+        for candidate in (f"rid-{i}" for i in range(100))
+        if _stable_cp_owner(candidate, 2) != rank
+    )
+    page_keys = ["page-0", "page-1"]
+
+    def receive_owner_hits(tensor, op, group):
+        assert op == torch.distributed.ReduceOp.MAX
+        tensor[1:] = 1
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", receive_owner_hits)
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.attn_cp_rank = rank
+    linker.attn_cp_size = 2
+    linker.cp_control_group = object()
+    linker.storage = SimpleNamespace(
+        batch_exists_v2=lambda *_args: pytest.fail(
+            "A non-owner rank must not query Mooncake."
+        )
+    )
+
+    restorable = linker._lookup_cp_request(
+        rid,
+        page_keys,
+        [PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, keys=page_keys)],
+    )
+
+    assert restorable == [1, 2]
 
 
 def test_async_offload_pins_node_until_completion():

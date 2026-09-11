@@ -5,7 +5,6 @@ import logging
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import replace
 from queue import Empty, Queue
 
 import torch
@@ -13,7 +12,6 @@ import torch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
-    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -50,11 +48,11 @@ _DEEPSEEK_V4_REPLICATED_POOLS = frozenset(
 )
 
 
-def _stable_cp_owner(page_key: str, cp_size: int) -> int:
-    """Map one logical cache page to exactly one CP rank."""
+def _stable_cp_owner(identity: str, cp_size: int) -> int:
+    """Map a stable request/node identity to exactly one CP rank."""
     if cp_size <= 0:
         raise ValueError(f"CP size must be positive, got {cp_size}.")
-    digest = hashlib.blake2b(page_key.encode("utf-8"), digest_size=8).digest()
+    digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=False) % cp_size
 
 
@@ -173,8 +171,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         # DeepSeek-V4 materializes the global token order before populating the
         # direct-linker pools, so these objects are replicas across attention CP
-        # ranks. Persist each logical page once and distribute ownership by a
-        # stable key hash instead of making every rank race on the same object.
+        # ranks. One CP rank persists a complete radix node; one CP rank reads a
+        # complete request and broadcasts it to its peers.
         self.cp_single_writer = params.attn_cp_size > 1 and bool(
             set(self.pools) & _DEEPSEEK_V4_REPLICATED_POOLS
         )
@@ -253,7 +251,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if self.cp_single_writer:
             logger.info(
                 "Mooncake CP single-writer/single-reader enabled: "
-                "rank=%d/%d namespace=%s",
+                "rank=%d/%d namespace=%s writer_owner=node_hash "
+                "reader_owner=request_id_hash",
                 self.attn_cp_rank,
                 self.attn_cp_size,
                 rank_suffix,
@@ -350,7 +349,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not page_keys:
             return []
         if getattr(self, "cp_single_reader", False):
-            restorable = self._lookup_cp_owned_pages(page_keys, expanded)
+            restorable = self._lookup_cp_request(rid, page_keys, expanded)
         else:
             result = self.storage.batch_exists_v2(page_keys, expanded)
             restorable = result.restorable_prefix_pages or []
@@ -366,77 +365,34 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         return restorable
 
-    def _lookup_cp_owned_pages(
-        self, page_keys: list[str], transfers: list[PoolTransfer]
+    def _lookup_cp_request(
+        self, rid: str, page_keys: list[str], transfers: list[PoolTransfer]
     ) -> list[int]:
-        """Query each object on its owner, then merge page hits across CP ranks."""
-        page_hits = torch.zeros(
-            (len(transfers), len(page_keys)), dtype=torch.int, device="cpu"
-        )
-        owned_positions = [
-            index
-            for index, key in enumerate(page_keys)
-            if _stable_cp_owner(key, self.attn_cp_size) == self.attn_cp_rank
-        ]
-        owned_keys = [page_keys[index] for index in owned_positions]
-
-        for pool_index, transfer in enumerate(transfers):
-            if not owned_keys:
-                continue
+        """Let the request owner query all objects, then publish its hit mask."""
+        hit_mask = torch.zeros(len(page_keys) + 1, dtype=torch.int, device="cpu")
+        owner = _stable_cp_owner(rid, self.attn_cp_size)
+        if owner == self.attn_cp_rank:
             try:
-                component_keys, key_multiplier = (
-                    self.storage._get_hybrid_page_component_keys(
-                        owned_keys, transfer
-                    )
-                )
-                exists = self.storage._batch_exist(
-                    self.storage._tag_keys(component_keys)
-                )
-                for local_index, page_index in enumerate(owned_positions):
-                    start = local_index * key_multiplier
-                    page_hits[pool_index, page_index] = int(
-                        len(exists[start : start + key_multiplier]) == key_multiplier
-                        and all(
-                            result == 1
-                            for result in exists[start : start + key_multiplier]
-                        )
-                    )
+                result = self.storage.batch_exists_v2(page_keys, transfers)
+                for pages in result.restorable_prefix_pages or ():
+                    hit_mask[pages] = 1
             except BaseException:
                 # Every rank must still enter the merge collective. Treat an
-                # owner-side metadata error as a miss for its pages.
+                # owner-side metadata error as a miss for the whole request.
                 logger.warning(
-                    "Mooncake CP owner lookup failed for pool=%s; treating its "
-                    "pages as misses.",
-                    transfer.name,
+                    "Mooncake CP request-owner lookup failed for rid=%s owner=%d; "
+                    "treating the request as a miss.",
+                    rid,
+                    owner,
                     exc_info=True,
                 )
 
         torch.distributed.all_reduce(
-            page_hits,
+            hit_mask,
             op=torch.distributed.ReduceOp.MAX,
             group=self.cp_control_group,
         )
-
-        restorable = set(range(1, len(page_keys) + 1))
-        for pool_index, transfer in enumerate(transfers):
-            exists = [bool(value) for value in page_hits[pool_index].tolist()]
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                boundary = exists.index(False) if False in exists else len(exists)
-                pool_restorable = set(range(1, boundary + 1))
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys or ()))
-                pool_restorable = {
-                    prefix
-                    for prefix in range(1, len(page_keys) + 1)
-                    if all(
-                        exists[index]
-                        for index in range(max(0, prefix - trailing), prefix)
-                    )
-                }
-            else:
-                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
-            restorable.intersection_update(pool_restorable)
-        return sorted(restorable)
+        return hit_mask.nonzero().flatten().tolist()
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
@@ -475,11 +431,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             source_tokens[source] = source_tokens.get(source, 0) + self.page_size
         metric_pages = logical_page_sources
         if getattr(self, "cp_single_reader", False):
-            metric_pages = {
-                key: sources
-                for key, sources in logical_page_sources.items()
-                if _stable_cp_owner(key, self.attn_cp_size) == self.attn_cp_rank
-            }
+            request_owner = _stable_cp_owner(rid, self.attn_cp_size)
+            metric_pages = (
+                logical_page_sources if request_owner == self.attn_cp_rank else {}
+            )
         self.pending_load_metrics[rid] = (
             len(metric_pages) * self.page_size,
             dict(source_tokens),
@@ -493,7 +448,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         if not expanded:
             return False
-        expanded = self._select_owned_cp_transfers(expanded)
+        if (
+            getattr(self, "cp_single_reader", False)
+            and _stable_cp_owner(rid, self.attn_cp_size) != self.attn_cp_rank
+        ):
+            expanded = []
         if rid in self.prepared_load_sessions:
             raise RuntimeError(f"Mooncake load for rid={rid} is already prepared.")
 
@@ -723,26 +682,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             batch_rids: dict[PoolName, list[str]] = {}
-            broadcast_batches: dict[PoolName, tuple[list[str], list[int]]] = {}
+            broadcast_batches: dict[
+                PoolName, tuple[list[str], list[int], list[int]]
+            ] = {}
             for rid, transfers in request_transfers:
+                single_reader = getattr(self, "cp_single_reader", False)
+                request_owner = (
+                    _stable_cp_owner(rid, self.attn_cp_size) if single_reader else 0
+                )
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
                     logical_keys = list(transfer.keys)
                     all_locations = self.pools[transfer.name].prepare_locations(
                         transfer.host_indices
                     )
-                    if getattr(self, "cp_single_reader", False):
-                        sync_keys, sync_locations = broadcast_batches.setdefault(
-                            transfer.name, ([], [])
+                    if single_reader:
+                        sync_keys, sync_locations, sync_owners = (
+                            broadcast_batches.setdefault(transfer.name, ([], [], []))
                         )
                         sync_keys.extend(logical_keys)
                         sync_locations.extend(all_locations)
-                        positions = [
-                            index
-                            for index, key in enumerate(logical_keys)
-                            if _stable_cp_owner(key, self.attn_cp_size)
-                            == self.attn_cp_rank
-                        ]
+                        sync_owners.extend([request_owner] * len(logical_keys))
+                        positions = (
+                            list(range(len(logical_keys)))
+                            if request_owner == self.attn_cp_rank
+                            else []
+                        )
                     else:
                         positions = list(range(len(logical_keys)))
 
@@ -857,16 +822,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def _broadcast_cp_layer(
         self,
-        batches: dict[PoolName, tuple[list[str], list[int]]],
+        batches: dict[PoolName, tuple[list[str], list[int], list[int]]],
         layer: int,
     ) -> None:
-        for name, (keys, locations) in batches.items():
+        for name, (_, locations, owners) in batches.items():
             pool = self.pools[name]
             for owner in range(self.attn_cp_size):
                 owner_locations = [
                     locations[index]
-                    for index, key in enumerate(keys)
-                    if _stable_cp_owner(key, self.attn_cp_size) == owner
+                    for index, page_owner in enumerate(owners)
+                    if page_owner == owner
                 ]
                 for buffer, rows in pool.get_prepared_layer_tensors(
                     owner_locations, layer
@@ -1127,63 +1092,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             f"failed_objects={len(failed_objects)}."
         )
 
-    def _select_owned_cp_transfers(
-        self, transfers: list[PoolTransfer]
-    ) -> list[PoolTransfer]:
-        """Keep only pages owned by this CP rank, preserving pool alignment."""
-        if not getattr(self, "cp_single_writer", False):
-            return transfers
-
-        rank = self.attn_cp_rank
-        size = self.attn_cp_size
-        selected: list[PoolTransfer] = []
-        ownership: dict[str, bool] = {}
-
-        def is_owned(key: str) -> bool:
-            if key not in ownership:
-                ownership[key] = _stable_cp_owner(key, size) == rank
-            return ownership[key]
-
-        for transfer in transfers:
-            keys = list(transfer.keys or ())
-            positions = [index for index, key in enumerate(keys) if is_owned(key)]
-            if not positions:
-                continue
-
-            def select_page_indices(indices):
-                if indices is None:
-                    return None
-                flat = indices.flatten()
-                expected = len(keys) * self.page_size
-                if flat.numel() != expected:
-                    raise ValueError(
-                        f"Pool {transfer.name} has {flat.numel()} indices for "
-                        f"{len(keys)} keys; expected {expected}."
-                    )
-                pages = flat.reshape(len(keys), self.page_size)
-                return pages[positions].reshape(-1)
-
-            selected.append(
-                replace(
-                    transfer,
-                    keys=[keys[index] for index in positions],
-                    host_indices=select_page_indices(transfer.host_indices),
-                    device_indices=select_page_indices(transfer.device_indices),
-                )
-            )
-        return selected
-
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
         self.freeze_gc_once()
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
-        expanded = self._select_owned_cp_transfers(expanded)
-        logical_pages = {
-            key for transfer in expanded for key in (transfer.keys or ())
-        }
-        tokens = len(logical_pages.intersection(kv.keys or ())) * self.page_size
+        node_keys = list(kv.keys or ())
+        if not node_keys:
+            return False
+        # The final chained page hash is a stable content identity for the whole
+        # radix node. Keep every page and every physical pool of that node on
+        # the same writer rank.
+        node_key = node_keys[-1]
+        if (
+            getattr(self, "cp_single_writer", False)
+            and _stable_cp_owner(node_key, self.attn_cp_size) != self.attn_cp_rank
+        ):
+            expanded = []
+        tokens = len(node_keys) * self.page_size if expanded else 0
         source = (
             "dfs" if getattr(self.storage, "dfs_replica_num", 0) > 0 else "local_disk"
         )
