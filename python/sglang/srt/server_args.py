@@ -9973,9 +9973,24 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
+            from sglang.srt.distributed.utils import is_pp_mtp_prefill
+
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism requires --disable-overlap-schedule"
+            assert self.speculative_algorithm is None or is_pp_mtp_prefill(self), (
+                "PP speculative execution is supported only for PD prefill with EAGLE"
+            )
+            if is_pp_mtp_prefill(self):
+                assert not (
+                    self.speculative_use_rejection_sampling
+                    or self.speculative_adaptive
+                    or self.enable_multi_layer_eagle
+                    or self.dp_size > 1
+                ), (
+                    "PP MTP prefill does not support rejection sampling, "
+                    "adaptive/multi-layer MTP or DP size > 1"
+                )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

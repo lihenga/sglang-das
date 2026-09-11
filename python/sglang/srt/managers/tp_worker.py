@@ -385,11 +385,16 @@ class TpModelWorker(BaseTpWorker):
         if server_args.is_ep_joiner:
             self.random_seed = get_device().random_seed
         else:
+            seed_group = (
+                self.model_runner.tp_group
+                if is_draft_worker and self.ps.pp_size > 1
+                else self.world_group
+            )
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
                 self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
-                self.world_group.cpu_group,
-                src=self.world_group.ranks[0],
+                seed_group.cpu_group,
+                src=seed_group.ranks[0],
             )[0]
         set_random_seed(self.random_seed)
 

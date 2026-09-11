@@ -472,8 +472,11 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
+            from sglang.srt.distributed.utils import is_pp_mtp_prefill
+
             assert (
                 self.support_pp
+                or (self.is_draft_worker and is_pp_mtp_prefill())
             ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates

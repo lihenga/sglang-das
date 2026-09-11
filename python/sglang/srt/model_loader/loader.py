@@ -300,7 +300,10 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    return model_class(**kwargs)
+    from sglang.srt.distributed.utils import pp_mtp_local_model_scope
+
+    with pp_mtp_local_model_scope():
+        return model_class(**kwargs)
 
 
 def _post_load_weights(model: nn.Module) -> None:

@@ -1485,10 +1485,11 @@ def make_layers(
     """Make a list of layers with the given layer function"""
     # circular imports
     from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.distributed.utils import is_pp_mtp_draft_build
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
-    assert not pp_size or num_hidden_layers >= pp_size
+    assert not pp_size or num_hidden_layers >= pp_size or is_pp_mtp_draft_build()
     start_layer, end_layer = (
         get_pp_indices(
             num_hidden_layers,

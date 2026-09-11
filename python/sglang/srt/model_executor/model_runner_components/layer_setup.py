@@ -197,9 +197,12 @@ def _assert_pp_mtp_compat(
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    from sglang.srt.distributed.utils import is_pp_mtp_prefill
+
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
+        or is_pp_mtp_prefill()
         or (
             (not spec_algorithm.is_none())
             and (num_effective_layers == model_num_layers)
