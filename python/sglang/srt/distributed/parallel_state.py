@@ -2617,7 +2617,6 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
-
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
     global _ATTN_TP
