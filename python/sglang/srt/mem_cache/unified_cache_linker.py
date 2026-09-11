@@ -199,28 +199,6 @@ class DevicePoolEntry:
                 offsets.extend([[value] for value in row_offsets])
         return ptrs, sizes, offsets
 
-    def get_prepared_layer_tensors(
-        self, locations: list[int], layer: int
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Return each layer buffer and the rows occupied by logical pages."""
-        buffer_index = self.layer_mapping.get(layer)
-        if buffer_index is None or not locations:
-            return []
-
-        result = []
-        for component in self.components:
-            buffer = component[buffer_index]
-            starts = torch.tensor(locations, dtype=torch.long, device=buffer.device)
-            if self._row_span == 1:
-                rows = starts
-            else:
-                offsets = torch.arange(
-                    self._row_span, dtype=torch.long, device=buffer.device
-                )
-                rows = (starts[:, None] + offsets).reshape(-1)
-            result.append((buffer, rows))
-        return result
-
 
 class DevicePoolGroup:
     """Physical device pools sharing one logical linker layer range."""
@@ -440,9 +418,7 @@ class UnifiedCacheLinkerWrapper:
             restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
         finally:
             time_stats = getattr(req, "time_stats", None)
-            timing_adder = getattr(
-                time_stats, "add_direct_lookup_duration", None
-            )
+            timing_adder = getattr(time_stats, "add_direct_lookup_duration", None)
             if timing_adder is not None:
                 timing_adder(time.perf_counter() - lookup_started)
         hit_pages = self._sync_restorable_prefix(
@@ -665,9 +641,7 @@ class UnifiedCacheLinkerWrapper:
         )
 
         if load_transfers:
-            timing_setter = getattr(
-                self.cache_linker, "set_request_time_stats", None
-            )
+            timing_setter = getattr(self.cache_linker, "set_request_time_stats", None)
             if timing_setter is not None and time_stats is not None:
                 timing_setter(req.rid, time_stats)
             if not self.cache_linker.load(req.rid, load_transfers):

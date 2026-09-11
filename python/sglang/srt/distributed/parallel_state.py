@@ -1998,7 +1998,6 @@ _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
-_ATTN_CP_CACHE: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -2040,12 +2039,6 @@ def get_attn_cp_overlap_group() -> GroupCoordinator:
     return _ATTN_CP_OVERLAP if _ATTN_CP_OVERLAP is not None else get_attn_cp_group()
 
 
-def get_attn_cp_cache_group() -> GroupCoordinator:
-    """Dedicated communicator for background external-cache replication."""
-    assert _ATTN_CP_CACHE is not None, "attention CP cache group is not initialized"
-    return _ATTN_CP_CACHE
-
-
 def _init_attn_cp_overlap_group(
     *,
     world_size: int,
@@ -2085,46 +2078,6 @@ def _init_attn_cp_overlap_group(
         backend,
         use_message_queue_broadcaster=False,
         group_name="attn_cp_overlap",
-        recovered_rank=recovered_rank,
-        rank_offset=rank_offset,
-        max_world_size=max_world_size,
-    )
-
-
-def _init_attn_cp_cache_group(
-    *,
-    world_size: int,
-    attn_cp_size: int,
-    attn_tp_size: int,
-    backend: Optional[str],
-    recovered_rank: bool,
-    rank_offset: int,
-    max_world_size: Optional[int],
-) -> None:
-    """Build a CP communicator used only by background cache transfers."""
-    global _ATTN_CP_CACHE
-    assert _ATTN_CP_CACHE is None, "attention CP cache group is already initialized"
-    if attn_cp_size <= 1:
-        return
-
-    span = attn_tp_size * attn_cp_size
-    group_ranks = [
-        list(range(base + i, base + i + span, attn_tp_size))
-        for base in range(0, world_size, span)
-        for i in range(attn_tp_size)
-    ]
-    rank = torch.distributed.get_rank()
-    mine = next(ranks for ranks in group_ranks if rank in ranks)
-    assert mine == get_attn_cp_group().ranks, (
-        f"attn_cp_cache partition {mine} does not match attn_cp "
-        f"{get_attn_cp_group().ranks}"
-    )
-    _ATTN_CP_CACHE = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=False,
-        group_name="attn_cp_cache",
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
         max_world_size=max_world_size,
@@ -2460,7 +2413,6 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
-    duplicate_attn_cp_cache_group: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2665,17 +2617,6 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
-    if duplicate_attn_cp_cache_group:
-        _init_attn_cp_cache_group(
-            world_size=world_size,
-            attn_cp_size=attn_cp_size,
-            attn_tp_size=attn_tp_size,
-            backend=backend,
-            recovered_rank=recovered_rank,
-            rank_offset=rank_offset,
-            max_world_size=max_world_size,
-        )
-
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
     global _ATTN_TP
@@ -3078,7 +3019,6 @@ def destroy_model_parallel():
 
     global _ATTN_CP
     global _ATTN_CP_OVERLAP
-    global _ATTN_CP_CACHE
     global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
@@ -3088,9 +3028,6 @@ def destroy_model_parallel():
     if _ATTN_CP_OVERLAP:
         _ATTN_CP_OVERLAP.destroy()
     _ATTN_CP_OVERLAP = None
-    if _ATTN_CP_CACHE:
-        _ATTN_CP_CACHE.destroy()
-    _ATTN_CP_CACHE = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
