@@ -56,6 +56,24 @@ def _stable_cp_owner(identity: str, cp_size: int) -> int:
     return int.from_bytes(digest, byteorder="big", signed=False) % cp_size
 
 
+def _cp_page_owner_map(
+    rid: str, transfers: list[PoolTransfer], cp_size: int
+) -> dict[str, int]:
+    """Assign unique logical pages round-robin from a request-hashed rank.
+
+    Every physical pool carrying the same logical page follows the same owner.
+    Round-robin, rather than an independent hash per page, bounds the load
+    imbalance for one request to at most one page bundle per rank.
+    """
+    first_owner = _stable_cp_owner(rid, cp_size)
+    owners: dict[str, int] = {}
+    for transfer in transfers:
+        for key in transfer.keys or ():
+            if key not in owners:
+                owners[key] = (first_owner + len(owners)) % cp_size
+    return owners
+
+
 def _get_mooncake_storage_metrics_dp_rank(server_args, params) -> int:
     if getattr(server_args, "enable_dp_attention", False):
         from sglang.srt.layers.dp_attention import get_attention_dp_rank
@@ -171,9 +189,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         # DeepSeek-V4 materializes the global token order before populating the
         # direct-linker pools, so these objects are replicas across attention CP
-        # ranks. Persist each radix node once, and query each request once.  KV
-        # data is still read independently into every rank's local buffers: in
-        # practice that is faster than one reader followed by CP replication.
+        # ranks. Persist each radix node once and query each request once.  For
+        # page-wise loads, distribute page bundles across CP ranks and restore
+        # the replicas with fused collectives; layer-wise loads retain the
+        # direct all-rank path because their small collectives are expensive.
         self.cp_single_writer = params.attn_cp_size > 1 and bool(
             set(self.pools) & _DEEPSEEK_V4_REPLICATED_POOLS
         )
@@ -181,10 +200,31 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.attn_cp_rank = params.attn_cp_rank
         self.attn_cp_size = params.attn_cp_size
         self.cp_control_group = params.attn_cp_cache_group
+        self.cp_cache_group = None
+        # Page-wise gets are sufficiently coarse to stripe one logical copy
+        # across CP ranks.  Layer-wise gets keep the all-rank direct path: the
+        # extra collectives would otherwise dominate small transfers.
+        self.cp_striped_page_reader = bool(
+            self.cp_single_writer and self.enable_page_wise_load
+        )
         if self.cp_single_lookup:
             if self.cp_control_group is None:
                 raise RuntimeError(
                     "Mooncake CP owner lookup requires an attention CP CPU group."
+                )
+        if self.cp_striped_page_reader:
+            from sglang.srt.distributed.parallel_state import get_attn_cp_cache_group
+
+            self.cp_cache_group = get_attn_cp_cache_group()
+            if self.cp_cache_group.world_size != self.attn_cp_size:
+                raise RuntimeError(
+                    "Mooncake CP cache group size does not match attention CP: "
+                    f"{self.cp_cache_group.world_size} != {self.attn_cp_size}."
+                )
+            if self.cp_cache_group.rank_in_group != self.attn_cp_rank:
+                raise RuntimeError(
+                    "Mooncake CP cache group rank does not match attention CP: "
+                    f"{self.cp_cache_group.rank_in_group} != {self.attn_cp_rank}."
                 )
 
         tp_rank = 0
@@ -233,10 +273,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.info(
                 "Mooncake CP node-owner writer/request-owner lookup enabled: "
                 "rank=%d/%d namespace=%s writer_owner=node_hash "
-                "lookup_owner=request_id_hash data_reader=all_ranks",
+                "lookup_owner=request_id_hash data_reader=%s",
                 self.attn_cp_rank,
                 self.attn_cp_size,
                 rank_suffix,
+                (
+                    "page_hash_striped+fused_allgather"
+                    if self.cp_striped_page_reader
+                    else "all_ranks"
+                ),
             )
 
         self.storage_metrics_collector = None
@@ -281,6 +326,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = {}
         self.pending_load_metrics: dict[str, tuple[int, dict[str, int], float]] = {}
         self.request_time_stats: dict[str, object] = {}
+        self._cp_exchange_send: torch.Tensor | None = None
+        self._cp_exchange_recv: torch.Tensor | None = None
         self.session_lock = threading.Lock()
         self.gc_frozen = False
         self.load_queue: Queue[
@@ -430,13 +477,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         seen = set()
         pool_page_components: dict[tuple[PoolName, str], list[str]] = {}
         for transfer in expanded:
+            logical_keys = list(transfer.keys)
             component_keys, key_multiplier = (
                 self.storage._get_hybrid_page_component_keys(
-                    list(transfer.keys), transfer
+                    logical_keys, transfer
                 )
             )
             tagged_component_keys = self.storage._tag_keys(component_keys)
-            for page_index, page_key in enumerate(transfer.keys):
+            for page_index, page_key in enumerate(logical_keys):
                 start = page_index * key_multiplier
                 pool_page_components.setdefault((transfer.name, page_key), []).extend(
                     tagged_component_keys[start : start + key_multiplier]
@@ -648,9 +696,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     ) -> None:
         request_success = {rid: False for rid, _ in request_transfers}
         try:
+            pool_object_counts: dict[PoolName, int] = {}
+            for _, transfers in request_transfers:
+                for transfer in transfers:
+                    pool_object_counts[transfer.name] = pool_object_counts.get(
+                        transfer.name, 0
+                    ) + len(transfer.keys or ())
+            use_cp_striping = bool(
+                getattr(self, "cp_striped_page_reader", False)
+                and any(
+                    count >= self.page_wise_load_threshold
+                    for count in pool_object_counts.values()
+                )
+            )
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             batch_rids: dict[PoolName, list[str]] = {}
+            cp_batches: dict[
+                PoolName, tuple[list[str], list[int], list[int]]
+            ] = {}
             for rid, transfers in request_transfers:
+                page_owners = (
+                    _cp_page_owner_map(rid, transfers, self.attn_cp_size)
+                    if use_cp_striping
+                    else {}
+                )
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
                     logical_keys = list(transfer.keys)
@@ -658,19 +727,59 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         transfer.host_indices
                     )
 
+                    if use_cp_striping:
+                        sync_keys, sync_locations, sync_owners = cp_batches.setdefault(
+                            transfer.name, ([], [], [])
+                        )
+                        owners = [page_owners[key] for key in logical_keys]
+                        sync_keys.extend(logical_keys)
+                        sync_locations.extend(all_locations)
+                        sync_owners.extend(owners)
+                        positions = [
+                            index
+                            for index, owner in enumerate(owners)
+                            if owner == self.attn_cp_rank
+                        ]
+                    else:
+                        positions = list(range(len(logical_keys)))
+
                     component_keys, key_multiplier = (
                         self.storage._get_hybrid_page_component_keys(
                             logical_keys, transfer
                         )
                     )
                     tagged_keys = self.storage._tag_keys(component_keys)
-                    for position in range(len(logical_keys)):
+                    for position in positions:
                         start = position * key_multiplier
                         keys.extend(tagged_keys[start : start + key_multiplier])
-                        locations.append(all_locations[position])
+                        locations.extend([all_locations[position]] * key_multiplier)
                     batch_rids.setdefault(transfer.name, []).extend(
-                        [rid] * (len(logical_keys) * key_multiplier)
+                        [rid] * (len(positions) * key_multiplier)
                     )
+
+            if use_cp_striping:
+                local_error = None
+                try:
+                    request_success = self._load_page_wise(
+                        counter_index,
+                        request_transfers,
+                        batches,
+                        batch_rids,
+                        complete_layers=False,
+                    )
+                    if not all(request_success.values()):
+                        raise RuntimeError(
+                            "Mooncake striped page-wise load failed on this CP rank."
+                        )
+                except BaseException as error:
+                    local_error = error
+
+                self._raise_if_cp_read_failed(local_error)
+                self._allgather_cp_pages(cp_batches)
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(counter_index, layer)
+                request_success = {rid: True for rid, _ in request_transfers}
+                return
 
             if self.enable_page_wise_load and any(
                 len(keys) >= self.page_wise_load_threshold
@@ -706,6 +815,140 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     time_stats.set_direct_load_finish_time()
                 self._finish_l4_metric("prefetch", rid, request_success.get(rid, False))
                 self.abort_prepared_load(rid)
+
+    def _raise_if_cp_read_failed(self, local_error: BaseException | None) -> None:
+        """Publish owner-read failure before entering a device collective."""
+        failed = torch.tensor(
+            int(local_error is not None), dtype=torch.int, device="cpu"
+        )
+        torch.distributed.all_reduce(
+            failed,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.cp_control_group,
+        )
+        if failed.item():
+            message = "Mooncake CP striped page-wise read failed."
+            if local_error is None:
+                message += " A peer page owner reported the failure."
+            raise RuntimeError(message) from local_error
+
+    def _cp_exchange_arenas(
+        self, required_send_bytes: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return grow-only byte arenas used by fused CP all-gathers."""
+        send = getattr(self, "_cp_exchange_send", None)
+        recv = getattr(self, "_cp_exchange_recv", None)
+        required_recv_bytes = required_send_bytes * self.attn_cp_size
+        if (
+            send is None
+            or send.device != device
+            or send.numel() < required_send_bytes
+        ):
+            send = torch.empty(required_send_bytes, dtype=torch.uint8, device=device)
+            self._cp_exchange_send = send
+        if (
+            recv is None
+            or recv.device != device
+            or recv.numel() < required_recv_bytes
+        ):
+            recv = torch.empty(required_recv_bytes, dtype=torch.uint8, device=device)
+            self._cp_exchange_recv = recv
+        return send[:required_send_bytes], recv[:required_recv_bytes]
+
+    def _allgather_cp_pages(
+        self,
+        batches: dict[PoolName, tuple[list[str], list[int], list[int]]],
+    ) -> None:
+        """Replicate striped pages with one fused byte all-gather per layer.
+
+        Mooncake has already populated each owner's rows.  Packing all physical
+        pools/components for a layer into one payload avoids the old
+        owner-by-pool-by-layer sequence of small broadcasts.  Page counts may
+        differ by one, so every owner pads to the largest payload for that
+        layer; receivers scatter only the owner's real bytes.
+        """
+        if self.cp_cache_group is None:
+            raise RuntimeError("Mooncake CP striped reader has no device group.")
+
+        for layer in range(self.num_layers):
+            owner_plans: list[list[tuple[torch.Tensor, torch.Tensor]]] = [
+                [] for _ in range(self.attn_cp_size)
+            ]
+            owner_sizes = [0] * self.attn_cp_size
+
+            for name, (_, locations, owners) in batches.items():
+                pool = self.pools[name]
+                for owner in range(self.attn_cp_size):
+                    owner_locations = [
+                        location
+                        for location, page_owner in zip(locations, owners)
+                        if page_owner == owner
+                    ]
+                    for buffer, rows in pool.get_prepared_layer_tensors(
+                        owner_locations, layer
+                    ):
+                        owner_plans[owner].append((buffer, rows))
+                        owner_sizes[owner] += (
+                            rows.numel()
+                            * buffer[0].numel()
+                            * buffer.element_size()
+                        )
+
+            max_bytes = max(owner_sizes, default=0)
+            if max_bytes == 0:
+                continue
+
+            local_plan = owner_plans[self.attn_cp_rank]
+            device = next(
+                buffer.device for plan in owner_plans for buffer, _ in plan
+            )
+            send, recv = self._cp_exchange_arenas(max_bytes, device)
+            send.zero_()
+            cursor = 0
+            for buffer, rows in local_plan:
+                element_count = rows.numel() * buffer[0].numel()
+                byte_count = element_count * buffer.element_size()
+                payload = send[cursor : cursor + byte_count].view(buffer.dtype)
+                payload = payload.reshape(rows.numel(), *buffer.shape[1:])
+                torch.index_select(
+                    buffer,
+                    0,
+                    rows,
+                    out=payload,
+                )
+                cursor += byte_count
+            if cursor != owner_sizes[self.attn_cp_rank]:
+                raise RuntimeError(
+                    "Mooncake CP pack size mismatch: "
+                    f"packed={cursor}, expected={owner_sizes[self.attn_cp_rank]}."
+                )
+
+            self.cp_cache_group.all_gather_into_tensor(recv, send)
+
+            for owner, plan in enumerate(owner_plans):
+                if owner == self.attn_cp_rank:
+                    continue
+                chunk = recv[owner * max_bytes : owner * max_bytes + owner_sizes[owner]]
+                cursor = 0
+                for buffer, rows in plan:
+                    element_count = rows.numel() * buffer[0].numel()
+                    byte_count = element_count * buffer.element_size()
+                    payload = chunk[cursor : cursor + byte_count].view(buffer.dtype)
+                    payload = payload.reshape(rows.numel(), *buffer.shape[1:])
+                    buffer.index_copy_(0, rows, payload)
+                    cursor += byte_count
+                if cursor != owner_sizes[owner]:
+                    raise RuntimeError(
+                        "Mooncake CP unpack size mismatch: "
+                        f"owner={owner}, unpacked={cursor}, "
+                        f"expected={owner_sizes[owner]}."
+                    )
+
+        # The model thread waits on a CPU future.  Do not publish layer
+        # completion while RCCL/scatter work is still pending on this device.
+        completed = device_module.Event()
+        completed.record()
+        completed.synchronize()
 
     def _load_layer_ranges(
         self,
@@ -790,6 +1033,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         request_transfers: list[tuple[str, list[PoolTransfer]]],
         batches: dict[PoolName, tuple[list[str], list[int]]],
         batch_rids: dict[PoolName, list[str]],
+        *,
+        complete_layers: bool = True,
     ) -> dict[str, bool]:
         """Load complete pages before releasing their layers to the consumer."""
         request_success = {rid: True for rid, _ in request_transfers}
@@ -875,8 +1120,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             pool_counts,
             len(all_keys),
         )
-        result = self.storage.store.batch_get_into_multi_buffer_ranges(
-            all_keys, all_ptrs, all_sizes, all_offsets
+        result = (
+            self.storage.store.batch_get_into_multi_buffer_ranges(
+                all_keys, all_ptrs, all_sizes, all_offsets
+            )
+            if all_keys
+            else []
         )
         expected = [sum(item) for item in all_sizes]
         transferred = (
@@ -919,7 +1168,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # made visible to the model.
         for rid, _ in request_transfers:
             self.abort_prepared_load(rid)
-        if all(request_success.values()):
+        if complete_layers and all(request_success.values()):
             for layer in range(self.num_layers):
                 self.layer_done_counter.complete(counter_index, layer)
         return request_success

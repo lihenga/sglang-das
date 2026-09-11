@@ -199,6 +199,33 @@ class DevicePoolEntry:
                 offsets.extend([[value] for value in row_offsets])
         return ptrs, sizes, offsets
 
+    def get_prepared_layer_tensors(
+        self, locations: list[int], layer: int
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Return the layer buffers and rows occupied by ``locations``.
+
+        The external-store range API writes directly into those rows.  CP
+        replication uses the same view to pack owner rows into one fused
+        collective payload and to scatter peer rows back into the local pool.
+        """
+        buffer_index = self.layer_mapping.get(layer)
+        if buffer_index is None or not locations:
+            return []
+
+        result = []
+        for component in self.components:
+            buffer = component[buffer_index]
+            starts = torch.tensor(locations, dtype=torch.long, device=buffer.device)
+            if self._row_span == 1:
+                rows = starts
+            else:
+                offsets = torch.arange(
+                    self._row_span, dtype=torch.long, device=buffer.device
+                )
+                rows = (starts[:, None] + offsets).reshape(-1)
+            result.append((buffer, rows))
+        return result
+
 
 class DevicePoolGroup:
     """Physical device pools sharing one logical linker layer range."""
