@@ -248,6 +248,22 @@ class UnifiedTreeCoreInterface(ABC):
         under host pressure; declines (is_dropped=False) if any node is locked."""
         ...
 
+    def detach_external_load_chain(
+        self, endpoint_id: NodeId, anchor_id: NodeId
+    ) -> list[NodeId]:
+        raise NotImplementedError
+
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        raise NotImplementedError
+
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        raise NotImplementedError
+
+    def invalidate_external_load_chain(
+        self, node_id: NodeId
+    ) -> DropSubtreeNoHostResult:
+        raise NotImplementedError
+
     @abstractmethod
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Demote a backed-up node: drop its device value after a successful backup."""

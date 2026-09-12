@@ -122,6 +122,7 @@ class UnifiedTreeNode:
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
         self.external_cache_stored = False
+        self.detached = False
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
@@ -438,6 +439,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         match result."""
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
+        self._detached_roots: dict[NodeId, UnifiedTreeNode] = {}
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
@@ -555,6 +557,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _unregister_node(self, node: UnifiedTreeNode) -> None:
         """Drop a tree node from the arena."""
         self._node_arena.pop(node.id, None)
+        if self._detached_roots.pop(node.id, None) is not None:
+            for child in node.children.values():
+                self._detached_roots[child.id] = child
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -863,6 +868,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node: UnifiedTreeNode, chunked: bool = False
     ) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
+        assert not node.detached, f"insert walk reached detached node {node.id}"
         if node.evicted or chunked:
             return False
         if self.is_write_back:
@@ -1115,6 +1121,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
+        new_node.detached = child.detached
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
@@ -1201,6 +1208,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
+        if node.detached or self._node_arena.get(node.id) is not node:
+            self.evictable_device_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            return
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
         else:
@@ -1352,6 +1363,67 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result.is_dropped = True
         return result
 
+    def detach_external_load_chain(
+        self, endpoint_id: NodeId, anchor_id: NodeId
+    ) -> list[NodeId]:
+        ids: list[NodeId] = []
+        node = self._node_arena.get(endpoint_id)
+        top = None
+        while node is not None and node is not self.root_node and node.id != anchor_id:
+            node.detached = True
+            ids.append(node.id)
+            top = node
+            node = node.parent
+        if top is None or top.key is None:
+            return ids
+
+        anchor = top.parent
+        key = top.key.child_key(self.page_size)
+        if anchor is not None and anchor.children.get(key) is top:
+            anchor.children.pop(key)
+            self._update_evictable_leaf_sets(anchor)
+        self._detached_roots[top.id] = top
+        return ids
+
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        return node_id in self._node_arena
+
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        node = self._node_arena.get(node_id)
+        while node is not None and node is not self.root_node:
+            if node.detached:
+                return True
+            node = node.parent
+        return False
+
+    def invalidate_external_load_chain(
+        self, node_id: NodeId
+    ) -> DropSubtreeNoHostResult:
+        result = DropSubtreeNoHostResult(is_dropped=False)
+        node = self._node_arena.get(node_id)
+        if node is None or node is self.root_node or not node.detached:
+            return result
+        if node.backuped or node.write_through_pending_id is not None:
+            return result
+        if node.load_back_pending_id is not None:
+            return result
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return result
+        if node.children:
+            return result
+        if any(cd.lock_ref > 0 for cd in node.component_data):
+            return result
+        if node.component_data[BASE_COMPONENT_TYPE].value is None:
+            return result
+        self._delete_unbacked_device_leaf(
+            node,
+            result.tracker,
+            device_frees=result.device_frees,
+            host_frees=result.host_frees,
+        )
+        result.is_dropped = True
+        return result
+
     def _release_all_component_layers(
         self,
         node: UnifiedTreeNode,
@@ -1387,8 +1459,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, StorageMedium.GPU, tracker, device_frees, host_frees
         )
         parent = node.parent
+        detached = node.detached
         self._remove_leaf_from_parent(node)
         self._update_evictable_leaf_sets(parent)
+        if detached:
+            return
         self._iteratively_delete_tombstone_leaf(
             node, tracker, device_frees=device_frees, host_frees=host_frees
         )
@@ -1633,10 +1708,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             component.discard_deleted_session_leaf(node)
 
         key = node.key.child_key(self.page_size)
-        v = node.parent.children.pop(key, None)
-        assert v == node
+        if node.parent.children.get(key) is node:
+            node.parent.children.pop(key)
+        else:
+            assert node.detached, f"node {node.id} is not its parent's child"
         # Deleted nodes must not linger in duplicate tracking as ghosts.
         self.full_host_duplicates.pop(node.id, None)
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
         self._unregister_node(node)
 
     def _evict_component_and_detach_lru(
@@ -1739,7 +1818,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         Only the Full (base) component is required; auxiliary components
         (Mamba, SWA) are not mandatory for D-leaf membership."""
         ct = BASE_COMPONENT_TYPE
-        if node is self.root_node or node.evicted:
+        if node is self.root_node or node.detached or node.evicted:
             return False
         if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
@@ -1756,7 +1835,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         Only the Full (base) component host_value is required; auxiliary
         components are not mandatory for H-leaf membership. In-flight DMA
         marks need no check: marked nodes are never ``evicted``."""
-        if node is self.root_node or not node.evicted:
+        if node is self.root_node or node.detached or not node.evicted:
             return False
         if not node.backuped:
             return False
@@ -2371,7 +2450,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _collect_all_nodes(self) -> list[UnifiedTreeNode]:
         nodes = []
-        stack = [self.root_node]
+        stack = [self.root_node, *self._detached_roots.values()]
         while stack:
             node = stack.pop()
             nodes.append(node)

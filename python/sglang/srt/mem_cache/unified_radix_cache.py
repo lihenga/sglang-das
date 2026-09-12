@@ -240,6 +240,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self._failed_linker_rids: list[str] = []
+        self._stranded_linker_nodes: list[NodeId] = []
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -347,6 +349,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
+        self._failed_linker_rids.clear()
+        self._stranded_linker_nodes.clear()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -759,6 +763,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+            self._reclaim_failed_linker_chain(req.rid)
             return
 
         if self.disable:
@@ -830,6 +835,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        self._reclaim_failed_linker_chain(req.rid)
 
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
@@ -2629,11 +2635,33 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_count = torch.tensor(
-                self.linker.num_completed_offloads(), dtype=torch.int, device="cpu"
+            if not all(
+                hasattr(self.linker, name)
+                for name in (
+                    "num_completed_loads",
+                    "take_completed_loads",
+                    "commit_completed_loads",
+                )
+            ):
+                finish_count = torch.tensor(
+                    self.linker.num_completed_offloads(), dtype=torch.int, device="cpu"
+                )
+                self._all_reduce_attn_groups(
+                    finish_count, torch.distributed.ReduceOp.MIN
+                )
+                self.linker.drain_offloads(int(finish_count.item()))
+                return
+            finish_counts = torch.tensor(
+                [
+                    self.linker.num_completed_loads(),
+                    self.linker.num_completed_offloads(),
+                ],
+                dtype=torch.int,
+                device="cpu",
             )
-            self._all_reduce_attn_groups(finish_count, torch.distributed.ReduceOp.MIN)
-            self.linker.drain_offloads(int(finish_count.item()))
+            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
+            self._collect_failed_linker_loads(int(finish_counts[0].item()))
+            self.linker.drain_offloads(int(finish_counts[1].item()))
             return
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
@@ -2692,6 +2720,68 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_metrics = StorageMetrics()
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def drain_linker_loads(self) -> list[str]:
+        if self.linker is None:
+            return []
+        finish_count = torch.tensor(
+            self.linker.num_completed_loads(), dtype=torch.int, device="cpu"
+        )
+        self._all_reduce_attn_groups(finish_count, torch.distributed.ReduceOp.MIN)
+        self._collect_failed_linker_loads(int(finish_count.item()))
+        failed = self._failed_linker_rids
+        self._failed_linker_rids = []
+        return failed
+
+    def _collect_failed_linker_loads(self, finish_count: int) -> None:
+        if finish_count <= 0:
+            return
+        local_successes = self.linker.take_completed_loads(finish_count)
+        successes = torch.tensor(
+            [int(success) for success in local_successes],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        failed = self.linker.commit_completed_loads(
+            [bool(success) for success in successes.tolist()]
+        )
+        if failed:
+            logger.error(
+                "External linker load failed for %d request(s): %s",
+                len(failed),
+                failed,
+            )
+            self._failed_linker_rids.extend(failed)
+
+    def _reclaim_failed_linker_chain(self, rid: str) -> None:
+        if self.linker is None:
+            return
+        pending = self._stranded_linker_nodes + self.linker.take_failed_chain(rid)
+        if not pending:
+            return
+        pending = list(dict.fromkeys(pending))
+        self._stranded_linker_nodes = []
+        stranded = []
+        for node_id in pending:
+            result = self.tree_core.invalidate_external_load_chain(node_id)
+            self._free_values(result.device_frees, result.host_frees)
+            if result.is_dropped:
+                continue
+            if self.tree_core.holds_detached_node(node_id):
+                stranded.append(node_id)
+        if stranded:
+            self._stranded_linker_nodes = stranded
+
+    def has_outstanding_failed_linker_chains(self) -> bool:
+        if self.linker is None:
+            return False
+        return bool(self._stranded_linker_nodes or self.linker.failed_chains)
+
+    def is_on_failed_linker_chain(self, node_id: Optional[NodeId]) -> bool:
+        if self.linker is None or node_id is None:
+            return False
+        return self.tree_core.is_on_detached_chain(node_id)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
