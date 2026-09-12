@@ -268,6 +268,133 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size)
 
 
+def _mha_direct_linker_components(
+    pool: Any,
+    *,
+    pool_name: PoolName,
+    layer_mapping: dict[int, int],
+    page_size: int,
+) -> tuple[list[list[torch.Tensor]], bool]:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    if not isinstance(pool, MHATokenToKVPool):
+        raise ValueError(
+            "The direct external linker only supports ordinary MHA pools for "
+            f"generic SWA, got {type(pool).__name__} for {pool_name}."
+        )
+    if pool.page_size != page_size:
+        raise ValueError(
+            f"{pool_name} page size must match the tree page size: "
+            f"{pool.page_size} != {page_size}."
+        )
+    if getattr(pool, "k_scale_buffer", None) is not None or getattr(
+        pool, "v_scale_buffer", None
+    ) is not None:
+        raise ValueError(
+            "The direct external linker does not yet support generic SWA "
+            f"pools with separate KV scale buffers: {pool_name}."
+        )
+
+    k_buffers = list(pool.k_buffer or [])
+    v_buffers = list(pool.v_buffer or [])
+    expected_layers = set(range(len(layer_mapping)))
+    if set(layer_mapping.values()) != expected_layers:
+        raise ValueError(
+            f"{pool_name} layer mapping must use contiguous local layer ids, "
+            f"got {sorted(layer_mapping.values())}."
+        )
+    if len(k_buffers) != len(layer_mapping) or len(v_buffers) != len(layer_mapping):
+        raise ValueError(
+            f"{pool_name} buffer count does not match its layer mapping: "
+            f"K={len(k_buffers)}, V={len(v_buffers)}, "
+            f"layers={len(layer_mapping)}."
+        )
+
+    row_counts = {int(buffer.shape[0]) for buffer in k_buffers + v_buffers}
+    if len(row_counts) != 1:
+        raise ValueError(
+            f"{pool_name} K/V buffers must share one leading dimension, "
+            f"got {sorted(row_counts)}."
+        )
+    row_count = row_counts.pop()
+    total_slots = int(pool.size) + page_size
+    if row_count == total_slots:
+        rows_are_pages = False
+    elif total_slots % page_size == 0 and row_count == total_slots // page_size:
+        rows_are_pages = True
+    else:
+        raise ValueError(
+            f"Cannot determine the direct-linker row layout for {pool_name}: "
+            f"rows={row_count}, size={pool.size}, page_size={page_size}."
+        )
+    return [k_buffers, v_buffers], rows_are_pages
+
+
+def _build_swa_device_pool_group(
+    kvcache: Any,
+    params: CacheInitParams,
+    page_size: int,
+) -> DevicePoolGroup:
+    if getattr(params, "mtp_draft_device_pools", ()):
+        raise ValueError(
+            "The generic SWA direct external linker does not yet support MTP "
+            "draft pools. Disable MTP or use the host-cache path."
+        )
+
+    full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
+    entries = []
+
+    def add_pool(
+        name: PoolName,
+        source: PoolName,
+        pool: Any,
+        layer_mapping: dict[int, int],
+        *,
+        packed: bool,
+    ) -> None:
+        if not layer_mapping:
+            return
+        components, rows_are_pages = _mha_direct_linker_components(
+            pool,
+            pool_name=name,
+            layer_mapping=layer_mapping,
+            page_size=page_size,
+        )
+        entries.append(
+            DevicePoolEntry(
+                name=name,
+                indices_from_pool=source,
+                device_pool=pool,
+                components=components,
+                layer_mapping=layer_mapping,
+                page_size=page_size,
+                rows_are_pages=rows_are_pages,
+                packed=packed,
+            )
+        )
+
+    add_pool(
+        PoolName.KV,
+        PoolName.KV,
+        kvcache.full_kv_pool,
+        full_mapping,
+        packed=True,
+    )
+    add_pool(
+        PoolName.SWA,
+        PoolName.SWA,
+        kvcache.swa_kv_pool,
+        swa_mapping,
+        packed=False,
+    )
+    return DevicePoolGroup(
+        entries,
+        len(full_mapping | swa_mapping),
+        page_size,
+        is_mla_backend=False,
+    )
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -1568,6 +1695,9 @@ class _SwaStrategy(StackStrategy):
             and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
             and components == {ComponentType.FULL, ComponentType.SWA}
         )
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        return _build_swa_device_pool_group(kvcache, params, page_size)
 
     def build(
         self,

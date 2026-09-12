@@ -482,6 +482,113 @@ def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
     assert c4_pool.get_prepared_layer_range_meta([0], 1) is None
 
 
+def test_swa_device_pool_group_maps_mha_buffers_and_layouts():
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    def mha_pool(k_dims, v_dims, *, rows_are_pages):
+        pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        pool.size = 6
+        pool.page_size = 2
+        rows = 4 if rows_are_pages else 8
+        shape = lambda dim: (rows, 2, dim) if rows_are_pages else (rows, dim)
+        pool.k_buffer = [torch.zeros(shape(dim), dtype=torch.uint8) for dim in k_dims]
+        pool.v_buffer = [torch.zeros(shape(dim), dtype=torch.uint8) for dim in v_dims]
+        pool.k_scale_buffer = None
+        pool.v_scale_buffer = None
+        return pool
+
+    kvcache = SWAKVPool.__new__(SWAKVPool)
+    kvcache.page_size = 2
+    kvcache.full_kv_pool = mha_pool([3, 5], [7, 11], rows_are_pages=False)
+    kvcache.swa_kv_pool = mha_pool([3, 5, 7], [11, 13, 17], rows_are_pages=True)
+    kvcache.layers_mapping = {
+        0: (0, True),
+        1: (0, False),
+        2: (1, True),
+        3: (1, False),
+        4: (2, True),
+    }
+
+    group = resolve_hybrid_device_pool_group(
+        kvcache=kvcache,
+        page_size=2,
+        params=SimpleNamespace(
+            req_to_token_pool=None,
+            mtp_draft_device_pools=(),
+        ),
+        components={ComponentType.FULL, ComponentType.SWA},
+    )
+
+    assert group.num_layers == 5
+    assert not group.is_mla_backend
+    assert set(group.entry_map) == {PoolName.KV, PoolName.SWA}
+    assert group.sources == {
+        PoolName.KV: PoolName.KV,
+        PoolName.SWA: PoolName.SWA,
+    }
+
+    full_pool = group.entry_map[PoolName.KV]
+    assert full_pool.packed
+    assert full_pool.layer_mapping == {1: 0, 3: 1}
+    pointers, sizes = full_pool.get_page_buffer_meta(torch.tensor([0, 1]))
+    full_buffers = (
+        kvcache.full_kv_pool.k_buffer + kvcache.full_kv_pool.v_buffer
+    )
+    assert pointers == [buffer[0].data_ptr() for buffer in full_buffers]
+    assert sizes == [6, 10, 14, 22]
+
+    swa_pool = group.entry_map[PoolName.SWA]
+    assert not swa_pool.packed
+    assert hasattr(swa_pool, "v_buffer")
+    assert swa_pool.layer_mapping == {0: 0, 2: 1, 4: 2}
+    locations = swa_pool.prepare_locations(torch.tensor([2, 3]))
+    assert locations == [1]
+    pointers, sizes = swa_pool.get_page_buffer_meta(torch.tensor([2, 3]))
+    swa_buffers = kvcache.swa_kv_pool.k_buffer + kvcache.swa_kv_pool.v_buffer
+    assert pointers == [buffer[1].data_ptr() for buffer in swa_buffers]
+    assert sizes == [6, 10, 14, 22, 26, 34]
+
+    pointers, sizes, offsets = swa_pool.get_prepared_layer_range_meta(locations, 2)
+    assert pointers == [
+        [kvcache.swa_kv_pool.k_buffer[1][1].data_ptr()],
+        [kvcache.swa_kv_pool.v_buffer[1][1].data_ptr()],
+    ]
+    assert sizes == [[10], [26]]
+    assert offsets == [[6], [22]]
+    assert swa_pool.get_prepared_layer_range_meta(locations, 3) is None
+
+    store = MooncakeStore.__new__(MooncakeStore)
+    store.registered_pools = group.entry_map
+    store.is_mla_backend = group.is_mla_backend
+    store.mha_suffix = "rank"
+    store.mla_suffix = "rank"
+    keys, multiplier = store._get_hybrid_page_component_keys(
+        ["page"], PoolTransfer(name=PoolName.SWA)
+    )
+    assert keys == [
+        f"page_rank_{PoolName.SWA}_k",
+        f"page_rank_{PoolName.SWA}_v",
+    ]
+    assert multiplier == 2
+
+
+def test_swa_device_pool_group_rejects_mtp_draft_pools():
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    kvcache = SWAKVPool.__new__(SWAKVPool)
+    with pytest.raises(ValueError, match="does not yet support MTP"):
+        resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=1,
+            params=SimpleNamespace(
+                req_to_token_pool=None,
+                mtp_draft_device_pools=(object(),),
+            ),
+            components={ComponentType.FULL, ComponentType.SWA},
+        )
+
+
 def test_mamba_strategy_rejects_direct_linker():
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
