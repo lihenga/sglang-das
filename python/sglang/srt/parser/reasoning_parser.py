@@ -1193,6 +1193,42 @@ class _PoolsideV1Detector(Qwen3Detector):
         self.reasoning_default = "explicit_enable_thinking"
 
 
+class Spark3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for Spark3 (IPT) models.
+
+    Reasoning format:
+      <think>...thinking...</think>[answer | <tool_call>...]
+
+    The chat template emits <think> as a generation prefix when enable_thinking
+    is set; the model closes it with </think> before answering or calling a tool.
+    Reasoning is opt-in via enable_thinking=True.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        think_excluded_tokens = ["<tool_call>", "</tool_call>"]
+        super().__init__(
+            "<think>",
+            "</think>",
+            think_excluded_tokens=think_excluded_tokens,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="explicit_enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class Apertus2509Detector(BaseReasoningFormatDetector):
     """
     Detector for Apertus 2509 models
@@ -1905,6 +1941,7 @@ class ReasoningParser:
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
+        "spark3": Spark3Detector,
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
     }

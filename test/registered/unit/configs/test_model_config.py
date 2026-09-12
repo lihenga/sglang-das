@@ -7,6 +7,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_hybrid_swa_model,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -31,12 +32,18 @@ class TestHybridLayerIds(CustomTestCase):
             "Gemma4ForConditionalGeneration",
             "LagunaForCausalLM",
             "MellumForCausalLM",
+            "Spark2_5ForCausalLM",
+            "Spark3ForCausalLM",
         ):
             with self.subTest(architecture=architecture):
                 self.assertEqual(
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+        for architecture in ("Spark2_5ForCausalLM", "Spark3ForCausalLM"):
+            with self.subTest(hybrid_architecture=architecture):
+                self.assertTrue(is_hybrid_swa_model([architecture], config))
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):

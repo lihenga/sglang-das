@@ -461,6 +461,81 @@ def fused_sigmoid_mul(
 
 
 @triton.jit
+def _fused_headwise_sigmoid_mul_kernel(
+    output_ptr,
+    attn_output_ptr,
+    gate_ptr,
+    gate_stride_row,
+    gate_stride_head,
+    hidden_dim: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fuse attn_output * sigmoid(gate) with one scalar gate per head."""
+    pid_row = tl.program_id(0).to(tl.int64)
+    pid_block = tl.program_id(1)
+
+    offsets = pid_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offsets < hidden_dim
+    head = offsets // HEAD_DIM
+
+    attn_off = pid_row * hidden_dim + offsets
+    attn = tl.load(attn_output_ptr + attn_off, mask=mask, other=0.0).to(tl.float32)
+
+    g = tl.load(
+        gate_ptr + pid_row * gate_stride_row + head * gate_stride_head,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    tl.store(output_ptr + attn_off, attn * tl.sigmoid(g), mask=mask)
+
+
+def fused_headwise_sigmoid_mul(
+    attn_output: torch.Tensor,
+    gate: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    inplace: bool = False,
+) -> torch.Tensor:
+    """
+    Fused per-head sigmoid gating of attention output.
+
+    Equivalent to::
+
+        attn_output.view(tokens, num_heads, head_dim) * sigmoid(gate).unsqueeze(-1)
+
+    where ``gate`` is (num_tokens, num_heads) -- one scalar per head, broadcast
+    over ``head_dim`` -- and ``attn_output`` is (num_tokens, num_heads * head_dim).
+    ``sigmoid`` is evaluated in fp32 and the product is rounded once on store.
+
+    When inplace=True, writes the result back to attn_output and returns it.
+    """
+    assert attn_output.is_contiguous(), "attn_output must be contiguous"
+    assert gate.ndim == 2 and gate.shape[1] == num_heads, "gate must be (tokens, heads)"
+    num_tokens = attn_output.shape[0]
+    hidden_dim = num_heads * head_dim
+    assert attn_output.shape == (num_tokens, hidden_dim)
+    assert gate.shape[0] == num_tokens
+
+    out = attn_output if inplace else torch.empty_like(attn_output)
+    block_h = 1024 if num_tokens < 1024 else 2048
+    grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
+    _fused_headwise_sigmoid_mul_kernel[grid](
+        out,
+        attn_output,
+        gate,
+        gate.stride(0),
+        gate.stride(1),
+        hidden_dim,
+        HEAD_DIM=head_dim,
+        BLOCK_H=block_h,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
 def _fused_gate_sigmoid_mul_add_kernel(
     hidden_states_ptr,  # [num_tokens, hidden_dim]
     gate_weight_ptr,  # [hidden_dim]
