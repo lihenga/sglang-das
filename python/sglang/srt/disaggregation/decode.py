@@ -1223,16 +1223,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
-        retractable_tokens = sum(
-            len(r.origin_input_ids) + len(r.output_ids)
-            for r in self.scheduler.running_batch.reqs
-        )
+        running_reqs = self._retractable_running_reqs()
+        retractable_tokens = sum(r.kv_committed_len for r in running_reqs)
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         swa_allocatable_tokens = 0
         if uses_swa_tail_prealloc:
             retractable_swa_tokens = sum(
-                self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
+                self._swa_retractable_len(r) for r in running_reqs
             )
             full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(
@@ -1406,6 +1404,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     retractable_tokens=retractable_tokens,
                     count_retracted=True,
                     extra_reserved_reqs=len(preallocated_reqs),
+                    extra_preallocated_reqs=preallocated_reqs,
                     hicache_reserved_tokens=reserved_restore_tokens,
                 )
                 if uses_swa_tail_prealloc:
@@ -1739,6 +1738,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
                 extra_reserved_reqs=len(preallocated_reqs) + 1,
+                extra_preallocated_reqs=(*preallocated_reqs, decode_req),
                 hicache_reserved_tokens=reserved_restore_tokens,
             )
             if uses_swa_tail_prealloc:
@@ -2041,23 +2041,48 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.req.extend_range.end for decode_req in self.transfer_queue.queue
         )
 
+    def _retractable_running_reqs(self):
+        # Queue admission runs before update_running_batch filters finished
+        # requests. Their released KV is already in available_size: counting it
+        # again as retractable would admit transfers that starve a live request.
+        return [
+            r
+            for r in self.scheduler.running_batch.reqs
+            if not r.finished() and r.req_pool_idx is not None
+        ]
+
     def _need_space_for_single_req(
-        self, retractable_tokens: Optional[int] = None
+        self, retractable_tokens: Optional[int] = None, extra_preallocated_reqs=()
     ) -> int:
-        need_space_for_single_req = (
-            max(
-                [
-                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-                    + len(x.origin_input_ids)
-                    - retractable_tokens
-                    for x in self.scheduler.running_batch.reqs
-                ]
+        if retractable_tokens is None:
+            return 0
+        running = self._retractable_running_reqs()
+        budgets = [
+            len(r.origin_input_ids)
+            + min(r.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+            for r in running
+        ]
+        # Transfer/prebuilt requests already pin KV but cannot be retracted.
+        # Reserve their remaining growth too, including allocations in this
+        # same admission pass (not yet published to transfer_queue).
+        pending = [r.req for r in (*self.transfer_queue.queue, *extra_preallocated_reqs)]
+        pending.extend(self.scheduler.waiting_queue)
+        last_batch = self.scheduler.last_batch
+        if last_batch and last_batch.forward_mode.is_prebuilt():
+            pending.extend(last_batch.reqs)
+        for r in pending:
+            if (
+                r.finished()
+                or r.req_pool_idx is None
+                or any(r is active for active in running)
+            ):
+                continue
+            budgets.append(
+                len(r.origin_input_ids)
+                + min(r.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                - r.kv_committed_len
             )
-            if retractable_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
-            else 0
-        )
-        return need_space_for_single_req
+        return max(0, max(budgets, default=0) - retractable_tokens)
 
     def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
         return (
@@ -2104,8 +2129,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         extra_reserved_reqs: int = 0,
         reserved_tokens: Optional[int] = None,
         hicache_reserved_tokens: int = 0,
+        extra_preallocated_reqs=(),
     ) -> int:
-        need_space_for_single_req = self._need_space_for_single_req(retractable_tokens)
+        need_space_for_single_req = self._need_space_for_single_req(
+            retractable_tokens, extra_preallocated_reqs
+        )
         if reserved_tokens is None:
             reserved_tokens = self._active_reserved_tokens(
                 extra_reserved_reqs=extra_reserved_reqs
@@ -2165,15 +2193,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         need_swa_space_for_single_req = self._need_space_for_single_req(
             retractable_tokens
         )
-        if (
-            retractable_swa_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
-        ):
+        running_reqs = self._retractable_running_reqs()
+        if retractable_swa_tokens is not None and running_reqs:
             need_swa_space_for_single_req = max(
                 self._swa_tail_len(len(x.origin_input_ids))
                 + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
                 - retractable_swa_tokens
-                for x in self.scheduler.running_batch.reqs
+                for x in running_reqs
             )
 
         if n_active is None:
