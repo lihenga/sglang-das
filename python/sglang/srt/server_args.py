@@ -6634,7 +6634,21 @@ class ServerArgs:
 
     def _handle_amd_specifics(self):
         if is_hip():
-            self._declare("_handle_amd_specifics", triton_attention_num_kv_splits=16)
+            # The AMD default only fills in when the caller kept the generic
+            # default (8). A value the caller asked for is honoured: the forced
+            # 16 used to silently swallow --triton-attention-num-kv-splits on
+            # HIP, so raising it for long-context decode had no effect at all.
+            raw = getattr(self, "_raw_input", None) or {}
+            if (
+                raw.get(
+                    "triton_attention_num_kv_splits",
+                    self.triton_attention_num_kv_splits,
+                )
+                == 8
+            ):
+                self._declare(
+                    "_handle_amd_specifics", triton_attention_num_kv_splits=16
+                )
 
     def _handle_nccl_pre_warm(self):
         # pre_warm_nccl is only used with CUDA or HIP hardware or NPU hardware

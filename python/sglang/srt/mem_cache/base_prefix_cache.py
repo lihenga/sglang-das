@@ -280,6 +280,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
+    def release_aborted_request(self, rid: str) -> None:
+        """Release request-scoped prefetch state, if the cache owns any.
+
+        Caches without storage prefetch state (e.g. ChunkCache) need no action.
+        Request KV allocation is released separately by the scheduler.
+        """
+
     def release_host_resources(self) -> None:
         """Release pinned host buffers in userspace on graceful shutdown.
 

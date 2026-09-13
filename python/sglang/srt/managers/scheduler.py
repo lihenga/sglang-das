@@ -94,6 +94,7 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    EXTERNAL_KV_LOAD_ERR_TYPE,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -1196,6 +1197,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._deferred_linker_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3157,9 +3159,12 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
-        req.to_finish = None
+        if req.to_finish is not None:
+            req.finished_reason = req.to_finish
+            req.to_finish = None
+        else:
+            prepare_abort(req, "Aborted")
+            req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
@@ -3172,7 +3177,13 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                rid=req.rid,
+                finished_reason=req.finished_reason.to_json(),
+            ),
+            req,
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4212,6 +4223,12 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if (
+            self.server_args.enable_unified_cache_external_linker
+            and batch.forward_mode.is_extend()
+        ):
+            self._mark_failed_linker_loads(batch)
+
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4242,6 +4259,43 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _mark_failed_linker_loads(self, batch: ScheduleBatch) -> None:
+        deferred = self._deferred_linker_rids
+        self._deferred_linker_rids = set()
+        failed = set(self.tree_cache.drain_linker_loads()) | deferred
+        sweep_chains = self.tree_cache.has_outstanding_failed_linker_chains()
+        if not failed and not sweep_chains:
+            return
+
+        message = "Aborted: external KV cache load failed."
+        candidates = list(batch.reqs)
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            candidates.extend(self.running_batch.reqs)
+        for req in candidates:
+            if req.rid in failed:
+                failed.discard(req.rid)
+            elif not (
+                sweep_chains
+                and self.tree_cache.is_on_failed_linker_chain(
+                    getattr(req, "last_node", None)
+                )
+            ):
+                continue
+            if req.finished() or req.to_finish is not None:
+                continue
+            req.skip_radix_cache_insert = True
+            req.to_finish = FINISH_ABORT(
+                message,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+            )
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            self._release_aborted_request(req.rid)
+            if req is self.chunked_req:
+                self._pending_chunked_abort_req = req
+
+        self._deferred_linker_rids = failed - deferred
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

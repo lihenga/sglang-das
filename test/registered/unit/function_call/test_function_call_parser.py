@@ -4845,6 +4845,56 @@ function call<|role_sep|>
         self.assertEqual(params["id"], "prefs")
 
 
+class TestSparkDetector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                        "required": ["city", "days"],
+                    },
+                ),
+            )
+        ]
+
+    def test_xml_kv_protocol_and_schema_types(self):
+        from sglang.srt.function_call.spark_detector import SparkDetector
+
+        source = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>上海</arg_value>"
+            "<arg_key>days</arg_key><arg_value>3</arg_value>"
+            "</tool_call>"
+        )
+        result = SparkDetector().detect_and_parse(source, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"city": "上海", "days": 3}
+        )
+
+    def test_stream_end_releases_partial_tool_tag_as_text(self):
+        """A partial tool marker at EOF must not silently drop visible text."""
+        from sglang.srt.function_call.spark_detector import SparkDetector
+
+        detector = SparkDetector()
+        result = detector.parse_streaming_increment("ordinary <tool_", self.tools)
+        final = detector.finish(self.tools)
+
+        self.assertEqual(result.normal_text + final.normal_text, "ordinary <tool_")
+        self.assertEqual(result.calls + final.calls, [])
+
+
 class TestGetStructureConstraint(unittest.TestCase):
     """Tests for FunctionCallParser.get_structure_constraint() logic.
 
@@ -4876,6 +4926,15 @@ class TestGetStructureConstraint(unittest.TestCase):
 
     def _constraint_json(self, result):
         return result[1].model_dump_json()
+
+    def test_spark_required_and_named_keep_native_xml_format(self):
+        """Spark required calls must not be constrained to incompatible JSON."""
+        parser = self._make_parser("spark25", strict=False)
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+
+        self.assertTrue(parser.detector.parses_required_natively())
+        self.assertIsNone(parser.get_structure_constraint("required"))
+        self.assertIsNone(parser.get_structure_constraint(named))
 
     # --- structural_tag detectors (kimi_k2, deepseekv3, qwen25, etc.) ---
 

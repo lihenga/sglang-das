@@ -43,6 +43,7 @@ from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.spark_detector import SparkDetector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import (
@@ -84,6 +85,8 @@ class FunctionCallParser:
         "muse": MuseGlimmerDetector,
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
+        "spark25": SparkDetector,
+        "spark": SparkDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,

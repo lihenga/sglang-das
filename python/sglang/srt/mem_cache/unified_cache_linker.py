@@ -80,6 +80,9 @@ class DevicePoolEntry:
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size
 
+        if hasattr(device_pool, "v_buffer"):
+            self.v_buffer = device_pool.v_buffer
+
         if not self.components or any(not component for component in self.components):
             raise ValueError(f"Device pool {name} has no storage buffers.")
         self.kv_buffer = [buffer for group in self.components for buffer in group]
@@ -195,7 +198,11 @@ class DevicePoolGroup:
     """Physical device pools sharing one logical linker layer range."""
 
     def __init__(
-        self, entries: Sequence[DevicePoolEntry], num_layers: int, page_size: int
+        self,
+        entries: Sequence[DevicePoolEntry],
+        num_layers: int,
+        page_size: int,
+        is_mla_backend: bool = True,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -204,6 +211,7 @@ class DevicePoolGroup:
         self.sources = {entry.name: entry.indices_from_pool for entry in self.entries}
         self.num_layers = num_layers
         self.page_size = page_size
+        self.is_mla_backend = is_mla_backend
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -282,6 +290,17 @@ class UnifiedCacheLinker(ABC):
         """Start queued loads and return the layer-counter consumer index."""
 
     @abstractmethod
+    def num_completed_loads(self) -> int:
+        """Return the number of completed load batches waiting to be consumed."""
+
+    @abstractmethod
+    def pop_completed_load(self) -> tuple[list[str], bool]:
+        """Consume the oldest completed load batch and return its result."""
+
+    def cancel_queued_load(self, rid: str) -> bool:
+        return False
+
+    @abstractmethod
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         """Queue every transfer for atomic persistence."""
 
@@ -334,6 +353,9 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams, NodeId]] = {}
+        self.failed_chains: dict[str, list[NodeId]] = {}
+        self.taken_loads: list[tuple[list[str], bool]] = []
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[tuple[NodeId, DecLockRefParams]] = []
 
@@ -530,8 +552,19 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        if load_transfers and not self.cache_linker.load(req.rid, load_transfers):
-            raise RuntimeError(f"Failed to queue the linker load for {req.rid=}.")
+        if load_transfers:
+            anchor = req.last_node
+            node_id = insert_result.last_device_node
+            lock_params = self.cache.inc_lock_ref(node_id).to_dec_params()
+            try:
+                queued = self.cache_linker.load(req.rid, load_transfers)
+            except BaseException:
+                self.cache.dec_lock_ref(node_id, lock_params)
+                raise
+            if not queued:
+                self.cache.dec_lock_ref(node_id, lock_params)
+                raise RuntimeError(f"Failed to queue the linker load for {req.rid=}.")
+            self.pending_loads[req.rid] = (node_id, lock_params, anchor)
 
         node = cache.resolve_node_handle(insert_result.last_device_node)
         while node.id != req.last_node:
@@ -674,6 +707,38 @@ class UnifiedCacheLinkerWrapper:
             node.external_cache_stored = self.cache_linker.pop_completed_offload()
             self.cache.dec_lock_ref(node_id, lock_params)
 
+    def num_completed_loads(self) -> int:
+        return self.cache_linker.num_completed_loads()
+
+    def take_completed_loads(self, finish_count: int) -> list[bool]:
+        taken = [self.cache_linker.pop_completed_load() for _ in range(finish_count)]
+        self.taken_loads.extend(taken)
+        return [success for _rids, success in taken]
+
+    def commit_completed_loads(self, successes) -> list[str]:
+        assert len(successes) <= len(self.taken_loads)
+        failed = []
+        for success in successes:
+            rids, _local_success = self.taken_loads.pop(0)
+            for rid in rids:
+                entry = self.pending_loads.pop(rid, None)
+                if entry is None:
+                    continue
+                node_id, lock_params, anchor = entry
+                if not success:
+                    self._detach_failed_chain(rid, node_id, anchor)
+                    failed.append(rid)
+                self.cache.dec_lock_ref(node_id, lock_params)
+        return failed
+
+    def _detach_failed_chain(self, rid: str, node_id: NodeId, anchor: NodeId) -> None:
+        self.failed_chains.setdefault(rid, []).extend(
+            self.cache.tree_core.detach_external_load_chain(node_id, anchor)
+        )
+
+    def take_failed_chain(self, rid: str):
+        return self.failed_chains.pop(rid, [])
+
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
 
@@ -682,10 +747,23 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self._release_pending_locks()
         self.pending_offloads.clear()
+
+    def _release_pending_locks(self) -> None:
+        for node_id, lock_params, _anchor in self.pending_loads.values():
+            self.cache.dec_lock_ref(node_id, lock_params)
+        self.pending_loads.clear()
+        self.failed_chains.clear()
+        self.taken_loads.clear()
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        if self.cache_linker.cancel_queued_load(rid):
+            node_id, lock_params, anchor = self.pending_loads.pop(rid)
+            self._detach_failed_chain(rid, node_id, anchor)
+            self.cache.dec_lock_ref(node_id, lock_params)
 
     def close(self) -> None:
         self.cache_linker.close()
+        self._release_pending_locks()

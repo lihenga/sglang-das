@@ -45,6 +45,16 @@ _MIN_BLOCK_KV = 32
 # heads per stage-1 tile, shared so the budget's head_tiles cannot drift from the launch
 _GROUPED_BLOCK_H = 16
 
+# Spark-X2.5 full attention, gfx950, TP2 (4:1 GQA, 256-wide heads): the 16-row stage-1
+# tile only ever fills 4 rows, so a half-height tile with a narrower KV block and two
+# warps was timed fastest -- at 128 splits / 68k kv, 239 us single-shot and 128 us
+# pipelined, against 275 us / 161 us for the 8/64/2 tile. Kept behind the launch-shape
+# gate so MLA and other GQA ratios keep the geometry _grouped_head_tiles sizes the
+# split budget for.
+_FULL_ATTENTION_BLOCK_H = 4
+_FULL_ATTENTION_BLOCK_N = 32
+_FULL_ATTENTION_NUM_WARPS = 2
+
 
 # gfx950 wants 32 where the HIP path otherwise takes 16. That is the model it was picked
 # against, not something a sweep isolated: at 16 the first dot is a single 16x16 MFMA
@@ -815,6 +825,7 @@ def _decode_grouped_att_m_fwd(
     aux_tensors=None,
     tune_mla: bool = False,
     forced_kv_splits: int = 0,
+    use_full_attention_tuning: bool = False,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -853,7 +864,6 @@ def _decode_grouped_att_m_fwd(
 
     BLOCK_H = _GROUPED_BLOCK_H
     MAX_KV_SPLITS = max_kv_splits
-    head_tiles = _grouped_head_tiles(head_num, kv_group_num)
 
     extra_kargs = {}
     num_stages = 2
@@ -864,6 +874,18 @@ def _decode_grouped_att_m_fwd(
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
 
+    if (
+        use_full_attention_tuning
+        and _is_hip
+        and not tune_mla
+        and Lk == 256
+        and Lv == 256
+        and kv_group_num == 4
+    ):
+        BLOCK_H = _FULL_ATTENTION_BLOCK_H
+        BLOCK = _FULL_ATTENTION_BLOCK_N
+        num_warps = _FULL_ATTENTION_NUM_WARPS
+
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide
         # count gets a batch-independent geometry too
@@ -873,6 +895,10 @@ def _decode_grouped_att_m_fwd(
             bucket.num_warps,
             bucket.num_stages,
         )
+
+    # Head tiles come from the tile the launch actually uses: the tuned geometry narrows
+    # BLOCK_H, and stage-1 keys heads off cur_head_id * min(BLOCK_H, kv_group_num).
+    head_tiles = triton.cdiv(head_num, min(BLOCK_H, kv_group_num))
 
     # Blocks at or above the split count return immediately, so the grid shrinks too.
     grid = (batch, head_tiles, forced_kv_splits or MAX_KV_SPLITS)
@@ -1158,6 +1184,7 @@ def decode_attention_fwd_grouped(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    use_full_attention_tuning: bool = False,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1180,6 +1207,7 @@ def decode_attention_fwd_grouped(
         aux_tensors=aux_tensors,
         tune_mla=tune_mla,
         forced_kv_splits=forced_kv_splits,
+        use_full_attention_tuning=use_full_attention_tuning,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1219,6 +1247,7 @@ def decode_attention_fwd(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    use_full_attention_tuning: bool = False,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -1277,4 +1306,5 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            use_full_attention_tuning=use_full_attention_tuning,
         )

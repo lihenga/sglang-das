@@ -1947,6 +1947,13 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
+        # Full-attention layers take the tuned stage-1 head tile on gfx950 (see
+        # _FULL_ATTENTION_* in decode_attention); sliding-window layers keep the shared
+        # geometry, which the SWA sweep did not beat.
+        use_full_attention_tuning = not (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+
         if self.dcp_size > 1:
             if score_mod is not None:
                 raise NotImplementedError(
@@ -1981,6 +1988,7 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                use_full_attention_tuning=use_full_attention_tuning,
             )
             local_lse = torch.logsumexp(
                 self.forward_metadata.attn_lse[
@@ -2013,6 +2021,7 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            use_full_attention_tuning=use_full_attention_tuning,
         )
         return o
 
