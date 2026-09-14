@@ -3794,7 +3794,20 @@ class Scheduler(
             logger.warning(msg_prefix + msg_details)
 
             for req in retracted_reqs:
-                self._add_request_to_queue(req, is_retracted=True)
+                if (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    and req.pd_rebootstrap_after_retract
+                ):
+                    if req.output_ids:
+                        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                    req.pd_rebootstrap_in_progress = True
+                    req.time_stats.set_retract_time()
+                    self.disagg_decode_prealloc_queue.add(
+                        req, is_rebootstrap=True
+                    )
+                    req.pd_rebootstrap_after_retract = False
+                else:
+                    self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
 

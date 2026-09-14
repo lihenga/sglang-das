@@ -3300,6 +3300,14 @@ class ServerArgs:
         ),
         NS("disagg"),
     ] = None
+    disaggregation_decode_retraction_rebootstrap: A[
+        bool,
+        (
+            "Recompute a retracted PD decode request on its prefill server "
+            "instead of synchronously copying its KV cache to CPU."
+        ),
+        NS("disagg"),
+    ] = False
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
@@ -8871,6 +8879,22 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if (
+            self.disaggregation_decode_retraction_rebootstrap
+            and self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-rebootstrap is only "
+                "supported on a PD decode server."
+            )
+        if (
+            self.disaggregation_decode_retraction_rebootstrap
+            and self.disaggregation_transfer_backend == "fake"
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-rebootstrap requires a "
+                "real PD transfer backend."
+            )
         if (
             self.disaggregation_decode_retraction_backup == "host_pool"
             and self.disaggregation_mode != "decode"
