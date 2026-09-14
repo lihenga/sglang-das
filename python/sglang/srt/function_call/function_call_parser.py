@@ -1,5 +1,6 @@
 import inspect
 import logging
+import os
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -86,7 +87,12 @@ class FunctionCallParser:
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "spark25": SparkDetector,
-        "spark": SparkDetector,
+        # The legacy tokenflow plugin registers its own SparkV1 parser.
+        **(
+            {}
+            if os.environ.get("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1"
+            else {"spark": SparkDetector}
+        ),
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
