@@ -230,6 +230,36 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
         )
     num_layers = kvcache.layer_num
     identity = {layer: layer for layer in range(num_layers)}
+    indexer_buffers = kvcache.index_k_with_scale_buffer
+
+    # Some DSA layers reuse another layer's top-k result and therefore do not
+    # own an Index-K buffer. Map the active model layers to the compact buffer
+    # list instead of assuming one Index-K buffer per model layer.
+    indexer_layer_ids = getattr(kvcache, "indexer_layer_ids", None)
+    if indexer_layer_ids is None:
+        indexer_mapping = identity
+        expected_indexer_buffers = num_layers
+    else:
+        start_layer = getattr(kvcache, "start_layer", 0)
+        indexer_mapping = {
+            layer_id - start_layer: buffer_index
+            for buffer_index, layer_id in enumerate(indexer_layer_ids)
+        }
+        invalid_layers = [
+            layer for layer in indexer_mapping if not 0 <= layer < num_layers
+        ]
+        if invalid_layers:
+            raise ValueError(
+                "DSA Index-K layers are outside the local layer range: "
+                f"{invalid_layers}, num_layers={num_layers}, start_layer={start_layer}."
+            )
+        expected_indexer_buffers = len(indexer_layer_ids)
+    if len(indexer_buffers) != expected_indexer_buffers:
+        raise ValueError(
+            "DSA Index-K buffer count does not match its layer mapping: "
+            f"buffers={len(indexer_buffers)}, "
+            f"mapped_layers={expected_indexer_buffers}."
+        )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -244,8 +274,8 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
-            layer_mapping=identity,
+            components=[indexer_buffers],
+            layer_mapping=indexer_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),

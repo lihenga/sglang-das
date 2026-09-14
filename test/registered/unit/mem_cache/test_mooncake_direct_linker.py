@@ -2084,6 +2084,38 @@ def test_dsa_device_pool_group_uses_assembler_strategy():
     }
 
 
+def test_dsa_device_pool_group_maps_sparse_indexer_layers():
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
+    kvcache.page_size = 2
+    kvcache.start_layer = 10
+    kvcache.layer_num = 5
+    kvcache.indexer_layer_ids = (10, 12, 14)
+    kvcache.kv_buffer = [
+        torch.zeros((8, 3), dtype=torch.uint8) for _ in range(kvcache.layer_num)
+    ]
+    indexer_buffers = [
+        torch.zeros((4, 7 + index), dtype=torch.uint8) for index in range(3)
+    ]
+    kvcache.index_key_cache = SimpleNamespace(buffer=indexer_buffers)
+
+    group = resolve_hybrid_device_pool_group(
+        kvcache=kvcache,
+        page_size=2,
+        params=SimpleNamespace(req_to_token_pool=None),
+        components={ComponentType.FULL},
+    )
+
+    indexer = group.entry_map[PoolName.INDEXER]
+    assert indexer.layer_mapping == {0: 0, 2: 1, 4: 2}
+    assert indexer.get_prepared_layer_range_meta([0], 1) is None
+    assert indexer.get_prepared_layer_range_meta([0], 3) is None
+    for layer, buffer_index in indexer.layer_mapping.items():
+        pointers, _, _ = indexer.get_prepared_layer_range_meta([0], layer)
+        assert pointers == [[indexer_buffers[buffer_index].data_ptr()]]
+
+
 def test_device_pool_group_allows_partial_side_pool_load():
     swa_pool = SimpleNamespace(
         name=PoolName.SWA,
