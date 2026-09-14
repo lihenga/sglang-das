@@ -3304,7 +3304,9 @@ class ServerArgs:
         bool,
         (
             "Recompute a retracted PD decode request on its prefill server "
-            "instead of synchronously copying its KV cache to CPU."
+            "instead of synchronously copying its KV cache to CPU. This also "
+            "enables conservative decode admission based on the projected "
+            "remaining tokens of all active requests."
         ),
         NS("disagg"),
     ] = False

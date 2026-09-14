@@ -1424,16 +1424,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
+            projected_tokens_for_request = (
+                origin_input_len
+                - prefix_len
+                + min(
+                    decode_req.req.sampling_params.max_new_tokens,
+                    CLIP_MAX_NEW_TOKEN,
+                )
+            )
+            if getattr(
+                get_disagg(),
+                "disaggregation_decode_retraction_rebootstrap",
+                False,
+            ):
+                projected_tokens_for_request += self.num_reserved_decode_tokens
+            else:
+                projected_tokens_for_request -= retractable_tokens
+
             if (
                 max(
                     required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+                    projected_tokens_for_request,
                 )
                 > full_allocatable_tokens
             ):
@@ -2099,6 +2110,46 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             n_active = self._active_req_count(extra_reserved_reqs)
         return self.num_reserved_decode_tokens * n_active
 
+    def _projected_active_growth_tokens(self, extra_preallocated_reqs=()) -> int:
+        """Return the page-aligned KV growth promised to active requests.
+
+        Normal PD admission assumes running requests can be retracted.
+        Rebootstrap mode deliberately avoids that assumption so one long
+        request cannot strand another long request behind a synchronous KV
+        backup when both approach their advertised output limits.
+        """
+        active_reqs = list(self.scheduler.running_batch.reqs)
+        active_reqs.extend(x.req for x in self.transfer_queue.queue)
+        active_reqs.extend(self.scheduler.waiting_queue)
+        active_reqs.extend(x.req for x in extra_preallocated_reqs)
+        last_batch = self.scheduler.last_batch
+        if last_batch and last_batch.forward_mode.is_prebuilt():
+            active_reqs.extend(last_batch.reqs)
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        seen = set()
+        growth = 0
+        for req in active_reqs:
+            if id(req) in seen or req.finished() or req.req_pool_idx is None:
+                continue
+            seen.add(id(req))
+            max_new_tokens = min(
+                req.sampling_params.max_new_tokens or 0,
+                CLIP_MAX_NEW_TOKEN,
+            )
+            projected_len = len(req.origin_input_ids) + max_new_tokens
+            allocated_len = (
+                req.kv.kv_allocated_len
+                if req.kv is not None
+                else req.kv_committed_len
+            )
+            growth += max(
+                0,
+                ceil_align(projected_len, page_size)
+                - ceil_align(allocated_len, page_size),
+            )
+        return growth
+
     def _swa_aware_allocatable_token_budgets(
         self,
         retractable_tokens: Optional[int] = None,
@@ -2131,8 +2182,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         hicache_reserved_tokens: int = 0,
         extra_preallocated_reqs=(),
     ) -> int:
+        conservative_admission = getattr(
+            get_disagg(),
+            "disaggregation_decode_retraction_rebootstrap",
+            False,
+        )
         need_space_for_single_req = self._need_space_for_single_req(
-            retractable_tokens, extra_preallocated_reqs
+            None if conservative_admission else retractable_tokens,
+            extra_preallocated_reqs,
         )
         if reserved_tokens is None:
             reserved_tokens = self._active_reserved_tokens(
@@ -2177,6 +2234,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             for req in self.retracted_queue:
                 full_required, _ = self._prealloc_required_tokens(req)
                 allocatable_tokens -= full_required
+
+        if conservative_admission:
+            allocatable_tokens -= self._projected_active_growth_tokens(
+                extra_preallocated_reqs
+            )
 
         allocatable_tokens -= hicache_reserved_tokens
         return allocatable_tokens
