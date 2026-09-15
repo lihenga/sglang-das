@@ -1169,6 +1169,9 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
+        # Set by low-memory retraction when this request can be recomputed on P
+        # instead of synchronously backed up to CPU on D.
+        self.pd_rebootstrap_after_retract = False
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
@@ -2867,7 +2870,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices), server_args):
+            rebootstrap_after_retract = (
+                getattr(
+                    server_args,
+                    "disaggregation_decode_retraction_rebootstrap",
+                    False,
+                )
+                and req.input_embeds is None
+                and req.multimodal_inputs is None
+            )
+            released = self.release_req(
+                idx,
+                len(sorted_indices),
+                server_args,
+                offload_kv=not rebootstrap_after_retract,
+            )
+            if released:
+                req.pd_rebootstrap_after_retract = rebootstrap_after_retract
                 retracted_reqs.append(req)
             else:
                 # The retraction host pool could not hold the backup and the

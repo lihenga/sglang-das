@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import threading
 import time
@@ -229,6 +230,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        self._pp_hicache_work = None
+        self._pp_hicache_counts = None
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -355,6 +358,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self._pp_hicache_work is not None:
+            self._pp_hicache_work.wait()
+            self._pp_hicache_work = self._pp_hicache_counts = None
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -2632,6 +2638,53 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
+    def _poll_pp_hicache_acks(self) -> tuple[int, int]:
+        """Commit only ACKs already queued on every stage, without a PP barrier.
+
+        A blocking PP collective here deadlocks the pipeline: a later stage may
+        still be waiting for this stage's next microbatch. Publish completion on
+        PP0's scheduling round, just like the other HiCache control messages.
+        """
+        cc = self.cache_controller
+        queues = (cc.ack_write_queue, cc.ack_load_queue)
+        if self._pp_hicache_work is None:
+            counts = torch.tensor(
+                [self._count_ready_acks(q) for q in queues], dtype=torch.int
+            )
+            self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.MIN)
+            self._pp_hicache_counts = counts
+            self._pp_hicache_work = torch.distributed.all_reduce(
+                counts, op=torch.distributed.ReduceOp.MIN,
+                group=self.pp_group, async_op=True,
+            )
+            return 0, 0
+
+        ready = torch.tensor(int(self._pp_hicache_work.is_completed()), dtype=torch.int)
+        self._all_reduce(ready, torch.distributed.ReduceOp.MIN)
+        if not ready.item():
+            return 0, 0
+        self._pp_hicache_work.wait()
+        counts = tuple(map(int, self._pp_hicache_counts.tolist()))
+        self._pp_hicache_work = self._pp_hicache_counts = None
+
+        # Equal queue lengths alone cannot detect a skipped/reordered write on
+        # cancellation. Never acknowledge a different node on a later stage.
+        digests = []
+        for queue, count in zip(queues, counts):
+            assert count <= len(queue), "HiCache ACK queue changed during PP sync"
+            nodes = tuple(tuple(ack.node_ids) for ack in queue[:count])
+            digest = hashlib.blake2b(repr(nodes).encode(), digest_size=8).digest()
+            digests.append(int.from_bytes(digest, "little") & ((1 << 63) - 1))
+        local = torch.tensor(digests, dtype=torch.int64)
+        expected = local.clone()
+        self._pp_sync(expected)
+        assert torch.equal(local, expected), (
+            f"HiCache ACK node order differs across PP stages: pp_rank={self.pp_rank}, "
+            f"counts={counts}, local={local.tolist()}, pp0={expected.tolist()}, "
+            f"queue_heads={[[a.node_ids for a in q[:8]] for q in queues]}"
+        )
+        return counts
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
@@ -2666,7 +2719,17 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
-        if self.pp_size != 1:
+        if (
+            self.pp_size != 1
+            and self.cache_controller is not None
+            and self.cache_controller.write_policy != "write_back"
+        ):
+            write_finish_count, load_finish_count = self._poll_pp_hicache_acks()
+            self.writing_check(finish_count=write_finish_count)
+            self.loading_check(finish_count=load_finish_count)
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+        elif self.pp_size != 1:
             finish_counts = torch.zeros(2, dtype=torch.int, device="cpu")
             if self.pp_rank == 0 and self.cache_controller is not None:
                 finish_counts[0] = self._count_ready_acks(

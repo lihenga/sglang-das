@@ -1516,14 +1516,22 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
-                if is_aborted(req) or is_pd_hidden_transfer_failed(req):
+                transfer_failed = is_aborted(req) or is_pd_hidden_transfer_failed(req)
+                if self.ps.pp_size > 1 or not transfer_failed:
+                    # PP stages resolve the same completed microbatch at different
+                    # times. A local transfer failure must not change its cache
+                    # insert/HiCache ACK order; release still follows PP consensus.
+                    req.output_ids.append(next_token_id)
+                    maybe_cache_unfinished_req(req, self.tree_cache)
+
+                if transfer_failed:
+                    if is_aborted(req):
+                        req.disagg_kv_sender.abort()
                     self.disagg_prefill_inflight_queue.append(req)
                     req.time_stats.set_prefill_transfer_queue_entry_time()
                     advance_logprob_pt(i, req)
                     continue
 
-                req.output_ids.append(next_token_id)
-                maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -1773,6 +1781,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        self.clear_pending_chunk_send(req)
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
