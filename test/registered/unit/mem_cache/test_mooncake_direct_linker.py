@@ -2413,6 +2413,7 @@ def test_cp_page_reader_fuses_layer_broadcast_and_restores_peer(monkeypatch):
     class _CPGroup:
         def __init__(self, rank):
             self.rank = rank
+            self.cpu_group = object()
 
         def broadcast(self, tensor, src):
             calls.append((self.rank, src, tensor.numel()))
@@ -2444,6 +2445,8 @@ def test_cp_page_reader_pack_failure_stops_before_device_broadcast(monkeypatch):
     calls = []
 
     class _CPGroup:
+        cpu_group = object()
+
         def broadcast(self, tensor, src):
             calls.append((tensor, src))
 
@@ -2474,6 +2477,8 @@ def test_cp_page_reader_scatter_failure_is_published_after_broadcast(monkeypatch
             raise ValueError("scatter failed")
 
     class _CPGroup:
+        cpu_group = object()
+
         def broadcast(self, tensor, src):
             calls.append(src)
 
@@ -2596,6 +2601,50 @@ def test_cp_non_lookup_owner_prepares_local_read_session():
     )
 
     assert session_starts == [["page-0", "page-1"]]
+
+
+def test_cp_page_read_error_sync_uses_cache_cpu_group(monkeypatch):
+    ordinary_group = object()
+    cache_cpu_group = object()
+    selected_groups = []
+
+    def record_all_reduce(tensor, op, group):
+        selected_groups.append(group)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce)
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.cp_control_group = ordinary_group
+    linker.cp_cache_group = SimpleNamespace(cpu_group=cache_cpu_group)
+
+    linker._raise_if_cp_read_failed(None)
+
+    assert selected_groups == [cache_cpu_group]
+
+
+def test_cp_lookup_request_uses_control_group(monkeypatch):
+    control_group = object()
+    selected_groups = []
+
+    def record_all_reduce(tensor, op, group):
+        selected_groups.append(group)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce)
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.attn_cp_rank = 0
+    linker.attn_cp_size = 1
+    linker.cp_control_group = control_group
+    linker.storage = SimpleNamespace(
+        batch_exists_v2=lambda keys, transfers: SimpleNamespace(
+            restorable_prefix_pages=[]
+        )
+    )
+
+    assert linker._lookup_cp_request(
+        "rid",
+        ["page-0"],
+        [PoolTransfer(name=PoolName.KV, keys=["page-0"])],
+    ) == []
+    assert selected_groups == [control_group]
 
 
 def test_cp_lookup_request_owner_queries_all_keys(monkeypatch):

@@ -979,11 +979,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         stage: str = "read",
     ) -> None:
         """Publish page-wise errors before entering a device collective."""
-        control_group = getattr(self, "cp_control_group", None)
-        if control_group is None:
-            control_group = getattr(
-                getattr(self, "cp_cache_group", None), "cpu_group", None
-            )
+        cache_group = getattr(self, "cp_cache_group", None)
+        if cache_group is None:
+            # Direct unit-test construction may omit the cache coordinator.
+            # Production page-wise mode initializes it in __init__, so this
+            # compatibility path cannot alias a configured cache group back
+            # to the scheduler's control group.
+            control_group = getattr(self, "cp_control_group", None)
+        else:
+            control_group = getattr(cache_group, "cpu_group", None)
+            if control_group is None:
+                raise RuntimeError(
+                    "Mooncake CP page-wise path has no dedicated cache CPU group."
+                )
         if control_group is None:
             raise RuntimeError("Mooncake CP page-wise path has no CPU control group.")
         failed = torch.tensor(
