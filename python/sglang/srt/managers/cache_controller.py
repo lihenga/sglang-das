@@ -573,6 +573,14 @@ class HiCacheController:
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
+            # Compile and load the CPU hash extension before serving requests.
+            # A short server warmup may never fill a cache page and reach hashing.
+            hash_init_start = time.monotonic()
+            self.get_hash_str([])
+            logger.info(
+                "HiCache native hash initialized in %.3f s",
+                time.monotonic() - hash_init_start,
+            )
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
