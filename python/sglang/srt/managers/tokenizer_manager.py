@@ -224,6 +224,8 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    dispatched: bool = False
+    abort_requested: bool = False
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -825,10 +827,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
-            # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop any that
-            # are still pending; entries already removed on the normal completion
-            # path are left untouched (pop is a no-op).
+            # scheduler would otherwise leak its state. Remove undispatched states;
+            # abort dispatched states and retain them until the scheduler returns a
+            # terminal response, so in-flight outputs never become orphaned.
             self._discard_pending_req_states(obj)
             raise
 
@@ -1567,6 +1568,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
             dispatched = True
+            state = self.rid_to_state.get(tokenized_obj.rid)
+            if state is not None:
+                state.dispatched = True
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
@@ -1599,6 +1603,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             self._dispatch_to_scheduler(batch_req)
             dispatched = True
+            for tokenized_obj in tokenized_objs:
+                state = self.rid_to_state.get(tokenized_obj.rid)
+                if state is not None:
+                    state.dispatched = True
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -1690,8 +1698,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        """Wait for the response of one request."""
         state = self.rid_to_state[obj.rid]
+        try:
+            async for response in self._wait_one_response_impl(obj, request, state):
+                yield response
+        finally:
+            self._abort_dispatched_request(obj.rid, state)
+
+    async def _wait_one_response_impl(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request],
+        state: ReqState,
+    ):
+        """Wait for the response of one request."""
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
         while True:
@@ -1948,14 +1968,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and get_serving().tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
-            return
+        marked_states = []
+        if abort_all:
+            marked_states = [
+                state
+                for state in self.rid_to_state.values()
+                if state.dispatched and not state.abort_requested
+            ]
+        else:
+            state = self.rid_to_state.get(rid)
+            if state is None and get_serving().tokenizer_worker_num == 1:
+                return
+            if state is not None and state.dispatched:
+                if state.abort_requested:
+                    return
+                marked_states = [state]
+
+        for state in marked_states:
+            state.abort_requested = True
+
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self._dispatch_to_scheduler(req)
+        try:
+            self._dispatch_to_scheduler(req)
+        except BaseException:
+            for state in marked_states:
+                state.abort_requested = False
+            raise
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -3402,18 +3440,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats.set_created_time(created_time)
 
     def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+        """Clean up rid_to_state entries created by _init_req_state for *obj*.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Requests that never reached the scheduler can be removed immediately.
+        Dispatched requests must stay registered until their abort or completion
+        output arrives, otherwise every later scheduler output becomes orphaned.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                continue
+            if state.dispatched:
+                self._abort_dispatched_request(rid, state)
+            elif self.rid_to_state.get(rid) is state:
+                self.rid_to_state.pop(rid)
+
+    def _abort_dispatched_request(self, rid: str, state: ReqState):
+        """Abort a dispatched request and release ownership if abort cannot be sent."""
+        if (
+            state.finished
+            or not state.dispatched
+            or self.rid_to_state.get(rid) is not state
+        ):
+            return
+        try:
+            self.abort_request(rid)
+        except Exception:
+            logger.exception("Failed to abort dispatched request rid=%s", rid)
+            if self.rid_to_state.get(rid) is state:
+                self.rid_to_state.pop(rid)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
