@@ -179,14 +179,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        self.layer_split_layout = bool(self.pool_group.storage_layout_tag)
 
         # DeepSeek-V4 materializes the global token order before populating the
         # direct-linker pools, so these objects are replicas across attention CP
         # ranks. Persist each radix node once, and query each request once.  KV
         # data is still read independently into every rank's local buffers: in
         # practice that is faster than one reader followed by CP replication.
-        self.cp_single_writer = params.attn_cp_size > 1 and bool(
-            set(self.pools) & _DEEPSEEK_V4_REPLICATED_POOLS
+        self.cp_single_writer = (
+            params.attn_cp_size > 1
+            and bool(set(self.pools) & _DEEPSEEK_V4_REPLICATED_POOLS)
+            and not self.layer_split_layout
         )
         self.cp_single_lookup = self.cp_single_writer
         self.attn_cp_rank = params.attn_cp_rank
@@ -237,6 +240,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # CacheInitParams; ownership, not the object key, identifies the writer.
         key_cp_rank = 0 if self.cp_single_writer else params.attn_cp_rank
         rank_suffix = f"tp{tp_rank}_cp{key_cp_rank}_pp{params.pp_rank}"
+        if self.layer_split_layout:
+            rank_suffix = f"{self.pool_group.storage_layout_tag}_{rank_suffix}"
         self.storage.mla_suffix = rank_suffix
         self.storage.mha_suffix = rank_suffix
         if self.cp_single_writer:
