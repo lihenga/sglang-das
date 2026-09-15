@@ -4873,19 +4873,23 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_seq_len: int,
     ):
         """
-        Fused method to get both index K and scale data in a single call using Triton.
+        Gather raw FP8 or INT8 index K bytes and FP32 scale bytes together.
         More efficient than calling get_index_k_continuous and get_index_k_scale_continuous separately.
 
         :param layer_id: Layer index
-        :param seq_len: Sequence length
+        :param seq_len_tensor: Per-request sequence lengths
         :param page_indices: Page indices tensor
-        :return: tuple of (k_fp8, k_scale) where
-                 k_fp8: (seq_len, index_head_dim), uint8
+        :return: tuple of (quantized_k, k_scale) where
+                 quantized_k: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
-        assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
+        assert self.use_scaled_index_k_cache, "Scaled index K cache is not enabled"
         return self.index_key_cache.get_k_and_scale(
-            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+            layer_id,
+            seq_len_tensor.contiguous(),
+            page_indices.contiguous(),
+            seq_len_sum,
+            max_seq_len,
         )
 
     def set_index_k_scale_buffer(
