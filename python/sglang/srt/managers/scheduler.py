@@ -1960,6 +1960,13 @@ class Scheduler(
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
 
+            # The current forward has already been submitted asynchronously.
+            # Use that GPU window to prepare Mooncake metadata/read sessions
+            # for the next likely prefill batch.  Final L1 allocation and the
+            # single-reader page-wise get remain part of formal admission.
+            if batch is not None:
+                self._prefetch_next_external_linker_batch()
+
             # Update last_batch
             self.last_batch = batch
 
@@ -2990,6 +2997,27 @@ class Scheduler(
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                 )
+
+    def _prefetch_next_external_linker_batch(self) -> None:
+        """Prepare one bounded Mooncake prefill window under overlap schedule."""
+        if (
+            not self.enable_overlap
+            or not self.server_args.enable_unified_cache_external_linker
+            or self.server_args.unified_cache_external_linker_backend != "mooncake"
+            or not self.server_args.mooncake_enable_page_wise_load
+            or not self.waiting_queue
+        ):
+            return
+
+        max_candidates = self.get_num_allocatable_reqs(len(self.running_batch.reqs))
+        if max_candidates <= 0:
+            return
+
+        prefetch = getattr(self.tree_cache, "prefetch_external_linker", None)
+        if prefetch is None:
+            return
+        for req in self.waiting_queue[:max_candidates]:
+            prefetch(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):

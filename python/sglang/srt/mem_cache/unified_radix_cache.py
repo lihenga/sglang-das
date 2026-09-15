@@ -2709,6 +2709,18 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.cache_controller.start_loading()
         return 0
 
+    def prefetch_external_linker(self, req) -> bool:
+        """Prepare an external read while the current GPU batch is running.
+
+        Matching may touch request metadata, but the linker intentionally uses
+        lookup-form transfers here: final L1 slots are allocated only if the
+        request is admitted by the next scheduler pass.
+        """
+        if self.linker is None:
+            return False
+        req.init_next_round_input(self, cow_mamba=False)
+        return self.linker.prepare_prefetched_load(req)
+
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.
 

@@ -10,7 +10,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult, MatchResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1392,17 +1392,21 @@ def test_wrapper_peer_prepare_failure_falls_back_before_tree_insert():
     assert len(collectives) == 1
 
 
-def test_wrapper_combines_prepare_and_source_in_one_collective():
+def test_wrapper_prefetch_reuses_prepare_and_source_collective():
     collectives = []
+    prepare_calls = []
 
     class _Component:
         component_type = ComponentType.FULL
 
         def build_external_linker_transfer(self, phase, node, keys):
+            indices = None
+            if phase == LinkerTransferPhase.LOAD:
+                indices = torch.tensor([11, 12])
             return PoolTransfer(
                 name=PoolName.KV,
                 keys=list(keys),
-                device_indices=torch.tensor([11, 12]),
+                device_indices=indices,
             )
 
         def update_external_linker_load(
@@ -1432,8 +1436,13 @@ def test_wrapper_combines_prepare_and_source_in_one_collective():
         ),
         resolve_node_handle=lambda value: node,
     )
+    def prepare_load(rid, transfers):
+        prepare_calls.append((rid, transfers))
+        assert all(transfer.device_indices is None for transfer in transfers)
+        return True
+
     backend = SimpleNamespace(
-        prepare_load=lambda rid, transfers: True,
+        prepare_load=prepare_load,
         get_prepared_load_source=lambda rid: "local_disk",
         load=lambda rid, transfers: True,
         abort_prepared_load=lambda rid: None,
@@ -1441,6 +1450,7 @@ def test_wrapper_combines_prepare_and_source_in_one_collective():
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = cache
     wrapper.cache_linker = backend
+    wrapper.prefetched_source_codes = {}
     wrapper.hit_markers = {
         "rid": ExternalCacheHitMarker(
             prefix_key=RadixKey(array("q", [1, 2])),
@@ -1460,10 +1470,71 @@ def test_wrapper_combines_prepare_and_source_in_one_collective():
         kv=None,
     )
 
+    assert wrapper.prepare_prefetched_load(req)
+    assert wrapper.prepare_prefetched_load(req)
     wrapper.load_back(req)
 
+    assert len(prepare_calls) == 1
     assert len(collectives) == 1
     assert req.cached_tokens_storage_source == "mooncake_memory"
+
+
+def test_wrapper_reuses_prefetched_lookup_when_tree_anchor_is_unchanged():
+    class _Component:
+        component_type = ComponentType.FULL
+
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOOKUP
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+    cache = SimpleNamespace(
+        page_size=1,
+        _components_tuple=(_Component(),),
+        get_last_hash_value=lambda node: None,
+    )
+    backend = SimpleNamespace(
+        lookup=lambda rid, transfers: pytest.fail("lookup must be reused"),
+        abort_prepared_load=lambda rid: pytest.fail("session must stay valid"),
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = cache
+    wrapper.cache_linker = backend
+    wrapper.prefetched_source_codes = {"rid": 3}
+
+    key = RadixKey(array("q", [1, 2]))
+    base = MatchResult(
+        device_indices=torch.empty((0,), dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+    tail_hashes = wrapper._tail_hashes(key, base, device_hit_len=0)
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=key,
+            tail_hashes=tail_hashes,
+            device_hit_len=0,
+        )
+    }
+
+    result = wrapper.match(key, SimpleNamespace(rid="rid"), base)
+
+    assert result.host_hit_length == 2
+    assert wrapper.prefetched_source_codes == {"rid": 3}
+
+
+def test_wrapper_release_request_cancels_prefetched_session():
+    aborted = []
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache_linker = SimpleNamespace(abort_prepared_load=aborted.append)
+    wrapper.hit_markers = {"rid": object()}
+    wrapper.prefetched_source_codes = {"rid": 3}
+
+    wrapper.release_request("rid")
+
+    assert wrapper.hit_markers == {}
+    assert wrapper.prefetched_source_codes == {}
+    assert aborted == ["rid"]
 
 
 def test_offload_runs_on_background_thread(monkeypatch):

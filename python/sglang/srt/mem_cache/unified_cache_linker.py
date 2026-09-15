@@ -434,6 +434,9 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # Read sessions opened while the previous batch is executing.  The
+        # final device slots are deliberately not allocated until load_back.
+        self.prefetched_source_codes: dict[str, int] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[tuple[NodeId, DecLockRefParams]] = []
 
@@ -451,14 +454,32 @@ class UnifiedCacheLinkerWrapper:
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
-        page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
         if device_hit_len >= len(key):
+            if req.rid in self.hit_markers:
+                self.release_request(req.rid)
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
+            if req.rid in self.hit_markers:
+                self.release_request(req.rid)
             return result
+
+        # A request can be matched once by the overlap prefetch window and
+        # again by formal admission.  Reuse only when the device anchor and
+        # content-addressed remote tail are still identical.  If the radix
+        # tree changed in between, discard the prepared session and perform a
+        # fresh lookup below.
+        prefetched = self.hit_markers.get(req.rid)
+        if prefetched is not None:
+            num_hit_pages = len(prefetched.tail_hashes)
+            if (
+                prefetched.device_hit_len == device_hit_len
+                and prefetched.tail_hashes == tail_hashes[:num_hit_pages]
+            ):
+                return self._apply_external_hit(result, prefetched)
+            self.release_request(req.rid)
 
         lookup_transfers = []
         for component in cache._components_tuple:
@@ -468,8 +489,6 @@ class UnifiedCacheLinkerWrapper:
             if transfer is None:
                 return result
             lookup_transfers.append(transfer)
-        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
-
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         lookup_started = time.perf_counter()
         try:
@@ -486,22 +505,38 @@ class UnifiedCacheLinkerWrapper:
         )
         if hit_pages == 0:
             return result
-        hit_tokens = hit_pages * page
-
-        swa_transfer = by_pool.get(PoolName.SWA)
-        swa_host_hit_length = (
-            min(len(swa_transfer.keys), hit_pages) * page
-            if swa_transfer is not None
-            else 0
-        )
-        # Mamba keeps a single state slot per node, so a hit is worth one slot.
-        mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+        hit_tokens = hit_pages * cache.page_size
 
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
             prefix_key=key[: device_hit_len + hit_tokens],
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
         )
+        return self._apply_external_hit(result, self.hit_markers[req.rid])
+
+    def _apply_external_hit(
+        self, result: MatchResult, hit: ExternalCacheHitMarker
+    ) -> MatchResult:
+        """Project a cached external lookup onto a fresh local tree match."""
+        cache = self.cache
+        hit_pages = len(hit.tail_hashes)
+        hit_tokens = hit_pages * cache.page_size
+
+        by_pool = {}
+        for component in cache._components_tuple:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+            )
+            if transfer is not None:
+                by_pool[transfer.name] = transfer
+
+        swa_transfer = by_pool.get(PoolName.SWA)
+        swa_host_hit_length = (
+            min(len(swa_transfer.keys), hit_pages) * cache.page_size
+            if swa_transfer is not None
+            else 0
+        )
+        mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
@@ -510,6 +545,64 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def prepare_prefetched_load(self, req: Req) -> bool:
+        """Open the Mooncake read session without allocating final L1 slots."""
+        hit = self.hit_markers.get(req.rid)
+        if hit is None:
+            return False
+        prefetched_source_codes = getattr(self, "prefetched_source_codes", None)
+        if prefetched_source_codes is None:
+            prefetched_source_codes = self.prefetched_source_codes = {}
+        if req.rid in prefetched_source_codes:
+            return True
+
+        transfers = []
+        for component in self.cache._components_tuple:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+            )
+            if transfer is None:
+                self.release_request(req.rid)
+                return False
+            transfers.append(transfer)
+
+        source_code = self._prepare_load_session(req, transfers)
+        if source_code == 0:
+            self.hit_markers.pop(req.rid, None)
+            return False
+        prefetched_source_codes[req.rid] = source_code
+        return True
+
+    def _prepare_load_session(self, req: Req, transfers: list[PoolTransfer]) -> int:
+        """Prepare and synchronize a backend read session across cache ranks."""
+        time_stats = getattr(req, "time_stats", None)
+        if time_stats is not None:
+            time_stats.set_direct_load_prepare_start_time()
+        prepared = False
+        try:
+            prepared = self.cache_linker.prepare_load(req.rid, transfers)
+        except BaseException:
+            logger.exception(
+                "External linker load preparation failed for rid=%s; "
+                "falling back to prefill.",
+                req.rid,
+            )
+        source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
+        local_source = source_getter(req.rid) if prepared and source_getter else None
+        source_code = MOONCAKE_SOURCE_CODES.get(local_source, 1)
+        prepared_and_source = torch.tensor(
+            0 if not prepared else source_code, dtype=torch.int
+        )
+        self.cache._all_reduce_attn_groups(
+            prepared_and_source, torch.distributed.ReduceOp.MIN
+        )
+        source_code = int(prepared_and_source.item())
+        if source_code == 0:
+            self.cache_linker.abort_prepared_load(req.rid)
+        if time_stats is not None:
+            time_stats.set_direct_load_prepare_finish_time()
+        return source_code
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -578,6 +671,8 @@ class UnifiedCacheLinkerWrapper:
                     component_transfers,
                     prefix_len,
                 )
+                getattr(self, "prefetched_source_codes", {}).pop(req.rid, None)
+                self.cache_linker.abort_prepared_load(req.rid)
                 return empty_indices, req.last_node
             component_transfers.append((component, transfer))
 
@@ -590,35 +685,16 @@ class UnifiedCacheLinkerWrapper:
         # decision or their prefix lengths (and therefore model collectives)
         # would diverge.
         time_stats = getattr(req, "time_stats", None)
-        if time_stats is not None:
-            time_stats.set_direct_load_prepare_start_time()
-        prepared = False
-        try:
-            prepared = self.cache_linker.prepare_load(
-                req.rid, [transfer for _, transfer in component_transfers]
+        source_code = getattr(self, "prefetched_source_codes", {}).pop(req.rid, 0)
+        prepared = source_code != 0
+        if not prepared:
+            source_code = self._prepare_load_session(
+                req, [transfer for _, transfer in component_transfers]
             )
-        except BaseException:
-            logger.exception(
-                "External linker load preparation failed for rid=%s; "
-                "falling back to prefill.",
-                req.rid,
-            )
-        source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
-        local_source = source_getter(req.rid) if prepared and source_getter else None
-        source_code = MOONCAKE_SOURCE_CODES.get(local_source, 1)
-        # MIN makes a failed preparation (0) win globally. Unknown sources
-        # use 1, so they also propagate instead of being hidden by a known
-        # source on another rank. Among known sources, the encoding matches
-        # Mooncake's memory-over-local-disk-over-DFS precedence.
-        prepared_and_source = torch.tensor(
-            0 if not prepared else source_code, dtype=torch.int
-        )
-        cache._all_reduce_attn_groups(
-            prepared_and_source, torch.distributed.ReduceOp.MIN
-        )
-        if int(prepared_and_source.item()) == 0:
-            if time_stats is not None:
-                time_stats.set_direct_load_prepare_finish_time()
+            prepared = source_code != 0
+        # source_code was synchronized either in the overlap prefetch window
+        # or by the just-in-time fallback above.
+        if source_code == 0:
             self.cache_linker.abort_prepared_load(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
@@ -644,7 +720,7 @@ class UnifiedCacheLinkerWrapper:
             )
             return empty_indices, req.last_node
 
-        source = MOONCAKE_SOURCES_BY_CODE.get(int(prepared_and_source.item()))
+        source = MOONCAKE_SOURCES_BY_CODE.get(source_code)
         if source is not None:
             req.storage_hit_length = len(tail_hashes) * cache.page_size
             req.cached_tokens_storage_source = f"mooncake_{source}"
@@ -775,8 +851,6 @@ class UnifiedCacheLinkerWrapper:
             # transfer will consume the session in that case.
             self.cache_linker.abort_prepared_load(req.rid)
 
-        if time_stats is not None:
-            time_stats.set_direct_load_prepare_finish_time()
         node = cache.resolve_node_handle(insert_result.last_device_node)
         while node.id != req.last_node:
             node.external_cache_stored = True
@@ -943,10 +1017,12 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        getattr(self, "prefetched_source_codes", {}).clear()
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        getattr(self, "prefetched_source_codes", {}).pop(rid, None)
         self.cache_linker.abort_prepared_load(rid)
 
     def close(self) -> None:
