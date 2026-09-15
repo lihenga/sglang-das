@@ -1521,6 +1521,9 @@ class Envs:
     SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
     )
+    # Prefer the existing AOT LightOp kernel for gfx936 INT8 index-K dequant.
+    # Set to false to use the Triton kernel with a runtime page-table stride.
+    SGLANG_DSA_HCU_LIGHTOP_INT8_INDEX_K_DEQUANT = EnvBool(True)
     SGLANG_DSA_COMPACT_INDEX_K_CACHE_PD = EnvBool(False)
     # HCU Q/K preparation; independent of the CUDA DSA indexer fusion switch.
     # Disable to run normalization (preserving input dtype) before separate RoPE.
