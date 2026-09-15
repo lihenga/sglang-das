@@ -1961,9 +1961,9 @@ class Scheduler(
                 self.launch_batch_sample_if_needed(batch_result, batch)
 
             # The current forward has already been submitted asynchronously.
-            # Use that GPU window to prepare Mooncake metadata/read sessions
-            # for the next likely prefill batch.  Final L1 allocation and the
-            # single-reader page-wise get remain part of formal admission.
+            # Use that GPU window to reserve final destinations and queue the
+            # next bounded Mooncake page-wise read.  Formal admission later
+            # validates the hit again before publishing it into the radix tree.
             if batch is not None:
                 self._prefetch_next_external_linker_batch()
 
@@ -3016,8 +3016,14 @@ class Scheduler(
         prefetch = getattr(self.tree_cache, "prefetch_external_linker", None)
         if prefetch is None:
             return
+        queued = False
         for req in self.waiting_queue[:max_candidates]:
-            prefetch(req)
+            queued = bool(prefetch(req)) or queued
+        if queued:
+            # Start the already-reserved destination reads now, while the
+            # current batch's GPU work is still in flight.  Formal admission
+            # later only publishes a completed reservation into the radix tree.
+            self.tree_cache.ready_to_load_host_cache(speculative=True)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):

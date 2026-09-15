@@ -2701,25 +2701,51 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
-    def ready_to_load_host_cache(self) -> int:
+    def ready_to_load_host_cache(self, *, speculative: bool = False) -> int:
         """Notify the cache controller to start the KV cache loading."""
         if self.linker is not None:
+            if speculative:
+                starter = getattr(
+                    self.linker, "start_prefetched_layer_wise_loading", None
+                )
+                if starter is not None:
+                    return starter()
             return self.linker.start_layer_wise_loading()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
 
     def prefetch_external_linker(self, req) -> bool:
-        """Prepare an external read while the current GPU batch is running.
+        """Queue an external read while the current GPU batch is running.
 
-        Matching may touch request metadata, but the linker intentionally uses
-        lookup-form transfers here: final L1 slots are allocated only if the
-        request is admitted by the next scheduler pass.
+        The linker reserves final device destinations but does not insert them
+        into the radix tree until the request's formal admission consumes the
+        completed reservation.
         """
         if self.linker is None:
             return False
+        if getattr(self.linker, "has_prefetched_load", lambda _rid: False)(
+            req.rid
+        ):
+            return True
         req.init_next_round_input(self, cow_mamba=False)
-        return self.linker.prepare_prefetched_load(req)
+        prefetch = getattr(self.linker, "prefetch_external_load", None)
+        if prefetch is None:
+            return self.linker.prepare_prefetched_load(req)
+        return prefetch(req)
+
+    def get_external_linker_reserved_tokens(self, rid: str) -> tuple[int, int]:
+        """Return this request's detached external-L1 reservation.
+
+        The scheduler uses this only to avoid charging a request twice: other
+        speculative reservations remain part of allocator availability.
+        """
+        if self.linker is None:
+            return 0, 0
+        getter = getattr(self.linker, "get_prefetched_load_tokens", None)
+        if getter is None:
+            return 0, 0
+        return getter(rid)
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.

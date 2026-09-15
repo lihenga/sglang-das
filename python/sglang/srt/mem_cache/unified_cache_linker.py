@@ -399,6 +399,15 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+class _PrefetchedExternalLoad(NamedTuple):
+    """Final device destinations reserved for one overlap-prefetched hit."""
+
+    req: Req
+    hit: ExternalCacheHitMarker
+    component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    prefix_len: int
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -434,9 +443,12 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
-        # Read sessions opened while the previous batch is executing.  The
-        # final device slots are deliberately not allocated until load_back.
+        # Read sessions opened while the previous batch is executing.
         self.prefetched_source_codes: dict[str, int] = {}
+        # Unlike the source-only prefetch above, these entries own final device
+        # slots.  They are intentionally detached from the radix tree until the
+        # request is admitted and the background get has completed.
+        self.prefetched_loads: dict[str, _PrefetchedExternalLoad] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[tuple[NodeId, DecLockRefParams]] = []
 
@@ -449,6 +461,32 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def has_prefetched_load(self, rid: str) -> bool:
+        return rid in getattr(self, "prefetched_loads", {})
+
+    def get_prefetched_load_tokens(self, rid: str) -> tuple[int, int]:
+        """Return reserved (full-attention, SWA) device tokens for ``rid``."""
+        reservation = getattr(self, "prefetched_loads", {}).get(rid)
+        if reservation is None:
+            return 0, 0
+
+        full_tokens = 0
+        swa_tokens = 0
+        for _, transfer in reservation.component_transfers:
+            indices = transfer.device_indices
+            if indices is None:
+                continue
+            num_tokens = (
+                int(indices.numel())
+                if hasattr(indices, "numel")
+                else len(indices)
+            )
+            if transfer.name == PoolName.KV:
+                full_tokens += num_tokens
+            elif transfer.name == PoolName.SWA:
+                swa_tokens += num_tokens
+        return full_tokens, swa_tokens
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -574,6 +612,138 @@ class UnifiedCacheLinkerWrapper:
         prefetched_source_codes[req.rid] = source_code
         return True
 
+    def _sync_prefetch_decision(self, accepted: bool) -> bool:
+        """Make reservation/queue failures agree before any peer enters a get."""
+        sync = getattr(self.cache, "_all_reduce_attn_groups", None)
+        if sync is None:
+            return accepted
+        decision = torch.tensor(int(accepted), dtype=torch.int)
+        sync(decision, torch.distributed.ReduceOp.MIN)
+        return bool(decision.item())
+
+    def _abort_component_transfers(
+        self,
+        req: Req,
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]],
+        prefix_len: int,
+    ) -> None:
+        if not component_transfers:
+            return
+        full = component_transfers[0][1]
+        for component, transfer in reversed(component_transfers):
+            try:
+                component.update_external_linker_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    full,
+                    transfer,
+                    prefix_len,
+                )
+            except BaseException:
+                logger.warning(
+                    "Failed to release prefetched Mooncake slots for rid=%s",
+                    req.rid,
+                    exc_info=True,
+                )
+
+    def prefetch_external_load(self, req: Req) -> bool:
+        """Reserve destinations and queue the actual backend get early.
+
+        The reservation is not inserted into the radix tree.  If the request's
+        next formal match changes, :meth:`release_request` returns the slots;
+        only ``load_back`` publishes the reservation after the completed get has
+        been verified.
+        """
+        rid = req.rid
+        prefetched_loads = getattr(self, "prefetched_loads", None)
+        if prefetched_loads is None:
+            prefetched_loads = self.prefetched_loads = {}
+        if rid in prefetched_loads:
+            return True
+        if not self.prepare_prefetched_load(req):
+            return False
+        hit = self.hit_markers.get(rid)
+        if hit is None:
+            return False
+        prefix_len = hit.device_hit_len + len(hit.tail_hashes) * self.cache.page_size
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
+        allocation_ok = True
+        try:
+            for component in self.cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, hit.tail_hashes
+                )
+                if transfer is None:
+                    allocation_ok = False
+                    break
+                component_transfers.append((component, transfer))
+        except BaseException:
+            allocation_ok = False
+            logger.warning(
+                "Mooncake overlap destination reservation failed for rid=%s",
+                rid,
+                exc_info=True,
+            )
+
+        if not self._sync_prefetch_decision(allocation_ok):
+            self._abort_component_transfers(req, component_transfers, prefix_len)
+            self.release_request(rid)
+            return False
+
+        transfers = [transfer for _, transfer in component_transfers]
+        queued = False
+        try:
+            queued = bool(self.cache_linker.load(rid, transfers))
+        except BaseException:
+            logger.warning(
+                "Mooncake overlap load queue failed for rid=%s",
+                rid,
+                exc_info=True,
+            )
+        if not self._sync_prefetch_decision(queued):
+            cancel = getattr(self.cache_linker, "cancel_prefetched_load", None)
+            if cancel is not None:
+                cancel(rid)
+            else:
+                self.cache_linker.abort_prepared_load(rid)
+            self._abort_component_transfers(req, component_transfers, prefix_len)
+            self.release_request(rid)
+            return False
+
+        # Mark only after ``load`` accepted the transfer.  The scheduler starts
+        # the worker after this method returns, so a failed queue attempt cannot
+        # leave an uncompleted wait event behind.  Treat a local tracking-hook
+        # failure like any other queue failure and make every rank roll back.
+        marked = True
+        marker = getattr(self.cache_linker, "mark_prefetched_load", None)
+        if marker is not None:
+            try:
+                marker(rid)
+            except BaseException:
+                marked = False
+                logger.warning(
+                    "Mooncake overlap completion tracking failed for rid=%s",
+                    rid,
+                    exc_info=True,
+                )
+        if not self._sync_prefetch_decision(marked):
+            cancel = getattr(self.cache_linker, "cancel_prefetched_load", None)
+            if cancel is not None:
+                cancel(rid)
+            else:
+                self.cache_linker.abort_prepared_load(rid)
+            self._abort_component_transfers(req, component_transfers, prefix_len)
+            self.release_request(rid)
+            return False
+
+        prefetched_loads[rid] = _PrefetchedExternalLoad(
+            req=req,
+            hit=hit,
+            component_transfers=component_transfers,
+            prefix_len=prefix_len,
+        )
+        return True
+
     def _prepare_load_session(self, req: Req, transfers: list[PoolTransfer]) -> int:
         """Prepare and synchronize a backend read session across cache ranks."""
         time_stats = getattr(req, "time_stats", None)
@@ -647,34 +817,97 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> device, then insert ----
 
+    def _discard_prefetched_load(
+        self, req: Req, reservation: _PrefetchedExternalLoad
+    ) -> None:
+        """Wait/cancel a reservation, then return every allocated device slot."""
+        cancel = getattr(self.cache_linker, "cancel_prefetched_load", None)
+        if cancel is not None:
+            try:
+                cancel(req.rid)
+            except BaseException:
+                logger.warning(
+                    "Failed to cancel queued prefetched load for rid=%s",
+                    req.rid,
+                    exc_info=True,
+                )
+        waiter = getattr(self.cache_linker, "wait_prefetched_load", None)
+        if waiter is not None:
+            try:
+                waiter(req.rid)
+            except BaseException:
+                logger.warning(
+                    "Failed waiting for prefetched load cleanup for rid=%s",
+                    req.rid,
+                    exc_info=True,
+                )
+        self._abort_component_transfers(
+            req,
+            reservation.component_transfers,
+            reservation.prefix_len,
+        )
+        self.cache_linker.abort_prepared_load(req.rid)
+
+    def _reset_external_hit_state(self, req: Req) -> None:
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        req.storage_hit_length = 0
+        req.cached_tokens_storage_source = None
+        req.cached_tokens_by_source = {
+            "l1_device": int(getattr(req, "cached_tokens_device", 0)),
+            "l3_mooncake_memory": 0,
+            "l4_mooncake_dfs": 0,
+            "l4_mooncake_local_disk": 0,
+        }
+
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
+        prefetched_loads = getattr(self, "prefetched_loads", None)
+        reservation = (
+            prefetched_loads.pop(req.rid, None)
+            if prefetched_loads is not None
+            else None
+        )
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
+            if reservation is not None:
+                self._discard_prefetched_load(req, reservation)
             return empty_indices, req.last_node
+
+        if reservation is not None:
+            # Do not publish the request's prefix until the complete one-shot
+            # read (including CP broadcasts) has succeeded.  This also makes a
+            # stale/canceled reservation safe to roll back without exposing a
+            # partially populated radix node.
+            waiter = getattr(self.cache_linker, "wait_prefetched_load", None)
+            prefetched_ok = True if waiter is None else bool(waiter(req.rid))
+            if not self._sync_prefetch_decision(prefetched_ok):
+                self._discard_prefetched_load(req, reservation)
+                self._reset_external_hit_state(req)
+                return empty_indices, req.last_node
+            component_transfers = reservation.component_transfers
+        else:
+            component_transfers = []
 
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
-        # Build per-component linker transfers.
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
-            if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+        # Build per-component linker transfers unless the overlap window already
+        # reserved the final destinations.
+        if reservation is None:
+            for component in cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
                 )
-                getattr(self, "prefetched_source_codes", {}).pop(req.rid, None)
-                self.cache_linker.abort_prepared_load(req.rid)
-                return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
+                if transfer is None:
+                    self._abort_component_transfers(req, component_transfers, prefix_len)
+                    getattr(self, "prefetched_source_codes", {}).pop(req.rid, None)
+                    self.cache_linker.abort_prepared_load(req.rid)
+                    return empty_indices, req.last_node
+                component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
@@ -696,23 +929,8 @@ class UnifiedCacheLinkerWrapper:
         # or by the just-in-time fallback above.
         if source_code == 0:
             self.cache_linker.abort_prepared_load(req.rid)
-            self._update_load(
-                ExternalLinkerLoadPhase.ABORT,
-                req,
-                component_transfers,
-                prefix_len,
-            )
-            req.host_hit_length = 0
-            req.swa_host_hit_length = 0
-            req.mamba_host_hit_length = 0
-            req.storage_hit_length = 0
-            req.cached_tokens_storage_source = None
-            req.cached_tokens_by_source = {
-                "l1_device": int(getattr(req, "cached_tokens_device", 0)),
-                "l3_mooncake_memory": 0,
-                "l4_mooncake_dfs": 0,
-                "l4_mooncake_local_disk": 0,
-            }
+            self._abort_component_transfers(req, component_transfers, prefix_len)
+            self._reset_external_hit_state(req)
             logger.warning(
                 "External linker load is no longer restorable for rid=%s; "
                 "falling back to normal prefill.",
@@ -839,16 +1057,22 @@ class UnifiedCacheLinkerWrapper:
                 req.cached_tokens_by_source,
             )
 
-        if load_transfers:
+        if reservation is None and load_transfers:
             timing_setter = getattr(self.cache_linker, "set_request_time_stats", None)
             if timing_setter is not None and time_stats is not None:
                 timing_setter(req.rid, time_stats)
             if not self.cache_linker.load(req.rid, load_transfers):
                 self.cache_linker.abort_prepared_load(req.rid)
                 raise RuntimeError(f"Failed to queue the linker load for {req.rid=}.")
-        else:
+        elif reservation is None:
             # A concurrent insert may have adopted every prepared page.  No
             # transfer will consume the session in that case.
+            self.cache_linker.abort_prepared_load(req.rid)
+        else:
+            # The overlap worker already consumed the full reservation.  The
+            # COMMIT phase above only narrows the ownership to the ranges that
+            # this insert adopted; queuing ``load_transfers`` again would issue
+            # a second backend.get for the same request.
             self.cache_linker.abort_prepared_load(req.rid)
 
         node = cache.resolve_node_handle(insert_result.last_device_node)
@@ -1012,17 +1236,34 @@ class UnifiedCacheLinkerWrapper:
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
 
+    def start_prefetched_layer_wise_loading(self) -> int:
+        """Start overlap-prefetched loads without creating a model consumer."""
+        starter = getattr(
+            self.cache_linker, "start_prefetched_layer_wise_loading", None
+        )
+        if starter is not None:
+            return starter()
+        return self.cache_linker.start_layer_wise_loading()
+
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        for rid, reservation in list(getattr(self, "prefetched_loads", {}).items()):
+            self._discard_prefetched_load(reservation.req, reservation)
         self.cache_linker.reset()
         self.hit_markers.clear()
         getattr(self, "prefetched_source_codes", {}).clear()
+        getattr(self, "prefetched_loads", {}).clear()
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
         getattr(self, "prefetched_source_codes", {}).pop(rid, None)
+        reservation = getattr(self, "prefetched_loads", {}).pop(rid, None)
+        if reservation is not None:
+            # A reservation may already be running on the background reader.
+            # Wait for that reader before returning its final L1 destinations.
+            self._discard_prefetched_load(reservation.req, reservation)
         self.cache_linker.abort_prepared_load(rid)
 
     def close(self) -> None:

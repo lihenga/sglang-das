@@ -122,6 +122,12 @@ class LayerWiseLoadCounter:
             if not future.done():
                 future.set_exception(error)
 
+    def retire(self, index: int) -> None:
+        """Discard a producer that has no model consumer."""
+        self.futures.pop(index, None)
+        self.errors.pop(index, None)
+        self.active_indices.discard(index)
+
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
         futures = self.futures.get(index)
@@ -336,6 +342,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = {}
         self.pending_load_metrics: dict[str, tuple[int, dict[str, int], float]] = {}
         self.request_time_stats: dict[str, object] = {}
+        # Requests launched by the overlap prefetch window need a completion
+        # result before their reserved device slots can be published into the
+        # radix tree.  Keep this separate from the layer counter: formal loads
+        # consume the counter from the model forward, while prefetched loads
+        # are waited on by the request that adopts their reservation.
+        self.prefetched_load_events: dict[str, threading.Event] = {}
+        self.prefetched_load_results: dict[str, bool] = {}
+        self.prefetched_load_lock = threading.Lock()
+        self.speculative_load_counters: set[int] = set()
         self._cp_broadcast_buffer: torch.Tensor | None = None
         self.session_lock = threading.Lock()
         self.gc_frozen = False
@@ -712,6 +727,62 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         getattr(self, "request_time_stats", {}).pop(rid, None)
         self.abort_prepared_load(rid)
 
+    def mark_prefetched_load(self, rid: str) -> None:
+        """Track one overlap-prefetched load until its worker completes."""
+        lock = getattr(self, "prefetched_load_lock", None)
+        if lock is None:
+            self.prefetched_load_lock = lock = threading.Lock()
+        if not hasattr(self, "prefetched_load_events"):
+            self.prefetched_load_events = {}
+        if not hasattr(self, "prefetched_load_results"):
+            self.prefetched_load_results = {}
+        with lock:
+            self.prefetched_load_events[rid] = threading.Event()
+            self.prefetched_load_results.pop(rid, None)
+
+    def _finish_prefetched_load(self, rid: str, success: bool) -> None:
+        lock = getattr(self, "prefetched_load_lock", None)
+        if lock is None:
+            return
+        with lock:
+            event = self.prefetched_load_events.get(rid)
+            if event is None:
+                return
+            self.prefetched_load_results[rid] = bool(success)
+            event.set()
+
+    def wait_prefetched_load(self, rid: str) -> bool:
+        """Wait for an overlap-prefetched load and consume its result."""
+        lock = getattr(self, "prefetched_load_lock", None)
+        if lock is None:
+            return True
+        with lock:
+            event = self.prefetched_load_events.get(rid)
+        if event is None:
+            # Backends or direct unit-test doubles without the optional
+            # tracking hook already completed the load synchronously.
+            return True
+        event.wait()
+        with lock:
+            success = self.prefetched_load_results.pop(rid, False)
+            self.prefetched_load_events.pop(rid, None)
+        return success
+
+    def cancel_prefetched_load(self, rid: str) -> bool:
+        """Cancel a prefetched load that has not entered the worker yet.
+
+        Once ``start_layer_wise_loading`` has handed the request to the load
+        thread, callers must wait for completion before freeing its destination
+        slots.  Returning ``False`` in that case lets the wrapper do exactly
+        that instead of racing an in-flight backend.get.
+        """
+        pending = self.pending_loads.pop(rid, None)
+        if pending is None:
+            return False
+        self.cancel_queued_load(rid)
+        self._finish_prefetched_load(rid, False)
+        return True
+
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
             return
@@ -721,6 +792,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.gc_frozen = True
 
     def start_layer_wise_loading(self) -> int:
+        return self._start_layer_wise_loading(speculative=False)
+
+    def start_prefetched_layer_wise_loading(self) -> int:
+        """Start a speculative load whose layer counter has no model consumer."""
+        return self._start_layer_wise_loading(speculative=True)
+
+    def _start_layer_wise_loading(self, *, speculative: bool) -> int:
         if not self.pending_loads:
             return -1
         self.freeze_gc_once()
@@ -734,6 +812,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 time_stats.set_direct_load_start_time(started)
 
         counter_index = self.layer_done_counter.update_producer()
+        if speculative:
+            counters = getattr(self, "speculative_load_counters", None)
+            if counters is None:
+                counters = self.speculative_load_counters = set()
+            counters.add(counter_index)
         ready_event = device_module.Event()
         ready_event.record()
         self.load_queue.put((counter_index, list(pending.items()), ready_event))
@@ -856,11 +939,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
             for rid, _ in request_transfers:
+                self._finish_prefetched_load(rid, request_success.get(rid, False))
                 time_stats = getattr(self, "request_time_stats", {}).pop(rid, None)
                 if time_stats is not None:
                     time_stats.set_direct_load_finish_time()
                 self._finish_l4_metric("prefetch", rid, request_success.get(rid, False))
                 self.abort_prepared_load(rid)
+            if counter_index in getattr(self, "speculative_load_counters", set()):
+                self.speculative_load_counters.discard(counter_index)
+                self.layer_done_counter.retire(counter_index)
 
     def _uses_cp_page_wise_reader(self) -> bool:
         """Whether this linker uses the single-reader page-wise path."""
@@ -1395,6 +1482,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.get_nowait()
             except Empty:
                 break
+        lock = getattr(self, "prefetched_load_lock", None)
+        if lock is not None:
+            with lock:
+                self.prefetched_load_events.clear()
+                self.prefetched_load_results.clear()
+        getattr(self, "speculative_load_counters", set()).clear()
         self.layer_done_counter.reset()
 
     def close(self) -> None:
