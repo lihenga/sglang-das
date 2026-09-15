@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
-    _cp_page_owner_map,
     _stable_cp_owner,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -1666,7 +1665,28 @@ def test_cp_non_owner_noop_keeps_offload_completion_fifo(monkeypatch):
     linker.offload_thread.join(timeout=5)
 
 
-def test_cp_all_ranks_fetch_complete_request_into_local_buffers():
+def test_cp_batch_reader_identity_is_stable_and_batch_scoped():
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.attn_cp_size = 2
+    batch = [("rid-b", []), ("rid-a", [])]
+
+    identity = linker._cp_batch_identity(batch)
+    assert identity == "rid-a,rid-b"
+    assert linker._cp_batch_identity(list(reversed(batch))) == identity
+    assert linker._cp_batch_reader_rank(batch) == _stable_cp_owner(identity, 2)
+
+    other_batch = next(
+        [(candidate, [])]
+        for candidate in (f"other-rid-{index}" for index in range(100))
+        if linker._cp_batch_reader_rank([(candidate, [])])
+        != linker._cp_batch_reader_rank(batch)
+    )
+    assert linker._cp_batch_reader_rank(other_batch) != linker._cp_batch_reader_rank(
+        batch
+    )
+
+
+def test_cp_small_load_keeps_all_ranks_fetching_local_buffers():
     rank = 0
     owner_rid = next(
         candidate
@@ -1697,10 +1717,12 @@ def test_cp_all_ranks_fetch_complete_request_into_local_buffers():
     completed_layers = []
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.cp_single_lookup = True
+    linker.cp_page_wise_reader = True
     linker.attn_cp_rank = rank
     linker.attn_cp_size = 2
     linker.num_layers = 1
-    linker.enable_page_wise_load = False
+    linker.enable_page_wise_load = True
+    linker.page_wise_load_threshold = len(page_keys) + 1
     linker.pools = {PoolName.DEEPSEEK_V4_C4: pool}
     linker.storage = SimpleNamespace(
         store=_Store(),
@@ -1732,31 +1754,28 @@ def test_cp_all_ranks_fetch_complete_request_into_local_buffers():
             ],
         )
 
-    # The request owner controls metadata lookup only. Both the lookup owner and
-    # a non-owner issue the complete data read into their own local KV slots.
+    # Below the page-wise threshold, CP replication is intentionally bypassed:
+    # both ranks issue the original layer-wise range get.
     assert read_calls == [page_keys, page_keys]
     assert completed_layers == [0, 0]
 
 
-def test_cp_striped_page_reader_fetches_only_owned_pages(monkeypatch):
+def test_cp_page_reader_fetches_complete_batch_only_on_dynamic_reader(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
-    rank = 0
-    page_keys = [f"striped-page-{index}" for index in range(32)]
+    page_keys = [f"page-{index}" for index in range(4)]
     transfer = PoolTransfer(
         name=PoolName.DEEPSEEK_V4_C4,
         keys=page_keys,
         host_indices=torch.arange(len(page_keys)),
     )
-    page_owners = _cp_page_owner_map("rid", [transfer], 2)
-    owned_keys = [key for key in page_keys if page_owners[key] == rank]
-    assert owned_keys and len(owned_keys) < len(page_keys)
-    read_calls = []
-    gathered_batches = []
 
-    class _Store:
-        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
-            read_calls.append(list(keys))
-            return [sum(item) for item in sizes]
+    read_calls = [[], []]
+    broadcasts = [[], []]
+    component_keys = [
+        component_key
+        for page_key in page_keys
+        for component_key in (f"{page_key}-k", f"{page_key}-v")
+    ]
 
     pool = SimpleNamespace(
         prepare_locations=lambda indices: indices.tolist(),
@@ -1766,105 +1785,219 @@ def test_cp_striped_page_reader_fetches_only_owned_pages(monkeypatch):
             [[0] for _ in locations],
         ),
     )
-    completed_layers = []
-    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-    linker.cp_striped_page_reader = True
-    linker.page_wise_load_threshold = 1
-    linker.cp_control_group = object()
-    linker.attn_cp_rank = rank
-    linker.attn_cp_size = 2
-    linker.num_layers = 1
-    linker.pools = {PoolName.DEEPSEEK_V4_C4: pool}
-    linker.storage = SimpleNamespace(
-        store=_Store(),
-        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
-        _tag_keys=lambda keys: keys,
-    )
-    linker.layer_done_counter = SimpleNamespace(
-        complete=lambda counter, layer: completed_layers.append(layer),
-        fail=lambda counter, error: pytest.fail(str(error)),
-    )
-    linker.request_time_stats = {}
-    linker._finish_l4_metric = lambda *args: None
-    linker.abort_prepared_load = lambda rid: None
-    linker._allgather_cp_pages = lambda batches: gathered_batches.append(batches)
+    request_transfers = [("rid", [transfer])]
+    reader_rank = _stable_cp_owner("rid", 2)
 
-    linker.load_layer_wise(
-        0,
-        [
-            (
-                "rid",
-                [
-                    transfer
-                ],
+    for rank in range(2):
+        class _Store:
+            def batch_get_into_multi_buffer_ranges(
+                self, keys, ptrs, sizes, offsets
+            ):
+                read_calls[rank].append(list(keys))
+                return [sum(item) for item in sizes]
+
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.cp_page_wise_reader = True
+        linker.cp_control_group = object()
+        linker.attn_cp_rank = rank
+        linker.attn_cp_size = 2
+        linker.num_layers = 2
+        linker.enable_page_wise_load = True
+        linker.page_wise_load_threshold = 1
+        linker.page_wise_load_batch_size = 16
+        linker.pools = {PoolName.DEEPSEEK_V4_C4: pool}
+        linker.storage = SimpleNamespace(
+            store=_Store(),
+            _get_hybrid_page_component_keys=lambda keys, transfer: (
+                component_keys,
+                2,
+            ),
+            _tag_keys=lambda keys: keys,
+        )
+        linker.layer_done_counter = SimpleNamespace(
+            complete=lambda counter, layer: pytest.fail(
+                "fused page-wise load should complete through _complete_cp_layer"
+            ),
+            fail=lambda counter, error: pytest.fail(str(error)),
+        )
+        linker.request_time_stats = {}
+        linker._finish_l4_metric = lambda *args: None
+        linker.abort_prepared_load = lambda rid: None
+        linker._complete_cp_layer = lambda counter, layer: None
+        linker._broadcast_cp_layer = (
+            lambda batches, layer, source, rank=rank: broadcasts[rank].append(
+                (layer, source, list(batches[PoolName.DEEPSEEK_V4_C4][0]))
             )
-        ],
-    )
+        )
 
-    assert read_calls == [owned_keys]
-    assert completed_layers == [0]
-    assert len(gathered_batches) == 1
-    _, locations, owners = gathered_batches[0][PoolName.DEEPSEEK_V4_C4]
-    assert locations == list(range(len(page_keys)))
-    assert owners == [page_owners[key] for key in page_keys]
+        linker.load_layer_wise(0, request_transfers)
+
+    assert read_calls[reader_rank] == [component_keys]
+    assert read_calls[1 - reader_rank] == []
+    for rank in range(2):
+        assert broadcasts[rank] == [
+            (0, reader_rank, page_keys),
+            (1, reader_rank, page_keys),
+        ]
 
 
-def test_cp_striped_page_reader_fuses_layer_into_one_allgather(monkeypatch):
-    class _Event:
-        def record(self):
-            pass
+def test_cp_page_reader_fuses_layer_broadcast_and_restores_peer(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
 
-        def synchronize(self):
-            pass
+    source_buffer = torch.tensor([[10], [20], [30], [40]], dtype=torch.int32)
+    peer_buffer = torch.zeros_like(source_buffer)
 
-    monkeypatch.setattr(mooncake_direct_linker.device_module, "Event", _Event)
+    def make_pool(buffer):
+        return DevicePoolEntry(
+            name=PoolName.DEEPSEEK_V4_C4,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[buffer]],
+            layer_mapping={0: 0},
+            page_size=1,
+            rows_are_pages=True,
+        )
 
-    buffer = torch.tensor([[10], [0], [30], [0]], dtype=torch.int32)
-    pool = DevicePoolEntry(
-        name=PoolName.DEEPSEEK_V4_C4,
-        indices_from_pool=PoolName.KV,
-        device_pool=None,
-        components=[[buffer]],
-        layer_mapping={0: 0},
-        page_size=1,
-        rows_are_pages=True,
-    )
+    batches = {
+        PoolName.DEEPSEEK_V4_C4: (
+            ["page-0", "page-1", "page-2", "page-3"],
+            [0, 1, 2, 3],
+        )
+    }
+    calls = []
+    shared_payload = {}
+
+    class _CPGroup:
+        def __init__(self, rank):
+            self.rank = rank
+
+        def broadcast(self, tensor, src):
+            calls.append((self.rank, src, tensor.numel()))
+            if self.rank == src:
+                shared_payload["bytes"] = tensor.clone()
+            else:
+                tensor.copy_(shared_payload["bytes"])
+
+    def make_linker(rank, buffer):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.attn_cp_rank = rank
+        linker.attn_cp_size = 2
+        linker.cp_control_group = object()
+        linker.cp_cache_group = _CPGroup(rank)
+        linker.pools = {PoolName.DEEPSEEK_V4_C4: make_pool(buffer)}
+        linker._cp_broadcast_buffer = None
+        return linker
+
+    make_linker(0, source_buffer)._broadcast_cp_layer(batches, 0, 0)
+    make_linker(1, peer_buffer)._broadcast_cp_layer(batches, 0, 0)
+
+    expected_call = (0, 0, source_buffer.numel() * source_buffer.element_size())
+    assert calls == [expected_call, (1, 0, expected_call[2])]
+    assert peer_buffer.tolist() == source_buffer.tolist()
+
+
+def test_cp_page_reader_pack_failure_stops_before_device_broadcast(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     calls = []
 
     class _CPGroup:
-        def all_gather_into_tensor(self, output, input_):
-            calls.append(input_.clone())
-            width = input_.numel()
-            output[:width].copy_(input_)
-            peer = (
-                torch.tensor([20, 40], dtype=torch.int32)
-                .view(torch.uint8)
-                .reshape(-1)
-            )
-            output[width : 2 * width].copy_(peer)
+        def broadcast(self, tensor, src):
+            calls.append((tensor, src))
 
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.attn_cp_rank = 0
     linker.attn_cp_size = 2
-    linker.num_layers = 1
+    linker.cp_control_group = object()
     linker.cp_cache_group = _CPGroup()
-    linker.pools = {PoolName.DEEPSEEK_V4_C4: pool}
-    linker._cp_exchange_send = None
-    linker._cp_exchange_recv = None
-
-    linker._allgather_cp_pages(
-        {
-            PoolName.DEEPSEEK_V4_C4: (
-                ["page-0", "page-1", "page-2", "page-3"],
-                [0, 1, 2, 3],
-                [0, 1, 0, 1],
-            )
-        }
+    linker._cp_layer_plan = lambda batches, layer: (_ for _ in ()).throw(
+        ValueError("pack failed")
     )
 
-    assert len(calls) == 1
-    assert calls[0].view(torch.int32).tolist() == [10, 30]
-    assert buffer.flatten().tolist() == [10, 20, 30, 40]
+    with pytest.raises(RuntimeError, match="plan/pack"):
+        linker._broadcast_cp_layer({}, 0, 0)
+    assert calls == []
+
+
+def test_cp_page_reader_scatter_failure_is_published_after_broadcast(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    calls = []
+
+    class _BadBuffer:
+        device = torch.device("cpu")
+        dtype = torch.int32
+        shape = (1, 1)
+
+        def index_copy_(self, *args):
+            raise ValueError("scatter failed")
+
+    class _CPGroup:
+        def broadcast(self, tensor, src):
+            calls.append(src)
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.attn_cp_rank = 1
+    linker.attn_cp_size = 2
+    linker.cp_control_group = object()
+    linker.cp_cache_group = _CPGroup()
+    linker._cp_layer_plan = lambda batches, layer: (
+        [(_BadBuffer(), torch.tensor([0]), 0, 4)],
+        4,
+        torch.device("cpu"),
+    )
+    linker._cp_payload_view = lambda *args: torch.zeros((1, 1), dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="scatter"):
+        linker._broadcast_cp_layer({}, 0, 0)
+    assert calls == [0]
+
+
+def test_cp_page_reader_event_failure_blocks_next_layer_broadcast(monkeypatch):
+    consensus = []
+
+    def record_consensus(tensor, *args, **kwargs):
+        consensus.append(int(tensor.item()))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", record_consensus)
+    page_keys = ["page-0"]
+    transfer = PoolTransfer(
+        name=PoolName.DEEPSEEK_V4_C4,
+        keys=page_keys,
+        host_indices=torch.tensor([0]),
+    )
+    pool = SimpleNamespace(prepare_locations=lambda indices: [0])
+    broadcasts = []
+    failures = []
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.cp_page_wise_reader = True
+    linker.cp_control_group = object()
+    linker.attn_cp_rank = _stable_cp_owner("rid", 2)
+    linker.attn_cp_size = 2
+    linker.num_layers = 2
+    linker.enable_page_wise_load = True
+    linker.page_wise_load_threshold = 1
+    linker.pools = {PoolName.DEEPSEEK_V4_C4: pool}
+    linker.storage = SimpleNamespace(
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.layer_done_counter = SimpleNamespace(
+        fail=lambda counter, error: failures.append(error),
+        complete=lambda counter, layer: pytest.fail("unexpected completion"),
+    )
+    linker.request_time_stats = {}
+    linker._finish_l4_metric = lambda *args: None
+    linker.abort_prepared_load = lambda rid: None
+    linker._load_page_wise = lambda *args, **kwargs: {"rid": True}
+    linker._broadcast_cp_layer = lambda batches, layer, source: broadcasts.append(layer)
+    linker._complete_cp_layer = lambda counter, layer: (_ for _ in ()).throw(
+        RuntimeError("event failed")
+    )
+
+    linker.load_layer_wise(0, [("rid", [transfer])])
+
+    assert broadcasts == [0]
+    assert consensus == [0, 1]
+    assert failures and "completion" in str(failures[0])
 
 
 def test_cp_non_lookup_owner_prepares_local_read_session():
