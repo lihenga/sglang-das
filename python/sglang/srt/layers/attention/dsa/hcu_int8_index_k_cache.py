@@ -9,7 +9,9 @@ one reusable BF16 workspace.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -24,6 +26,22 @@ INDEX_K_HEAD_DIM = 128
 INDEX_K_SCALE_BYTES = 4
 INDEX_K_BYTES_PER_TOKEN = INDEX_K_HEAD_DIM + INDEX_K_SCALE_BYTES
 INDEX_K_EPSILON = 1e-6
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_lightop_index_k_dequant():
+    # Resolve once; older LightOp wheels may not export this native operator.
+    # Do not catch execution errors: a failed HIP launch must reach the caller.
+    try:
+        from lightop.op import dequantize_index_k_int8_paged
+    except ImportError:
+        logger.warning(
+            "LightOp INT8 index-K dequant is unavailable; using the Triton backend."
+        )
+        return None
+    return dequantize_index_k_int8_paged
 
 
 class IndexKCacheMode(str, Enum):
@@ -254,7 +272,9 @@ def quantize_and_store_index_k_int8(
     )
 
 
-@triton.jit
+# The page-table allocation width changes with the request length. Keep it a
+# runtime value, including alignment/value specialization, to bound JIT modules.
+@triton.jit(do_not_specialize=["block_table_stride_0"])
 def _dequantize_index_k_int8_paged_kernel(
     int8_k_ptr,
     scale_ptr,
@@ -262,7 +282,7 @@ def _dequantize_index_k_int8_paged_kernel(
     context_lens_ptr,
     workspace_ptr,
     page_claims_ptr,
-    block_table_stride_0: tl.constexpr,
+    block_table_stride_0,
     k_page_stride_0: tl.constexpr,
     scale_page_stride_0: tl.constexpr,
     workspace_page_stride_0: tl.constexpr,
@@ -376,6 +396,12 @@ def dequantize_index_k_int8_paged(
         return workspace
 
     if packed_cache.is_cuda:
+        if is_hcu() and envs.SGLANG_DSA_HCU_LIGHTOP_INT8_INDEX_K_DEQUANT.get():
+            lightop_dequant = _get_lightop_index_k_dequant()
+            if lightop_dequant is not None:
+                return lightop_dequant(
+                    packed_cache, block_tables, context_lens, workspace, page_claims
+                )
         _dequantize_index_k_int8_paged_kernel[
             (block_tables.shape[0], block_tables.shape[1])
         ](
