@@ -455,6 +455,8 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Opt in to page membership tables for KV page reclamation.
+    SGLANG_KV_FREE_PAGE_TABLE = EnvBool(False)
     # Use the LightOp kernel for paged KV-cache extend allocation.
     SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
