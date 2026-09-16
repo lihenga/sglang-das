@@ -221,6 +221,7 @@ def test_layersplit_disables_cp_single_writer_and_isolates_namespace(monkeypatch
     group = SimpleNamespace(
         entry_map={PoolName.DEEPSEEK_V4_C4: pool},
         num_layers=1,
+        rank_replicated=True,
         storage_layout_tag="dsv4ls_v1_cp2_layout",
         sources={PoolName.DEEPSEEK_V4_C4: PoolName.KV},
     )
@@ -267,7 +268,7 @@ def test_layersplit_disables_cp_single_writer_and_isolates_namespace(monkeypatch
 
     assert not linker.cp_single_writer
     assert not linker.cp_single_lookup
-    assert storage.mla_suffix == "dsv4ls_v1_cp2_layout_tp0_cp1_pp0"
+    assert storage.mla_suffix == "dsv4ls_v1_cp2_layout_cp1_pp0"
     assert storage.mha_suffix == storage.mla_suffix
 
 
@@ -286,6 +287,7 @@ def test_regular_dsv4_keeps_cp_single_writer_namespace(monkeypatch):
     group = SimpleNamespace(
         entry_map={PoolName.DEEPSEEK_V4_C4: pool},
         num_layers=1,
+        rank_replicated=False,
         storage_layout_tag="",
         sources={PoolName.DEEPSEEK_V4_C4: PoolName.KV},
     )
@@ -333,6 +335,35 @@ def test_regular_dsv4_keeps_cp_single_writer_namespace(monkeypatch):
     assert linker.cp_single_writer
     assert linker.cp_single_lookup
     assert storage.mla_suffix == "tp0_cp0_pp0"
+
+
+def test_rank_replicated_tp_non_owner_noop_completes_successfully(monkeypatch):
+    monkeypatch.setattr(mooncake_direct_linker, "freeze_gc", lambda _: None)
+
+    pool = SimpleNamespace(
+        name=PoolName.DEEPSEEK_V4_C4,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.page_size = 1
+    linker.pool_group = DevicePoolGroup(
+        [pool], num_layers=1, page_size=1, rank_replicated=True
+    )
+    linker.storage = SimpleNamespace()
+    linker.gc_frozen = False
+    linker.offload_owner = False
+    linker.offload_results = Queue()
+
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page"],
+        device_indices=torch.tensor([0]),
+    )
+
+    assert linker.offload([transfer])
+    assert linker.num_completed_offloads() == 1
+    assert linker.pop_completed_offload() is True
 
 
 class _Allocator:
