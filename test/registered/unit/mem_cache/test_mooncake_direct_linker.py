@@ -271,6 +271,70 @@ def test_layersplit_disables_cp_single_writer_and_isolates_namespace(monkeypatch
     assert storage.mha_suffix == storage.mla_suffix
 
 
+def test_regular_dsv4_keeps_cp_single_writer_namespace(monkeypatch):
+    class _NoopThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    pool = SimpleNamespace(
+        name=PoolName.DEEPSEEK_V4_C4,
+        get_hybrid_pool_buffer=lambda: [],
+    )
+    group = SimpleNamespace(
+        entry_map={PoolName.DEEPSEEK_V4_C4: pool},
+        num_layers=1,
+        storage_layout_tag="",
+        sources={PoolName.DEEPSEEK_V4_C4: PoolName.KV},
+    )
+    monkeypatch.setattr(
+        mooncake_direct_linker,
+        "resolve_hybrid_device_pool_group",
+        lambda **_kwargs: group,
+    )
+    monkeypatch.setattr(mooncake_direct_linker.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+
+    server_args = SimpleNamespace(
+        mooncake_page_wise_load_threshold=1,
+        mooncake_page_wise_load_batch_size=1,
+        mooncake_enable_page_wise_load=False,
+        hicache_storage_backend_extra_config=None,
+        tp_size=1,
+        model_path="test-model",
+        enable_dp_attention=False,
+        extra_metric_labels={},
+    )
+    params = SimpleNamespace(
+        page_size=1,
+        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: object()),
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=1,
+        attn_cp_size=2,
+        tp_cache_group=None,
+        attn_cp_cache_group=object(),
+        attn_tp_cache_group=None,
+        enable_metrics=False,
+        dp_rank=0,
+        req_to_token_pool=SimpleNamespace(),
+    )
+    storage = SimpleNamespace(store=SimpleNamespace(register_buffer=lambda *_: 0))
+
+    linker = MooncakeDirectLinker(
+        server_args,
+        params,
+        components=None,
+        storage=storage,
+    )
+
+    assert linker.cp_single_writer
+    assert linker.cp_single_lookup
+    assert storage.mla_suffix == "tp0_cp0_pp0"
+
+
 class _Allocator:
     def __init__(self, slots=None):
         self.slots = slots
