@@ -414,7 +414,12 @@ def _build_dsa_device_pool_group(
             rows_are_pages=True,
         ),
     ]
-    return DevicePoolGroup(entries, num_layers, page_size)
+    return DevicePoolGroup(
+        entries,
+        num_layers,
+        page_size,
+        rank_replicated=True,
+    )
 
 
 def build_kv_host_pool(
