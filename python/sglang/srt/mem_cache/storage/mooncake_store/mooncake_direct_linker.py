@@ -292,6 +292,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES requires "
                 "SGLANG_MOONCAKE_READ_PLAN=1"
             )
+        if self.read_plan_reuse_ranges and self.enable_page_wise_load:
+            raise ValueError(
+                "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES is incompatible with "
+                "page-wise Mooncake loads"
+            )
         if self.read_plan_enabled:
             if not callable(getattr(self.storage.store, "create_read_plan", None)):
                 raise RuntimeError(
@@ -791,11 +796,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             layouts,
             self.num_layers,
             reuse_ranges=self.read_plan_reuse_ranges,
+            page_wise=self.enable_page_wise_load,
             buffer_owners=self.pools,
         )
         self.layer_done_counter.bind(counter_index, plan)
         # run() and wait() release the GIL. Each layer becomes visible only after
         # every pool's bytes have been checked; the last wait includes cleanup.
+        # In page-wise mode a single batch_get carries all groups per key, so the
+        # first wait(0) blocks until every page is complete and later waits are
+        # no-ops, matching _load_page_wise's all-or-nothing release.
         plan.run()
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
