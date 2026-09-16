@@ -2274,7 +2274,10 @@ def test_layersplit_storage_tag_is_stable_and_capacity_independent():
     assert tag != _make_layersplit_dsv4_group(0, draft_layers=1).storage_layout_tag
 
 
-def test_layersplit_round_trip_preserves_owned_and_draft_bytes():
+@pytest.mark.parametrize("enable_page_wise_load", [False, True])
+def test_layersplit_round_trip_preserves_owned_and_draft_bytes(
+    enable_page_wise_load,
+):
     for rank in (0, 1):
         group = _make_layersplit_dsv4_group(rank)
         transfers = group.resolve_transfers(
@@ -2330,7 +2333,9 @@ def test_layersplit_round_trip_preserves_owned_and_draft_bytes():
         linker.storage = storage
         linker.pools = group.entry_map
         linker.num_layers = group.num_layers
-        linker.enable_page_wise_load = False
+        linker.enable_page_wise_load = enable_page_wise_load
+        linker.page_wise_load_threshold = 1
+        linker.page_wise_load_batch_size = 1
         linker.layer_done_counter = mooncake_direct_linker.LayerWiseLoadCounter(
             group.num_layers
         )
