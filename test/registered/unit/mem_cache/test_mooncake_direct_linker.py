@@ -2266,6 +2266,89 @@ def test_layersplit_maps_owned_sparse_families_and_replicates_draft():
     assert offsets == [[9]]
 
 
+@pytest.mark.parametrize(
+    ("rank", "expected_mapping"),
+    [
+        (0, {0: (0, 3), 1: (1, 4)}),
+        (1, {0: (3,), 1: (4,)}),
+    ],
+)
+def test_layersplit_read_plan_expands_packed_draft_layer_mapping(
+    rank, expected_mapping
+):
+    group = _make_layersplit_dsv4_group(rank)
+    pool = group.entry_map[PoolName.SWA]
+    assert {
+        layer: pool.layer_mapping[layer] for layer in expected_mapping
+    } == expected_mapping
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.storage = SimpleNamespace(
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.pools = group.entry_map
+    linker.num_layers = group.num_layers
+    transfer = PoolTransfer(
+        name=PoolName.SWA,
+        keys=["page"],
+        host_indices=torch.tensor([2, 3]),
+    )
+
+    layouts = linker._prepare_read_plan_layouts([("rid", [transfer])])
+    keys, locations, packed, layer_layout = layouts[0]
+
+    assert keys == ["page"]
+    assert locations == [1]
+    assert packed
+    for layer, mapping in expected_mapping.items():
+        assert layer_layout[layer] == [
+            (
+                *pool.buffer_meta[0][buffer_index],
+                pool._component_offsets[0][buffer_index],
+            )
+            for buffer_index in mapping
+        ]
+
+
+def test_load_with_read_plan_passes_page_wise_flag():
+    group = _make_layersplit_dsv4_group(1)
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    calls = []
+
+    class _Plan:
+        def run(self):
+            calls.append("run")
+
+    def create_read_plan(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _Plan()
+
+    linker.storage = SimpleNamespace(
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        _tag_keys=lambda keys: keys,
+        store=SimpleNamespace(create_read_plan=create_read_plan),
+    )
+    linker.pools = group.entry_map
+    linker.num_layers = group.num_layers
+    linker.read_plan_reuse_ranges = False
+    linker.enable_page_wise_load = True
+    linker.layer_done_counter = SimpleNamespace(
+        bind=lambda index, plan: calls.append("bind")
+    )
+    transfer = PoolTransfer(
+        name=PoolName.SWA,
+        keys=["page"],
+        host_indices=torch.tensor([2, 3]),
+    )
+
+    linker.load_with_read_plan(7, [("rid", [transfer])])
+
+    _, kwargs = calls[0]
+    assert kwargs["page_wise"] is True
+    assert calls[1:] == ["bind", "run"]
+
+
 def test_layersplit_storage_tag_is_stable_and_capacity_independent():
     tag = _make_layersplit_dsv4_group(0).storage_layout_tag
     assert tag.startswith("dsv4ls_v1_cp2_")
