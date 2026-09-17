@@ -156,6 +156,74 @@ class LayerWiseLoadCounter:
         self.errors.clear()
         self.active_indices.clear()
 
+class ReadPlanLoadCounter:
+    """Publish one Mooncake ReadPlan; wait for each layer without holding the GIL."""
+
+    def __init__(self, num_layers: int, sync_groups=()):
+        self.num_layers = num_layers
+        self.sync_groups = tuple(group for group in sync_groups if group is not None)
+        self.producer_index = self.consumer_index = -1
+        self.plans: dict[int, Future] = {}
+        self.errors: dict[int, BaseException] = {}
+        self.active_indices: set[int] = set()
+
+    def update_producer(self) -> int:
+        self.producer_index += 1
+        self.plans[self.producer_index] = Future()
+        self.active_indices.add(self.producer_index)
+        return self.producer_index
+
+    def set_consumer(self, index: int) -> None:
+        self.consumer_index = index
+
+    def bind(self, index: int, plan) -> None:
+        self.plans[index].set_result(plan)
+
+    def fail(self, index: int, error: BaseException) -> None:
+        future = self.plans.get(index)
+        if future is not None and not future.done():
+            future.set_exception(error)
+
+    def wait_until(self, threshold: int) -> None:
+        index = self.consumer_index
+        future = self.plans.get(index)
+        if future is None:
+            return
+        try:
+            future.result().wait(threshold)
+        except BaseException as error:
+            # Finish the model forward before reporting the error. Raising here
+            # can leave peer TP ranks blocked in a later model collective.
+            self.errors[index] = error
+        finally:
+            if threshold == self.num_layers - 1:
+                self.plans.pop(index, None)
+
+    def raise_if_failed(self) -> None:
+        index = self.consumer_index
+        if index not in self.active_indices:
+            return
+        error = self.errors.get(index)
+        failed = torch.tensor(int(error is not None), dtype=torch.int, device="cpu")
+        for group in self.sync_groups:
+            if torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(
+                    failed, op=torch.distributed.ReduceOp.MAX, group=group
+                )
+        if failed.item():
+            self.active_indices.discard(index)
+            self.errors.pop(index, None)
+            message = "Mooncake layer-wise KV load failed for the current batch."
+            if error is None:
+                message += " A peer cache rank reported the failure."
+            raise ExternalLinkerLoadError(message) from error
+        self.active_indices.discard(index)
+
+    def reset(self) -> None:
+        self.producer_index = self.consumer_index = -1
+        self.plans.clear()
+        self.errors.clear()
+        self.active_indices.clear()
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
     def __init__(
@@ -273,6 +341,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         self.storage.mla_suffix = rank_suffix
         self.storage.mha_suffix = rank_suffix
+        self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
+        self.read_plan_reuse_ranges = (
+            os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
+        )
+        if self.read_plan_reuse_ranges and not self.read_plan_enabled:
+            raise ValueError(
+                "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES requires "
+                "SGLANG_MOONCAKE_READ_PLAN=1"
+            )
+        if self.read_plan_reuse_ranges and self.enable_page_wise_load:
+            raise ValueError(
+                "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES is incompatible with "
+                "page-wise Mooncake loads"
+            )
+        if self.read_plan_enabled:
+            if not callable(getattr(self.storage.store, "create_read_plan", None)):
+                raise RuntimeError(
+                    "Mooncake ReadPlan requires a package with create_read_plan. "
+                    "Install the ReadPlan-enabled Mooncake package."
+                )
+            logger.info(
+                "Mooncake ReadPlan enabled; address reuse=%s",
+                self.read_plan_reuse_ranges,
+            )
         if self.cp_single_writer:
             logger.info(
                 "Mooncake CP node-owner writer/request-owner lookup enabled: "
@@ -302,15 +394,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage_metrics_collector = collector_cls(labels=labels)
 
         self.register_buffers()
-        self.layer_done_counter = LayerWiseLoadCounter(
-            self.num_layers,
-            sync_groups=(
-                (params.attn_cp_cache_group, params.attn_tp_cache_group)
-                if params.attn_cp_cache_group is not None
-                or params.attn_tp_cache_group is not None
-                else (params.tp_cache_group,)
-            ),
-        )
+        if self.read_plan_enabled:
+            self.layer_done_counter = ReadPlanLoadCounter(
+                self.num_layers,
+                sync_groups=(
+                    (params.attn_cp_cache_group, params.attn_tp_cache_group)
+                    if params.attn_cp_cache_group is not None
+                    or params.attn_tp_cache_group is not None
+                    else (params.tp_cache_group,)
+                ),
+            )
+        else:      
+            self.layer_done_counter = LayerWiseLoadCounter(
+                self.num_layers,
+                sync_groups=(
+                    (params.attn_cp_cache_group, params.attn_tp_cache_group)
+                    if params.attn_cp_cache_group is not None
+                    or params.attn_tp_cache_group is not None
+                    else (params.tp_cache_group,)
+                ),
+            )
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
@@ -752,6 +855,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     ) -> None:
         request_success = {rid: False for rid, _ in request_transfers}
         try:
+            if getattr(self, "read_plan_enabled", False):
+                self.load_with_read_plan(counter_index, request_transfers)
+                return
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             batch_rids: dict[PoolName, list[str]] = {}
             for rid, transfers in request_transfers:
@@ -1073,6 +1179,65 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             f"Mooncake range get failed for pool={name}, {location}, "
             f"failed_objects={len(failed_objects)}."
         )
+
+    def _prepare_read_plan_layouts(
+        self, request_transfers: list[tuple[str, list[PoolTransfer]]]
+    ):
+        # Consolidate index copies once per pool, preserving request/key order.
+        # Each component describes (base, row stride, byte count, source offset).
+        # Locations may be non-contiguous; Mooncake expands addresses in C++.
+        batches = {}
+        for _rid, transfers in request_transfers:
+            for transfer in transfers:
+                keys, indices = batches.setdefault(transfer.name, ([], []))
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                keys.extend(self.storage._tag_keys(component_keys))
+                indices.append(transfer.host_indices)
+
+        layouts = []
+        for name, (keys, indices) in batches.items():
+            pool = self.pools[name]
+            joined = indices[0] if len(indices) == 1 else torch.cat(indices)
+            locations = pool.prepare_locations(joined)
+            layout = []
+            for layer in range(self.num_layers):
+                index = pool.layer_mapping.get(layer)
+                layout.append(
+                    []
+                    if index is None
+                    else [
+                        (*component[index], offsets[index])
+                        for component, offsets in zip(
+                            pool.buffer_meta, pool._component_offsets
+                        )
+                    ]
+                )
+            layouts.append((keys, locations, pool.packed, layout))
+
+        return layouts
+
+    def load_with_read_plan(
+        self,
+        counter_index: int,
+        request_transfers: list[tuple[str, list[PoolTransfer]]],
+    ) -> None:
+        layouts = self._prepare_read_plan_layouts(request_transfers)
+        plan = self.storage.store.create_read_plan(
+            layouts,
+            self.num_layers,
+            reuse_ranges=self.read_plan_reuse_ranges,
+            page_wise=self.enable_page_wise_load,
+            buffer_owners=self.pools,
+        )
+        self.layer_done_counter.bind(counter_index, plan)
+        # run() and wait() release the GIL. Each layer becomes visible only after
+        # every pool's bytes have been checked; the last wait includes cleanup.
+        # In page-wise mode a single batch_get carries all groups per key, so the
+        # first wait(0) blocks until every page is complete and later waits are
+        # no-ops, matching _load_page_wise's all-or-nothing release.
+        plan.run()
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
