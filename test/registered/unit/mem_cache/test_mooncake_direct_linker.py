@@ -2314,7 +2314,10 @@ def test_layersplit_round_trip_preserves_owned_and_draft_bytes(
                 expected.append((ptr, size, chunk))
                 ctypes.memset(ptr, 0, size)
 
+        calls = []
+
         def range_get(keys, pointers, sizes, offsets, objects=objects):
+            calls.append((list(keys), sizes, offsets))
             result = []
             for key, page_ptrs, page_sizes, page_offsets in zip(
                 keys, pointers, sizes, offsets
@@ -2333,6 +2336,7 @@ def test_layersplit_round_trip_preserves_owned_and_draft_bytes(
         linker.storage = storage
         linker.pools = group.entry_map
         linker.num_layers = group.num_layers
+        linker.layer_split_layout = True
         linker.enable_page_wise_load = enable_page_wise_load
         linker.page_wise_load_threshold = 1
         linker.page_wise_load_batch_size = 1
@@ -2344,12 +2348,133 @@ def test_layersplit_round_trip_preserves_owned_and_draft_bytes(
         linker.abort_prepared_load = lambda rid: None
         linker._finish_l4_metric = lambda *args: None
         index = linker.layer_done_counter.update_producer()
-        assert linker.load_layer_wise(index, [("rid", transfers)])
+        linker.load_layer_wise(index, [("rid", transfers)])
+        owned_layers = {
+            layer
+            for entry in group.entry_map.values()
+            for layer in entry.layer_mapping
+        }
+        expected_calls = 1 if enable_page_wise_load else len(owned_layers)
+        assert len(calls) == expected_calls
         assert all(
             future.done() for future in linker.layer_done_counter.futures[index]
         )
         for ptr, size, chunk in expected:
             assert ctypes.string_at(ptr, size) == chunk
+
+
+def test_layersplit_layer_wise_merges_pools_per_layer_without_early_completion():
+    calls = []
+    events = []
+    payloads = {
+        "page-kv": b"kv-layer-0",
+        "page-swa": b"swa-layer-0",
+        "page-kv-layer-1": b"kv-layer-1",
+    }
+    buffers = {}
+
+    def make_pool(name, layers):
+        pool_buffers = {
+            layer: torch.zeros(len(payloads[key]), dtype=torch.uint8)
+            for layer, key in layers.items()
+        }
+        buffers[name] = pool_buffers
+
+        def get_meta(locations, layer):
+            buffer = pool_buffers.get(layer)
+            if buffer is None:
+                return None
+            size = buffer.numel()
+            return (
+                [[buffer.data_ptr()] for _ in locations],
+                [[size] for _ in locations],
+                [[0] for _ in locations],
+            )
+
+        return SimpleNamespace(
+            prepare_locations=lambda indices: indices.tolist(),
+            get_prepared_layer_range_meta=get_meta,
+        )
+
+    pools = {
+        PoolName.KV: make_pool(
+            PoolName.KV,
+            {0: "page-kv", 1: "page-kv-layer-1"},
+        ),
+        PoolName.SWA: make_pool(PoolName.SWA, {0: "page-swa"}),
+    }
+
+    def range_get(keys, pointers, sizes, offsets):
+        calls.append((list(keys), sizes, offsets))
+        events.append(("get", list(keys)))
+        result = []
+        for key, page_ptrs, page_sizes, page_offsets in zip(
+            keys, pointers, sizes, offsets
+        ):
+            for ptr, size, offset in zip(page_ptrs, page_sizes, page_offsets):
+                chunk = payloads[key][offset : offset + size]
+                assert len(chunk) == size
+                ctypes.memmove(ptr, chunk, size)
+            result.append(sum(page_sizes))
+        return result
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.layer_split_layout = True
+    linker.num_layers = 2
+    linker.enable_page_wise_load = False
+    linker.page_wise_load_threshold = 100
+    linker.pools = pools
+    linker.storage = SimpleNamespace(
+        store=SimpleNamespace(batch_get_into_multi_buffer_ranges=range_get),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (
+            [f"{key}-{transfer.name.value}" for key in keys],
+            1,
+        ),
+        _tag_keys=lambda keys: keys,
+    )
+    linker.layer_done_counter = SimpleNamespace(
+        complete=lambda counter, layer: events.append(("complete", layer)),
+        fail=lambda counter, error: pytest.fail(str(error)),
+    )
+    linker.request_time_stats = {}
+    linker.pending_load_metrics = {}
+    linker.abort_prepared_load = lambda rid: None
+    linker._finish_l4_metric = lambda *args: None
+
+    linker.load_layer_wise(
+        0,
+        [
+            (
+                "rid",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=["page"],
+                        host_indices=torch.tensor([0]),
+                    ),
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        keys=["page"],
+                        host_indices=torch.tensor([0]),
+                    ),
+                ],
+            )
+        ],
+    )
+
+    assert [keys for keys, _, _ in calls] == [
+        ["page-kv", "page-swa"],
+        ["page-kv"],
+    ]
+    assert events == [
+        ("get", ["page-kv", "page-swa"]),
+        ("complete", 0),
+        ("get", ["page-kv"]),
+        ("complete", 1),
+    ]
+    assert bytes(buffers[PoolName.KV][0].tolist()) == payloads["page-kv"]
+    assert bytes(buffers[PoolName.SWA][0].tolist()) == payloads["page-swa"]
+    assert bytes(buffers[PoolName.KV][1].tolist()) == payloads["page-kv-layer-1"]
 
 
 def test_mamba_strategy_rejects_direct_linker():

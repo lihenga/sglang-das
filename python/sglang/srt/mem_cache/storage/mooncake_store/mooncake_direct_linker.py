@@ -819,6 +819,76 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         batches: dict[PoolName, tuple[list[str], list[int]]],
         batch_rids: dict[PoolName, list[str]],
     ) -> None:
+        # LayerSplit ranks own different layer/pool families.  Keep all ranges
+        # for one logical layer in a single Mooncake call so an owner reads its
+        # local namespace once, while still omitting pools that do not own this
+        # layer.  The regular path intentionally keeps its historical
+        # pool-by-pool calls (in particular for replicated CP and PP layouts).
+        if getattr(self, "layer_split_layout", False):
+            all_keys: list[str] = []
+            all_ptrs: list[list[int]] = []
+            all_sizes: list[list[int]] = []
+            all_offsets: list[list[int]] = []
+            all_rids: list[str | None] = []
+            all_pools: list[PoolName] = []
+
+            for name, (keys, locations) in batches.items():
+                if not keys:
+                    continue
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+                if meta is None:
+                    continue
+                ptrs, sizes, offsets = meta
+                if not (len(ptrs) == len(sizes) == len(offsets) == len(keys)):
+                    raise ValueError(
+                        f"Mooncake LayerSplit pool={name} layer={layer} produced "
+                        f"range lengths ptrs={len(ptrs)} sizes={len(sizes)} "
+                        f"offsets={len(offsets)} for {len(keys)} keys."
+                    )
+                rids = batch_rids.get(name, [None] * len(keys))
+                if len(rids) != len(keys):
+                    raise ValueError(
+                        f"Mooncake LayerSplit pool={name} layer={layer} has "
+                        f"{len(rids)} request ids for {len(keys)} keys."
+                    )
+                all_keys.extend(keys)
+                all_ptrs.extend(ptrs)
+                all_sizes.extend(sizes)
+                all_offsets.extend(offsets)
+                all_rids.extend(rids)
+                all_pools.extend([name] * len(keys))
+
+            if not all_keys:
+                return
+
+            pool_counts: dict[str, int] = {}
+            for name in all_pools:
+                pool_counts[str(name)] = pool_counts.get(str(name), 0) + 1
+            logger.debug(
+                "Mooncake LayerSplit range get start: counter=%d rids=%s "
+                "rids_size=%d pools=%s layer=%d objects=%d",
+                counter_index,
+                sorted({rid for rid in all_rids if rid is not None}),
+                len(all_rids),
+                pool_counts,
+                layer,
+                len(all_keys),
+            )
+            result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                all_keys, all_ptrs, all_sizes, all_offsets
+            )
+            self._validate_range_get_result(
+                result,
+                all_keys,
+                all_sizes,
+                request_transfers,
+                None,
+                layer,
+                rids=all_rids,
+                pools=all_pools,
+            )
+            return
+
         for name, (keys, locations) in batches.items():
             if not keys:
                 continue
@@ -841,7 +911,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 keys, ptrs, sizes, offsets
             )
             self._validate_range_get_result(
-                result, keys, sizes, request_transfers, name, layer
+                result,
+                keys,
+                sizes,
+                request_transfers,
+                name,
+                layer,
+                rids=rids,
+                pools=[name] * len(keys),
             )
 
     def _finish_l4_metric(self, operation: str, rid: str, success: bool) -> None:
@@ -1034,8 +1111,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         keys: list[str],
         sizes: list[list[int]],
         request_transfers: list[tuple[str, list[PoolTransfer]]],
-        name: PoolName,
+        name: PoolName | None,
         layer: int | None,
+        *,
+        rids: list[str | None] | None = None,
+        pools: list[PoolName | None] | None = None,
     ) -> None:
         expected = [sum(item) for item in sizes]
         transferred = (
@@ -1058,19 +1138,35 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             wanted = expected[index] if index < len(expected) else None
             if actual != wanted:
                 failed_objects.append(
-                    {"key": key, "transferred": actual, "expected": wanted}
+                    {
+                        "key": key,
+                        "rid": (
+                            rids[index]
+                            if rids is not None and index < len(rids)
+                            else None
+                        ),
+                        "pool": (
+                            pools[index]
+                            if pools is not None and index < len(pools)
+                            else name
+                        ),
+                        "layer": layer,
+                        "transferred": actual,
+                        "expected": wanted,
+                    }
                 )
         location = "complete_page" if layer is None else f"layer={layer}"
+        pool_label = name if name is not None else "aggregated"
         logger.error(
             "Mooncake lookup/session succeeded but range get failed: "
             "rids=%s pool=%s %s failed_objects=%s",
             [rid for rid, _ in request_transfers],
-            name,
+            pool_label,
             location,
             failed_objects,
         )
         raise RuntimeError(
-            f"Mooncake range get failed for pool={name}, {location}, "
+            f"Mooncake range get failed for pool={pool_label}, {location}, "
             f"failed_objects={len(failed_objects)}."
         )
 
