@@ -7,6 +7,7 @@ CUDA-graph capturable.
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -460,8 +461,16 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        disable_multimem = os.getenv(
+            "SGLANG_DISABLE_TRITON_SYMM_MEM_AG", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if disable_multimem and enabled:
+            logger.info(
+                "multimem all-gather disabled by "
+                "SGLANG_DISABLE_TRITON_SYMM_MEM_AG"
+            )
         # None => always NCCL; _UNINIT => build on first eager call.
-        self._state = self._UNINIT if enabled else None
+        self._state = self._UNINIT if enabled and not disable_multimem else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group

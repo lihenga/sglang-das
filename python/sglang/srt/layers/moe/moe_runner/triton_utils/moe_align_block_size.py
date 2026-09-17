@@ -48,12 +48,12 @@ if _is_cuda:
 _CUDA_SMALL_BATCH_MAX_BUCKETS = 64
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["numel"])
 def _hcu_moe_align_stage1(
     topk_ids_ptr,
     tokens_cnts_ptr,
     num_experts: tl.constexpr,
-    numel: tl.constexpr,
+    numel,
     tokens_per_thread: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -93,7 +93,7 @@ def _hcu_moe_align_stage3(
     tl.store(num_tokens_post_pad_ptr, last_cumsum)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["numel"])
 def _hcu_moe_align_stage4(
     topk_ids_ptr,
     sorted_ids_ptr,
@@ -102,7 +102,7 @@ def _hcu_moe_align_stage4(
     cumsum_ptr,
     num_experts: tl.constexpr,
     block_size: tl.constexpr,
-    numel: tl.constexpr,
+    numel,
     tokens_per_thread: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -113,12 +113,14 @@ def _hcu_moe_align_stage4(
 
     token_begin = pid * tokens_per_thread
     thread_counts = pid * num_experts
-    for i in range(token_begin, tl.minimum(token_begin + tokens_per_thread, numel)):
-        expert_id = tl.load(topk_ids_ptr + i)
-        token_cnt = tl.load(tokens_cnts_ptr + thread_counts + expert_id)
-        rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
-        tl.store(sorted_ids_ptr + rank_post_pad, i)
-        tl.store(tokens_cnts_ptr + thread_counts + expert_id, token_cnt + 1)
+    for offset in range(tokens_per_thread):
+        i = token_begin + offset
+        if i < numel:
+            expert_id = tl.load(topk_ids_ptr + i)
+            token_cnt = tl.load(tokens_cnts_ptr + thread_counts + expert_id)
+            rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
+            tl.store(sorted_ids_ptr + rank_post_pad, i)
+            tl.store(tokens_cnts_ptr + thread_counts + expert_id, token_cnt + 1)
 
 
 def _hcu_moe_align_block_size_triton(
@@ -131,7 +133,11 @@ def _hcu_moe_align_block_size_triton(
 ) -> None:
     """Portable HCU align which avoids LightOp's corrupt count/sort scratch."""
     numel = topk_ids.numel()
-    tokens_per_thread = triton.cdiv(numel, num_experts)
+    # Bucket the compile-time loop bound so changing batch sizes reuse a small,
+    # finite set of Triton specializations. The exact numel stays runtime-only.
+    tokens_per_thread = max(
+        1, triton.next_power_of_2(triton.cdiv(numel, num_experts))
+    )
     tokens_cnts = torch.zeros(
         (num_experts + 1, num_experts),
         dtype=torch.int32,
