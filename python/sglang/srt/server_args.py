@@ -2911,6 +2911,25 @@ class ServerArgs:
         "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
         NS("memory"),
     ] = False
+    mooncake_page_wise_load_threshold: A[
+        int,
+        "Minimum number of Mooncake direct-linker keys that switches loading "
+        "from the layer-wise flow to the complete-page flow.",
+        NS("memory"),
+    ] = 10
+    mooncake_page_wise_load_batch_size: A[
+        int,
+        "Maximum number of keys in one complete-page Mooncake direct-linker "
+        "read call.",
+        NS("memory"),
+    ] = 128
+    mooncake_enable_page_wise_load: A[
+        bool,
+        "Enable page-wise loading for Mooncake direct-linker. When enabled, "
+        "switches from layer-wise flow to complete-page flow based on key "
+        "count threshold.",
+        NS("memory"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
@@ -8926,6 +8945,12 @@ class ServerArgs:
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
+        if self.enable_unified_cache_external_linker and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
 
