@@ -50,6 +50,16 @@ _DEEPSEEK_V4_REPLICATED_POOLS = frozenset(
 )
 
 
+def _storage_suffix(
+    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+) -> str:
+    parts = []
+    if not rank_replicated:
+        parts.append(f"tp{tp_rank}")
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    return "_".join(parts)
+
+
 def _stable_cp_owner(identity: str, cp_size: int) -> int:
     """Map a stable request/node identity to exactly one CP rank."""
     if cp_size <= 0:
@@ -179,14 +189,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        self.rank_replicated = bool(getattr(self.pool_group, "rank_replicated", False))
+        self.layer_split_layout = bool(
+            getattr(self.pool_group, "storage_layout_tag", "")
+        )
 
         # DeepSeek-V4 materializes the global token order before populating the
         # direct-linker pools, so these objects are replicas across attention CP
         # ranks. Persist each radix node once, and query each request once.  KV
         # data is still read independently into every rank's local buffers: in
         # practice that is faster than one reader followed by CP replication.
-        self.cp_single_writer = params.attn_cp_size > 1 and bool(
-            set(self.pools) & _DEEPSEEK_V4_REPLICATED_POOLS
+        self.cp_single_writer = (
+            params.attn_cp_size > 1
+            and bool(set(self.pools) & _DEEPSEEK_V4_REPLICATED_POOLS)
+            and not self.layer_split_layout
         )
         self.cp_single_lookup = self.cp_single_writer
         self.attn_cp_rank = params.attn_cp_rank
@@ -198,20 +214,29 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     "Mooncake CP owner lookup requires an attention CP CPU group."
                 )
 
+        tp_group = getattr(params, "attn_tp_cache_group", None) or params.tp_cache_group
         tp_rank = 0
+        tp_size = server_args.tp_size
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+            tp_rank = torch.distributed.get_rank(group=tp_group)
+            tp_size = torch.distributed.get_world_size(group=tp_group)
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.tp_offload_owner = not self.rank_replicated or tp_rank == 0
+        # Keep the target commit's public/debug attribute for callers that
+        # inspect the direct linker topology.
+        self.offload_owner = self.tp_offload_owner
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
+            tp_size=tp_size,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
             attn_cp_rank=params.attn_cp_rank,
             attn_cp_size=params.attn_cp_size,
-            is_mla_model=True,
+            is_mla_model=self.rank_replicated,
             enable_storage_metrics=False,
             is_page_first_layout=False,
             model_name=server_args.model_path,
@@ -236,7 +261,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # compatibility with caches produced before CP rank was propagated into
         # CacheInitParams; ownership, not the object key, identifies the writer.
         key_cp_rank = 0 if self.cp_single_writer else params.attn_cp_rank
-        rank_suffix = f"tp{tp_rank}_cp{key_cp_rank}_pp{params.pp_rank}"
+        rank_suffix = _storage_suffix(
+            rank_replicated=self.rank_replicated,
+            tp_rank=tp_rank,
+            attn_cp_rank=key_cp_rank,
+            pp_rank=params.pp_rank,
+        )
+        if self.layer_split_layout:
+            rank_suffix = (
+                f"{getattr(self.pool_group, 'storage_layout_tag', '')}_{rank_suffix}"
+            )
         self.storage.mla_suffix = rank_suffix
         self.storage.mha_suffix = rank_suffix
         if self.cp_single_writer:
@@ -1045,6 +1079,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self.freeze_gc_once()
+        if not getattr(
+            self, "tp_offload_owner", getattr(self, "offload_owner", True)
+        ):
+            # Replicated attention-TP ranks share the owner's namespace. Keep
+            # one completion per queued node so the wrapper's FIFO remains
+            # aligned across ranks, but do not write the same objects twice.
+            self.offload_results.put(True)
+            return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         node_keys = list(kv.keys or ())
         if not node_keys:

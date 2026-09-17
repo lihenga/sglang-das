@@ -103,7 +103,7 @@ class DevicePoolEntry:
         indices_from_pool: PoolName,
         device_pool: Any,
         components: Sequence[Sequence[torch.Tensor]],
-        layer_mapping: dict[int, int],
+        layer_mapping: dict[int, int | Sequence[int]],
         page_size: int,
         rows_are_pages: bool,
         packed: bool = True,
@@ -204,14 +204,16 @@ class DevicePoolEntry:
         return self._rows(indices)
 
     def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
-        buffer_index = self.layer_mapping.get(layer)
-        if buffer_index is None:
+        mapped = self.layer_mapping.get(layer)
+        if mapped is None:
             return None
+        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
 
         items = []
         for component, offsets in zip(self.buffer_meta, self._component_offsets):
-            base_ptr, row_stride, size = component[buffer_index]
-            items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+            for buffer_index in buffer_indices:
+                base_ptr, row_stride, size = component[buffer_index]
+                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:
@@ -235,7 +237,13 @@ class DevicePoolGroup:
     """Physical device pools sharing one logical linker layer range."""
 
     def __init__(
-        self, entries: Sequence[DevicePoolEntry], num_layers: int, page_size: int
+        self,
+        entries: Sequence[DevicePoolEntry],
+        num_layers: int,
+        page_size: int,
+        *,
+        rank_replicated: bool = False,
+        storage_layout_tag: str = "",
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -244,6 +252,8 @@ class DevicePoolGroup:
         self.sources = {entry.name: entry.indices_from_pool for entry in self.entries}
         self.num_layers = num_layers
         self.page_size = page_size
+        self.rank_replicated = rank_replicated
+        self.storage_layout_tag = storage_layout_tag
         self.kv_buffer = None
 
     def resolve_transfers(

@@ -1,3 +1,4 @@
+import ctypes
 import threading
 from array import array
 from queue import Queue
@@ -203,6 +204,166 @@ def test_mooncake_direct_linker_storage_metrics_dp_rank(
     )
 
     assert captured_labels["dp_rank"] == expected_dp_rank
+
+
+def test_layersplit_disables_cp_single_writer_and_isolates_namespace(monkeypatch):
+    class _NoopThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    pool = SimpleNamespace(
+        name=PoolName.DEEPSEEK_V4_C4,
+        get_hybrid_pool_buffer=lambda: [],
+    )
+    group = SimpleNamespace(
+        entry_map={PoolName.DEEPSEEK_V4_C4: pool},
+        num_layers=1,
+        rank_replicated=True,
+        storage_layout_tag="dsv4ls_v1_cp2_layout",
+        sources={PoolName.DEEPSEEK_V4_C4: PoolName.KV},
+    )
+    monkeypatch.setattr(
+        mooncake_direct_linker,
+        "resolve_hybrid_device_pool_group",
+        lambda **_kwargs: group,
+    )
+    monkeypatch.setattr(mooncake_direct_linker.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+
+    server_args = SimpleNamespace(
+        mooncake_page_wise_load_threshold=1,
+        mooncake_page_wise_load_batch_size=1,
+        mooncake_enable_page_wise_load=False,
+        hicache_storage_backend_extra_config=None,
+        tp_size=1,
+        model_path="test-model",
+        enable_dp_attention=False,
+        extra_metric_labels={},
+    )
+    params = SimpleNamespace(
+        page_size=1,
+        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: object()),
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=1,
+        attn_cp_size=2,
+        tp_cache_group=None,
+        attn_cp_cache_group=None,
+        attn_tp_cache_group=None,
+        enable_metrics=False,
+        dp_rank=0,
+        req_to_token_pool=SimpleNamespace(),
+    )
+    storage = SimpleNamespace(store=SimpleNamespace(register_buffer=lambda *_: 0))
+
+    linker = MooncakeDirectLinker(
+        server_args,
+        params,
+        components=None,
+        storage=storage,
+    )
+
+    assert not linker.cp_single_writer
+    assert not linker.cp_single_lookup
+    assert storage.mla_suffix == "dsv4ls_v1_cp2_layout_cp1_pp0"
+    assert storage.mha_suffix == storage.mla_suffix
+
+
+def test_regular_dsv4_keeps_cp_single_writer_namespace(monkeypatch):
+    class _NoopThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    pool = SimpleNamespace(
+        name=PoolName.DEEPSEEK_V4_C4,
+        get_hybrid_pool_buffer=lambda: [],
+    )
+    group = SimpleNamespace(
+        entry_map={PoolName.DEEPSEEK_V4_C4: pool},
+        num_layers=1,
+        rank_replicated=False,
+        storage_layout_tag="",
+        sources={PoolName.DEEPSEEK_V4_C4: PoolName.KV},
+    )
+    monkeypatch.setattr(
+        mooncake_direct_linker,
+        "resolve_hybrid_device_pool_group",
+        lambda **_kwargs: group,
+    )
+    monkeypatch.setattr(mooncake_direct_linker.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+
+    server_args = SimpleNamespace(
+        mooncake_page_wise_load_threshold=1,
+        mooncake_page_wise_load_batch_size=1,
+        mooncake_enable_page_wise_load=False,
+        hicache_storage_backend_extra_config=None,
+        tp_size=1,
+        model_path="test-model",
+        enable_dp_attention=False,
+        extra_metric_labels={},
+    )
+    params = SimpleNamespace(
+        page_size=1,
+        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: object()),
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=1,
+        attn_cp_size=2,
+        tp_cache_group=None,
+        attn_cp_cache_group=object(),
+        attn_tp_cache_group=None,
+        enable_metrics=False,
+        dp_rank=0,
+        req_to_token_pool=SimpleNamespace(),
+    )
+    storage = SimpleNamespace(store=SimpleNamespace(register_buffer=lambda *_: 0))
+
+    linker = MooncakeDirectLinker(
+        server_args,
+        params,
+        components=None,
+        storage=storage,
+    )
+
+    assert linker.cp_single_writer
+    assert linker.cp_single_lookup
+    assert storage.mla_suffix == "tp0_cp0_pp0"
+
+
+def test_rank_replicated_tp_non_owner_noop_completes_successfully(monkeypatch):
+    monkeypatch.setattr(mooncake_direct_linker, "freeze_gc", lambda _: None)
+
+    pool = SimpleNamespace(
+        name=PoolName.DEEPSEEK_V4_C4,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.page_size = 1
+    linker.pool_group = DevicePoolGroup(
+        [pool], num_layers=1, page_size=1, rank_replicated=True
+    )
+    linker.storage = SimpleNamespace()
+    linker.gc_frozen = False
+    linker.offload_owner = False
+    linker.offload_results = Queue()
+
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page"],
+        device_indices=torch.tensor([0]),
+    )
+
+    assert linker.offload([transfer])
+    assert linker.num_completed_offloads() == 1
+    assert linker.pop_completed_offload() is True
 
 
 class _Allocator:
@@ -2017,6 +2178,178 @@ def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
     assert sizes == [[5]]
     assert offsets == [[5]]
     assert c4_pool.get_prepared_layer_range_meta([0], 1) is None
+
+
+def _make_layersplit_dsv4_group(rank, *, rows=8, cp_size=2, draft_layers=2):
+    from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+        CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+    )
+
+    pool = CpCacheLayerSplitDeepSeekV4TokenToKVPool.__new__(
+        CpCacheLayerSplitDeepSeekV4TokenToKVPool
+    )
+    pool._unified_kv = False
+    pool.start_layer = pool._stage_start = 1
+    pool.end_layer = pool._stage_end = 7
+    pool.compression_ratios = [0, 4, 128, 4, 128, 128, 128]
+    pool.swa_page_size = 2
+    pool._init_cp_cache_layer_split(
+        cp_rank=rank,
+        cp_size=cp_size,
+        layer_shard_start_layer=1,
+        layer_shard_layer_num=6,
+    )
+    pool._swa_global_to_local = pool._build_owned_layer_local_index_map()
+    owned = list(pool._swa_global_to_local)
+
+    def buffers(layers, width):
+        return [
+            torch.full((rows, width), layer + width, dtype=torch.uint8)
+            for layer in layers
+        ]
+
+    c4 = [layer for layer in owned if pool.compression_ratios[layer] == 4]
+    c128 = [layer for layer in owned if pool.compression_ratios[layer] == 128]
+    pool.swa_kv_pool = SimpleNamespace(kv_buffer=buffers(owned, 3))
+    pool.c4_kv_pool = SimpleNamespace(kv_buffer=buffers(c4, 5))
+    pool.c128_kv_pool = SimpleNamespace(kv_buffer=buffers(c128, 7))
+    pool.c4_indexer_kv_pool = SimpleNamespace(
+        index_k_with_scale_buffer=buffers(c4, 9)
+    )
+    pool.compress_state_pools = [None] * 7
+    pool.indexer_compress_state_pools = [None] * 7
+    for layer in c4:
+        for states in (pool.compress_state_pools, pool.indexer_compress_state_pools):
+            states[layer] = SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(
+                    kv_score=torch.full((rows * 2, 3), float(layer))
+                ),
+            )
+    pool._rebuild_compressed_layer_mapping_for_cp()
+    drafts = buffers(range(draft_layers), 11)
+    return resolve_hybrid_device_pool_group(
+        kvcache=pool,
+        page_size=2,
+        params=SimpleNamespace(
+            mtp_draft_device_pools=(
+                SimpleNamespace(swa_kv_pool=SimpleNamespace(kv_buffer=drafts)),
+            )
+        ),
+        components={ComponentType.FULL, ComponentType.SWA},
+    )
+
+
+def test_layersplit_maps_owned_sparse_families_and_replicates_draft():
+    first = _make_layersplit_dsv4_group(0)
+    second = _make_layersplit_dsv4_group(1)
+
+    assert first.num_layers == 6
+    assert first.rank_replicated
+    assert first.entry_map[PoolName.DEEPSEEK_V4_C4].layer_mapping == {
+        0: 0,
+        2: 1,
+    }
+    assert first.entry_map[PoolName.DEEPSEEK_V4_C4_STATE].layer_mapping == {
+        0: 0,
+        2: 1,
+    }
+    assert PoolName.DEEPSEEK_V4_C4 not in second.entry_map
+    assert PoolName.DEEPSEEK_V4_C4_STATE not in second.entry_map
+
+    swa = second.entry_map[PoolName.SWA]
+    assert swa.layer_mapping == {3: 0, 4: 1, 5: 2, 0: (3,), 1: (4,)}
+    assert swa.get_prepared_layer_range_meta([1], 2) is None
+    pointers, sizes, offsets = swa.get_prepared_layer_range_meta([1], 0)
+    assert pointers == [[swa.components[0][3][1].data_ptr()]]
+    assert sizes == [[11]]
+    assert offsets == [[9]]
+
+
+def test_layersplit_storage_tag_is_stable_and_capacity_independent():
+    tag = _make_layersplit_dsv4_group(0).storage_layout_tag
+    assert tag.startswith("dsv4ls_v1_cp2_")
+    assert tag == _make_layersplit_dsv4_group(0, rows=16).storage_layout_tag
+    assert tag != _make_layersplit_dsv4_group(0, cp_size=3).storage_layout_tag
+    assert tag != _make_layersplit_dsv4_group(0, draft_layers=1).storage_layout_tag
+
+
+@pytest.mark.parametrize("enable_page_wise_load", [False, True])
+def test_layersplit_round_trip_preserves_owned_and_draft_bytes(
+    enable_page_wise_load,
+):
+    for rank in (0, 1):
+        group = _make_layersplit_dsv4_group(rank)
+        transfers = group.resolve_transfers(
+            [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=["page"],
+                    device_indices=torch.tensor([2, 3]),
+                ),
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=["page"],
+                    device_indices=torch.tensor([2, 3]),
+                ),
+            ]
+        )
+        objects, expected = {}, []
+        storage = MooncakeStore.__new__(MooncakeStore)
+        storage.registered_pools = group.entry_map
+        storage.mem_pool_host = group
+        storage.is_mla_backend = True
+        storage.mla_suffix = f"{group.storage_layout_tag}_cp{rank}_pp0"
+        storage.config_prefix = None
+        for transfer in transfers:
+            entry = group.entry_map[transfer.name]
+            keys, _ = storage._get_hybrid_page_component_keys(
+                transfer.keys, transfer
+            )
+            assert len(keys) == 1
+            ptrs, sizes = entry.get_page_buffer_meta(transfer.host_indices)
+            chunks = [ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)]
+            objects[keys[0]] = b"".join(chunks)
+            for ptr, size, chunk in zip(ptrs, sizes, chunks):
+                expected.append((ptr, size, chunk))
+                ctypes.memset(ptr, 0, size)
+
+        def range_get(keys, pointers, sizes, offsets, objects=objects):
+            result = []
+            for key, page_ptrs, page_sizes, page_offsets in zip(
+                keys, pointers, sizes, offsets
+            ):
+                for ptr, size, offset in zip(page_ptrs, page_sizes, page_offsets):
+                    chunk = objects[key][offset : offset + size]
+                    assert len(chunk) == size
+                    ctypes.memmove(ptr, chunk, size)
+                result.append(sum(page_sizes))
+            return result
+
+        storage.store = SimpleNamespace(
+            batch_get_into_multi_buffer_ranges=range_get,
+        )
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.storage = storage
+        linker.pools = group.entry_map
+        linker.num_layers = group.num_layers
+        linker.enable_page_wise_load = enable_page_wise_load
+        linker.page_wise_load_threshold = 1
+        linker.page_wise_load_batch_size = 1
+        linker.layer_done_counter = mooncake_direct_linker.LayerWiseLoadCounter(
+            group.num_layers
+        )
+        linker.request_time_stats = {}
+        linker.pending_load_metrics = {}
+        linker.abort_prepared_load = lambda rid: None
+        linker._finish_l4_metric = lambda *args: None
+        index = linker.layer_done_counter.update_producer()
+        assert linker.load_layer_wise(index, [("rid", transfers)])
+        assert all(
+            future.done() for future in linker.layer_done_counter.futures[index]
+        )
+        for ptr, size, chunk in expected:
+            assert ctypes.string_at(ptr, size) == chunk
 
 
 def test_mamba_strategy_rejects_direct_linker():
