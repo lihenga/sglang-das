@@ -241,16 +241,28 @@ def _with_packed_draft_mapping(
     *,
     target_device_layer_num: int,
     draft_layer_num: int,
+    target_transfer_layer_num: int | None = None,
 ) -> dict[int, int | tuple[int, ...]]:
     """Attach draft depth N to the same transfer layer as target layer N."""
-    if draft_layer_num > len(layer_mapping):
+    target_transfer_layer_num = (
+        len(layer_mapping)
+        if target_transfer_layer_num is None
+        else target_transfer_layer_num
+    )
+    if draft_layer_num > target_transfer_layer_num:
         raise ValueError(
             "Packed draft layers exceed the target transfer layer count: "
-            f"{draft_layer_num} > {len(layer_mapping)}."
+            f"{draft_layer_num} > {target_transfer_layer_num}."
         )
     result: dict[int, int | tuple[int, ...]] = dict(layer_mapping)
     for depth in range(draft_layer_num):
-        result[depth] = (layer_mapping[depth], target_device_layer_num + depth)
+        mapped = layer_mapping.get(depth)
+        draft_buffer_index = target_device_layer_num + depth
+        result[depth] = (
+            (draft_buffer_index,)
+            if mapped is None
+            else (mapped, draft_buffer_index)
+        )
     return result
 
 
@@ -420,12 +432,12 @@ def _build_dsa_device_pool_group(
         target_device_layer_num=num_layers,
         draft_layer_num=len(draft_kv_buffers),
     )
-    for depth, _ in enumerate(draft_indexer_buffers):
-        mapped = indexer_mapping.get(depth)
-        draft_buffer_index = len(indexer_buffers) + depth
-        indexer_mapping[depth] = (
-            (draft_buffer_index,) if mapped is None else (mapped, draft_buffer_index)
-        )
+    indexer_mapping = _with_packed_draft_mapping(
+        indexer_mapping,
+        target_device_layer_num=len(indexer_buffers),
+        draft_layer_num=len(draft_indexer_buffers),
+        target_transfer_layer_num=num_layers,
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
