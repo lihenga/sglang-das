@@ -4166,8 +4166,8 @@ class DeepseekSparseAttnMultiStepBackend:
 
 
 # Backward-compat aliases (deprecated: use DSA class names)
-DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
-DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-DSAMetadata = DSAMetadata
-DSAFlashMLAMetadata = DSAFlashMLAMetadata
-DSAIndexerMetadata = DSAIndexerMetadata
+NativeSparseAttnBackend = DeepseekSparseAttnBackend
+NativeSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
+NSAMetadata = DSAMetadata
+NSAFlashMLAMetadata = DSAFlashMLAMetadata
+NSAIndexerMetadata = DSAIndexerMetadata
