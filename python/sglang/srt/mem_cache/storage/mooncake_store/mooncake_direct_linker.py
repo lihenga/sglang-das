@@ -114,6 +114,12 @@ class LayerWiseLoadCounter:
             if not future.done():
                 future.set_exception(error)
 
+    def retire(self, index: int) -> None:
+        """Discard a producer that has no model consumer."""
+        self.futures.pop(index, None)
+        self.errors.pop(index, None)
+        self.active_indices.discard(index)
+
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
         futures = self.futures.get(index)
@@ -264,9 +270,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         # DeepSeek-V4 materializes the global token order before populating the
         # direct-linker pools, so these objects are replicas across attention CP
-        # ranks. Persist each radix node once, and query each request once.  KV
-        # data is still read independently into every rank's local buffers: in
-        # practice that is faster than one reader followed by CP replication.
+        # ranks. Persist each radix node once and query each request once. KV
+        # data is read independently into every rank's local buffers so
+        # layer-wise loads can publish each locally completed layer without a
+        # CP read-aggregation collective. Layer-split layouts use the same
+        # direct per-rank read path.
         self.cp_single_writer = (
             params.attn_cp_size > 1
             and bool(set(self.pools) & _DEEPSEEK_V4_REPLICATED_POOLS)
@@ -369,10 +377,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.info(
                 "Mooncake CP node-owner writer/request-owner lookup enabled: "
                 "rank=%d/%d namespace=%s writer_owner=node_hash "
-                "lookup_owner=request_id_hash data_reader=all_ranks",
+                "lookup_owner=request_id_hash page_reader=%s",
                 self.attn_cp_rank,
                 self.attn_cp_size,
                 rank_suffix,
+                "all_ranks",
             )
 
         self.storage_metrics_collector = None
@@ -428,6 +437,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = {}
         self.pending_load_metrics: dict[str, tuple[int, dict[str, int], float]] = {}
         self.request_time_stats: dict[str, object] = {}
+        # Requests launched by the overlap prefetch window need a completion
+        # result before their reserved device slots can be published into the
+        # radix tree.  Keep this separate from the layer counter: formal loads
+        # consume the counter from the model forward, while prefetched loads
+        # are waited on by the request that adopts their reservation.
+        self.prefetched_load_events: dict[str, threading.Event] = {}
+        self.prefetched_load_results: dict[str, bool] = {}
+        self.prefetched_load_lock = threading.Lock()
+        self.speculative_load_counters: set[int] = set()
         self.session_lock = threading.Lock()
         self.gc_frozen = False
         self.load_queue: Queue[
@@ -583,16 +601,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         seen = set()
         pool_page_components: dict[tuple[PoolName, str], list[str]] = {}
         for transfer in expanded:
+            logical_keys = list(transfer.keys)
             logical_pool_name = self.pool_group.sources.get(
                 transfer.name, transfer.name
             )
             component_keys, key_multiplier = (
                 self.storage._get_hybrid_page_component_keys(
-                    list(transfer.keys), transfer
+                    logical_keys, transfer
                 )
             )
             tagged_component_keys = self.storage._tag_keys(component_keys)
-            for page_index, page_key in enumerate(transfer.keys):
+            for page_index, page_key in enumerate(logical_keys):
                 start = page_index * key_multiplier
                 pool_page_components.setdefault(
                     (logical_pool_name, page_key), []
@@ -808,6 +827,62 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         getattr(self, "request_time_stats", {}).pop(rid, None)
         self.abort_prepared_load(rid)
 
+    def mark_prefetched_load(self, rid: str) -> None:
+        """Track one overlap-prefetched load until its worker completes."""
+        lock = getattr(self, "prefetched_load_lock", None)
+        if lock is None:
+            self.prefetched_load_lock = lock = threading.Lock()
+        if not hasattr(self, "prefetched_load_events"):
+            self.prefetched_load_events = {}
+        if not hasattr(self, "prefetched_load_results"):
+            self.prefetched_load_results = {}
+        with lock:
+            self.prefetched_load_events[rid] = threading.Event()
+            self.prefetched_load_results.pop(rid, None)
+
+    def _finish_prefetched_load(self, rid: str, success: bool) -> None:
+        lock = getattr(self, "prefetched_load_lock", None)
+        if lock is None:
+            return
+        with lock:
+            event = self.prefetched_load_events.get(rid)
+            if event is None:
+                return
+            self.prefetched_load_results[rid] = bool(success)
+            event.set()
+
+    def wait_prefetched_load(self, rid: str) -> bool:
+        """Wait for an overlap-prefetched load and consume its result."""
+        lock = getattr(self, "prefetched_load_lock", None)
+        if lock is None:
+            return True
+        with lock:
+            event = self.prefetched_load_events.get(rid)
+        if event is None:
+            # Backends or direct unit-test doubles without the optional
+            # tracking hook already completed the load synchronously.
+            return True
+        event.wait()
+        with lock:
+            success = self.prefetched_load_results.pop(rid, False)
+            self.prefetched_load_events.pop(rid, None)
+        return success
+
+    def cancel_prefetched_load(self, rid: str) -> bool:
+        """Cancel a prefetched load that has not entered the worker yet.
+
+        Once ``start_layer_wise_loading`` has handed the request to the load
+        thread, callers must wait for completion before freeing its destination
+        slots.  Returning ``False`` in that case lets the wrapper do exactly
+        that instead of racing an in-flight backend.get.
+        """
+        pending = self.pending_loads.pop(rid, None)
+        if pending is None:
+            return False
+        self.cancel_queued_load(rid)
+        self._finish_prefetched_load(rid, False)
+        return True
+
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
             return
@@ -817,6 +892,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.gc_frozen = True
 
     def start_layer_wise_loading(self) -> int:
+        return self._start_layer_wise_loading(speculative=False)
+
+    def start_prefetched_layer_wise_loading(self) -> int:
+        """Start a speculative load whose layer counter has no model consumer."""
+        return self._start_layer_wise_loading(speculative=True)
+
+    def _start_layer_wise_loading(self, *, speculative: bool) -> int:
         if not self.pending_loads:
             return -1
         self.freeze_gc_once()
@@ -830,6 +912,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 time_stats.set_direct_load_start_time(started)
 
         counter_index = self.layer_done_counter.update_producer()
+        if speculative:
+            counters = getattr(self, "speculative_load_counters", None)
+            if counters is None:
+                counters = self.speculative_load_counters = set()
+            counters.add(counter_index)
         ready_event = device_module.Event()
         ready_event.record()
         self.load_queue.put((counter_index, list(pending.items()), ready_event))
@@ -867,7 +954,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     all_locations = self.pools[transfer.name].prepare_locations(
                         transfer.host_indices
                     )
-
                     component_keys, key_multiplier = (
                         self.storage._get_hybrid_page_component_keys(
                             logical_keys, transfer
@@ -877,7 +963,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     for position in range(len(logical_keys)):
                         start = position * key_multiplier
                         keys.extend(tagged_keys[start : start + key_multiplier])
-                        locations.append(all_locations[position])
+                        locations.extend([all_locations[position]] * key_multiplier)
                     batch_rids.setdefault(transfer.name, []).extend(
                         [rid] * (len(logical_keys) * key_multiplier)
                     )
@@ -911,11 +997,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
             for rid, _ in request_transfers:
+                self._finish_prefetched_load(rid, request_success.get(rid, False))
                 time_stats = getattr(self, "request_time_stats", {}).pop(rid, None)
                 if time_stats is not None:
                     time_stats.set_direct_load_finish_time()
                 self._finish_l4_metric("prefetch", rid, request_success.get(rid, False))
                 self.abort_prepared_load(rid)
+            if counter_index in getattr(self, "speculative_load_counters", set()):
+                self.speculative_load_counters.discard(counter_index)
+                self.layer_done_counter.retire(counter_index)
 
     def _load_layer_ranges(
         self,
@@ -1000,6 +1090,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         request_transfers: list[tuple[str, list[PoolTransfer]]],
         batches: dict[PoolName, tuple[list[str], list[int]]],
         batch_rids: dict[PoolName, list[str]],
+        *,
+        complete_layers: bool = True,
     ) -> dict[str, bool]:
         """Load complete pages before releasing their layers to the consumer."""
         request_success = {rid: True for rid, _ in request_transfers}
@@ -1085,8 +1177,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             pool_counts,
             len(all_keys),
         )
-        result = self.storage.store.batch_get_into_multi_buffer_ranges(
-            all_keys, all_ptrs, all_sizes, all_offsets
+        result = (
+            self.storage.store.batch_get_into_multi_buffer_ranges(
+                all_keys, all_ptrs, all_sizes, all_offsets
+            )
+            if all_keys
+            else []
         )
         expected = [sum(item) for item in all_sizes]
         transferred = (
@@ -1129,7 +1225,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # made visible to the model.
         for rid, _ in request_transfers:
             self.abort_prepared_load(rid)
-        if all(request_success.values()):
+        if complete_layers and all(request_success.values()):
             for layer in range(self.num_layers):
                 self.layer_done_counter.complete(counter_index, layer)
         return request_success
@@ -1336,6 +1432,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.get_nowait()
             except Empty:
                 break
+        lock = getattr(self, "prefetched_load_lock", None)
+        if lock is not None:
+            with lock:
+                self.prefetched_load_events.clear()
+                self.prefetched_load_results.clear()
+        getattr(self, "speculative_load_counters", set()).clear()
         self.layer_done_counter.reset()
 
     def close(self) -> None:

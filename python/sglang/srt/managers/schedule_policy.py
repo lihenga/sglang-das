@@ -751,6 +751,39 @@ class PrefillAdder:
             extend_input_len, max_new_tokens, swa_host_hit_length
         )
 
+    def _external_prefetch_reservation(self, req) -> tuple[int, int]:
+        """Return this request's detached external-L1 (full, SWA) tokens."""
+        getter = getattr(self.tree_cache, "get_external_linker_reserved_tokens", None)
+        if getter is None or not callable(getter):
+            return 0, 0
+        try:
+            reservation = getter(req.rid)
+        except (AttributeError, TypeError, ValueError):
+            return 0, 0
+        if not isinstance(reservation, (tuple, list)) or len(reservation) != 2:
+            return 0, 0
+        try:
+            return max(0, int(reservation[0])), max(0, int(reservation[1]))
+        except (TypeError, ValueError):
+            return 0, 0
+
+    def _swa_budget_for_admission(
+        self,
+        extend_input_len: int,
+        max_new_tokens: int,
+        swa_host_hit_length: int = 0,
+        reserved_swa_tokens: int = 0,
+    ) -> int:
+        return max(
+            0,
+            self._swa_budget_for_req(
+                extend_input_len,
+                max_new_tokens,
+                swa_host_hit_length,
+            )
+            - reserved_swa_tokens,
+        )
+
     def _swa_reserved_tokens(
         self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
     ) -> int:
@@ -780,7 +813,12 @@ class PrefillAdder:
             CLIP_MAX_NEW_TOKENS,
         )
 
-    def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
+    def _swa_chunk_cap(
+        self,
+        max_new_tokens: int,
+        swa_host_hit_length: int = 0,
+        reserved_swa_tokens: int = 0,
+    ) -> int:
         """Largest page-aligned extend chunk the SWA pool can admit right now,
         keeping a sliding window of headroom below rem_swa_tokens; 0 if not
         even one page fits. Only valid when is_hybrid_swa is True.
@@ -793,15 +831,22 @@ class PrefillAdder:
         evictable — so each pass's transient footprint fits the pool."""
         # extend_input_len=0: this solves for the extend chunk itself, so the
         # reserved headroom is the post-chunk decode window only.
-        cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(
-            0, max_new_tokens, swa_host_hit_length
+        cap = int(self.rem_swa_tokens) - self._swa_budget_for_admission(
+            0,
+            max_new_tokens,
+            swa_host_hit_length,
+            reserved_swa_tokens,
         )
         if cap <= 0:
             return 0
         return cap // self.page_size * self.page_size
 
     def _swa_req_never_fits(
-        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
+        self,
+        extend_input_len: int,
+        max_new_tokens: int,
+        swa_host_hit_length: int = 0,
+        reserved_swa_tokens: int = 0,
     ) -> bool:
         """True when a request's SWA budget exceeds the *entire* SWA pool, so it
         can never be admitted whole no matter how far the pool drains.
@@ -814,11 +859,17 @@ class PrefillAdder:
         requests to retract (observed as a severe retraction/re-prefill storm on
         hybrid-SWA models at high concurrency)."""
         capacity = self.token_to_kv_pool_allocator.size_swa
+        total_demand = self._swa_budget_for_req(
+            extend_input_len, max_new_tokens, swa_host_hit_length
+        )
+        # ``rem_swa_tokens`` already excludes this request's detached
+        # reservation. Compare the corresponding incremental demand with the
+        # capacity left after that reservation; algebraically this is the
+        # original total-demand-vs-total-capacity test.
+        incremental_demand = total_demand - reserved_swa_tokens
+        remaining_capacity = capacity - reserved_swa_tokens
         return (
-            self._swa_budget_for_req(
-                extend_input_len, max_new_tokens, swa_host_hit_length
-            )
-            >= capacity
+            incremental_demand >= remaining_capacity
         )
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
@@ -1003,15 +1054,22 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        reserved_full_tokens, reserved_swa_tokens = self._external_prefetch_reservation(
+            req
+        )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            _rem_tokens = min(
+                self.rem_chunk_tokens,
+                int(self.rem_total_tokens) + reserved_full_tokens,
+            )
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
                 _rem_tokens = min(
-                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
+                    _rem_tokens,
+                    int(self.rem_swa_tokens) + reserved_swa_tokens - self.page_size,
                 )
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
@@ -1071,10 +1129,16 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
+        reserved_full_tokens, reserved_swa_tokens = self._external_prefetch_reservation(
+            req
+        )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        paged_input = self.ceil_paged_tokens(cand_extend_input_len)
+        paged_input = max(
+            0,
+            self.ceil_paged_tokens(cand_extend_input_len) - reserved_full_tokens,
+        )
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
@@ -1082,8 +1146,10 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
             if (
-                self._swa_budget_for_req(
-                    cand_extend_input_len, self._swa_new_tokens(req)
+                self._swa_budget_for_admission(
+                    cand_extend_input_len,
+                    self._swa_new_tokens(req),
+                    reserved_swa_tokens=reserved_swa_tokens,
                 )
                 > self.rem_swa_tokens
             ):
@@ -1231,7 +1297,14 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        reserved_full_tokens, reserved_swa_tokens = (
+            self._external_prefetch_reservation(req)
+        )
+        total_tokens = (
+            max(0, cand_extend_input_len - reserved_full_tokens)
+            + max_new
+            + self.page_size
+        )
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
@@ -1249,20 +1322,24 @@ class PrefillAdder:
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
             # driven only by the freshly-prefilled tail (the loaded window is
             # charged separately via swa_host_hit_length).
-            swa_needed = self._swa_budget_for_req(
+            swa_needed = self._swa_budget_for_admission(
                 real_input_tokens,
                 self._swa_new_tokens(req),
                 swa_host_hit_length=req.swa_host_hit_length,
+                reserved_swa_tokens=reserved_swa_tokens,
             )
             if swa_needed >= self.rem_swa_tokens:
                 if not self._swa_req_never_fits(
                     real_input_tokens,
                     self._swa_new_tokens(req),
                     req.swa_host_hit_length,
+                    reserved_swa_tokens,
                 ):
                     return AddReqResult.NO_TOKEN
                 swa_cap = self._swa_chunk_cap(
-                    self._swa_new_tokens(req), req.swa_host_hit_length
+                    self._swa_new_tokens(req),
+                    req.swa_host_hit_length,
+                    reserved_swa_tokens,
                 )
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
                     return AddReqResult.NO_TOKEN
@@ -1285,20 +1362,24 @@ class PrefillAdder:
 
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
-                swa_needed = self._swa_budget_for_req(
+                swa_needed = self._swa_budget_for_admission(
                     real_input_tokens,
                     self._swa_new_tokens(req),
                     swa_host_hit_length=req.swa_host_hit_length,
+                    reserved_swa_tokens=reserved_swa_tokens,
                 )
                 if swa_needed >= self.rem_swa_tokens:
                     if not self._swa_req_never_fits(
                         real_input_tokens,
                         self._swa_new_tokens(req),
                         req.swa_host_hit_length,
+                        reserved_swa_tokens,
                     ):
                         return AddReqResult.NO_TOKEN
                     swa_cap = self._swa_chunk_cap(
-                        self._swa_new_tokens(req), req.swa_host_hit_length
+                        self._swa_new_tokens(req),
+                        req.swa_host_hit_length,
+                        reserved_swa_tokens,
                     )
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
                         return AddReqResult.NO_TOKEN

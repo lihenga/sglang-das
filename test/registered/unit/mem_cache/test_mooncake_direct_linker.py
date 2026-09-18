@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import InsertResult, MatchResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    LayerWiseLoadCounter,
     MooncakeDirectLinker,
     _stable_cp_owner,
 )
@@ -548,6 +550,178 @@ def test_load_waits_for_scheduler_stream(monkeypatch):
     linker.load_queue.join()
     linker.load_queue.put(None)
     thread.join(timeout=5)
+
+
+def test_speculative_load_counter_is_retired_after_worker_completion(monkeypatch):
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.num_layers = 1
+    linker.enable_page_wise_load = False
+    linker.layer_done_counter = LayerWiseLoadCounter(1)
+    linker.speculative_load_counters = set()
+    linker.gc_frozen = True
+    linker.request_time_stats = {}
+    linker.pending_load_metrics = {}
+    linker.storage_metrics_collector = None
+    linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.prepared_load_page_sources = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lock = threading.Lock()
+    linker.pending_loads = {"rid": []}
+    linker.load_queue = Queue()
+    linker.stats = {"load": 0}
+    linker.storage = SimpleNamespace(store=SimpleNamespace())
+
+    monkeypatch.setattr(
+        mooncake_direct_linker.device_module,
+        "Event",
+        lambda: SimpleNamespace(record=lambda: None),
+    )
+    counter_index = linker.start_prefetched_layer_wise_loading()
+    assert counter_index == 0
+    queued_counter, transfers, _ = linker.load_queue.get_nowait()
+    assert queued_counter == counter_index
+    linker.load_layer_wise(counter_index, transfers)
+    linker.load_queue.task_done()
+
+    assert linker.speculative_load_counters == set()
+    assert counter_index not in linker.layer_done_counter.futures
+    assert counter_index not in linker.layer_done_counter.active_indices
+
+
+def test_queued_prefetched_load_cancel_signals_failure():
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pending_loads = {"rid": []}
+    linker.pending_load_metrics = {}
+    linker.request_time_stats = {}
+    linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.prepared_load_page_sources = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lock = threading.Lock()
+
+    linker.mark_prefetched_load("rid")
+    assert linker.cancel_prefetched_load("rid")
+    assert linker.wait_prefetched_load("rid") is False
+    assert linker.pending_loads == {}
+
+
+def test_prefill_admission_credits_its_external_reservation():
+    cache = SimpleNamespace(
+        get_external_linker_reserved_tokens=lambda rid: (64, 0),
+        supports_mamba=lambda: False,
+        is_tree_cache=lambda: False,
+        inc_lock_ref=lambda node: SimpleNamespace(),
+        dec_lock_ref=lambda node: None,
+        init_load_back=lambda params: (
+            torch.arange(64, dtype=torch.int64),
+            params.req.last_node,
+        ),
+        full_evictable_size=lambda: 0,
+        swa_evictable_size=lambda: 0,
+        evictable_size=lambda: 0,
+    )
+    allocator = SimpleNamespace(available_size=lambda: 64)
+    adder = PrefillAdder(
+        page_size=16,
+        tree_cache=cache,
+        token_to_kv_pool_allocator=allocator,
+        running_batch=SimpleNamespace(reqs=[], batch_size=lambda: 0),
+        new_token_ratio=1.0,
+        rem_input_tokens=1000,
+        rem_chunk_tokens=None,
+    )
+
+    req = SimpleNamespace(
+        rid="reserved",
+        prefix_indices=torch.empty((0,), dtype=torch.int64),
+        full_untruncated_fill_ids=list(range(96)),
+        host_hit_length=64,
+        swa_host_hit_length=0,
+        storage_hit_length=64,
+        best_match_node=0,
+        last_node=0,
+        cache_protected_len=0,
+        output_ids=[],
+        retracted_stain=False,
+        mamba_pool_idx=None,
+        sampling_params=SimpleNamespace(max_new_tokens=0, ignore_eos=False),
+        needs_host_load_back=lambda: True,
+    )
+    req.set_extend_range = lambda start, end: setattr(
+        req, "extend_range", SimpleNamespace(length=end - start)
+    )
+
+    # Without the request-owned 64-token credit, total_tokens is 112 and the
+    # 64-token allocator would reject the candidate before formal load-back.
+    assert (
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        == AddReqResult.CONTINUE
+    )
+    assert req in adder.can_run_list
+
+
+def test_swa_never_fit_accounts_for_reserved_capacity():
+    adder = PrefillAdder.__new__(PrefillAdder)
+    adder.page_size = 16
+    adder.tree_cache = SimpleNamespace(sliding_window_size=32)
+    adder.rem_chunk_tokens = None
+    adder.token_to_kv_pool_allocator = SimpleNamespace(size_swa=100)
+
+    total_demand = adder._swa_budget_for_req(100, 40)
+    assert total_demand == 116
+    # The request still needs 76 incremental tokens, while only 60 tokens of
+    # the pool remain after crediting its detached 40-token reservation.
+    assert adder._swa_req_never_fits(100, 40, reserved_swa_tokens=40)
+
+
+def test_wrapper_reports_only_reserved_full_and_swa_tokens():
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.prefetched_loads = {
+        "rid": SimpleNamespace(
+            component_transfers=[
+                (
+                    SimpleNamespace(),
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        device_indices=torch.arange(8),
+                        keys=["k"],
+                    ),
+                ),
+                (
+                    SimpleNamespace(),
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        device_indices=torch.arange(4),
+                        keys=["s"],
+                    ),
+                ),
+            ]
+        )
+    }
+
+    assert wrapper.get_prefetched_load_tokens("rid") == (8, 4)
+    assert wrapper.get_prefetched_load_tokens("missing") == (0, 0)
+
+
+def test_radix_speculative_ready_uses_wrapper_speculative_starter():
+    calls = []
+    direct = SimpleNamespace(
+        start_prefetched_layer_wise_loading=lambda: (
+            calls.append("speculative") or 7
+        ),
+        start_layer_wise_loading=lambda: calls.append("formal") or 8,
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache_linker = direct
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = wrapper
+    cache.cache_controller = None
+
+    assert cache.ready_to_load_host_cache(speculative=True) == 7
+    assert calls == ["speculative"]
 
 
 def test_session_start_negative_result_falls_back_and_logs_key(caplog):
@@ -1553,17 +1727,21 @@ def test_wrapper_peer_prepare_failure_falls_back_before_tree_insert():
     assert len(collectives) == 1
 
 
-def test_wrapper_combines_prepare_and_source_in_one_collective():
+def test_wrapper_prefetch_reuses_prepare_and_source_collective():
     collectives = []
+    prepare_calls = []
 
     class _Component:
         component_type = ComponentType.FULL
 
         def build_external_linker_transfer(self, phase, node, keys):
+            indices = None
+            if phase == LinkerTransferPhase.LOAD:
+                indices = torch.tensor([11, 12])
             return PoolTransfer(
                 name=PoolName.KV,
                 keys=list(keys),
-                device_indices=torch.tensor([11, 12]),
+                device_indices=indices,
             )
 
         def update_external_linker_load(
@@ -1593,10 +1771,99 @@ def test_wrapper_combines_prepare_and_source_in_one_collective():
         ),
         resolve_node_handle=lambda value: node,
     )
+    def prepare_load(rid, transfers):
+        prepare_calls.append((rid, transfers))
+        assert all(transfer.device_indices is None for transfer in transfers)
+        return True
+
     backend = SimpleNamespace(
-        prepare_load=lambda rid, transfers: True,
+        prepare_load=prepare_load,
         get_prepared_load_source=lambda rid: "local_disk",
         load=lambda rid, transfers: True,
+        abort_prepared_load=lambda rid: None,
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = cache
+    wrapper.cache_linker = backend
+    wrapper.prefetched_source_codes = {}
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=RadixKey(array("q", [1, 2])),
+            tail_hashes=["page-a", "page-b"],
+            device_hit_len=0,
+        )
+    }
+    req = SimpleNamespace(
+        rid="rid",
+        last_node=0,
+        prefix_indices=empty,
+        host_hit_length=2,
+        swa_host_hit_length=0,
+        mamba_host_hit_length=0,
+        storage_hit_length=0,
+        cached_tokens_storage_source=None,
+        kv=None,
+    )
+
+    assert wrapper.prepare_prefetched_load(req)
+    assert wrapper.prepare_prefetched_load(req)
+    wrapper.load_back(req)
+
+    assert len(prepare_calls) == 1
+    assert len(collectives) == 1
+    assert req.cached_tokens_storage_source == "mooncake_memory"
+
+
+def test_wrapper_adopts_completed_prefetch_without_a_second_get():
+    collectives = []
+    load_calls = []
+
+    class _Component:
+        component_type = ComponentType.FULL
+
+        def build_external_linker_transfer(self, phase, node, keys):
+            indices = None
+            if phase == LinkerTransferPhase.LOAD:
+                indices = torch.tensor([11, 12])
+            return PoolTransfer(
+                name=PoolName.KV,
+                keys=list(keys),
+                device_indices=indices,
+            )
+
+        def update_external_linker_load(
+            self, phase, req, full, transfer, prefix_len, **kwargs
+        ):
+            return transfer
+
+    empty = torch.empty((0,), dtype=torch.int64)
+    node = SimpleNamespace(id=0, parent=None, external_cache_stored=False)
+
+    def reduce_decision(value, op):
+        collectives.append((value.item(), op))
+        value.fill_(3)
+
+    cache = SimpleNamespace(
+        page_size=1,
+        _components_tuple=(_Component(),),
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(device_indices=empty),
+            collect_full_device_indices=lambda last, previous: torch.tensor([11, 12]),
+        ),
+        _all_reduce_attn_groups=reduce_decision,
+        insert=lambda params: SimpleNamespace(
+            mamba_exist=False,
+            last_device_node=0,
+            adopted_ranges={ComponentType.FULL: [(0, 2)]},
+        ),
+        resolve_node_handle=lambda value: node,
+    )
+    backend = SimpleNamespace(
+        prepare_load=lambda rid, transfers: True,
+        get_prepared_load_source=lambda rid: "memory",
+        load=lambda rid, transfers: (load_calls.append((rid, transfers)) or True),
+        mark_prefetched_load=lambda rid: None,
+        wait_prefetched_load=lambda rid: True,
         abort_prepared_load=lambda rid: None,
     )
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
@@ -1618,13 +1885,289 @@ def test_wrapper_combines_prepare_and_source_in_one_collective():
         mamba_host_hit_length=0,
         storage_hit_length=0,
         cached_tokens_storage_source=None,
+        cached_tokens_device=0,
+        cached_tokens_by_source={},
         kv=None,
     )
 
+    assert wrapper.prefetch_external_load(req)
     wrapper.load_back(req)
 
-    assert len(collectives) == 1
+    assert len(load_calls) == 1
+    assert wrapper.prefetched_loads == {}
     assert req.cached_tokens_storage_source == "mooncake_memory"
+    assert collectives
+
+
+def test_prefetched_release_waits_before_freeing_inflight_slots():
+    order = []
+
+    class _Component:
+        def update_external_linker_load(
+            self, phase, req, full, transfer, prefix_len, **kwargs
+        ):
+            if phase == ExternalLinkerLoadPhase.ABORT:
+                order.append("free")
+            return None
+
+    req = SimpleNamespace(rid="rid")
+    transfer = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page"],
+        device_indices=torch.tensor([1]),
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache_linker = SimpleNamespace(
+        cancel_prefetched_load=lambda rid: (order.append("cancel") or False),
+        wait_prefetched_load=lambda rid: (order.append("wait") or True),
+        abort_prepared_load=lambda rid: order.append("session_end"),
+    )
+    reservation = SimpleNamespace(
+        component_transfers=[(_Component(), transfer)],
+        prefix_len=1,
+    )
+
+    wrapper._discard_prefetched_load(req, reservation)
+
+    assert order.index("wait") < order.index("free")
+    assert order[-1] == "session_end"
+
+
+def test_stale_rematch_rolls_back_prefetched_slots():
+    freed = []
+    events = []
+
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+        def update_external_linker_load(
+            self, phase, req, full, transfer, prefix_len, **kwargs
+        ):
+            if phase == ExternalLinkerLoadPhase.ABORT:
+                freed.append(transfer.device_indices.tolist())
+            return None
+
+    cache = SimpleNamespace(
+        page_size=1,
+        _components_tuple=(_Component(),),
+        get_last_hash_value=lambda node: None,
+        _all_reduce_attn_groups=lambda value, op: None,
+    )
+    backend = SimpleNamespace(
+        lookup=lambda rid, transfers: [],
+        cancel_prefetched_load=lambda rid: (events.append("cancel") or False),
+        wait_prefetched_load=lambda rid: (events.append("wait") or True),
+        abort_prepared_load=lambda rid: events.append("session_end"),
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = cache
+    wrapper.cache_linker = backend
+    wrapper.prefetched_source_codes = {"rid": 3}
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=RadixKey(array("q", [1, 2])),
+            tail_hashes=["stale"],
+            device_hit_len=0,
+        )
+    }
+    wrapper.prefetched_loads = {
+        "rid": SimpleNamespace(
+            req=SimpleNamespace(rid="rid"),
+            component_transfers=[
+                (
+                    _Component(),
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=["stale"],
+                        device_indices=torch.tensor([5]),
+                    ),
+                )
+            ],
+            prefix_len=1,
+        )
+    }
+    result = MatchResult(
+        device_indices=torch.empty((0,), dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+
+    wrapper.match(RadixKey(array("q", [1, 2])), SimpleNamespace(rid="rid"), result)
+
+    assert freed == [[5]]
+    assert events == ["cancel", "wait", "session_end"]
+    assert wrapper.prefetched_loads == {}
+
+
+def test_prefetch_allocation_failure_is_synchronized_and_rolled_back():
+    aborted = []
+    freed = []
+    collective_count = 0
+
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            return PoolTransfer(
+                name=PoolName.KV,
+                keys=list(keys),
+                device_indices=torch.tensor([11, 12]),
+            )
+
+        def update_external_linker_load(
+            self, phase, req, full, transfer, prefix_len, **kwargs
+        ):
+            if phase == ExternalLinkerLoadPhase.ABORT:
+                freed.append(transfer.device_indices.tolist())
+            return None
+
+    def reduce(value, op):
+        nonlocal collective_count
+        collective_count += 1
+        # Session source succeeds; destination allocation fails on one rank.
+        value.fill_(3 if collective_count == 1 else 0)
+
+    cache = SimpleNamespace(
+        page_size=1,
+        _components_tuple=(_Component(),),
+        _all_reduce_attn_groups=reduce,
+    )
+    backend = SimpleNamespace(
+        prepare_load=lambda rid, transfers: True,
+        get_prepared_load_source=lambda rid: "memory",
+        abort_prepared_load=aborted.append,
+        load=lambda rid, transfers: pytest.fail("allocation failure must not queue"),
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = cache
+    wrapper.cache_linker = backend
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=RadixKey(array("q", [1, 2])),
+            tail_hashes=["page-a", "page-b"],
+            device_hit_len=0,
+        )
+    }
+    req = SimpleNamespace(rid="rid")
+
+    assert not wrapper.prefetch_external_load(req)
+    assert freed == [[11, 12]]
+    assert aborted == ["rid"]
+    assert wrapper.prefetched_loads == {}
+
+
+def test_prefetch_queue_failure_is_synchronized_and_rolled_back():
+    aborted = []
+    freed = []
+    collective_count = 0
+
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            return PoolTransfer(
+                name=PoolName.KV,
+                keys=list(keys),
+                device_indices=torch.tensor([11, 12]),
+            )
+
+        def update_external_linker_load(
+            self, phase, req, full, transfer, prefix_len, **kwargs
+        ):
+            if phase == ExternalLinkerLoadPhase.ABORT:
+                freed.append(transfer.device_indices.tolist())
+            return None
+
+    def reduce(value, op):
+        nonlocal collective_count
+        collective_count += 1
+        # Session and destination allocation succeed; the queue fails globally.
+        value.fill_(1 if collective_count < 3 else 0)
+
+    cache = SimpleNamespace(
+        page_size=1,
+        _components_tuple=(_Component(),),
+        _all_reduce_attn_groups=reduce,
+    )
+    backend = SimpleNamespace(
+        prepare_load=lambda rid, transfers: True,
+        get_prepared_load_source=lambda rid: "memory",
+        abort_prepared_load=aborted.append,
+        load=lambda rid, transfers: False,
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = cache
+    wrapper.cache_linker = backend
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=RadixKey(array("q", [1, 2])),
+            tail_hashes=["page-a", "page-b"],
+            device_hit_len=0,
+        )
+    }
+    req = SimpleNamespace(rid="rid")
+
+    assert not wrapper.prefetch_external_load(req)
+    assert collective_count == 3
+    assert freed == [[11, 12]]
+    assert aborted
+    assert wrapper.prefetched_loads == {}
+
+
+def test_wrapper_reuses_prefetched_lookup_when_tree_anchor_is_unchanged():
+    class _Component:
+        component_type = ComponentType.FULL
+
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOOKUP
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+    cache = SimpleNamespace(
+        page_size=1,
+        _components_tuple=(_Component(),),
+        get_last_hash_value=lambda node: None,
+    )
+    backend = SimpleNamespace(
+        lookup=lambda rid, transfers: pytest.fail("lookup must be reused"),
+        abort_prepared_load=lambda rid: pytest.fail("session must stay valid"),
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = cache
+    wrapper.cache_linker = backend
+    wrapper.prefetched_source_codes = {"rid": 3}
+
+    key = RadixKey(array("q", [1, 2]))
+    base = MatchResult(
+        device_indices=torch.empty((0,), dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+    tail_hashes = wrapper._tail_hashes(key, base, device_hit_len=0)
+    wrapper.hit_markers = {
+        "rid": ExternalCacheHitMarker(
+            prefix_key=key,
+            tail_hashes=tail_hashes,
+            device_hit_len=0,
+        )
+    }
+
+    result = wrapper.match(key, SimpleNamespace(rid="rid"), base)
+
+    assert result.host_hit_length == 2
+    assert wrapper.prefetched_source_codes == {"rid": 3}
+
+
+def test_wrapper_release_request_cancels_prefetched_session():
+    aborted = []
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache_linker = SimpleNamespace(abort_prepared_load=aborted.append)
+    wrapper.hit_markers = {"rid": object()}
+    wrapper.prefetched_source_codes = {"rid": 3}
+
+    wrapper.release_request("rid")
+
+    assert wrapper.hit_markers == {}
+    assert wrapper.prefetched_source_codes == {}
+    assert aborted == ["rid"]
 
 
 def test_offload_runs_on_background_thread(monkeypatch):
@@ -1826,7 +2369,7 @@ def test_cp_non_owner_noop_keeps_offload_completion_fifo(monkeypatch):
     linker.offload_thread.join(timeout=5)
 
 
-def test_cp_all_ranks_fetch_complete_request_into_local_buffers():
+def test_cp_page_wise_load_keeps_all_ranks_fetching_local_buffers():
     rank = 0
     owner_rid = next(
         candidate
@@ -1860,7 +2403,8 @@ def test_cp_all_ranks_fetch_complete_request_into_local_buffers():
     linker.attn_cp_rank = rank
     linker.attn_cp_size = 2
     linker.num_layers = 1
-    linker.enable_page_wise_load = False
+    linker.enable_page_wise_load = True
+    linker.page_wise_load_threshold = 1
     linker.pools = {PoolName.DEEPSEEK_V4_C4: pool}
     linker.storage = SimpleNamespace(
         store=_Store(),
@@ -1892,8 +2436,8 @@ def test_cp_all_ranks_fetch_complete_request_into_local_buffers():
             ],
         )
 
-    # The request owner controls metadata lookup only. Both the lookup owner and
-    # a non-owner issue the complete data read into their own local KV slots.
+    # Page-wise reads remain local to each CP rank; no read aggregation or
+    # replica broadcast is introduced by this strategy.
     assert read_calls == [page_keys, page_keys]
     assert completed_layers == [0, 0]
 
@@ -1951,6 +2495,32 @@ def test_cp_non_lookup_owner_prepares_local_read_session():
     )
 
     assert session_starts == [["page-0", "page-1"]]
+
+
+def test_cp_lookup_request_uses_control_group(monkeypatch):
+    control_group = object()
+    selected_groups = []
+
+    def record_all_reduce(tensor, op, group):
+        selected_groups.append(group)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce)
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.attn_cp_rank = 0
+    linker.attn_cp_size = 1
+    linker.cp_control_group = control_group
+    linker.storage = SimpleNamespace(
+        batch_exists_v2=lambda keys, transfers: SimpleNamespace(
+            restorable_prefix_pages=[]
+        )
+    )
+
+    assert linker._lookup_cp_request(
+        "rid",
+        ["page-0"],
+        [PoolTransfer(name=PoolName.KV, keys=["page-0"])],
+    ) == []
+    assert selected_groups == [control_group]
 
 
 def test_cp_lookup_request_owner_queries_all_keys(monkeypatch):
@@ -2311,7 +2881,8 @@ def test_layersplit_read_plan_expands_packed_draft_layer_mapping(
         ]
 
 
-def test_load_with_read_plan_passes_page_wise_flag():
+@pytest.mark.parametrize("enable_page_wise_load", [False, True])
+def test_layersplit_read_plan_preserves_page_wise_choice(enable_page_wise_load):
     group = _make_layersplit_dsv4_group(1)
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     calls = []
@@ -2332,7 +2903,7 @@ def test_load_with_read_plan_passes_page_wise_flag():
     linker.pools = group.entry_map
     linker.num_layers = group.num_layers
     linker.read_plan_reuse_ranges = False
-    linker.enable_page_wise_load = True
+    linker.enable_page_wise_load = enable_page_wise_load
     linker.layer_done_counter = SimpleNamespace(
         bind=lambda index, plan: calls.append("bind")
     )
@@ -2345,7 +2916,7 @@ def test_load_with_read_plan_passes_page_wise_flag():
     linker.load_with_read_plan(7, [("rid", [transfer])])
 
     _, kwargs = calls[0]
-    assert kwargs["page_wise"] is True
+    assert kwargs["page_wise"] is enable_page_wise_load
     assert calls[1:] == ["bind", "run"]
 
 
@@ -2397,7 +2968,10 @@ def test_layersplit_round_trip_preserves_owned_and_draft_bytes(
                 expected.append((ptr, size, chunk))
                 ctypes.memset(ptr, 0, size)
 
+        range_get_calls = []
+
         def range_get(keys, pointers, sizes, offsets, objects=objects):
+            range_get_calls.append(list(keys))
             result = []
             for key, page_ptrs, page_sizes, page_offsets in zip(
                 keys, pointers, sizes, offsets
@@ -2419,9 +2993,16 @@ def test_layersplit_round_trip_preserves_owned_and_draft_bytes(
         linker.enable_page_wise_load = enable_page_wise_load
         linker.page_wise_load_threshold = 1
         linker.page_wise_load_batch_size = 1
-        linker.layer_done_counter = mooncake_direct_linker.LayerWiseLoadCounter(
-            group.num_layers
-        )
+        completed_layers = []
+        counter = mooncake_direct_linker.LayerWiseLoadCounter(group.num_layers)
+        original_complete = counter.complete
+
+        def complete(counter_index, layer):
+            completed_layers.append(layer)
+            original_complete(counter_index, layer)
+
+        counter.complete = complete
+        linker.layer_done_counter = counter
         linker.request_time_stats = {}
         linker.pending_load_metrics = {}
         linker.abort_prepared_load = lambda rid: None
@@ -2431,6 +3012,11 @@ def test_layersplit_round_trip_preserves_owned_and_draft_bytes(
         assert all(
             future.done() for future in linker.layer_done_counter.futures[index]
         )
+        assert completed_layers == list(range(group.num_layers))
+        if enable_page_wise_load:
+            assert len(range_get_calls) == 1
+        else:
+            assert len(range_get_calls) > 1
         for ptr, size, chunk in expected:
             assert ctypes.string_at(ptr, size) == chunk
 
