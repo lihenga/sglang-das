@@ -192,9 +192,12 @@ class UnifiedCacheLinkerWrapper:
             # PP0's absolute boundary also survives later local L1 rematches.
             key = key[:known_hit_len]
         elif cache.pp_size > 1:
-            req.external_cache_hit_length = 0
             if cache.pp_rank != 0:
+                req.external_cache_hit_length = 0
                 return result
+            # The local device hit is part of PP0's canonical restorable
+            # boundary even when the external tail lookup misses.
+            req.external_cache_hit_length = device_hit_len
 
         if device_hit_len >= len(key):
             return result
@@ -220,7 +223,7 @@ class UnifiedCacheLinkerWrapper:
                 num_pages=len(tail_hashes),
                 device_hit_pages=0,
             )
-            if cache.pp_size > 1 and hit_pages:
+            if cache.pp_size > 1:
                 req.external_cache_hit_length = device_hit_len + hit_pages * page
         else:
             hit_pages = len(tail_hashes)
@@ -350,7 +353,9 @@ class UnifiedCacheLinkerWrapper:
             # Load into request-owned slots. The existing PP result ring delays
             # normal insert/dedup until every stage has completed this prefill.
             try:
-                self._queue_load(req.rid, req.last_node, prepared_transfers)
+                self._queue_load(
+                    req.rid, req.last_node, prepared_transfers, anchor=req.last_node
+                )
             except BaseException:
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT,
