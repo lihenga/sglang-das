@@ -874,16 +874,12 @@ class PrefillBootstrapQueue:
                 pp_good_rids,
                 pp_bad_rids,
             )
-            uncovered = [i for i, poll in enumerate(polls) if poll is None]
-            if uncovered:
-                local_polls = poll_and_all_reduce_attn_cp_tp_group(
-                    [self.queue[i].disagg_kv_sender for i in uncovered],
-                    self.scheduler.attn_cp_cpu_group,
-                    self.scheduler.attn_tp_cpu_group,
-                )
-                for i, local_poll in zip(uncovered, local_polls):
-                    if local_poll == KVPoll.Failed:
-                        polls[i] = KVPoll.Failed
+            # Requests absent from this consensus round must stay queued.
+            # A local failure can arrive while an older ready consensus is in
+            # flight. Removing it here lets another PP stage admit the same
+            # request, producing different batches (and CP token shapes).
+            # get_ready_bootstrapped_rids_for_pp propagates failures through
+            # the ordered PP bad-RID consensus before they are removed.
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
