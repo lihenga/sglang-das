@@ -206,14 +206,39 @@ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
 
 
 def split_cached_prefix_by_tier(
-    prefix_len: int, host_hit_len: int, storage_hit_len: int
+    prefix_len: int,
+    host_hit_len: int,
+    storage_hit_len: int,
+    source_counts: dict[str, int] | None = None,
 ) -> tuple[int, int, int]:
     """Split a request's cached prefix into (device, host, storage) tokens.
 
     prefix_len is len(prefix_indices) AFTER host load-back, so it contains the
     host-loaded portion; host_hit_len in turn contains the storage-prefetched
-    portion (storage is clamped to it to handle edge cases).
+    portion (storage is clamped to it to handle edge cases). Source counts are
+    durable across rematches, unlike host_hit_len, so use them to preserve the
+    original external source attribution after a loaded prefix is rematched in
+    the device cache.
     """
+    external_storage = sum(
+        int((source_counts or {}).get(source, 0))
+        for source in (
+            "l3_mooncake_memory",
+            "l4_mooncake_dfs",
+            "l4_mooncake_local_disk",
+        )
+    )
+    if external_storage:
+        host = max(0, host_hit_len - storage_hit_len)
+        if host + external_storage > prefix_len:
+            raise ValueError(
+                "External cache source counts exceed the matched cached prefix: "
+                f"host={host}, external_storage={external_storage}, "
+                f"prefix_len={prefix_len}"
+            )
+        device = prefix_len - host - external_storage
+        return device, host, external_storage
+
     storage = min(host_hit_len, storage_hit_len)
     host = host_hit_len - storage
     device = max(0, prefix_len - host_hit_len)
@@ -2512,8 +2537,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
                 # would incorrectly count previously computed tokens as cache hits.
                 if not req._cache_breakdown_computed:
+                    source_counts = getattr(req, "cached_tokens_by_source", {})
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    # after prefetch completes.
+                    # after prefetch completes. source_counts also preserves the
+                    # loaded source when init_next_round_input rematches this prefix.
                     (
                         req.cached_tokens_device,
                         req.cached_tokens_host,
@@ -2522,8 +2549,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         prefix_len=len(req.prefix_indices),
                         host_hit_len=req.host_hit_length,
                         storage_hit_len=req.storage_hit_length,
+                        source_counts=source_counts,
                     )
-                    source_counts = getattr(req, "cached_tokens_by_source", {})
                     # The device prefix is authoritative after load-back. A
                     # Mooncake load starts with this map initialized to zero,
                     # so copying source_counts["l1_device"] here would erase a

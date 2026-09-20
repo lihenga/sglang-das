@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+_PD_FIRST_TOKEN_TRACE = envs.SGLANG_DEBUG_PD_FIRST_TOKEN.get()
 
 _is_npu = is_npu()
 
@@ -1591,6 +1592,27 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
+                if _PD_FIRST_TOKEN_TRACE and not getattr(
+                    req, "_pd_first_token_trace_p_logged", False
+                ):
+                    req._pd_first_token_trace_p_logged = True
+                    top2_ids = None
+                    top2_logprobs = None
+                    if req.return_logprob and req.logprob.top_logprobs_num > 0:
+                        if req.logprob.output_top_logprobs_idx:
+                            top2_ids = req.logprob.output_top_logprobs_idx[0][:2]
+                        if req.logprob.output_top_logprobs_val:
+                            top2_logprobs = req.logprob.output_top_logprobs_val[0][:2]
+                    logger.info(
+                        "PD_FIRST_TOKEN_TRACE stage=p_sample rid=%s token_id=%s "
+                        "row=%d bs=%d top2_ids=%s top2_logprobs=%s",
+                        req.rid,
+                        next_token_id,
+                        i,
+                        len(batch.reqs),
+                        top2_ids,
+                        top2_logprobs,
+                    )
                 if req.return_sampling_mask:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output

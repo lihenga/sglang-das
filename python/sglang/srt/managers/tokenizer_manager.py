@@ -172,6 +172,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+_PD_FIRST_TOKEN_TRACE = envs.SGLANG_DEBUG_PD_FIRST_TOKEN.get()
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -2311,6 +2312,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
                 state.output_ids.extend(delta_output_ids)
+                if (
+                    _PD_FIRST_TOKEN_TRACE
+                    and state.finished
+                    and state.output_ids
+                    and not getattr(
+                        state, "_pd_first_token_trace_final_logged", False
+                    )
+                ):
+                    state._pd_first_token_trace_final_logged = True
+                    first_text_segment = state.text or (
+                        state.text_chunks[0] if state.text_chunks else ""
+                    )
+                    first_output_id = state.output_ids[0]
+                    logger.info(
+                        "PD_FIRST_TOKEN_TRACE stage=final_output rid=%s "
+                        "token_id=%s first_output_id=%s first_segment_text=%r",
+                        recv_obj.rids[i],
+                        first_output_id,
+                        first_output_id,
+                        first_text_segment[:64],
+                    )
 
                 if is_stream:
                     if incremental:

@@ -119,6 +119,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+_PD_FIRST_TOKEN_TRACE = envs.SGLANG_DEBUG_PD_FIRST_TOKEN.get()
 
 _is_npu = is_npu()
 _is_hcu = is_hcu()
@@ -3042,9 +3043,35 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
+            metadata_received_output_id = (
+                int(output_id[0].item()) if _PD_FIRST_TOKEN_TRACE else None
+            )
         else:
             committed_output_id = output_id[0].item()
+            metadata_received_output_id = committed_output_id
         decode_req.req.output_ids.append(committed_output_id)
+        if _PD_FIRST_TOKEN_TRACE and not getattr(
+            decode_req.req, "_pd_first_token_trace_d_logged", False
+        ):
+            decode_req.req._pd_first_token_trace_d_logged = True
+            top2_ids = None
+            top2_logprobs = None
+            if (
+                decode_req.req.return_logprob
+                and decode_req.req.logprob.top_logprobs_num > 0
+            ):
+                top2_ids = output_top_logprobs_idx[:2].tolist()
+                top2_logprobs = output_top_logprobs_val[:2].tolist()
+            logger.info(
+                "PD_FIRST_TOKEN_TRACE stage=d_receive rid=%s token_id=%s "
+                "metadata_received=%s committed=%s top2_ids=%s top2_logprobs=%s",
+                decode_req.req.rid,
+                committed_output_id,
+                metadata_received_output_id,
+                committed_output_id,
+                top2_ids,
+                top2_logprobs,
+            )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that

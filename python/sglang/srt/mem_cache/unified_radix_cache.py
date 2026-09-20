@@ -540,6 +540,42 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
         return self.linker.prefetch_to_host(req)
 
+    def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
+        """Return one rank-wide admission state for a queued DFS prefetch."""
+        if self.linker is None:
+            local_state = "not_tracked"
+        else:
+            local_state = self.linker.get_host_prefetch_admission_state(rid)
+
+        state_names = ("not_tracked", "pending", "ready", "terminal")
+        counts = torch.tensor(
+            [int(local_state == state) for state in state_names], dtype=torch.int
+        )
+        self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
+        not_tracked, pending, ready, terminal = (int(value) for value in counts)
+
+        # A still-running native read takes precedence over terminal states on
+        # other ranks. Defer until no rank can still be using its session.
+        if pending:
+            return "pending"
+        if terminal or (not_tracked and ready):
+            return "terminal"
+        if ready:
+            return "ready"
+        if not_tracked:
+            return "not_tracked"
+        return "terminal"
+
+    def cancel_waiting_queue_prefetch(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.cancel_waiting_queue_prefetch(rid)
+
+    def clear_external_hit_for_prefetch_fallback(self, req) -> None:
+        if self.linker is not None:
+            self.linker.clear_external_hit_for_prefetch_fallback(req)
+        else:
+            UnifiedCacheLinkerWrapper._clear_external_hit(req)
+
     def is_chunk_cache(self) -> bool:
         return self.disable
 

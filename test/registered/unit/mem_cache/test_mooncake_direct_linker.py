@@ -2935,6 +2935,93 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
     assert pp0.has_hit("rid") == (hit_pages * 2 > device_hit_len)
 
 
+@pytest.mark.parametrize(
+    ("rank_states", "expected"),
+    [
+        ([(True, "queued"), (True, "reading")], "pending"),
+        ([(True, "ready"), (True, "reading")], "pending"),
+        ([(True, "failed"), (True, "reading")], "pending"),
+        ([(False, "reading"), (True, "ready")], "pending"),
+        ([(True, "ready"), (True, "ready")], "ready"),
+        ([(True, "failed"), (True, "ready")], "terminal"),
+        ([(False, "ready"), (True, "ready")], "terminal"),
+        ([(False, None), (False, None)], "not_tracked"),
+    ],
+)
+def test_waiting_prefetch_admission_state_is_rank_wide(rank_states, expected):
+    wrappers = []
+    for tracked, local_status in rank_states:
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.host_prefetch_hits = {"rid": object()} if tracked else {}
+        wrapper.cache_linker = SimpleNamespace(
+            get_host_prefetch_status=lambda rid, status=local_status: status,
+            cancel_host_prefetch=lambda rid: pytest.fail(
+                "admission state checks must not cancel a prefetch"
+            ),
+        )
+        wrappers.append(wrapper)
+
+    local_states = [
+        wrapper.get_host_prefetch_admission_state("rid") for wrapper in wrappers
+    ]
+    state_names = ("not_tracked", "pending", "ready", "terminal")
+    reduced_counts = torch.tensor(
+        [local_states.count(state) for state in state_names], dtype=torch.int
+    )
+    results = []
+    for wrapper in wrappers:
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.linker = wrapper
+
+        def reduce_state_counts(counts, op):
+            assert op == torch.distributed.ReduceOp.SUM
+            counts.copy_(reduced_counts)
+
+        cache._all_reduce_attn_groups = reduce_state_counts
+        results.append(cache.get_waiting_queue_prefetch_admission_state("rid"))
+
+    assert results == [expected] * len(rank_states)
+
+
+def test_terminal_waiting_prefetch_fallback_cleans_hit_state():
+    cancelled = []
+    marker = object()
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.hit_markers = {"rid": marker}
+    wrapper.host_prefetch_hits = {"rid": marker}
+    wrapper.cache_linker = SimpleNamespace(
+        cancel_host_prefetch=cancelled.append,
+    )
+    req = SimpleNamespace(
+        rid="rid",
+        host_hit_length=8,
+        swa_host_hit_length=4,
+        mamba_host_hit_length=1,
+        storage_hit_length=8,
+        cached_tokens_storage_source="mooncake_dfs",
+        cached_tokens_device=2,
+        cached_tokens_by_source={"l1_device": 2, "l4_mooncake_dfs": 8},
+    )
+
+    wrapper.cancel_waiting_queue_prefetch(req.rid)
+    wrapper.clear_external_hit_for_prefetch_fallback(req)
+
+    assert cancelled == [req.rid]
+    assert req.rid not in wrapper.hit_markers
+    assert req.rid not in wrapper.host_prefetch_hits
+    assert req.host_hit_length == 0
+    assert req.swa_host_hit_length == 0
+    assert req.mamba_host_hit_length == 0
+    assert req.storage_hit_length == 0
+    assert req.cached_tokens_storage_source is None
+    assert req.cached_tokens_by_source == {
+        "l1_device": 2,
+        "l3_mooncake_memory": 0,
+        "l4_mooncake_dfs": 0,
+        "l4_mooncake_local_disk": 0,
+    }
+
+
 def test_waiting_prefetch_rematch_reuses_equal_radix_key_without_lookup():
     class _Component:
         def build_external_linker_transfer(self, phase, node, keys):

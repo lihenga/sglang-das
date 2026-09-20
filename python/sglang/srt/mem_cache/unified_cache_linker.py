@@ -452,6 +452,30 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def get_host_prefetch_admission_state(self, rid: str) -> str:
+        """Return this rank's waiting-queue prefetch state for admission sync."""
+        tracked = rid in self.host_prefetch_hits
+        status = self.cache_linker.get_host_prefetch_status(rid)
+        if status in {"preparing", "queued", "reading"}:
+            # Even if the hit marker was lost locally, do not cancel a native
+            # read that may still be using its prepared session.
+            return "pending"
+        if tracked and status == "ready":
+            return "ready"
+        if not tracked and status is None:
+            return "not_tracked"
+        return "terminal"
+
+    def cancel_waiting_queue_prefetch(self, rid: str) -> None:
+        self.hit_markers.pop(rid, None)
+        self.host_prefetch_hits.pop(rid, None)
+        self.cache_linker.cancel_host_prefetch(rid)
+
+    def clear_external_hit_for_prefetch_fallback(self, req: Req) -> None:
+        self.hit_markers.pop(req.rid, None)
+        self.host_prefetch_hits.pop(req.rid, None)
+        self._clear_external_hit(req)
+
     def prefetch_to_host(self, req: Req) -> bool:
         """Submit the current external hit for DFS-to-pinned prefetch.
 
