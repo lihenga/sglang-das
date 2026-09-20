@@ -117,6 +117,10 @@ class LayerWiseLoadCounter:
         self.futures.clear()
 
 
+class ExternalLinkerLoadError(RuntimeError):
+    """A recoverable external-cache load failure for the current batch."""
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
