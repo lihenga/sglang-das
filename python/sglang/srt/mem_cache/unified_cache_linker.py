@@ -354,6 +354,10 @@ class UnifiedCacheLinker(ABC):
         """Return the backend host-prefetch state, or ``None`` if absent."""
         return None
 
+    def revalidate_host_prefetch(self, rid: str) -> bool:
+        """Revalidate the prepared session without copying into device memory."""
+        return False
+
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         """Transfer a READY host-prefetch session to the normal load path."""
         return False
@@ -700,7 +704,33 @@ class UnifiedCacheLinkerWrapper:
                     status,
                 )
                 return empty_indices, req.last_node
-            if not self.cache_linker.claim_ready_host_prefetch(req.rid):
+
+            locally_valid = False
+            try:
+                locally_valid = self.cache_linker.revalidate_host_prefetch(req.rid)
+            except BaseException:
+                logger.exception(
+                    "Mooncake host prefetch session revalidation failed for rid=%s",
+                    req.rid,
+                )
+            valid = torch.tensor(int(locally_valid), dtype=torch.int)
+            cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
+            if int(valid.item()) == 0:
+                self.cache_linker.cancel_host_prefetch(req.rid)
+                self._clear_external_hit(req)
+                logger.debug(
+                    "Mooncake host prefetch session expired before admission for "
+                    "rid=%s; falling back to normal prefill.",
+                    req.rid,
+                )
+                return empty_indices, req.last_node
+
+            claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
+            claimed_all = torch.tensor(int(claimed), dtype=torch.int)
+            cache._all_reduce_attn_groups(
+                claimed_all, torch.distributed.ReduceOp.MIN
+            )
+            if int(claimed_all.item()) == 0:
                 self.cache_linker.cancel_host_prefetch(req.rid)
                 self._clear_external_hit(req)
                 return empty_indices, req.last_node

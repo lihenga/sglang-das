@@ -206,6 +206,72 @@ def test_mooncake_direct_linker_storage_metrics_dp_rank(
     assert captured_labels["dp_rank"] == expected_dp_rank
 
 
+def test_host_prefetch_and_read_plan_can_be_enabled_together(monkeypatch):
+    class _NoopThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    group = SimpleNamespace(
+        entry_map={},
+        num_layers=1,
+        rank_replicated=False,
+        storage_layout_tag="",
+        sources={},
+    )
+    monkeypatch.setattr(
+        mooncake_direct_linker,
+        "resolve_hybrid_device_pool_group",
+        lambda **_kwargs: group,
+    )
+    monkeypatch.setattr(mooncake_direct_linker.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+    monkeypatch.setenv("SGLANG_MOONCAKE_READ_PLAN", "1")
+
+    server_args = SimpleNamespace(
+        mooncake_page_wise_load_threshold=1,
+        mooncake_page_wise_load_batch_size=1,
+        mooncake_enable_page_wise_load=False,
+        mooncake_enable_waiting_queue_dfs_prefetch=True,
+        hicache_storage_backend_extra_config=None,
+        tp_size=1,
+        model_path="test-model",
+        enable_dp_attention=False,
+        extra_metric_labels={},
+    )
+    params = SimpleNamespace(
+        page_size=1,
+        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: object()),
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        tp_cache_group=None,
+        attn_cp_cache_group=None,
+        attn_tp_cache_group=None,
+        enable_metrics=False,
+        dp_rank=0,
+    )
+    store = SimpleNamespace(
+        create_read_plan=lambda *_args, **_kwargs: None,
+        batch_get_session_prefetch=lambda _keys: [],
+        batch_get_session_refresh=lambda _keys: [],
+        register_buffer=lambda *_args: 0,
+    )
+
+    linker = MooncakeDirectLinker(
+        server_args,
+        params,
+        components=None,
+        storage=SimpleNamespace(store=store),
+    )
+
+    assert linker.host_prefetch_enabled
+    assert linker.read_plan_enabled
+
+
 def test_layersplit_disables_cp_single_writer_and_isolates_namespace(monkeypatch):
     class _NoopThread:
         def __init__(self, *args, **kwargs):
@@ -596,10 +662,15 @@ def test_session_start_negative_result_falls_back_and_logs_key(caplog):
 
 def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
     prefetch_calls = []
+    refresh_calls = []
 
     class _Store:
         def batch_get_session_prefetch(self, keys):
             prefetch_calls.append(list(keys))
+            return [0] * len(keys)
+
+        def batch_get_session_refresh(self, keys):
+            refresh_calls.append(list(keys))
             return [0] * len(keys)
 
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -609,6 +680,7 @@ def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
     linker.host_prefetch_entries = {}
     linker.host_prefetch_queue = Queue()
     linker.prepared_load_sessions = {}
+    linker.session_lock = threading.Lock()
     linker.storage = SimpleNamespace(store=_Store())
     linker.stats = {
         "host_prefetch_submitted": 0,
@@ -632,6 +704,9 @@ def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
         linker.host_prefetch_queue.join()
         assert prefetch_calls == [["page-a", "page-b"]]
         assert linker.get_host_prefetch_status("rid") == "ready"
+        assert linker.revalidate_host_prefetch("rid")
+        assert prefetch_calls == [["page-a", "page-b"]]
+        assert refresh_calls == [["page-a", "page-b"]]
         assert linker.claim_ready_host_prefetch("rid")
         assert linker.prepared_load_sessions["rid"] == ["page-a", "page-b"]
         assert linker.stats["host_prefetch_consumed"] == 1
@@ -2357,7 +2432,7 @@ def test_layersplit_read_plan_expands_packed_draft_layer_mapping(
         ]
 
 
-def test_load_with_read_plan_passes_page_wise_flag():
+def test_load_with_read_plan_borrows_prepared_sessions():
     group = _make_layersplit_dsv4_group(1)
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     calls = []
@@ -2379,20 +2454,57 @@ def test_load_with_read_plan_passes_page_wise_flag():
     linker.num_layers = group.num_layers
     linker.read_plan_reuse_ranges = False
     linker.enable_page_wise_load = True
+    linker.host_prefetch_enabled = True
+    linker.prepared_load_sessions = {
+        "ordinary-rid": ["ordinary-key"],
+        "host-prefetched-rid": ["prefetched-key"],
+    }
     linker.layer_done_counter = SimpleNamespace(
         bind=lambda index, plan: calls.append("bind")
     )
-    transfer = PoolTransfer(
+    ordinary_transfer = PoolTransfer(
         name=PoolName.SWA,
-        keys=["page"],
+        keys=["ordinary-key"],
+        host_indices=torch.tensor([2, 3]),
+    )
+    prefetched_transfer = PoolTransfer(
+        name=PoolName.SWA,
+        keys=["prefetched-key"],
         host_indices=torch.tensor([2, 3]),
     )
 
-    linker.load_with_read_plan(7, [("rid", [transfer])])
+    linker.load_with_read_plan(
+        7,
+        [
+            ("ordinary-rid", [ordinary_transfer]),
+            ("host-prefetched-rid", [prefetched_transfer]),
+        ],
+    )
 
     _, kwargs = calls[0]
     assert kwargs["page_wise"] is True
+    assert kwargs["borrowed_sessions"] is True
     assert calls[1:] == ["bind", "run"]
+
+
+def test_successful_read_plan_marks_request_metric_success():
+    metric_results = []
+    aborted = []
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.read_plan_enabled = True
+    linker.load_with_read_plan = lambda counter, transfers: None
+    linker.request_time_stats = {}
+    linker._finish_l4_metric = (
+        lambda operation, rid, success: metric_results.append(
+            (operation, rid, success)
+        )
+    )
+    linker.abort_prepared_load = aborted.append
+
+    linker.load_layer_wise(3, [("rid", [])])
+
+    assert metric_results == [("prefetch", "rid", True)]
+    assert aborted == ["rid"]
 
 
 def test_layersplit_storage_tag_is_stable_and_capacity_independent():
@@ -2876,6 +2988,73 @@ def test_waiting_prefetch_rematch_reuses_equal_radix_key_without_lookup():
 
     assert second.host_hit_length == 4
     assert backend.lookup_calls == 0
+
+
+def test_ready_waiting_prefetch_expiry_falls_back_before_claim():
+    empty = torch.empty((0,), dtype=torch.int64)
+    cancelled = []
+    collectives = []
+
+    class _Backend:
+        def get_host_prefetch_status(self, rid):
+            assert rid == "rid"
+            return "ready"
+
+        def revalidate_host_prefetch(self, rid):
+            assert rid == "rid"
+            return False
+
+        def claim_ready_host_prefetch(self, rid):
+            pytest.fail("an expired READY prefetch must not be claimed")
+
+        def cancel_host_prefetch(self, rid):
+            cancelled.append(rid)
+
+        def prepare_load(self, rid, transfers):
+            pytest.fail("expired prefetch must fall back before load preparation")
+
+    def all_reduce(value, op):
+        collectives.append(op)
+
+    marker = ExternalCacheHitMarker(
+        prefix_key=RadixKey(array("q", [1, 2])),
+        tail_hashes=["page-a"],
+        device_hit_len=0,
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(
+        page_size=2,
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(device_indices=empty)
+        ),
+        _all_reduce_attn_groups=all_reduce,
+    )
+    wrapper.cache_linker = _Backend()
+    wrapper.hit_markers = {"rid": marker}
+    wrapper.host_prefetch_hits = {"rid": marker}
+    req = SimpleNamespace(
+        rid="rid",
+        last_node=7,
+        host_hit_length=2,
+        swa_host_hit_length=2,
+        mamba_host_hit_length=1,
+        storage_hit_length=2,
+        cached_tokens_storage_source="mooncake_dfs",
+        cached_tokens_device=0,
+        time_stats=None,
+    )
+
+    indices, node = wrapper.load_back(req)
+
+    assert indices.numel() == 0
+    assert node == 7
+    assert cancelled == ["rid"]
+    assert len(collectives) == 2  # READY and session validation are rank-wide.
+    assert req.host_hit_length == 0
+    assert req.swa_host_hit_length == 0
+    assert req.mamba_host_hit_length == 0
+    assert req.storage_hit_length == 0
+    assert req.cached_tokens_storage_source is None
 
 
 @pytest.mark.parametrize("load_outcome", [True, False, "raise"])

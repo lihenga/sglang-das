@@ -55,6 +55,49 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(req, 8)
         req.time_stats.set_prefill_bootstrap_queue_entry_time.assert_called_once()
 
+    def test_prefill_queue_rejection_does_not_start_external_prefetch(self):
+        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        scheduler.disagg_prefill_bootstrap_queue.add.return_value = False
+        req = self._new_req(priority=None)
+
+        scheduler._add_request_to_queue(req)
+
+        scheduler._prefetch_kvcache.assert_not_called()
+        req.time_stats.set_prefill_bootstrap_queue_entry_time.assert_not_called()
+
+    def test_waiting_queue_dfs_prefetch_gate_enables_pd_prefill_only(self):
+        for mode, expected in (
+            (DisaggregationMode.NULL, True),
+            (DisaggregationMode.PREFILL, True),
+            (DisaggregationMode.DECODE, False),
+        ):
+            with self.subTest(mode=mode):
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.server_args = SimpleNamespace(
+                    mooncake_enable_waiting_queue_dfs_prefetch=True,
+                    enable_unified_cache_external_linker=True,
+                    unified_cache_external_linker_backend="mooncake",
+                )
+                scheduler.disaggregation_mode = mode
+                scheduler.schedule_policy = "fcfs"
+                scheduler.ps = SimpleNamespace(pp_size=1)
+                scheduler.enable_hicache_storage = False
+                scheduler.tree_cache = SimpleNamespace(
+                    prefetch_external_linker_to_host=MagicMock()
+                )
+                req = SimpleNamespace(
+                    prefill_attempt_count=0,
+                    init_next_round_input=MagicMock(),
+                )
+
+                Scheduler._prefetch_kvcache(scheduler, req)
+
+                self.assertEqual(
+                    scheduler.tree_cache.prefetch_external_linker_to_host.call_count,
+                    int(expected),
+                )
+                self.assertEqual(req.init_next_round_input.call_count, int(expected))
+
     def test_decode_mode_assigns_default_priority_before_prealloc_queue(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)
         req = self._new_req(priority=None)

@@ -845,10 +845,11 @@ class PrefillBootstrapQueue:
         pd_hidden_state(req).owner_direct_sent = False
         return True
 
-    def add(self, req: Req, num_kv_heads: int) -> None:
+    def add(self, req: Req, num_kv_heads: int) -> bool:
         if not self.create_sender(req, num_kv_heads):
-            return
+            return False
         self.queue.append(req)
+        return True
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -1913,8 +1914,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+        self._release_aborted_request(req.rid)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""

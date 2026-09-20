@@ -145,6 +145,40 @@ class TestPrefillExternalLinkerFailure(unittest.TestCase):
         self.assertFalse(req.pending_bootstrap)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
 
+    def test_bootstrap_failure_releases_external_prefetch_without_hicache(self):
+        req = SimpleNamespace(
+            rid="failed-bootstrap-rid",
+            bootstrap_room="room",
+            return_logprob=False,
+            req_pool_idx=None,
+            kv=None,
+            mamba_pool_idx=None,
+            pending_bootstrap=True,
+            disagg_kv_sender=SimpleNamespace(failure_exception=lambda: None),
+            time_stats=SimpleNamespace(
+                trace_ctx=SimpleNamespace(abort=MagicMock())
+            ),
+        )
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(tp_rank=0),
+            clear_pending_chunk_send=MagicMock(),
+            enable_hicache_storage=False,
+            _release_aborted_request=MagicMock(),
+            req_to_metadata_buffer_idx_allocator=object(),
+            disagg_metadata_buffers=SimpleNamespace(pd_hidden_pool=None),
+            output_streamer=SimpleNamespace(stream_output=MagicMock()),
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
+        ), patch("sglang.srt.disaggregation.prefill.prepare_abort"):
+            SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(
+                scheduler, req
+            )
+
+        scheduler._release_aborted_request.assert_called_once_with(req.rid)
+
 
 if __name__ == "__main__":
     unittest.main()

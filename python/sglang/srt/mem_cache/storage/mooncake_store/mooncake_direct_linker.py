@@ -397,17 +397,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.read_plan_reuse_ranges,
             )
         if self.host_prefetch_enabled:
-            if self.read_plan_enabled:
-                raise ValueError(
-                    "Mooncake waiting-queue DFS prefetch does not yet support "
-                    "SGLANG_MOONCAKE_READ_PLAN=1."
-                )
             if not callable(
                 getattr(self.storage.store, "batch_get_session_prefetch", None)
+            ) or not callable(
+                getattr(self.storage.store, "batch_get_session_refresh", None)
             ):
                 raise RuntimeError(
                     "Mooncake waiting-queue DFS prefetch requires a Mooncake "
-                    "package with batch_get_session_prefetch()."
+                    "package with batch_get_session_prefetch() and "
+                    "batch_get_session_refresh()."
                 )
         if self.cp_single_writer:
             logger.info(
@@ -862,6 +860,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             entry = self.host_prefetch_entries.get(rid)
             return None if entry is None else str(entry.get("state"))
 
+    def revalidate_host_prefetch(self, rid: str) -> bool:
+        with self.host_prefetch_lock:
+            entry = self.host_prefetch_entries.get(rid)
+            if (
+                entry is None
+                or entry.get("state") != "ready"
+                or entry.get("cancelled")
+            ):
+                return False
+
+        with self.session_lock:
+            keys = list(self.prepared_load_sessions.get(rid, ()))
+        if not keys:
+            return False
+
+        try:
+            results = list(self.storage.store.batch_get_session_refresh(keys))
+        except BaseException:
+            logger.warning(
+                "Mooncake waiting-queue host prefetch lease refresh failed for rid=%s",
+                rid,
+                exc_info=True,
+            )
+            return False
+        return len(results) == len(keys) and all(result == 0 for result in results)
+
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
@@ -1080,6 +1104,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         try:
             if getattr(self, "read_plan_enabled", False):
                 self.load_with_read_plan(counter_index, request_transfers)
+                request_success = {rid: True for rid, _ in request_transfers}
                 return
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             batch_rids: dict[PoolName, list[str]] = {}
@@ -1449,11 +1474,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         request_transfers: list[tuple[str, list[PoolTransfer]]],
     ) -> None:
         layouts = self._prepare_read_plan_layouts(request_transfers)
+        # Every request enters pending_loads through load(), which holds its
+        # prepared get-session refs (the unified linker prepares before commit;
+        # load() also prepares direct callers). Borrow those sessions so the
+        # plan cannot replace/end a key-indexed session or drop a host-prefetched
+        # object cache. abort_prepared_load() remains the sole owner of release.
         plan = self.storage.store.create_read_plan(
             layouts,
             self.num_layers,
             reuse_ranges=self.read_plan_reuse_ranges,
             page_wise=self.enable_page_wise_load,
+            borrowed_sessions=True,
             buffer_owners=self.pools,
         )
         self.layer_done_counter.bind(counter_index, plan)

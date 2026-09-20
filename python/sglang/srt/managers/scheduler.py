@@ -2964,7 +2964,10 @@ class Scheduler(
             )
             and self.server_args.enable_unified_cache_external_linker
             and self.server_args.unified_cache_external_linker_backend == "mooncake"
-            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self.disaggregation_mode in (
+                DisaggregationMode.NULL,
+                DisaggregationMode.PREFILL,
+            )
             and self.schedule_policy == "fcfs"
             and self.ps.pp_size == 1
             and not is_retracted
@@ -3028,11 +3031,12 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req, is_retracted=is_retracted)
-            self.disagg_prefill_bootstrap_queue.add(
+            added = self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
-            req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if added:
+                req.time_stats.set_prefill_bootstrap_queue_entry_time()
+                self._prefetch_kvcache(req, is_retracted=is_retracted)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
