@@ -258,6 +258,10 @@ class DevicePoolGroup:
         return resolved
 
 
+class ExternalLinkerLoadError(RuntimeError):
+    """A recoverable external-cache load failure for the current batch."""
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
