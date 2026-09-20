@@ -419,7 +419,7 @@ DSV4_PREFILL_BACKEND_CHOICES = [
     "flashmla_sparse_q8",
 ]
 
-DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
+DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer", "lightop"]
 
 DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = [
     "auto",
@@ -1913,7 +1913,7 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer', 'lightop' (TopK2048). The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
             choices=DSA_TOPK_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),

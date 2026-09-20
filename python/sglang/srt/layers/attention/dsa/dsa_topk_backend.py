@@ -27,9 +27,13 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+    LIGHTOP = "lightop"
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
+
+    def is_lightop(self) -> bool:
+        return self == DSATopKBackend.LIGHTOP
 
     def is_torch(self) -> bool:
         return self == DSATopKBackend.TORCH
@@ -47,6 +51,13 @@ class DSATopKBackend(Enum):
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.is_lightop():
+            from lightop.attention import fast_topk_transform_ragged_fused
+
+            return fast_topk_transform_ragged_fused(
+                score, lengths, torch.zeros_like(lengths), topk,
+                row_starts=row_starts,
+            )
         if self.is_sgl_kernel():
             from sgl_kernel import fast_topk_v2
 
@@ -141,14 +152,17 @@ class DSATopKBackend(Enum):
         # dispatched to v2 above.
         assert attn_metadata.page_table_1 is not None
 
-        if self.is_sgl_kernel():
-            # Honor the selected backend on HCU as well.  The old HCU-only
-            # override silently routed the legacy fused transforms to LightOp
-            # even when --dsa-topk-backend=sgl-kernel was requested.
-            from sgl_kernel import (
-                fast_topk_transform_fused,
-                fast_topk_transform_ragged_fused,
-            )
+        if self.is_sgl_kernel() or self.is_lightop():
+            if self.is_lightop():
+                from lightop.attention import (
+                    fast_topk_transform_fused,
+                    fast_topk_transform_ragged_fused,
+                )
+            else:
+                from sgl_kernel import (
+                    fast_topk_transform_fused,
+                    fast_topk_transform_ragged_fused,
+                )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
                 page_table_size_1 = (
@@ -156,7 +170,7 @@ class DSATopKBackend(Enum):
                     if batch_idx_list is not None
                     else attn_metadata.page_table_1
                 )
-                return fast_topk_transform_fused(
+                result = fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
                     page_table_size_1=page_table_size_1,
@@ -164,6 +178,10 @@ class DSATopKBackend(Enum):
                     topk=topk,
                     row_starts=row_starts,
                 )
+                if self.is_lightop():
+                    attn_metadata.lightop_kv_reuse.page_indices = result
+                    attn_metadata.lightop_kv_reuse.dedup_key = None
+                return result
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
                     raise RuntimeError(

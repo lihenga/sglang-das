@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -194,6 +194,12 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+@dataclass
+class LightOpKVReuseState:
+    page_indices: Optional[torch.Tensor] = None
+    dedup_key: Optional[Tuple[int, int, int]] = None
+
+
 @dataclass(frozen=True)
 class DSAMetadata:
     page_size: int
@@ -240,6 +246,11 @@ class DSAMetadata:
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless the SGL top-k v2 path is enabled.
     topk_v2_plan: Optional[torch.Tensor] = None
+    # Only the mapping is shared across IndexShare layers; each layer gathers
+    # its own KV. A new TopK producer resets this state before the first gather.
+    lightop_kv_group_size: int = 1
+    lightop_kv_reuse: LightOpKVReuseState = field(default_factory=LightOpKVReuseState)
+
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -808,6 +819,7 @@ class DeepseekSparseAttnBackend(
         if (
             self.dsa_topk_backend.is_sgl_kernel()
             or self.dsa_topk_backend.is_flashinfer()
+            or self.dsa_topk_backend.is_lightop()
         ):
             return topk_indices
         raise RuntimeError(
@@ -1229,6 +1241,13 @@ class DeepseekSparseAttnBackend(
             )
 
         metadata = DSAMetadata(
+            lightop_kv_group_size=(
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify()
+                and self._lightop_decode_gather is not None
+                and self.dsa_topk_backend.is_lightop()
+                else 1
+            ),
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
@@ -1588,6 +1607,13 @@ class DeepseekSparseAttnBackend(
             )
 
         metadata = DSAMetadata(
+            lightop_kv_group_size=(
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify()
+                and self._lightop_decode_gather is not None
+                and self.dsa_topk_backend.is_lightop()
+                else 1
+            ),
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
@@ -3269,12 +3295,30 @@ class DeepseekSparseAttnBackend(
                 q_input.shape[0]
             )
             selected_indices = indices[:, 0, :]
+            gather_kwargs = {}
+            if (
+                forward_mode.is_target_verify()
+                and metadata.lightop_kv_group_size > 1
+                and metadata.lightop_kv_reuse.page_indices is page_table_1
+                and selected_indices.shape[0] % metadata.lightop_kv_group_size == 0
+            ):
+                rows = selected_indices.shape[0]
+                key = (rows, lightop_kv_cache.numel(), metadata.lightop_kv_group_size)
+                gather_kwargs = dict(
+                    tokens_per_request=metadata.lightop_kv_group_size,
+                    reuse_compact_indices=metadata.lightop_kv_reuse.dedup_key == key,
+                )
+                metadata.lightop_kv_reuse.dedup_key = key
+            else:
+                # An intervening ordinary gather overwrites the shared mapping.
+                metadata.lightop_kv_reuse.dedup_key = None
             self._lightop_decode_gather(
                 lightop_kv_cache,
                 selected_indices,
                 gathered_kv,
                 cache_seqlens,
                 compact_indices,
+                **gather_kwargs,
             )
             o, _, _ = flash_mla_sparse_fwd(
                 q=q_input[:, 0],
