@@ -346,6 +346,21 @@ class UnifiedCacheLinker(ABC):
     def set_request_time_stats(self, rid: str, time_stats) -> None:
         """Associate request timing state with a subsequently queued load."""
 
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Start a request-scoped host prefetch without allocating device pages."""
+        return False
+
+    def get_host_prefetch_status(self, rid: str) -> str | None:
+        """Return the backend host-prefetch state, or ``None`` if absent."""
+        return None
+
+    def claim_ready_host_prefetch(self, rid: str) -> bool:
+        """Transfer a READY host-prefetch session to the normal load path."""
+        return False
+
+    def cancel_host_prefetch(self, rid: str) -> None:
+        """Cancel or retire a request-scoped host prefetch."""
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
@@ -417,6 +432,9 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # Waiting-queue prefetches retain the original hit until admission can
+        # rematch it. The backend owns the pinned session and readiness state.
+        self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[tuple[NodeId, DecLockRefParams]] = []
 
@@ -429,6 +447,86 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def prefetch_to_host(self, req: Req) -> bool:
+        """Submit the current external hit for DFS-to-pinned prefetch.
+
+        Lookup and the cross-rank hit boundary have already been established by
+        ``req.init_next_round_input``. Session preparation remains synchronous;
+        only the DFS read runs on the backend worker.
+        """
+        hit = self.hit_markers.get(req.rid)
+        if hit is None:
+            return False
+
+        transfers = []
+        for component in self.cache._components_tuple:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+            )
+            if transfer is None:
+                return False
+            transfers.append(transfer)
+
+        submitted = False
+        try:
+            submitted = self.cache_linker.submit_host_prefetch(req.rid, transfers)
+        except BaseException:
+            logger.exception(
+                "Mooncake waiting-queue prefetch submit failed for rid=%s", req.rid
+            )
+
+        globally_submitted = torch.tensor(int(submitted), dtype=torch.int)
+        self.cache._all_reduce_attn_groups(
+            globally_submitted, torch.distributed.ReduceOp.MIN
+        )
+        if int(globally_submitted.item()) == 0:
+            self.cache_linker.cancel_host_prefetch(req.rid)
+            return False
+
+        self.host_prefetch_hits[req.rid] = hit
+        return True
+
+    def _apply_external_hit(
+        self,
+        req: Req,
+        result: MatchResult,
+        hit: ExternalCacheHitMarker,
+        by_pool: dict[PoolName, PoolTransfer],
+    ) -> MatchResult:
+        page = self.cache.page_size
+        hit_pages = len(hit.tail_hashes)
+        hit_tokens = hit_pages * page
+        swa_transfer = by_pool.get(PoolName.SWA)
+        swa_host_hit_length = (
+            min(len(swa_transfer.keys), hit_pages) * page
+            if swa_transfer is not None
+            else 0
+        )
+        mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+        self.hit_markers[req.rid] = hit
+        return result._replace(
+            last_host_node=result.best_match_node,
+            host_hit_length=hit_tokens,
+            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            mamba_host_hit_length=max(
+                result.mamba_host_hit_length, mamba_host_hit_length
+            ),
+        )
+
+    @staticmethod
+    def _clear_external_hit(req: Req) -> None:
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        req.storage_hit_length = 0
+        req.cached_tokens_storage_source = None
+        req.cached_tokens_by_source = {
+            "l1_device": int(getattr(req, "cached_tokens_device", 0)),
+            "l3_mooncake_memory": 0,
+            "l4_mooncake_dfs": 0,
+            "l4_mooncake_local_disk": 0,
+        }
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -447,11 +545,19 @@ class UnifiedCacheLinkerWrapper:
             if cache.pp_rank != 0:
                 return result
 
+        host_prefetch_hits = getattr(self, "host_prefetch_hits", {})
+        prefetched_hit = host_prefetch_hits.get(req.rid)
         if device_hit_len >= len(key):
+            if prefetched_hit is not None:
+                host_prefetch_hits.pop(req.rid, None)
+                self.cache_linker.cancel_host_prefetch(req.rid)
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
+            if prefetched_hit is not None:
+                host_prefetch_hits.pop(req.rid, None)
+                self.cache_linker.cancel_host_prefetch(req.rid)
             return result
 
         lookup_transfers = []
@@ -460,9 +566,39 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
             if transfer is None:
+                if prefetched_hit is not None:
+                    host_prefetch_hits.pop(req.rid, None)
+                    self.cache_linker.cancel_host_prefetch(req.rid)
                 return result
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+
+        if prefetched_hit is not None:
+            expected_len = prefetched_hit.device_hit_len + len(
+                prefetched_hit.tail_hashes
+            ) * page
+            current_prefix = key[:expected_len]
+            same_prefix = (
+                current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
+                and current_prefix.cache_salt
+                == prefetched_hit.prefix_key.cache_salt
+                and current_prefix.is_bigram == prefetched_hit.prefix_key.is_bigram
+                and current_prefix.raw_token_ids()
+                == prefetched_hit.prefix_key.raw_token_ids()
+            )
+            reusable = (
+                device_hit_len == prefetched_hit.device_hit_len
+                and list(tail_hashes[: len(prefetched_hit.tail_hashes)])
+                == prefetched_hit.tail_hashes
+                and same_prefix
+            )
+            if reusable:
+                return self._apply_external_hit(
+                    req, result, prefetched_hit, by_pool
+                )
+
+            host_prefetch_hits.pop(req.rid, None)
+            self.cache_linker.cancel_host_prefetch(req.rid)
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if known_hit_len is None:
@@ -487,27 +623,16 @@ class UnifiedCacheLinkerWrapper:
             return result
         hit_tokens = hit_pages * page
 
-        swa_transfer = by_pool.get(PoolName.SWA)
-        swa_host_hit_length = (
-            min(len(swa_transfer.keys), hit_pages) * page
-            if swa_transfer is not None
-            else 0
-        )
-        # Mamba keeps a single state slot per node, so a hit is worth one slot.
-        mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
-
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
             prefix_key=key[: device_hit_len + hit_tokens],
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
         )
-        return result._replace(
-            last_host_node=result.best_match_node,
-            host_hit_length=hit_tokens,
-            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
-            mamba_host_hit_length=max(
-                result.mamba_host_hit_length, mamba_host_hit_length
-            ),
+        return self._apply_external_hit(
+            req,
+            result,
+            self.hit_markers[req.rid],
+            by_pool,
         )
 
     def _sync_restorable_prefix(
@@ -560,6 +685,27 @@ class UnifiedCacheLinkerWrapper:
         if hit is None:
             return empty_indices, req.last_node
 
+        prepared_from_host_prefetch = False
+        if getattr(self, "host_prefetch_hits", {}).pop(req.rid, None) is not None:
+            status = self.cache_linker.get_host_prefetch_status(req.rid)
+            ready = torch.tensor(int(status == "ready"), dtype=torch.int)
+            cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
+            if int(ready.item()) == 0:
+                self.cache_linker.cancel_host_prefetch(req.rid)
+                self._clear_external_hit(req)
+                logger.debug(
+                    "Mooncake host prefetch not ready at admission for rid=%s "
+                    "(local_state=%s); falling back to normal prefill.",
+                    req.rid,
+                    status,
+                )
+                return empty_indices, req.last_node
+            if not self.cache_linker.claim_ready_host_prefetch(req.rid):
+                self.cache_linker.cancel_host_prefetch(req.rid)
+                self._clear_external_hit(req)
+                return empty_indices, req.last_node
+            prepared_from_host_prefetch = True
+
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
@@ -571,6 +717,8 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
             if transfer is None:
+                if prepared_from_host_prefetch:
+                    self.cache_linker.abort_prepared_load(req.rid)
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT,
                     req,
@@ -591,17 +739,18 @@ class UnifiedCacheLinkerWrapper:
         time_stats = getattr(req, "time_stats", None)
         if time_stats is not None:
             time_stats.set_direct_load_prepare_start_time()
-        prepared = False
-        try:
-            prepared = self.cache_linker.prepare_load(
-                req.rid, [transfer for _, transfer in component_transfers]
-            )
-        except BaseException:
-            logger.exception(
-                "External linker load preparation failed for rid=%s; "
-                "falling back to prefill.",
-                req.rid,
-            )
+        prepared = prepared_from_host_prefetch
+        if not prepared:
+            try:
+                prepared = self.cache_linker.prepare_load(
+                    req.rid, [transfer for _, transfer in component_transfers]
+                )
+            except BaseException:
+                logger.exception(
+                    "External linker load preparation failed for rid=%s; "
+                    "falling back to prefill.",
+                    req.rid,
+                )
         source_getter = getattr(self.cache_linker, "get_prepared_load_source", None)
         local_source = source_getter(req.rid) if prepared and source_getter else None
         source_code = MOONCAKE_SOURCE_CODES.get(local_source, 1)
@@ -625,17 +774,7 @@ class UnifiedCacheLinkerWrapper:
                 component_transfers,
                 prefix_len,
             )
-            req.host_hit_length = 0
-            req.swa_host_hit_length = 0
-            req.mamba_host_hit_length = 0
-            req.storage_hit_length = 0
-            req.cached_tokens_storage_source = None
-            req.cached_tokens_by_source = {
-                "l1_device": int(getattr(req, "cached_tokens_device", 0)),
-                "l3_mooncake_memory": 0,
-                "l4_mooncake_dfs": 0,
-                "l4_mooncake_local_disk": 0,
-            }
+            self._clear_external_hit(req)
             logger.warning(
                 "External linker load is no longer restorable for rid=%s; "
                 "falling back to normal prefill.",
@@ -985,10 +1124,15 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        getattr(self, "host_prefetch_hits", {}).clear()
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        getattr(self, "host_prefetch_hits", {}).pop(rid, None)
+        cancel = getattr(self.cache_linker, "cancel_host_prefetch", None)
+        if cancel is not None:
+            cancel(rid)
         self.cache_linker.abort_prepared_load(rid)
 
     def close(self) -> None:

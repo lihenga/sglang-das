@@ -535,6 +535,11 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def prefetch_external_linker_to_host(self, req) -> bool:
+        if self.linker is None:
+            return False
+        return self.linker.prefetch_to_host(req)
+
     def is_chunk_cache(self) -> bool:
         return self.disable
 

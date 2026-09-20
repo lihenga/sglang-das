@@ -2955,7 +2955,24 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
+    def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
+        if (
+            getattr(
+                self.server_args,
+                "mooncake_enable_waiting_queue_dfs_prefetch",
+                False,
+            )
+            and self.server_args.enable_unified_cache_external_linker
+            and self.server_args.unified_cache_external_linker_backend == "mooncake"
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and self.schedule_policy == "fcfs"
+            and self.ps.pp_size == 1
+            and not is_retracted
+            and req.prefill_attempt_count == 0
+        ):
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            self.tree_cache.prefetch_external_linker_to_host(req)
+
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -3007,11 +3024,11 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            self._prefetch_kvcache(req)
+            self._prefetch_kvcache(req, is_retracted=is_retracted)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req)
+            self._prefetch_kvcache(req, is_retracted=is_retracted)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )

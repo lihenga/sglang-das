@@ -345,6 +345,37 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
         )
+        self.host_prefetch_enabled = bool(
+            getattr(
+                server_args,
+                "mooncake_enable_waiting_queue_dfs_prefetch",
+                False,
+            )
+        )
+        self.host_prefetch_limit = int(
+            getattr(
+                server_args,
+                "mooncake_waiting_queue_dfs_prefetch_max_requests",
+                8,
+            )
+        )
+        self.host_prefetch_max_pages = int(
+            getattr(
+                server_args,
+                "mooncake_waiting_queue_dfs_prefetch_max_pages",
+                1024,
+            )
+        )
+        if self.host_prefetch_limit <= 0:
+            raise ValueError(
+                "--mooncake-waiting-queue-dfs-prefetch-max-requests must be "
+                f"positive, got {self.host_prefetch_limit}."
+            )
+        if self.host_prefetch_max_pages <= 0:
+            raise ValueError(
+                "--mooncake-waiting-queue-dfs-prefetch-max-pages must be "
+                f"positive, got {self.host_prefetch_max_pages}."
+            )
         if self.read_plan_reuse_ranges and not self.read_plan_enabled:
             raise ValueError(
                 "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES requires "
@@ -365,6 +396,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Mooncake ReadPlan enabled; address reuse=%s",
                 self.read_plan_reuse_ranges,
             )
+        if self.host_prefetch_enabled:
+            if self.read_plan_enabled:
+                raise ValueError(
+                    "Mooncake waiting-queue DFS prefetch does not yet support "
+                    "SGLANG_MOONCAKE_READ_PLAN=1."
+                )
+            if not callable(
+                getattr(self.storage.store, "batch_get_session_prefetch", None)
+            ):
+                raise RuntimeError(
+                    "Mooncake waiting-queue DFS prefetch requires a Mooncake "
+                    "package with batch_get_session_prefetch()."
+                )
         if self.cp_single_writer:
             logger.info(
                 "Mooncake CP node-owner writer/request-owner lookup enabled: "
@@ -429,6 +473,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_load_metrics: dict[str, tuple[int, dict[str, int], float]] = {}
         self.request_time_stats: dict[str, object] = {}
         self.session_lock = threading.Lock()
+        self.host_prefetch_lock = threading.Lock()
+        self.host_prefetch_entries: dict[str, dict[str, object]] = {}
+        self.host_prefetch_queue: Queue[tuple[str, list[str]] | None] = Queue()
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, list[tuple[str, list[PoolTransfer]]], object] | None
@@ -437,13 +484,31 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tuple[list[PoolTransfer], int, str, float, object] | None
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
-        self.stats = {"lookup": 0, "load": 0, "load_fallback": 0, "offload": 0}
+        self.stats = {
+            "lookup": 0,
+            "load": 0,
+            "load_fallback": 0,
+            "offload": 0,
+            "host_prefetch_submitted": 0,
+            "host_prefetch_ready": 0,
+            "host_prefetch_consumed": 0,
+            "host_prefetch_not_ready": 0,
+            "host_prefetch_failed": 0,
+        }
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
             name=f"mooncake-load-tp{tp_rank}",
         )
         self.load_thread.start()
+        self.host_prefetch_thread = None
+        if self.host_prefetch_enabled:
+            self.host_prefetch_thread = threading.Thread(
+                target=self.host_prefetch_thread_func,
+                daemon=True,
+                name=f"mooncake-host-prefetch-tp{tp_rank}",
+            )
+            self.host_prefetch_thread.start()
         self.offload_thread = threading.Thread(
             target=self.offload_thread_func,
             daemon=True,
@@ -728,6 +793,149 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 )
         return True
 
+    def submit_host_prefetch(
+        self, rid: str, transfers: list[PoolTransfer]
+    ) -> bool:
+        if not self.host_prefetch_enabled:
+            return False
+
+        kv_transfer = next(
+            (transfer for transfer in transfers if transfer.name == PoolName.KV), None
+        )
+        if (
+            kv_transfer is None
+            or not kv_transfer.keys
+            or len(kv_transfer.keys)
+            > getattr(self, "host_prefetch_max_pages", 1024)
+        ):
+            self.stats["host_prefetch_not_ready"] += 1
+            return False
+
+        with self.host_prefetch_lock:
+            active = sum(
+                entry.get("state")
+                in {"preparing", "queued", "reading", "ready"}
+                for entry in self.host_prefetch_entries.values()
+            )
+            if rid in self.host_prefetch_entries or active >= self.host_prefetch_limit:
+                self.stats["host_prefetch_not_ready"] += 1
+                return False
+            self.host_prefetch_entries[rid] = {
+                "state": "preparing",
+                "cancelled": False,
+                "submitted_at": time.perf_counter(),
+            }
+
+        try:
+            if not self.prepare_load(rid, transfers):
+                raise RuntimeError("Mooncake session preparation failed")
+            keys = list(self.prepared_load_sessions.get(rid, ()))
+            if not keys:
+                raise RuntimeError("Mooncake session preparation returned no keys")
+        except BaseException:
+            logger.warning(
+                "Mooncake waiting-queue host prefetch preparation failed for rid=%s",
+                rid,
+                exc_info=True,
+            )
+            with self.host_prefetch_lock:
+                entry = self.host_prefetch_entries.get(rid)
+                if entry is not None:
+                    entry["state"] = "failed"
+            self._abort_prepared_load_now(rid)
+            self.stats["host_prefetch_failed"] += 1
+            return False
+
+        with self.host_prefetch_lock:
+            entry = self.host_prefetch_entries.get(rid)
+            if entry is None or entry.get("cancelled"):
+                self._abort_prepared_load_now(rid)
+                return False
+            entry["state"] = "queued"
+            entry["keys"] = keys
+        self.host_prefetch_queue.put((rid, keys))
+        self.stats["host_prefetch_submitted"] += 1
+        return True
+
+    def get_host_prefetch_status(self, rid: str) -> str | None:
+        with self.host_prefetch_lock:
+            entry = self.host_prefetch_entries.get(rid)
+            return None if entry is None else str(entry.get("state"))
+
+    def claim_ready_host_prefetch(self, rid: str) -> bool:
+        with self.host_prefetch_lock:
+            entry = self.host_prefetch_entries.get(rid)
+            if entry is None or entry.get("state") != "ready":
+                return False
+            self.host_prefetch_entries.pop(rid, None)
+        self.stats["host_prefetch_consumed"] += 1
+        return True
+
+    def cancel_host_prefetch(self, rid: str) -> None:
+        with self.host_prefetch_lock:
+            entry = self.host_prefetch_entries.get(rid)
+            if entry is not None and entry.get("state") in {
+                "preparing",
+                "queued",
+                "reading",
+            }:
+                self.stats["host_prefetch_not_ready"] += 1
+        self.abort_prepared_load(rid)
+
+    def host_prefetch_thread_func(self) -> None:
+        while True:
+            task = self.host_prefetch_queue.get()
+            try:
+                if task is None:
+                    return
+                rid, keys = task
+                with self.host_prefetch_lock:
+                    entry = self.host_prefetch_entries.get(rid)
+                    if entry is None:
+                        continue
+                    if entry.get("cancelled"):
+                        entry["state"] = "cancelled"
+                        cancelled = True
+                    else:
+                        entry["state"] = "reading"
+                        cancelled = False
+
+                success = False
+                if not cancelled:
+                    try:
+                        results = list(
+                            self.storage.store.batch_get_session_prefetch(keys)
+                        )
+                        success = len(results) == len(keys) and all(
+                            result == 0 for result in results
+                        )
+                    except BaseException:
+                        logger.warning(
+                            "Mooncake waiting-queue DFS prefetch failed for rid=%s",
+                            rid,
+                            exc_info=True,
+                        )
+
+                with self.host_prefetch_lock:
+                    entry = self.host_prefetch_entries.get(rid)
+                    cancelled = bool(entry is None or entry.get("cancelled"))
+                    if entry is not None:
+                        if cancelled:
+                            entry["state"] = "cancelled"
+                        else:
+                            entry["state"] = "ready" if success else "failed"
+                        if success and not cancelled:
+                            entry["ready_at"] = time.perf_counter()
+
+                if success and not cancelled:
+                    self.stats["host_prefetch_ready"] += 1
+                else:
+                    self._abort_prepared_load_now(rid)
+                    if not cancelled:
+                        self.stats["host_prefetch_failed"] += 1
+            finally:
+                self.host_prefetch_queue.task_done()
+
     def get_prepared_load_source(self, rid: str) -> str | None:
         return getattr(self, "prepared_load_sources", {}).get(rid)
 
@@ -795,13 +1003,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     exc_info=True,
                 )
 
-    def abort_prepared_load(self, rid: str) -> None:
+    def _abort_prepared_load_now(self, rid: str) -> None:
         self.pending_loads.pop(rid, None)
         getattr(self, "prepared_load_sources", {}).pop(rid, None)
         getattr(self, "prepared_load_page_sources", {}).pop(rid, None)
         with self.session_lock:
             keys = self.prepared_load_sessions.pop(rid, [])
             self._rollback_session_refs_locked(keys)
+
+    def abort_prepared_load(self, rid: str) -> None:
+        prefetch_lock = getattr(self, "host_prefetch_lock", None)
+        if prefetch_lock is not None:
+            with prefetch_lock:
+                entry = self.host_prefetch_entries.get(rid)
+                if entry is not None and entry.get("state") in {
+                    "preparing",
+                    "queued",
+                    "reading",
+                }:
+                    entry["cancelled"] = True
+                    return
+                self.host_prefetch_entries.pop(rid, None)
+        self._abort_prepared_load_now(rid)
 
     def cancel_queued_load(self, rid: str) -> None:
         getattr(self, "pending_load_metrics", {}).pop(rid, None)
@@ -1324,6 +1547,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.offload_results.get_nowait()
 
     def reset(self) -> None:
+        with self.host_prefetch_lock:
+            for entry in self.host_prefetch_entries.values():
+                entry["cancelled"] = True
+        if self.host_prefetch_enabled:
+            self.host_prefetch_queue.join()
         for rid in list(self.pending_loads):
             getattr(self, "pending_load_metrics", {}).pop(rid, None)
             self.abort_prepared_load(rid)
@@ -1331,6 +1559,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_queue.join()
         for rid in list(self.prepared_load_sessions):
             self.abort_prepared_load(rid)
+        with self.host_prefetch_lock:
+            self.host_prefetch_entries.clear()
         while True:
             try:
                 self.offload_results.get_nowait()
@@ -1342,7 +1572,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.reset()
         self.load_queue.put(None)
         self.offload_queue.put(None)
+        if self.host_prefetch_thread is not None:
+            self.host_prefetch_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
+        if self.host_prefetch_thread is not None:
+            self.host_prefetch_thread.join()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()

@@ -594,6 +594,52 @@ def test_session_start_negative_result_falls_back_and_logs_key(caplog):
     assert "-702" in caplog.text
 
 
+def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
+    prefetch_calls = []
+
+    class _Store:
+        def batch_get_session_prefetch(self, keys):
+            prefetch_calls.append(list(keys))
+            return [0] * len(keys)
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_enabled = True
+    linker.host_prefetch_limit = 8
+    linker.host_prefetch_lock = threading.Lock()
+    linker.host_prefetch_entries = {}
+    linker.host_prefetch_queue = Queue()
+    linker.prepared_load_sessions = {}
+    linker.storage = SimpleNamespace(store=_Store())
+    linker.stats = {
+        "host_prefetch_submitted": 0,
+        "host_prefetch_ready": 0,
+        "host_prefetch_consumed": 0,
+        "host_prefetch_not_ready": 0,
+        "host_prefetch_failed": 0,
+    }
+
+    def prepare_load(rid, _transfers):
+        linker.prepared_load_sessions[rid] = ["page-a", "page-b"]
+        return True
+
+    linker.prepare_load = prepare_load
+    thread = threading.Thread(target=linker.host_prefetch_thread_func, daemon=True)
+    thread.start()
+    try:
+        assert linker.submit_host_prefetch(
+            "rid", [PoolTransfer(name=PoolName.KV, keys=["page-a", "page-b"])]
+        )
+        linker.host_prefetch_queue.join()
+        assert prefetch_calls == [["page-a", "page-b"]]
+        assert linker.get_host_prefetch_status("rid") == "ready"
+        assert linker.claim_ready_host_prefetch("rid")
+        assert linker.prepared_load_sessions["rid"] == ["page-a", "page-b"]
+        assert linker.stats["host_prefetch_consumed"] == 1
+    finally:
+        linker.host_prefetch_queue.put(None)
+        thread.join(timeout=5)
+
+
 def test_prepare_load_reports_local_disk_source():
     ended = []
     calls = []
@@ -2775,6 +2821,61 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
     )
     assert len(pp0_backend.lookup_calls) == 1
     assert pp0.has_hit("rid") == (hit_pages * 2 > device_hit_len)
+
+
+def test_waiting_prefetch_rematch_reuses_equal_radix_key_without_lookup():
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOOKUP
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+    class _Backend:
+        def __init__(self):
+            self.lookup_calls = 0
+
+        def lookup(self, rid, transfers):
+            self.lookup_calls += 1
+            return [2]
+
+        def cancel_host_prefetch(self, rid):
+            pytest.fail(f"equal prefetch for {rid} must not be cancelled")
+
+    backend = _Backend()
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(
+        page_size=2,
+        pp_size=1,
+        pp_rank=0,
+        _components_tuple=(_Component(),),
+        _all_reduce_attn_groups=lambda tensor, op: None,
+        get_last_hash_value=lambda node: None,
+    )
+    wrapper.cache_linker = backend
+    wrapper.hit_markers = {}
+    wrapper.host_prefetch_hits = {}
+    req = SimpleNamespace(rid="rid", external_cache_hit_length=None, time_stats=None)
+    empty_match = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+
+    first_key = RadixKey(
+        array("q", [1, 2, 3, 4]), extra_key="tenant", cache_salt="salt"
+    )
+    first = wrapper.match(first_key, req, empty_match)
+    assert first.host_hit_length == 4
+    wrapper.host_prefetch_hits[req.rid] = wrapper.hit_markers[req.rid]
+    backend.lookup_calls = 0
+
+    equal_but_distinct_key = RadixKey(
+        array("q", [1, 2, 3, 4]), extra_key="tenant", cache_salt="salt"
+    )
+    second = wrapper.match(equal_but_distinct_key, req, empty_match)
+
+    assert second.host_hit_length == 4
+    assert backend.lookup_calls == 0
 
 
 @pytest.mark.parametrize("load_outcome", [True, False, "raise"])

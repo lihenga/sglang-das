@@ -2948,6 +2948,23 @@ class ServerArgs:
         "count threshold.",
         NS("memory"),
     ] = False
+    mooncake_enable_waiting_queue_dfs_prefetch: A[
+        bool,
+        "Prefetch Mooncake DFS objects into its pinned session cache while "
+        "requests wait in the FCFS scheduler queue.",
+        NS("memory"),
+    ] = False
+    mooncake_waiting_queue_dfs_prefetch_max_requests: A[
+        int,
+        "Maximum number of queued, reading, or ready Mooncake waiting-queue "
+        "DFS-prefetch requests retained per scheduler rank.",
+        NS("memory"),
+    ] = 8
+    mooncake_waiting_queue_dfs_prefetch_max_pages: A[
+        int,
+        "Maximum number of logical KV pages prefetched for one waiting request.",
+        NS("memory"),
+    ] = 1024
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
     # -------------------------------------------------------------------------
