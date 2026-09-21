@@ -539,17 +539,28 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def prefetch_external_linker_to_host(self, req) -> bool:
-        if self.linker is None:
-            return False
-        return self.linker.prefetch_to_host(req)
+        return self.prefetch_external_linker_to_host_batch((req,))[0]
 
-    def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
-        """Return one rank-wide admission state for a queued DFS prefetch."""
-        local_state = (
-            "not_tracked"
-            if self.linker is None
-            else self.linker.get_host_prefetch_admission_state(rid)
-        )
+    def prefetch_external_linker_to_host_batch(
+        self, reqs: Sequence["Req"]
+    ) -> list[bool]:
+        if self.linker is None:
+            return [False] * len(reqs)
+        return self.linker.prefetch_to_host_batch(reqs)
+
+    def get_waiting_queue_prefetch_admission_states(
+        self, rids: Sequence[str]
+    ) -> list[str]:
+        """Return rank-wide admission states for queued DFS prefetches.
+
+        Rows are ordered like ``rids`` so the scheduler can inspect the whole
+        waiting queue with one collective per scheduling round. The scheduler
+        refreshes these states every round; a pending result is never cached
+        across rounds where its backend session may have completed.
+        """
+        if not rids:
+            return []
+
         state_names = (
             "not_tracked",
             "pending",
@@ -557,28 +568,47 @@ class UnifiedRadixCache(BasePrefixCache):
             "no_prefetch_needed",
             "terminal",
         )
-        counts = torch.tensor(
-            [int(local_state == state) for state in state_names], dtype=torch.int
-        )
+        state_to_index = {state: index for index, state in enumerate(state_names)}
+        counts = torch.zeros((len(rids), len(state_names)), dtype=torch.int)
+        for row, rid in enumerate(rids):
+            local_state = (
+                "not_tracked"
+                if self.linker is None
+                else self.linker.get_host_prefetch_admission_state(rid)
+            )
+            state_index = state_to_index.get(local_state)
+            if state_index is not None:
+                counts[row, state_index] = 1
         self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
-        not_tracked, pending, dfs_prefetched, no_prefetch_needed, terminal = (
-            int(value) for value in counts
-        )
 
-        # PENDING wins: an in-flight native read owns its private session and
-        # must finish before any rank may fall back to the normal load path.
-        if pending:
-            return "pending"
-        completed = dfs_prefetched + no_prefetch_needed
-        if terminal or (not_tracked and completed):
-            return "terminal"
-        if dfs_prefetched:
-            return "dfs_prefetched"
-        if no_prefetch_needed:
-            return "no_prefetch_needed"
-        if not_tracked:
-            return "not_tracked"
-        return "terminal"
+        states = []
+        for row in counts:
+            not_tracked, pending, dfs_prefetched, no_prefetch_needed, terminal = (
+                int(value) for value in row
+            )
+            # PENDING wins: an in-flight native read owns its private session
+            # and must finish before any rank may use the normal load path.
+            if pending:
+                state = "pending"
+            else:
+                completed = dfs_prefetched + no_prefetch_needed
+                if terminal or (not_tracked and completed):
+                    state = "terminal"
+                elif dfs_prefetched:
+                    state = "dfs_prefetched"
+                elif no_prefetch_needed:
+                    state = "no_prefetch_needed"
+                elif not_tracked:
+                    state = "not_tracked"
+                else:
+                    # Unknown or inconsistent local states fail closed.
+                    state = "terminal"
+            states.append(state)
+        return states
+
+    def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
+        """Return one rank-wide admission state for a queued DFS prefetch."""
+        return self.get_waiting_queue_prefetch_admission_states((rid,))[0]
 
     def cancel_waiting_queue_prefetch(self, rid: str) -> None:
         if self.linker is not None:

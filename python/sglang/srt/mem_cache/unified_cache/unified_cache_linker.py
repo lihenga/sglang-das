@@ -225,42 +225,65 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.cancel_host_prefetch(rid)
 
     def prefetch_to_host(self, req: Req) -> bool:
-        hit = self.hit_markers.get(req.rid)
-        transfers = []
-        locally_eligible = hit is not None
-        if hit is not None:
-            try:
-                for component in self.cache._components_tuple:
-                    transfer = component.build_external_linker_transfer(
-                        LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
-                    )
-                    if transfer is None:
-                        locally_eligible = False
-                        break
-                    transfers.append(transfer)
-            except Exception:
-                locally_eligible = False
+        return self.prefetch_to_host_batch((req,))[0]
 
-        eligible = torch.tensor(int(locally_eligible), dtype=torch.int)
+    def prefetch_to_host_batch(self, reqs: Sequence[Req]) -> list[bool]:
+        if not reqs:
+            return []
+
+        hits = []
+        transfers_by_req = []
+        eligible = torch.zeros(len(reqs), dtype=torch.int)
+        for index, req in enumerate(reqs):
+            hit = self.hit_markers.get(req.rid)
+            transfers = []
+            locally_eligible = hit is not None
+            if hit is not None:
+                try:
+                    for component in self.cache._components_tuple:
+                        transfer = component.build_external_linker_transfer(
+                            LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+                        )
+                        if transfer is None:
+                            locally_eligible = False
+                            break
+                        transfers.append(transfer)
+                except Exception:
+                    locally_eligible = False
+            hits.append(hit)
+            transfers_by_req.append(transfers)
+            eligible[index] = int(locally_eligible)
+
         self.cache._all_reduce_attn_groups(eligible, torch.distributed.ReduceOp.MIN)
-        if int(eligible.item()) == 0:
-            return False
+        globally_eligible = [bool(int(value)) for value in eligible]
+        if not any(globally_eligible):
+            return [False] * len(reqs)
 
-        try:
-            submitted = self.cache_linker.submit_host_prefetch(req.rid, transfers)
-        except BaseException:
-            submitted = False
+        submitted = torch.zeros(len(reqs), dtype=torch.int)
+        for index, req in enumerate(reqs):
+            if not globally_eligible[index]:
+                continue
+            try:
+                submitted[index] = int(
+                    self.cache_linker.submit_host_prefetch(
+                        req.rid, transfers_by_req[index]
+                    )
+                )
+            except BaseException:
+                submitted[index] = 0
 
-        globally_submitted = torch.tensor(int(submitted), dtype=torch.int)
         self.cache._all_reduce_attn_groups(
-            globally_submitted, torch.distributed.ReduceOp.MIN
+            submitted, torch.distributed.ReduceOp.MIN
         )
-        if int(globally_submitted.item()) == 0:
-            self.cache_linker.cancel_host_prefetch(req.rid)
-            return False
-
-        self.host_prefetch_hits[req.rid] = hit
-        return True
+        globally_submitted = [bool(int(value)) for value in submitted]
+        for index, req in enumerate(reqs):
+            if not globally_eligible[index]:
+                continue
+            if globally_submitted[index]:
+                self.host_prefetch_hits[req.rid] = hits[index]
+            else:
+                self.cache_linker.cancel_host_prefetch(req.rid)
+        return globally_submitted
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -438,40 +461,53 @@ class UnifiedCacheLinkerWrapper:
         if self.host_prefetch_hits.pop(req.rid, None) is not None:
             status = self.cache_linker.get_host_prefetch_status(req.rid)
             locally_complete = status in {"dfs_prefetched", "no_prefetch_needed"}
-            ready = torch.tensor(int(locally_complete), dtype=torch.int)
-            cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
-            if int(ready.item()) == 0:
-                self.cache_linker.cancel_host_prefetch(req.rid)
-                self.hit_markers[req.rid] = hit
-                return self.load_back(req)
+            locally_valid = False
+            locally_claimed = False
 
-            if status == "no_prefetch_needed":
-                locally_valid = True
-            else:
-                try:
-                    locally_valid = (
-                        status == "dfs_prefetched"
-                        and self.cache_linker.revalidate_host_prefetch(req.rid)
-                    )
-                except BaseException:
-                    locally_valid = False
-            valid = torch.tensor(int(locally_valid), dtype=torch.int)
-            cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
-            if int(valid.item()) == 0:
-                self.cache_linker.cancel_host_prefetch(req.rid)
-                self.hit_markers[req.rid] = hit
-                return self.load_back(req)
+            # Evaluate each local stage in order, then reduce all three
+            # verdicts together. A peer may claim early; on any global failure
+            # cancel_host_prefetch rolls that claim back before fallback.
+            if locally_complete:
+                if status == "no_prefetch_needed":
+                    locally_valid = True
+                else:
+                    try:
+                        locally_valid = (
+                            status == "dfs_prefetched"
+                            and self.cache_linker.revalidate_host_prefetch(req.rid)
+                        )
+                    except BaseException:
+                        locally_valid = False
 
-            if status == "no_prefetch_needed":
-                self.cache_linker.cancel_host_prefetch(req.rid)
-                claimed = True
-            else:
-                claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
-            claimed_all = torch.tensor(int(claimed), dtype=torch.int)
-            cache._all_reduce_attn_groups(
-                claimed_all, torch.distributed.ReduceOp.MIN
+                if locally_valid:
+                    if status == "no_prefetch_needed":
+                        # The worker already released this session; retire the
+                        # status entry and treat this stage as a successful claim.
+                        try:
+                            self.cache_linker.cancel_host_prefetch(req.rid)
+                            locally_claimed = True
+                        except BaseException:
+                            locally_claimed = False
+                    else:
+                        try:
+                            locally_claimed = (
+                                self.cache_linker.claim_ready_host_prefetch(req.rid)
+                            )
+                        except BaseException:
+                            locally_claimed = False
+
+            verdicts = torch.tensor(
+                [
+                    int(locally_complete),
+                    int(locally_valid),
+                    int(locally_claimed),
+                ],
+                dtype=torch.int,
             )
-            if int(claimed_all.item()) == 0:
+            cache._all_reduce_attn_groups(
+                verdicts, torch.distributed.ReduceOp.MIN
+            )
+            if int(verdicts.min().item()) == 0:
                 # cancel_host_prefetch also rolls a locally claimed session
                 # back when another rank fails the claim.
                 self.cache_linker.cancel_host_prefetch(req.rid)

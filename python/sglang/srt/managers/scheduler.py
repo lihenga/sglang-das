@@ -2014,28 +2014,47 @@ class Scheduler(
             for recv_req in recv_reqs:
                 self._materialize_cuda_vmm_inputs(recv_req)
 
-        for recv_req in recv_reqs:
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
-                continue
+        active_prefetch_batch = getattr(
+            self, "_pending_waiting_queue_prefetch_reqs", None
+        )
+        owns_prefetch_batch = active_prefetch_batch is None
+        if owns_prefetch_batch:
+            active_prefetch_batch = []
+            self._pending_waiting_queue_prefetch_reqs = active_prefetch_batch
 
-            output = self._request_dispatcher(recv_req)
-            if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+        try:
+            for recv_req in recv_reqs:
+                # Skip health check when server is busy — ongoing requests already carry health info.
+                if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
+                    for_health_check=True
+                ):
+                    self.return_health_check_ipcs.append(
+                        getattr(recv_req, "http_worker_ipc", None)
+                    )
+                    continue
+
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    if self.rust_server is not None:
+                        # Embedded Rust server: every control-request response goes
+                        # back through the egress ring (the zmq tokenizer socket is
+                        # not consumed); the Rust api_server shapes it per-endpoint.
+                        self.rust_server.push_control_output(recv_req, output)
+                    elif isinstance(output, RpcReqOutput):
+                        if self.ipc_channels.recv_from_rpc is not None:
+                            sock_send(self.ipc_channels.recv_from_rpc, output)
+                    else:
+                        self.ipc_channels.send_to_tokenizer.send_output(
+                            output, recv_req
+                        )
+        finally:
+            if owns_prefetch_batch:
+                self._pending_waiting_queue_prefetch_reqs = None
+
+        if owns_prefetch_batch and active_prefetch_batch:
+            self.tree_cache.prefetch_external_linker_to_host_batch(
+                active_prefetch_batch
+            )
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -2896,7 +2915,13 @@ class Scheduler(
             and req.prefill_attempt_count == 0
         ):
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            self.tree_cache.prefetch_external_linker_to_host(req)
+            pending_prefetch_reqs = getattr(
+                self, "_pending_waiting_queue_prefetch_reqs", None
+            )
+            if pending_prefetch_reqs is None:
+                self.tree_cache.prefetch_external_linker_to_host(req)
+            else:
+                pending_prefetch_reqs.append(req)
 
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -3538,8 +3563,30 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+
+        waiting_queue_prefetch_enabled = (
+            getattr(
+                self.server_args,
+                "mooncake_enable_waiting_queue_dfs_prefetch",
+                False,
+            )
+            and self.server_args.enable_unified_cache_external_linker
+            and self.server_args.unified_cache_external_linker_backend == "mooncake"
+            and self.disaggregation_mode
+            in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
+            and self.schedule_policy == "fcfs"
+            and self.ps.pp_size == 1
+        )
+        waiting_queue_prefetch_states = (
+            self.tree_cache.get_waiting_queue_prefetch_admission_states(
+                [req.rid for req in self.waiting_queue]
+            )
+            if waiting_queue_prefetch_enabled
+            else None
+        )
+
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req_index, req in enumerate(self.waiting_queue):
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3560,25 +3607,8 @@ class Scheduler(
                     break
 
             abandoned_prefetch = False
-            if (
-                getattr(
-                    self.server_args,
-                    "mooncake_enable_waiting_queue_dfs_prefetch",
-                    False,
-                )
-                and self.server_args.enable_unified_cache_external_linker
-                and self.server_args.unified_cache_external_linker_backend
-                == "mooncake"
-                and self.disaggregation_mode
-                in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
-                and self.schedule_policy == "fcfs"
-                and self.ps.pp_size == 1
-            ):
-                prefetch_state = (
-                    self.tree_cache.get_waiting_queue_prefetch_admission_state(
-                        req.rid
-                    )
-                )
+            if waiting_queue_prefetch_enabled:
+                prefetch_state = waiting_queue_prefetch_states[req_index]
                 if prefetch_state == "pending":
                     continue
                 abandoned_prefetch = prefetch_state == "terminal"
