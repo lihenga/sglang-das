@@ -1203,6 +1203,32 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        if msg_type == "proxy":
+            parallel = get_parallel()
+            logger.warning(
+                "PP proxy send: pp_rank=%s cp_rank=%s tp_rank=%s async=%s "
+                "keys=%s shapes=%s dtypes=%s devices=%s",
+                parallel.pp_rank,
+                parallel.attn_cp_rank,
+                parallel.attn_tp_rank,
+                async_send,
+                sorted(tensor_dict.keys()),
+                {
+                    name: tuple(value.shape)
+                    for name, value in tensor_dict.items()
+                    if isinstance(value, torch.Tensor)
+                },
+                {
+                    name: str(value.dtype)
+                    for name, value in tensor_dict.items()
+                    if isinstance(value, torch.Tensor)
+                },
+                {
+                    name: str(value.device)
+                    for name, value in tensor_dict.items()
+                    if isinstance(value, torch.Tensor)
+                },
+            )
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1249,12 +1275,35 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=self.attn_tp_group,
-                )
+            tensor_dict = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=self.attn_tp_group,
             )
+            parallel = get_parallel()
+            logger.warning(
+                "PP proxy recv: pp_rank=%s cp_rank=%s tp_rank=%s "
+                "keys=%s shapes=%s dtypes=%s devices=%s",
+                parallel.pp_rank,
+                parallel.attn_cp_rank,
+                parallel.attn_tp_rank,
+                sorted(tensor_dict.keys()),
+                {
+                    name: tuple(value.shape)
+                    for name, value in tensor_dict.items()
+                    if isinstance(value, torch.Tensor)
+                },
+                {
+                    name: str(value.dtype)
+                    for name, value in tensor_dict.items()
+                    if isinstance(value, torch.Tensor)
+                },
+                {
+                    name: str(value.device)
+                    for name, value in tensor_dict.items()
+                    if isinstance(value, torch.Tensor)
+                },
+            )
+            pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
@@ -1494,6 +1543,41 @@ class SchedulerPPMixin:
                     if cur_batch.spec_algorithm.is_dspark():
                         self.model_worker.set_pp_proxy_tensors_for_next_forward(None)
                 self._pp_maybe_send_dspark_owner_direct_hidden(cur_batch, result)
+                if (
+                    not self.pp_group.is_last_rank
+                    and result.pp_hidden_states_proxy_tensors is not None
+                ):
+                    parallel = get_parallel()
+                    proxy = result.pp_hidden_states_proxy_tensors.tensors
+                    logger.warning(
+                        "PP proxy produced: mb_id=%s pp_rank=%s cp_rank=%s "
+                        "tp_rank=%s rids=%s shapes=%s dtypes=%s "
+                        "cp_total_tokens=%s cp_per_rank_actual_tokens=%s "
+                        "extend_seq_lens=%s forward_mode=%s",
+                        mb_id,
+                        parallel.pp_rank,
+                        parallel.attn_cp_rank,
+                        parallel.attn_tp_rank,
+                        [req.rid for req in cur_batch.reqs],
+                        {
+                            name: tuple(value.shape)
+                            for name, value in proxy.items()
+                            if isinstance(value, torch.Tensor)
+                        },
+                        {
+                            name: str(value.dtype)
+                            for name, value in proxy.items()
+                            if isinstance(value, torch.Tensor)
+                        },
+                        getattr(cur_batch.attn_cp_metadata, "total_seq_lens", None),
+                        getattr(
+                            cur_batch.attn_cp_metadata,
+                            "per_rank_actual_token",
+                            None,
+                        ),
+                        getattr(cur_batch, "extend_seq_lens_cpu", None),
+                        getattr(cur_batch, "forward_mode", None),
+                    )
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",

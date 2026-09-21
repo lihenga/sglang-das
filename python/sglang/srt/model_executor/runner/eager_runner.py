@@ -370,6 +370,44 @@ class EagerRunner(BaseRunner):
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
+            parallel = get_parallel()
+            proxy_shapes = (
+                {
+                    name: tuple(value.shape)
+                    for name, value in pp_proxy_tensors.tensors.items()
+                    if isinstance(value, torch.Tensor)
+                }
+                if pp_proxy_tensors is not None
+                else None
+            )
+            logger.warning(
+                "CP-v2 model input: pp_rank=%s cp_rank=%s tp_rank=%s "
+                "rids=%s input_ids=%s input_embeds=%s sharded_embeds=%s "
+                "positions=%s sharded_positions=%s proxy_shapes=%s "
+                "cp_total_tokens=%s cp_per_rank_actual_tokens=%s "
+                "extend_seq_lens=%s forward_mode=%s",
+                parallel.pp_rank,
+                parallel.attn_cp_rank,
+                parallel.attn_tp_rank,
+                getattr(forward_batch, "rids", None),
+                tuple(forward_batch.input_ids.shape)
+                if forward_batch.input_ids is not None
+                else None,
+                tuple(input_embeds.shape),
+                tuple(sharded_input_embeds.shape),
+                tuple(forward_batch.positions.shape),
+                tuple(sharded_positions.shape),
+                proxy_shapes,
+                getattr(forward_batch.attn_cp_metadata, "total_seq_lens", None),
+                getattr(
+                    forward_batch.attn_cp_metadata,
+                    "per_rank_actual_token",
+                    None,
+                ),
+                getattr(forward_batch, "extend_seq_lens_cpu", None),
+                getattr(forward_batch, "forward_mode", None),
+            )
             hidden_states = model.model(
                 forward_batch.input_ids,
                 sharded_positions,

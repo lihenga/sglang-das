@@ -2810,6 +2810,38 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
             initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
+            parallel = get_parallel()
+            expected_tokens = None
+            if getattr(forward_batch, "attn_cp_metadata", None) is not None:
+                per_rank_tokens = getattr(
+                    forward_batch.attn_cp_metadata,
+                    "per_rank_actual_token",
+                    None,
+                )
+                if per_rank_tokens is not None:
+                    expected_tokens = per_rank_tokens[parallel.attn_cp_rank]
+            logger.warning(
+                "DeepSeek PP model input: pp_rank=%s cp_rank=%s tp_rank=%s "
+                "rids=%s hidden_states=%s residual=%s positions=%s "
+                "expected_cp_tokens=%s cp_total_tokens=%s "
+                "cp_per_rank_actual_tokens=%s input_ids=%s extend_seq_lens=%s",
+                parallel.pp_rank,
+                parallel.attn_cp_rank,
+                parallel.attn_tp_rank,
+                getattr(forward_batch, "rids", None),
+                tuple(hidden_states.shape),
+                tuple(residual.shape) if residual is not None else None,
+                tuple(positions.shape),
+                expected_tokens,
+                getattr(forward_batch.attn_cp_metadata, "total_seq_lens", None),
+                getattr(
+                    forward_batch.attn_cp_metadata,
+                    "per_rank_actual_token",
+                    None,
+                ),
+                tuple(input_ids.shape) if input_ids is not None else None,
+                getattr(forward_batch, "extend_seq_lens_cpu", None),
+            )
         index_topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
         if not self.pp_group.is_first_rank:
             assert not (

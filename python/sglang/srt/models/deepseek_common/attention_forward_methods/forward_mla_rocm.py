@@ -589,6 +589,49 @@ class DeepseekMLARocmForwardMixin:
                 or self.current_attention_backend == "triton"
             )
         ):
+            position_tokens = positions.shape[-1]
+            if q_pe.shape[0] != position_tokens or k_pe.shape[0] != position_tokens:
+                parallel = get_parallel()
+                logger.error(
+                    "ROCm MLA RoPE token mismatch: pp_rank=%s cp_rank=%s "
+                    "layer_id=%s rids=%s hidden_states=%s positions=%s "
+                    "q_pe=%s k_pe=%s input_ids=%s extend_seq_lens=%s "
+                    "cp_total_tokens=%s cp_per_rank_actual_tokens=%s",
+                    parallel.pp_rank,
+                    parallel.attn_cp_rank,
+                    self.layer_id,
+                    getattr(forward_batch, "rids", None),
+                    tuple(hidden_states.shape),
+                    tuple(positions.shape),
+                    tuple(q_pe.shape),
+                    tuple(k_pe.shape),
+                    tuple(forward_batch.input_ids.shape)
+                    if forward_batch.input_ids is not None
+                    else None,
+                    getattr(forward_batch, "extend_seq_lens_cpu", None),
+                    getattr(forward_batch.attn_cp_metadata, "total_seq_lens", None),
+                    getattr(
+                        forward_batch.attn_cp_metadata,
+                        "per_rank_actual_token",
+                        None,
+                    ),
+                )
+
+            if q_pe.shape[0] != position_tokens or k_pe.shape[0] != position_tokens:
+                logger.warning(
+                    "ROCm MLA RoPE input details: pp_rank=%s cp_rank=%s tp_rank=%s "
+                    "layer_id=%s q_pe_stride=%s k_pe_stride=%s positions_stride=%s "
+                    "forward_mode=%s attn_cp_metadata=%s",
+                    parallel.pp_rank,
+                    parallel.attn_cp_rank,
+                    parallel.attn_tp_rank,
+                    self.layer_id,
+                    tuple(q_pe.stride()),
+                    tuple(k_pe.stride()),
+                    tuple(positions.stride()),
+                    getattr(forward_batch, "forward_mode", None),
+                    getattr(forward_batch, "attn_cp_metadata", None),
+                )
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
