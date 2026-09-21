@@ -475,8 +475,8 @@ class UnifiedCacheLinkerWrapper:
         """Submit the current external hit for DFS-to-pinned prefetch.
 
         Lookup and the cross-rank hit boundary have already been established by
-        ``req.init_next_round_input``. Session preparation remains synchronous;
-        only the DFS read runs on the backend worker.
+        ``req.init_next_round_input``. The backend worker owns both session
+        preparation and the DFS read so this scheduler path stays nonblocking.
         """
         hit = self.hit_markers.get(req.rid)
         if hit is None:

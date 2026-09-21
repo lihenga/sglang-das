@@ -554,8 +554,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
         not_tracked, pending, ready, terminal = (int(value) for value in counts)
 
-        # A still-running native read takes precedence so every rank abandons
-        # the speculation instead of letting READY ranks claim it.
+        # A still-running native read takes precedence. Admission follows a
+        # rank-wide wait_complete policy until every rank is READY; otherwise
+        # READY ranks could claim sessions while slower ranks are still using
+        # theirs.
         if pending:
             return "pending"
         if terminal or (not_tracked and ready):

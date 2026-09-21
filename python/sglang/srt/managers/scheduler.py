@@ -3664,7 +3664,16 @@ class Scheduler(
                         req.rid
                     )
                 )
-                abandoned_prefetch = prefetch_state in {"pending", "terminal"}
+                if prefetch_state == "pending":
+                    # Match HiCache's wait_complete policy: waiting is
+                    # scheduler-nonblocking (other requests can still be
+                    # considered), while the request keeps ownership of its
+                    # in-flight Mooncake session.  Cancelling here cannot stop
+                    # a native DFS read and would make admission issue the same
+                    # lookup/read again.
+                    req.time_stats.set_queue_wait_reason("mooncake_dfs_prefetch")
+                    continue
+                abandoned_prefetch = prefetch_state == "terminal"
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -3678,10 +3687,9 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             if abandoned_prefetch:
-                # Admission never waits for speculative DFS I/O. Retire the
-                # prefetch rank-wide, then rematch through the normal on-demand
-                # external lookup path. An in-flight native read keeps its own
-                # session alive until its worker returns.
+                # A failed prefetch is only an optimization failure. Retire it
+                # rank-wide, then rematch through the normal on-demand external
+                # lookup path instead of forcing model recomputation.
                 self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
 
             req.init_next_round_input(self.tree_cache)
