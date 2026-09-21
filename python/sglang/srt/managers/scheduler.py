@@ -2879,7 +2879,25 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
+    def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
+        if (
+            getattr(
+                self.server_args,
+                "mooncake_enable_waiting_queue_dfs_prefetch",
+                False,
+            )
+            and self.server_args.enable_unified_cache_external_linker
+            and self.server_args.unified_cache_external_linker_backend == "mooncake"
+            and self.disaggregation_mode
+            in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
+            and self.schedule_policy == "fcfs"
+            and self.ps.pp_size == 1
+            and not is_retracted
+            and req.prefill_attempt_count == 0
+        ):
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            self.tree_cache.prefetch_external_linker_to_host(req)
+
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -2931,15 +2949,16 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            self._prefetch_kvcache(req)
+            self._prefetch_kvcache(req, is_retracted=is_retracted)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req)
-            self.disagg_prefill_bootstrap_queue.add(
+            added = self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
-            req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if added:
+                req.time_stats.set_prefill_bootstrap_queue_entry_time()
+                self._prefetch_kvcache(req, is_retracted=is_retracted)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
@@ -3540,6 +3559,30 @@ class Scheduler(
                 ):
                     break
 
+            abandoned_prefetch = False
+            if (
+                getattr(
+                    self.server_args,
+                    "mooncake_enable_waiting_queue_dfs_prefetch",
+                    False,
+                )
+                and self.server_args.enable_unified_cache_external_linker
+                and self.server_args.unified_cache_external_linker_backend
+                == "mooncake"
+                and self.disaggregation_mode
+                in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
+                and self.schedule_policy == "fcfs"
+                and self.ps.pp_size == 1
+            ):
+                prefetch_state = (
+                    self.tree_cache.get_waiting_queue_prefetch_admission_state(
+                        req.rid
+                    )
+                )
+                if prefetch_state == "pending":
+                    continue
+                abandoned_prefetch = prefetch_state == "terminal"
+
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
@@ -3549,6 +3592,11 @@ class Scheduler(
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+
+            if abandoned_prefetch:
+                # Wait for every in-flight rank first, then retire the failed
+                # speculative state and rematch via the normal external path.
+                self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
 
             req.init_next_round_input(self.tree_cache)
             if (

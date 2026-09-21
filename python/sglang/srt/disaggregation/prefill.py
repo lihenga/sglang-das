@@ -885,10 +885,11 @@ class PrefillBootstrapQueue:
         pd_hidden_state(req).owner_direct_sent = False
         return True
 
-    def add(self, req: Req, num_kv_heads: int) -> None:
+    def add(self, req: Req, num_kv_heads: int) -> bool:
         if not self.create_sender(req, num_kv_heads):
-            return
+            return False
         self.queue.append(req)
+        return True
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:

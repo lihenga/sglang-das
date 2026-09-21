@@ -538,6 +538,52 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def prefetch_external_linker_to_host(self, req) -> bool:
+        if self.linker is None:
+            return False
+        return self.linker.prefetch_to_host(req)
+
+    def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
+        """Return one rank-wide admission state for a queued DFS prefetch."""
+        local_state = (
+            "not_tracked"
+            if self.linker is None
+            else self.linker.get_host_prefetch_admission_state(rid)
+        )
+        state_names = (
+            "not_tracked",
+            "pending",
+            "dfs_prefetched",
+            "no_prefetch_needed",
+            "terminal",
+        )
+        counts = torch.tensor(
+            [int(local_state == state) for state in state_names], dtype=torch.int
+        )
+        self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
+        not_tracked, pending, dfs_prefetched, no_prefetch_needed, terminal = (
+            int(value) for value in counts
+        )
+
+        # PENDING wins: an in-flight native read owns its private session and
+        # must finish before any rank may fall back to the normal load path.
+        if pending:
+            return "pending"
+        completed = dfs_prefetched + no_prefetch_needed
+        if terminal or (not_tracked and completed):
+            return "terminal"
+        if dfs_prefetched:
+            return "dfs_prefetched"
+        if no_prefetch_needed:
+            return "no_prefetch_needed"
+        if not_tracked:
+            return "not_tracked"
+        return "terminal"
+
+    def cancel_waiting_queue_prefetch(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.cancel_waiting_queue_prefetch(rid)
+
     def is_chunk_cache(self) -> bool:
         return self.disable
 
