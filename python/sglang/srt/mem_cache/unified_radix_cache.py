@@ -554,8 +554,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
         not_tracked, pending, ready, terminal = (int(value) for value in counts)
 
-        # A still-running native read takes precedence over terminal states on
-        # other ranks. Defer until no rank can still be using its session.
+        # A still-running native read takes precedence so every rank abandons
+        # the speculation instead of letting READY ranks claim it.
         if pending:
             return "pending"
         if terminal or (not_tracked and ready):
@@ -569,12 +569,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def cancel_waiting_queue_prefetch(self, rid: str) -> None:
         if self.linker is not None:
             self.linker.cancel_waiting_queue_prefetch(rid)
-
-    def clear_external_hit_for_prefetch_fallback(self, req) -> None:
-        if self.linker is not None:
-            self.linker.clear_external_hit_for_prefetch_fallback(req)
-        else:
-            UnifiedCacheLinkerWrapper._clear_external_hit(req)
 
     def is_chunk_cache(self) -> bool:
         return self.disable

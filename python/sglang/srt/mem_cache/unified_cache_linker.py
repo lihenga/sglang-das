@@ -471,11 +471,6 @@ class UnifiedCacheLinkerWrapper:
         self.host_prefetch_hits.pop(rid, None)
         self.cache_linker.cancel_host_prefetch(rid)
 
-    def clear_external_hit_for_prefetch_fallback(self, req: Req) -> None:
-        self.hit_markers.pop(req.rid, None)
-        self.host_prefetch_hits.pop(req.rid, None)
-        self._clear_external_hit(req)
-
     def prefetch_to_host(self, req: Req) -> bool:
         """Submit the current external hit for DFS-to-pinned prefetch.
 

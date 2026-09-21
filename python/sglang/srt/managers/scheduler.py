@@ -3644,7 +3644,7 @@ class Scheduler(
                     self._mark_waiting_queue_reason("running_batch_full", queue_index)
                     break
 
-            terminal_prefetch = False
+            abandoned_prefetch = False
             if (
                 getattr(
                     self.server_args,
@@ -3664,10 +3664,7 @@ class Scheduler(
                         req.rid
                     )
                 )
-                if prefetch_state == "pending":
-                    req.time_stats.set_queue_wait_reason("mooncake_dfs_prefetch")
-                    continue
-                terminal_prefetch = prefetch_state == "terminal"
+                abandoned_prefetch = prefetch_state in {"pending", "terminal"}
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -3680,16 +3677,14 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            if terminal_prefetch:
-                # This state is rank-wide. Retire it before rematching so every
-                # rank follows the same normal external lookup path.
+            if abandoned_prefetch:
+                # Admission never waits for speculative DFS I/O. Retire the
+                # prefetch rank-wide, then rematch through the normal on-demand
+                # external lookup path. An in-flight native read keeps its own
+                # session alive until its worker returns.
                 self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
 
             req.init_next_round_input(self.tree_cache)
-            if terminal_prefetch:
-                # A terminal prefetch falls back as one request-wide decision,
-                # even if the normal rematch found an external hit again.
-                self.tree_cache.clear_external_hit_for_prefetch_fallback(req)
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"

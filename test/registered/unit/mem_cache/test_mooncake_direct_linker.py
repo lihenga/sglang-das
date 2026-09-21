@@ -680,6 +680,8 @@ def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
     linker.host_prefetch_entries = {}
     linker.host_prefetch_queue = Queue()
     linker.prepared_load_sessions = {}
+    linker.prepared_load_sources = {}
+    linker.prepared_load_page_sources = {}
     linker.session_lock = threading.Lock()
     linker.storage = SimpleNamespace(store=_Store())
     linker.stats = {
@@ -692,6 +694,8 @@ def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
 
     def prepare_load(rid, _transfers):
         linker.prepared_load_sessions[rid] = ["page-a", "page-b"]
+        linker.prepared_load_sources[rid] = "dfs"
+        linker.prepared_load_page_sources[rid] = {(PoolName.KV, "page-a"): "dfs"}
         return True
 
     linker.prepare_load = prepare_load
@@ -709,8 +713,79 @@ def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
         assert refresh_calls == [["page-a", "page-b"]]
         assert linker.claim_ready_host_prefetch("rid")
         assert linker.prepared_load_sessions["rid"] == ["page-a", "page-b"]
+        assert linker._host_prefetch_session_rid("rid") not in (
+            linker.prepared_load_sessions
+        )
+        assert linker.prepared_load_sources == {"rid": "dfs"}
+        assert linker.prepared_load_page_sources == {
+            "rid": {(PoolName.KV, "page-a"): "dfs"}
+        }
         assert linker.stats["host_prefetch_consumed"] == 1
     finally:
+        linker.host_prefetch_queue.put(None)
+        thread.join(timeout=5)
+
+
+def test_cancelled_waiting_prefetch_does_not_block_on_demand_session():
+    reading = threading.Event()
+    finish_read = threading.Event()
+    aborted = []
+
+    class _Store:
+        def batch_get_session_prefetch(self, keys):
+            reading.set()
+            assert finish_read.wait(timeout=5)
+            return [0] * len(keys)
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_enabled = True
+    linker.host_prefetch_limit = 8
+    linker.host_prefetch_lock = threading.Lock()
+    linker.host_prefetch_entries = {}
+    linker.host_prefetch_queue = Queue()
+    linker.prepared_load_sessions = {}
+    linker.session_lock = threading.Lock()
+    linker.storage = SimpleNamespace(store=_Store())
+    linker.stats = {
+        "host_prefetch_submitted": 0,
+        "host_prefetch_ready": 0,
+        "host_prefetch_consumed": 0,
+        "host_prefetch_not_ready": 0,
+        "host_prefetch_failed": 0,
+    }
+
+    def prepare_load(rid, _transfers):
+        assert rid not in linker.prepared_load_sessions
+        linker.prepared_load_sessions[rid] = ["page-a"]
+        return True
+
+    def abort_now(rid):
+        aborted.append(rid)
+        linker.prepared_load_sessions.pop(rid, None)
+
+    linker.prepare_load = prepare_load
+    linker._abort_prepared_load_now = abort_now
+    thread = threading.Thread(target=linker.host_prefetch_thread_func, daemon=True)
+    thread.start()
+    try:
+        assert linker.submit_host_prefetch(
+            "rid", [PoolTransfer(name=PoolName.KV, keys=["page-a"])]
+        )
+        assert reading.wait(timeout=5)
+
+        linker.cancel_host_prefetch("rid")
+        speculative_rid = linker._host_prefetch_session_rid("rid")
+        assert speculative_rid in linker.prepared_load_sessions
+        assert prepare_load("rid", [])
+
+        finish_read.set()
+        linker.host_prefetch_queue.join()
+        assert aborted == [speculative_rid]
+        assert speculative_rid not in linker.prepared_load_sessions
+        assert linker.prepared_load_sessions["rid"] == ["page-a"]
+        assert linker.get_host_prefetch_status("rid") is None
+    finally:
+        finish_read.set()
         linker.host_prefetch_queue.put(None)
         thread.join(timeout=5)
 
@@ -2983,7 +3058,7 @@ def test_waiting_prefetch_admission_state_is_rank_wide(rank_states, expected):
     assert results == [expected] * len(rank_states)
 
 
-def test_terminal_waiting_prefetch_fallback_cleans_hit_state():
+def test_waiting_prefetch_fallback_preserves_external_hit_state():
     cancelled = []
     marker = object()
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
@@ -3004,22 +3079,15 @@ def test_terminal_waiting_prefetch_fallback_cleans_hit_state():
     )
 
     wrapper.cancel_waiting_queue_prefetch(req.rid)
-    wrapper.clear_external_hit_for_prefetch_fallback(req)
-
     assert cancelled == [req.rid]
     assert req.rid not in wrapper.hit_markers
     assert req.rid not in wrapper.host_prefetch_hits
-    assert req.host_hit_length == 0
-    assert req.swa_host_hit_length == 0
-    assert req.mamba_host_hit_length == 0
-    assert req.storage_hit_length == 0
-    assert req.cached_tokens_storage_source is None
-    assert req.cached_tokens_by_source == {
-        "l1_device": 2,
-        "l3_mooncake_memory": 0,
-        "l4_mooncake_dfs": 0,
-        "l4_mooncake_local_disk": 0,
-    }
+    assert req.host_hit_length == 8
+    assert req.swa_host_hit_length == 4
+    assert req.mamba_host_hit_length == 1
+    assert req.storage_hit_length == 8
+    assert req.cached_tokens_storage_source == "mooncake_dfs"
+    assert req.cached_tokens_by_source == {"l1_device": 2, "l4_mooncake_dfs": 8}
 
 
 def test_waiting_prefetch_rematch_reuses_equal_radix_key_without_lookup():

@@ -821,13 +821,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.host_prefetch_entries[rid] = {
                 "state": "preparing",
                 "cancelled": False,
+                "session_rid": self._host_prefetch_session_rid(rid),
                 "submitted_at": time.perf_counter(),
             }
 
+        session_rid = self._host_prefetch_session_rid(rid)
         try:
-            if not self.prepare_load(rid, transfers):
+            if not self.prepare_load(session_rid, transfers):
                 raise RuntimeError("Mooncake session preparation failed")
-            keys = list(self.prepared_load_sessions.get(rid, ()))
+            keys = list(self.prepared_load_sessions.get(session_rid, ()))
             if not keys:
                 raise RuntimeError("Mooncake session preparation returned no keys")
         except BaseException:
@@ -840,7 +842,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 entry = self.host_prefetch_entries.get(rid)
                 if entry is not None:
                     entry["state"] = "failed"
-            self._abort_prepared_load_now(rid)
+            self._abort_prepared_load_now(session_rid)
             self.stats["host_prefetch_failed"] += 1
             return False
 
@@ -869,9 +871,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 or entry.get("cancelled")
             ):
                 return False
+            session_rid = str(entry["session_rid"])
 
         with self.session_lock:
-            keys = list(self.prepared_load_sessions.get(rid, ()))
+            keys = list(self.prepared_load_sessions.get(session_rid, ()))
         if not keys:
             return False
 
@@ -891,6 +894,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             entry = self.host_prefetch_entries.get(rid)
             if entry is None or entry.get("state") != "ready":
                 return False
+            session_rid = str(entry["session_rid"])
+            with self.session_lock:
+                if (
+                    rid in self.prepared_load_sessions
+                    or session_rid not in self.prepared_load_sessions
+                ):
+                    return False
+                self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
+                    session_rid
+                )
+                for attr in (
+                    "prepared_load_sources",
+                    "prepared_load_page_sources",
+                ):
+                    values = getattr(self, attr, None)
+                    if values is not None and session_rid in values:
+                        values[rid] = values.pop(session_rid)
             self.host_prefetch_entries.pop(rid, None)
         self.stats["host_prefetch_consumed"] += 1
         return True
@@ -898,13 +918,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def cancel_host_prefetch(self, rid: str) -> None:
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
+            if entry is None:
+                return
+            session_rid = str(entry["session_rid"])
             if entry is not None and entry.get("state") in {
                 "preparing",
                 "queued",
                 "reading",
             }:
                 self.stats["host_prefetch_not_ready"] += 1
-        self.abort_prepared_load(rid)
+                entry["cancelled"] = True
+                return
+            self.host_prefetch_entries.pop(rid, None)
+        self._abort_prepared_load_now(session_rid)
+
+    @staticmethod
+    def _host_prefetch_session_rid(rid: str) -> str:
+        return f"__sglang_waiting_queue_prefetch__:{rid}"
 
     def host_prefetch_thread_func(self) -> None:
         while True:
@@ -923,6 +953,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     else:
                         entry["state"] = "reading"
                         cancelled = False
+                    session_rid = str(entry["session_rid"])
 
                 success = False
                 if not cancelled:
@@ -954,7 +985,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if success and not cancelled:
                     self.stats["host_prefetch_ready"] += 1
                 else:
-                    self._abort_prepared_load_now(rid)
+                    self._abort_prepared_load_now(session_rid)
+                    if cancelled:
+                        with self.host_prefetch_lock:
+                            self.host_prefetch_entries.pop(rid, None)
                     if not cancelled:
                         self.stats["host_prefetch_failed"] += 1
             finally:
