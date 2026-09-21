@@ -473,7 +473,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.session_lock = threading.Lock()
         self.host_prefetch_lock = threading.Lock()
         self.host_prefetch_entries: dict[str, dict[str, object]] = {}
-        self.host_prefetch_queue: Queue[tuple[str, list[str]] | None] = Queue()
+        self.host_prefetch_queue: Queue[
+            tuple[str, list[PoolTransfer]] | None
+        ] = Queue()
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, list[tuple[str, list[PoolTransfer]]], object] | None
@@ -819,48 +821,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.stats["host_prefetch_not_ready"] += 1
                 return False
             self.host_prefetch_entries[rid] = {
-                "state": "preparing",
+                "state": "queued",
                 "cancelled": False,
                 "session_rid": self._host_prefetch_session_rid(rid),
                 "submitted_at": time.perf_counter(),
             }
 
-        session_rid = self._host_prefetch_session_rid(rid)
-        try:
-            if not self.prepare_load(session_rid, transfers):
-                raise RuntimeError("Mooncake session preparation failed")
-            keys = list(self.prepared_load_sessions.get(session_rid, ()))
-            if not keys:
-                raise RuntimeError("Mooncake session preparation returned no keys")
-        except BaseException:
-            logger.warning(
-                "Mooncake waiting-queue host prefetch preparation failed for rid=%s",
-                rid,
-                exc_info=True,
-            )
-            with self.host_prefetch_lock:
-                entry = self.host_prefetch_entries.get(rid)
-                if entry is not None:
-                    entry["state"] = "failed"
-            self._abort_prepared_load_now(session_rid)
-            self.stats["host_prefetch_failed"] += 1
-            return False
-
-        with self.host_prefetch_lock:
-            entry = self.host_prefetch_entries.get(rid)
-            if entry is None or entry.get("cancelled"):
-                self.host_prefetch_entries.pop(rid, None)
-                cancelled_before_queue = True
-            else:
-                entry["state"] = "queued"
-                entry["keys"] = keys
-                cancelled_before_queue = False
-        if cancelled_before_queue:
-            # prepare_load() used the private speculative rid. The request rid
-            # may already own an unrelated on-demand session by this point.
-            self._abort_prepared_load_now(session_rid)
-            return False
-        self.host_prefetch_queue.put((rid, keys))
+        # Session creation can contact DFS, so leave the scheduler path after
+        # recording the request and let the host-prefetch worker own both
+        # preparation and the subsequent DFS read.
+        self.host_prefetch_queue.put((rid, list(transfers)))
         self.stats["host_prefetch_submitted"] += 1
         return True
 
@@ -934,11 +904,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             session_rid = str(entry["session_rid"])
             if state in {"preparing", "queued", "reading"}:
                 self.stats["host_prefetch_not_ready"] += 1
+            if state in {"preparing", "reading"}:
                 entry["cancelled"] = True
                 return
+            # Queued work has not prepared a session yet. Remove the entry so
+            # its eventual queue item is skipped; the private RID cleanup is
+            # harmless if an earlier attempt left any state behind.
             self.host_prefetch_entries.pop(rid, None)
-        # A claimed session has already moved to the request rid; all other
-        # terminal states still use the private speculative rid.
+        # A claimed session has already moved to the request RID; all other
+        # states use the private speculative RID.
         self._abort_prepared_load_now(rid if state == "claimed" else session_rid)
 
     @staticmethod
@@ -951,53 +925,119 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                rid, keys = task
+                rid, transfers = task
                 with self.host_prefetch_lock:
                     entry = self.host_prefetch_entries.get(rid)
                     if entry is None:
                         continue
+                    session_rid = str(entry["session_rid"])
                     if entry.get("cancelled"):
                         entry["state"] = "cancelled"
                         cancelled = True
                     else:
-                        entry["state"] = "reading"
+                        entry["state"] = "preparing"
                         cancelled = False
-                    session_rid = str(entry["session_rid"])
 
-                success = False
-                if not cancelled:
-                    try:
-                        results = list(
-                            self.storage.store.batch_get_session_prefetch(keys)
+                if cancelled:
+                    self._abort_prepared_load_now(session_rid)
+                    with self.host_prefetch_lock:
+                        if self.host_prefetch_entries.get(rid) is entry:
+                            self.host_prefetch_entries.pop(rid, None)
+                    continue
+
+                prepared = False
+                try:
+                    prepared = self.prepare_load(session_rid, transfers)
+                    with self.session_lock:
+                        keys = list(self.prepared_load_sessions.get(session_rid, ()))
+                    if not prepared or not keys:
+                        raise RuntimeError(
+                            "Mooncake session preparation returned no keys"
                         )
-                        success = len(results) == len(keys) and all(
-                            result == 0 for result in results
+                except BaseException:
+                    logger.warning(
+                        "Mooncake waiting-queue host prefetch preparation failed "
+                        "for rid=%s",
+                        rid,
+                        exc_info=True,
+                    )
+                    self._abort_prepared_load_now(session_rid)
+                    with self.host_prefetch_lock:
+                        current = self.host_prefetch_entries.get(rid)
+                        cancelled = bool(
+                            current is not entry
+                            or current is None
+                            or current.get("cancelled")
                         )
-                    except BaseException:
-                        logger.warning(
-                            "Mooncake waiting-queue DFS prefetch failed for rid=%s",
-                            rid,
-                            exc_info=True,
-                        )
+                        if current is entry:
+                            if cancelled:
+                                self.host_prefetch_entries.pop(rid, None)
+                            else:
+                                current["state"] = "failed"
+                    if not cancelled:
+                        self.stats["host_prefetch_failed"] += 1
+                    continue
 
                 with self.host_prefetch_lock:
-                    entry = self.host_prefetch_entries.get(rid)
-                    cancelled = bool(entry is None or entry.get("cancelled"))
-                    if entry is not None:
-                        if cancelled:
-                            entry["state"] = "cancelled"
-                        else:
-                            entry["state"] = "ready" if success else "failed"
-                        if success and not cancelled:
-                            entry["ready_at"] = time.perf_counter()
+                    current = self.host_prefetch_entries.get(rid)
+                    cancelled = bool(
+                        current is not entry
+                        or current is None
+                        or current.get("cancelled")
+                    )
+                    if current is entry and not cancelled:
+                        current["keys"] = keys
+                        current["state"] = "reading"
+
+                if cancelled:
+                    self._abort_prepared_load_now(session_rid)
+                    with self.host_prefetch_lock:
+                        if self.host_prefetch_entries.get(rid) is entry:
+                            self.host_prefetch_entries.pop(rid, None)
+                    continue
+
+                success = False
+                try:
+                    results = list(
+                        self.storage.store.batch_get_session_prefetch(keys)
+                    )
+                    success = len(results) == len(keys) and all(
+                        result == 0 for result in results
+                    )
+                except BaseException:
+                    logger.warning(
+                        "Mooncake waiting-queue DFS prefetch failed for rid=%s",
+                        rid,
+                        exc_info=True,
+                    )
+
+                with self.host_prefetch_lock:
+                    current = self.host_prefetch_entries.get(rid)
+                    cancelled = bool(
+                        current is not entry
+                        or current is None
+                        or current.get("cancelled")
+                    )
+                    if current is entry and not cancelled and success:
+                        current["state"] = "ready"
+                        current["ready_at"] = time.perf_counter()
 
                 if success and not cancelled:
                     self.stats["host_prefetch_ready"] += 1
                 else:
                     self._abort_prepared_load_now(session_rid)
-                    if cancelled:
-                        with self.host_prefetch_lock:
-                            self.host_prefetch_entries.pop(rid, None)
+                    with self.host_prefetch_lock:
+                        current = self.host_prefetch_entries.get(rid)
+                        cancelled = bool(
+                            current is not entry
+                            or current is None
+                            or current.get("cancelled")
+                        )
+                        if current is entry:
+                            if cancelled:
+                                self.host_prefetch_entries.pop(rid, None)
+                            else:
+                                current["state"] = "failed"
                     if not cancelled:
                         self.stats["host_prefetch_failed"] += 1
             finally:
@@ -1080,18 +1120,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def abort_prepared_load(self, rid: str) -> None:
         prefetch_lock = getattr(self, "host_prefetch_lock", None)
+        speculative_rid = None
         if prefetch_lock is not None:
             with prefetch_lock:
                 entry = self.host_prefetch_entries.get(rid)
-                if entry is not None and entry.get("state") in {
-                    "preparing",
-                    "queued",
-                    "reading",
-                }:
-                    entry["cancelled"] = True
-                    return
-                self.host_prefetch_entries.pop(rid, None)
+                if entry is not None:
+                    state = entry.get("state")
+                    session_rid = str(entry["session_rid"])
+                    if state in {"preparing", "reading"}:
+                        # The worker owns the private session until its native
+                        # call returns. Still release any independent on-demand
+                        # session under the request RID below.
+                        entry["cancelled"] = True
+                    else:
+                        self.host_prefetch_entries.pop(rid, None)
+                        if state != "claimed":
+                            speculative_rid = session_rid
         self._abort_prepared_load_now(rid)
+        if speculative_rid is not None:
+            self._abort_prepared_load_now(speculative_rid)
 
     def cancel_queued_load(self, rid: str) -> None:
         getattr(self, "pending_load_metrics", {}).pop(rid, None)

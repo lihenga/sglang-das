@@ -727,6 +727,31 @@ def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
         thread.join(timeout=5)
 
 
+def test_waiting_queue_host_prefetch_submission_does_not_prepare_inline():
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_enabled = True
+    linker.host_prefetch_limit = 8
+    linker.host_prefetch_lock = threading.Lock()
+    linker.host_prefetch_entries = {}
+    linker.host_prefetch_queue = Queue()
+    linker.stats = {
+        "host_prefetch_submitted": 0,
+        "host_prefetch_not_ready": 0,
+    }
+    linker.prepare_load = lambda rid, transfers: pytest.fail(
+        "session preparation must run on the prefetch worker"
+    )
+    transfer = PoolTransfer(name=PoolName.KV, keys=["page-a"])
+
+    assert linker.submit_host_prefetch("rid", [transfer])
+    assert linker.get_host_prefetch_status("rid") == "queued"
+    queued_rid, queued_transfers = linker.host_prefetch_queue.get_nowait()
+    assert queued_rid == "rid"
+    assert queued_transfers == [transfer]
+    linker.host_prefetch_queue.task_done()
+    assert linker.stats["host_prefetch_submitted"] == 1
+
+
 def test_cancelled_waiting_prefetch_does_not_block_on_demand_session():
     reading = threading.Event()
     finish_read = threading.Event()
@@ -3016,9 +3041,9 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
     [
         ([(True, "queued"), (True, "reading")], "pending"),
         ([(True, "ready"), (True, "reading")], "pending"),
-        ([(True, "failed"), (True, "reading")], "terminal"),
+        ([(True, "failed"), (True, "reading")], "pending"),
         ([(False, "reading"), (True, "ready")], "pending"),
-        ([(False, None), (True, "reading")], "terminal"),
+        ([(False, None), (True, "reading")], "pending"),
         ([(True, "ready"), (True, "ready")], "ready"),
         ([(True, "failed"), (True, "ready")], "terminal"),
         ([(False, "ready"), (True, "ready")], "terminal"),

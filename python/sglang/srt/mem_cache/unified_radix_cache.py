@@ -554,13 +554,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
         not_tracked, pending, ready, terminal = (int(value) for value in counts)
 
-        # A pending rank can wait for READY ranks while its read finishes, but
-        # no speculative session can be claimed safely after a failure or when
-        # one rank never tracked the request.
-        if terminal or (not_tracked and (pending or ready)):
-            return "terminal"
+        # Do not fall back while any rank still owns in-flight prefetch work.
+        # Cancelling a native call cannot interrupt it, and admission could
+        # start the same DFS read again. This also covers not_tracked + pending
+        # after a rank-local submission failure; once pending work drains, the
+        # mixed state becomes terminal and the request can use the normal load
+        # path.
         if pending:
             return "pending"
+        if terminal or (not_tracked and ready):
+            return "terminal"
         if ready:
             return "ready"
         if not_tracked:
