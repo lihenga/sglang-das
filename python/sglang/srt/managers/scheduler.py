@@ -4816,7 +4816,6 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self._release_aborted_request(req.rid)
-            self.beam_coordinator.retire_group(req)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -5339,6 +5338,13 @@ def configure_scheduler_process(
             numa_bind_to_node(numa_node)
 
     return dp_rank
+
+
+def _make_abort_req(
+    req: Req, finished_reason: Optional[dict] = None
+) -> AbortReq:
+    """Build the tokenizer notification for an aborted request."""
+    return AbortReq(rid=req.rid, finished_reason=finished_reason)
 
 
 def run_scheduler_process(
