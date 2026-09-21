@@ -551,6 +551,20 @@ class UnifiedCacheLinkerWrapper:
             "l4_mooncake_local_disk": 0,
         }
 
+    def _retry_external_load_after_host_prefetch_failure(
+        self, req: Req, hit: ExternalCacheHitMarker
+    ) -> tuple[torch.Tensor, NodeId]:
+        """Retry the ordinary external load without dropping a valid hit.
+
+        The speculative host session is separate from the request's external
+        hit marker. If READY validation or claim fails, the marker still
+        describes the original on-demand path and must be restored before
+        retrying ``load_back``. The recursive call is single-shot because the
+        host-prefetch marker has already been consumed.
+        """
+        self.hit_markers[req.rid] = hit
+        return self.load_back(req)
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -715,14 +729,15 @@ class UnifiedCacheLinkerWrapper:
             cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
             if int(ready.item()) == 0:
                 self.cache_linker.cancel_host_prefetch(req.rid)
-                self._clear_external_hit(req)
                 logger.debug(
                     "Mooncake host prefetch not ready at admission for rid=%s "
-                    "(local_state=%s); falling back to normal prefill.",
+                    "(local_state=%s); falling back to normal external load.",
                     req.rid,
                     status,
                 )
-                return empty_indices, req.last_node
+                return self._retry_external_load_after_host_prefetch_failure(
+                    req, hit
+                )
 
             locally_valid = False
             try:
@@ -736,13 +751,14 @@ class UnifiedCacheLinkerWrapper:
             cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
             if int(valid.item()) == 0:
                 self.cache_linker.cancel_host_prefetch(req.rid)
-                self._clear_external_hit(req)
                 logger.debug(
                     "Mooncake host prefetch session expired before admission for "
-                    "rid=%s; falling back to normal prefill.",
+                    "rid=%s; falling back to normal external load.",
                     req.rid,
                 )
-                return empty_indices, req.last_node
+                return self._retry_external_load_after_host_prefetch_failure(
+                    req, hit
+                )
 
             claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
             claimed_all = torch.tensor(int(claimed), dtype=torch.int)
@@ -751,8 +767,9 @@ class UnifiedCacheLinkerWrapper:
             )
             if int(claimed_all.item()) == 0:
                 self.cache_linker.cancel_host_prefetch(req.rid)
-                self._clear_external_hit(req)
-                return empty_indices, req.last_node
+                return self._retry_external_load_after_host_prefetch_failure(
+                    req, hit
+                )
             prepared_from_host_prefetch = True
 
         device_hit_len = hit.device_hit_len

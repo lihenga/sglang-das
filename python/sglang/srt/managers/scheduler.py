@@ -3664,7 +3664,12 @@ class Scheduler(
                         req.rid
                     )
                 )
-                abandoned_prefetch = prefetch_state in {"pending", "terminal"}
+                if prefetch_state == "pending":
+                    req.time_stats.set_queue_wait_reason(
+                        "mooncake_waiting_queue_dfs_prefetch"
+                    )
+                    continue
+                abandoned_prefetch = prefetch_state == "terminal"
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -3678,10 +3683,10 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             if abandoned_prefetch:
-                # Admission never waits for speculative DFS I/O. Retire the
-                # prefetch rank-wide, then rematch through the normal on-demand
-                # external lookup path. An in-flight native read keeps its own
-                # session alive until its worker returns.
+                # A terminal or rank-inconsistent prefetch cannot be claimed
+                # everywhere. Retire it rank-wide, then rematch through the
+                # normal on-demand external load path. An in-flight native read
+                # keeps its own session alive until its worker returns.
                 self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
 
             req.init_next_round_input(self.tree_cache)

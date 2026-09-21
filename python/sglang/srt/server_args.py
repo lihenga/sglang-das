@@ -2951,12 +2951,15 @@ class ServerArgs:
     mooncake_enable_waiting_queue_dfs_prefetch: A[
         bool,
         "Prefetch Mooncake DFS objects into its pinned session cache while "
-        "requests wait in the FCFS scheduler queue.",
+        "requests wait in the FCFS scheduler queue. Hold admission until "
+        "the prefetch is ready on all ranks; failures use the normal external "
+        "load path.",
         NS("memory"),
     ] = False
     mooncake_waiting_queue_dfs_prefetch_max_requests: A[
         int,
-        "Maximum number of queued, reading, or ready Mooncake waiting-queue "
+        "Maximum number of preparing, queued, reading, or ready Mooncake "
+        "waiting-queue "
         "DFS-prefetch requests retained per scheduler rank.",
         NS("memory"),
     ] = 8

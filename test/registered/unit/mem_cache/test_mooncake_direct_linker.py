@@ -721,6 +721,7 @@ def test_waiting_queue_host_prefetch_becomes_ready_without_device_load():
             "rid": {(PoolName.KV, "page-a"): "dfs"}
         }
         assert linker.stats["host_prefetch_consumed"] == 1
+        assert linker.get_host_prefetch_status("rid") == "claimed"
     finally:
         linker.host_prefetch_queue.put(None)
         thread.join(timeout=5)
@@ -3015,8 +3016,9 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
     [
         ([(True, "queued"), (True, "reading")], "pending"),
         ([(True, "ready"), (True, "reading")], "pending"),
-        ([(True, "failed"), (True, "reading")], "pending"),
+        ([(True, "failed"), (True, "reading")], "terminal"),
         ([(False, "reading"), (True, "ready")], "pending"),
+        ([(False, None), (True, "reading")], "terminal"),
         ([(True, "ready"), (True, "ready")], "ready"),
         ([(True, "failed"), (True, "ready")], "terminal"),
         ([(False, "ready"), (True, "ready")], "terminal"),
@@ -3145,31 +3147,50 @@ def test_waiting_prefetch_rematch_reuses_equal_radix_key_without_lookup():
     assert backend.lookup_calls == 0
 
 
-def test_ready_waiting_prefetch_expiry_falls_back_before_claim():
+@pytest.mark.parametrize("failure", ["status", "revalidate", "claim"])
+def test_ready_waiting_prefetch_failure_retries_normal_external_load(failure):
     empty = torch.empty((0,), dtype=torch.int64)
     cancelled = []
-    collectives = []
+    prepare_observations = []
+
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOAD
+            return PoolTransfer(
+                name=PoolName.KV,
+                keys=list(keys),
+                device_indices=empty,
+            )
 
     class _Backend:
         def get_host_prefetch_status(self, rid):
             assert rid == "rid"
-            return "ready"
+            return "reading" if failure == "status" else "ready"
 
         def revalidate_host_prefetch(self, rid):
             assert rid == "rid"
-            return False
+            assert failure != "status"
+            return failure != "revalidate"
 
         def claim_ready_host_prefetch(self, rid):
-            pytest.fail("an expired READY prefetch must not be claimed")
+            assert rid == "rid"
+            assert failure == "claim"
+            return False
 
         def cancel_host_prefetch(self, rid):
             cancelled.append(rid)
 
         def prepare_load(self, rid, transfers):
-            pytest.fail("expired prefetch must fall back before load preparation")
+            prepare_observations.append(
+                (rid, wrapper.hit_markers.get(rid), req.host_hit_length)
+            )
+            return False
+
+        def abort_prepared_load(self, rid):
+            pass
 
     def all_reduce(value, op):
-        collectives.append(op)
+        pass
 
     marker = ExternalCacheHitMarker(
         prefix_key=RadixKey(array("q", [1, 2])),
@@ -3179,6 +3200,8 @@ def test_ready_waiting_prefetch_expiry_falls_back_before_claim():
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = SimpleNamespace(
         page_size=2,
+        pp_size=1,
+        _components_tuple=(_Component(),),
         tree_core=SimpleNamespace(
             empty_match_result=SimpleNamespace(device_indices=empty)
         ),
@@ -3187,6 +3210,7 @@ def test_ready_waiting_prefetch_expiry_falls_back_before_claim():
     wrapper.cache_linker = _Backend()
     wrapper.hit_markers = {"rid": marker}
     wrapper.host_prefetch_hits = {"rid": marker}
+    wrapper._update_load = lambda *args, **kwargs: []
     req = SimpleNamespace(
         rid="rid",
         last_node=7,
@@ -3204,12 +3228,42 @@ def test_ready_waiting_prefetch_expiry_falls_back_before_claim():
     assert indices.numel() == 0
     assert node == 7
     assert cancelled == ["rid"]
-    assert len(collectives) == 2  # READY and session validation are rank-wide.
+    assert prepare_observations == [("rid", marker, 2)]
     assert req.host_hit_length == 0
     assert req.swa_host_hit_length == 0
     assert req.mamba_host_hit_length == 0
     assert req.storage_hit_length == 0
     assert req.cached_tokens_storage_source is None
+
+
+def test_claimed_host_prefetch_cancel_aborts_request_session():
+    ended = []
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_lock = threading.Lock()
+    linker.host_prefetch_entries = {
+        "rid": {
+            "state": "claimed",
+            "cancelled": False,
+            "session_rid": linker._host_prefetch_session_rid("rid"),
+        }
+    }
+    linker.prepared_load_sessions = {"rid": ["page-a"]}
+    linker.pending_loads = {}
+    linker.session_refcounts = {"page-a": 1}
+    linker.session_sources = {"page-a": "dfs"}
+    linker.session_lock = threading.Lock()
+    linker.storage = SimpleNamespace(
+        store=SimpleNamespace(
+            batch_get_session_end=lambda keys: ended.append(list(keys))
+        )
+    )
+
+    linker.cancel_host_prefetch("rid")
+
+    assert linker.host_prefetch_entries == {}
+    assert linker.prepared_load_sessions == {}
+    assert linker.session_refcounts == {}
+    assert ended == [["page-a"]]
 
 
 @pytest.mark.parametrize("load_outcome", [True, False, "raise"])

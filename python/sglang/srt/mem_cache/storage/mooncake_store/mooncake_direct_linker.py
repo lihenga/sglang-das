@@ -849,10 +849,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is None or entry.get("cancelled"):
-                self._abort_prepared_load_now(rid)
-                return False
-            entry["state"] = "queued"
-            entry["keys"] = keys
+                self.host_prefetch_entries.pop(rid, None)
+                cancelled_before_queue = True
+            else:
+                entry["state"] = "queued"
+                entry["keys"] = keys
+                cancelled_before_queue = False
+        if cancelled_before_queue:
+            # prepare_load() used the private speculative rid. The request rid
+            # may already own an unrelated on-demand session by this point.
+            self._abort_prepared_load_now(session_rid)
+            return False
         self.host_prefetch_queue.put((rid, keys))
         self.stats["host_prefetch_submitted"] += 1
         return True
@@ -911,7 +918,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     values = getattr(self, attr, None)
                     if values is not None and session_rid in values:
                         values[rid] = values.pop(session_rid)
-            self.host_prefetch_entries.pop(rid, None)
+            # Keep the entry until the normal load path releases the claimed
+            # session. If another rank fails the all-reduce claim decision,
+            # cancel_host_prefetch() can roll this local claim back too.
+            entry["state"] = "claimed"
         self.stats["host_prefetch_consumed"] += 1
         return True
 
@@ -920,17 +930,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             entry = self.host_prefetch_entries.get(rid)
             if entry is None:
                 return
+            state = entry.get("state")
             session_rid = str(entry["session_rid"])
-            if entry is not None and entry.get("state") in {
-                "preparing",
-                "queued",
-                "reading",
-            }:
+            if state in {"preparing", "queued", "reading"}:
                 self.stats["host_prefetch_not_ready"] += 1
                 entry["cancelled"] = True
                 return
             self.host_prefetch_entries.pop(rid, None)
-        self._abort_prepared_load_now(session_rid)
+        # A claimed session has already moved to the request rid; all other
+        # terminal states still use the private speculative rid.
+        self._abort_prepared_load_now(rid if state == "claimed" else session_rid)
 
     @staticmethod
     def _host_prefetch_session_rid(rid: str) -> str:

@@ -98,6 +98,88 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 )
                 self.assertEqual(req.init_next_round_input.call_count, int(expected))
 
+    def test_pending_waiting_queue_dfs_prefetch_keeps_request_queued(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        req = SimpleNamespace(
+            rid="req",
+            time_stats=MagicMock(),
+            init_next_round_input=MagicMock(),
+        )
+        scheduler.waiting_queue = [req]
+        scheduler.grammar_manager = SimpleNamespace(
+            has_waiting_grammars=lambda: False
+        )
+        scheduler.enable_hierarchical_cache = False
+        scheduler.server_args = SimpleNamespace(
+            enable_unified_cache_external_linker=True,
+            unified_cache_external_linker_backend="mooncake",
+            mooncake_enable_waiting_queue_dfs_prefetch=True,
+        )
+        scheduler.tree_cache = SimpleNamespace(
+            check_hicache_events=MagicMock(),
+            get_waiting_queue_prefetch_admission_state=MagicMock(
+                return_value="pending"
+            ),
+            cancel_waiting_queue_prefetch=MagicMock(),
+        )
+        scheduler.enable_priority_preemption = False
+        scheduler.is_hybrid_swa = False
+        scheduler.min_free_slots_delayer = None
+        scheduler.chunked_req = None
+        scheduler.get_num_allocatable_reqs = MagicMock(return_value=16)
+        scheduler.policy = SimpleNamespace(calc_priority=MagicMock())
+        scheduler.enable_lora = False
+        scheduler.page_size = 1
+        scheduler.token_to_kv_pool_allocator = object()
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        scheduler.max_prefill_tokens = 16
+        scheduler.chunked_prefill_size = 16
+        scheduler.is_mixed_chunk = False
+        scheduler.priority_scheduling_preemption_threshold = 0
+        scheduler.max_prefill_bs = 16
+        scheduler.max_running_requests = 16
+        scheduler.dllm_config = None
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=object())
+        )
+        scheduler.req_to_token_pool = SimpleNamespace()
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.schedule_policy = "fcfs"
+        scheduler.ps = SimpleNamespace(pp_size=1)
+        scheduler.enable_hicache_storage = False
+        running_batch = SimpleNamespace(batch_is_full=False, reqs=[])
+        adder = SimpleNamespace(can_run_list=[], preempt_list=[])
+
+        with (
+            patch("sglang.srt.managers.scheduler.PrefillAdder") as prefill_adder,
+            patch(
+                "sglang.srt.managers.scheduler.get_schedule",
+                return_value=SimpleNamespace(prefill_max_requests=16),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_memory",
+                return_value=SimpleNamespace(enable_flexkv=False),
+            ),
+            patch("sglang.srt.managers.scheduler.TEST_RETRACT", False),
+        ):
+            prefill_adder.return_value = adder
+            batch, updated_running_batch = Scheduler._get_new_batch_prefill_raw(
+                scheduler, None, running_batch
+            )
+
+        self.assertIsNone(batch)
+        self.assertIs(updated_running_batch, running_batch)
+        self.assertEqual(scheduler.waiting_queue, [req])
+        get_prefetch_state = (
+            scheduler.tree_cache.get_waiting_queue_prefetch_admission_state
+        )
+        get_prefetch_state.assert_called_once_with(req.rid)
+        scheduler.tree_cache.cancel_waiting_queue_prefetch.assert_not_called()
+        req.time_stats.set_queue_wait_reason.assert_called_once_with(
+            "mooncake_waiting_queue_dfs_prefetch"
+        )
+        req.init_next_round_input.assert_not_called()
+
     def test_decode_mode_assigns_default_priority_before_prealloc_queue(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)
         req = self._new_req(priority=None)
