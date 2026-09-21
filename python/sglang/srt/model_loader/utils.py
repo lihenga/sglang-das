@@ -236,7 +236,12 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
             install_spark_v1_int8_deepgemm_adapter,
         )
 
+        from sglang.srt.models.sparkv1_layer_split import (
+            install_spark_v1_layer_split_prefetch,
+        )
+
         install_spark_v1_0512_adapters(model_config.hf_text_config)
+        install_spark_v1_layer_split_prefetch()
         install_spark_v1_int8_deepgemm_adapter()
     setattr(model_config, "_resolved_model_arch", resolved_arch)
     setattr(
