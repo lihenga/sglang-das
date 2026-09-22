@@ -122,6 +122,67 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
 
+    def test_host_prefetch_worker_batches_native_reads(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.host_prefetch_lock = threading.Lock()
+        linker.session_lock = threading.Lock()
+        linker.host_prefetch_queue = Queue()
+        linker.host_prefetch_batch_limit = 3
+        linker.host_prefetch_limit = 3
+        linker.host_prefetch_max_bytes = 1 << 20
+        linker.host_prefetch_entries = {}
+        linker.prepared_load_sessions = {}
+        linker.session_sources = {}
+        linker.session_refcounts = {}
+        store = Mock()
+        store.batch_get_session_prefetch.return_value = [0, 0]
+        linker.storage = types.SimpleNamespace(store=store)
+        linker._update_host_prefetch_reservation_metrics = Mock()
+        linker._observe_host_prefetch_latency = Mock()
+
+        transfers_by_rid = {
+            "rid-1": [PoolTransfer(name=PoolName.KV, keys=["key-1"])],
+            "rid-2": [PoolTransfer(name=PoolName.KV, keys=["key-2"])],
+            "rid-3": [PoolTransfer(name=PoolName.KV, keys=["key-1"])],
+        }
+        for index, (rid, transfers) in enumerate(transfers_by_rid.items(), 1):
+            key = transfers[0].keys[0]
+            linker.host_prefetch_entries[rid] = {
+                "state": "queued",
+                "cancelled": False,
+                "transfers": transfers,
+                "session_rid": f"session-{index}",
+                "object_sizes": {key: 4096},
+                "reserved_bytes": 4096,
+                "queued_at": 0.0,
+            }
+
+        def prepare(session_rid, transfers):
+            key = transfers[0].keys[0]
+            linker.prepared_load_sessions[session_rid] = [key]
+            linker.session_sources[key] = "dfs"
+            return True
+
+        linker.prepare_load = Mock(side_effect=prepare)
+        for rid, transfers in transfers_by_rid.items():
+            linker.host_prefetch_queue.put((rid, transfers))
+        linker.host_prefetch_queue.put(None)
+
+        worker = threading.Thread(target=linker.host_prefetch_thread_func)
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        linker.host_prefetch_queue.join()
+
+        store.batch_get_session_prefetch.assert_called_once_with(["key-1", "key-2"])
+        self.assertEqual(
+            [
+                linker.host_prefetch_entries[rid]["state"]
+                for rid in ("rid-1", "rid-2", "rid-3")
+            ],
+            ["dfs_prefetched", "dfs_prefetched", "dfs_prefetched"],
+        )
+
     def test_queued_host_prefetch_cancel_is_atomic(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.host_prefetch_lock = threading.Lock()
