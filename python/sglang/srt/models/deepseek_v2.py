@@ -2811,10 +2811,11 @@ class DeepseekV2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
             initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
             parallel = get_parallel()
+            cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
             expected_tokens = None
-            if getattr(forward_batch, "attn_cp_metadata", None) is not None:
+            if cp_metadata is not None:
                 per_rank_tokens = getattr(
-                    forward_batch.attn_cp_metadata,
+                    cp_metadata,
                     "per_rank_actual_token",
                     None,
                 )
@@ -2833,9 +2834,9 @@ class DeepseekV2Model(nn.Module):
                 tuple(residual.shape) if residual is not None else None,
                 tuple(positions.shape),
                 expected_tokens,
-                getattr(forward_batch.attn_cp_metadata, "total_seq_lens", None),
+                getattr(cp_metadata, "total_seq_lens", None),
                 getattr(
-                    forward_batch.attn_cp_metadata,
+                    cp_metadata,
                     "per_rank_actual_token",
                     None,
                 ),

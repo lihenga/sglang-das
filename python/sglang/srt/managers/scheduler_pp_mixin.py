@@ -1552,8 +1552,8 @@ class SchedulerPPMixin:
                     logger.warning(
                         "PP proxy produced: mb_id=%s pp_rank=%s cp_rank=%s "
                         "tp_rank=%s rids=%s shapes=%s dtypes=%s "
-                        "cp_total_tokens=%s cp_per_rank_actual_tokens=%s "
-                        "extend_seq_lens=%s forward_mode=%s",
+                        "schedule_extend_num_tokens=%s schedule_extend_lens=%s "
+                        "forward_mode=%s",
                         mb_id,
                         parallel.pp_rank,
                         parallel.attn_cp_rank,
@@ -1569,13 +1569,8 @@ class SchedulerPPMixin:
                             for name, value in proxy.items()
                             if isinstance(value, torch.Tensor)
                         },
-                        getattr(cur_batch.attn_cp_metadata, "total_seq_lens", None),
-                        getattr(
-                            cur_batch.attn_cp_metadata,
-                            "per_rank_actual_token",
-                            None,
-                        ),
-                        getattr(cur_batch, "extend_seq_lens_cpu", None),
+                        cur_batch.extend_num_tokens,
+                        cur_batch.extend_lens,
                         getattr(cur_batch, "forward_mode", None),
                     )
                 set_time_batch(

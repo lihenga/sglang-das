@@ -592,6 +592,7 @@ class DeepseekMLARocmForwardMixin:
             position_tokens = positions.shape[-1]
             if q_pe.shape[0] != position_tokens or k_pe.shape[0] != position_tokens:
                 parallel = get_parallel()
+                cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
                 logger.error(
                     "ROCm MLA RoPE token mismatch: pp_rank=%s cp_rank=%s "
                     "layer_id=%s rids=%s hidden_states=%s positions=%s "
@@ -609,9 +610,9 @@ class DeepseekMLARocmForwardMixin:
                     if forward_batch.input_ids is not None
                     else None,
                     getattr(forward_batch, "extend_seq_lens_cpu", None),
-                    getattr(forward_batch.attn_cp_metadata, "total_seq_lens", None),
+                    getattr(cp_metadata, "total_seq_lens", None),
                     getattr(
-                        forward_batch.attn_cp_metadata,
+                        cp_metadata,
                         "per_rank_actual_token",
                         None,
                     ),
