@@ -2967,6 +2967,17 @@ class ServerArgs:
         "load path.",
         NS("memory"),
     ] = False
+    mooncake_waiting_queue_dfs_prefetch_policy: A[
+        str,
+        Arg(
+            help="Admission policy for waiting-queue Mooncake DFS prefetch. "
+            "wait_complete keeps requests queued until every rank is ready; "
+            "best_effort cancels a globally pending prefetch and admits via "
+            "the normal external load path.",
+            choices=["wait_complete", "best_effort"],
+        ),
+        NS("memory"),
+    ] = "wait_complete"
     mooncake_waiting_queue_dfs_prefetch_max_requests: A[
         int,
         "Maximum number of preparing, queued, reading, or ready Mooncake "

@@ -3584,6 +3584,12 @@ class Scheduler(
             if waiting_queue_prefetch_enabled
             else None
         )
+        waiting_queue_prefetch_policy = getattr(
+            self.server_args,
+            "mooncake_waiting_queue_dfs_prefetch_policy",
+            "wait_complete",
+        )
+        pending_prefetch_skipped = 0
 
         # Get requests from the waiting queue to a new prefill batch
         for req_index, req in enumerate(self.waiting_queue):
@@ -3610,9 +3616,32 @@ class Scheduler(
             if waiting_queue_prefetch_enabled:
                 prefetch_state = waiting_queue_prefetch_states[req_index]
                 if prefetch_state == "pending":
-                    continue
-                abandoned_prefetch = prefetch_state == "terminal"
-
+                    if waiting_queue_prefetch_policy == "best_effort":
+                        # A global pending verdict means at least one rank is
+                        # still reading. Cancel the request-scoped marker on
+                        # every rank before rematching through the normal
+                        # external path below.
+                        self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
+                        self.tree_cache.record_waiting_queue_prefetch_event(
+                            "cancelled_for_admission"
+                        )
+                        self.tree_cache.record_waiting_queue_prefetch_event(
+                            "fallback_load"
+                        )
+                    else:
+                        pending_prefetch_skipped += 1
+                        self.tree_cache.record_waiting_queue_prefetch_event(
+                            "pending_skipped"
+                        )
+                        continue
+                elif prefetch_state == "terminal":
+                    abandoned_prefetch = True
+                    self.tree_cache.record_waiting_queue_prefetch_event(
+                        "terminal_cancel"
+                    )
+                    self.tree_cache.record_waiting_queue_prefetch_event(
+                        "fallback_load"
+                    )
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
@@ -3692,6 +3721,10 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if pending_prefetch_skipped > 0:
+                self.tree_cache.record_waiting_queue_prefetch_event(
+                    "no_runnable_batch_due_prefetch"
+                )
             return None, running_batch
 
         can_run_set = set(can_run_list)

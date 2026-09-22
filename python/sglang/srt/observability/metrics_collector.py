@@ -1967,6 +1967,34 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        waiting_prefetch_event_labels = [*labels.keys(), "event"]
+        self.waiting_queue_dfs_prefetch_events_total = Counter(
+            name="sglang:mooncake_waiting_queue_dfs_prefetch_events_total",
+            documentation=(
+                "Waiting-queue Mooncake DFS-prefetch admission events. "
+                "The event label is a bounded scheduler/backend outcome."
+            ),
+            labelnames=waiting_prefetch_event_labels,
+        )
+        self.waiting_queue_dfs_prefetch_latency_seconds = Histogram(
+            name="sglang:mooncake_waiting_queue_dfs_prefetch_latency_seconds",
+            documentation=(
+                "Waiting-queue Mooncake DFS-prefetch lifecycle latency in "
+                "seconds, by bounded stage (queue, read, ready, claim)."
+            ),
+            labelnames=[*labels.keys(), "stage"],
+            buckets=duration_buckets,
+        )
+        self.waiting_queue_dfs_prefetch_reserved_bytes = Gauge(
+            name="sglang:mooncake_waiting_queue_dfs_prefetch_reserved_bytes",
+            documentation=(
+                "Estimated pinned-buffer bytes reserved by waiting-queue "
+                "Mooncake DFS prefetch, by state (active or ready)."
+            ),
+            labelnames=[*labels.keys(), "state"],
+            multiprocess_mode="mostrecent",
+        )
+
         bucket_io = [
             1,
             5,
@@ -2016,6 +2044,31 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
+
+    def increment_waiting_queue_dfs_prefetch_event(
+        self, event: str, count: int = 1
+    ) -> None:
+        if count > 0:
+            self.waiting_queue_dfs_prefetch_events_total.labels(
+                **self.labels, event=event
+            ).inc(count)
+
+    def observe_waiting_queue_dfs_prefetch_latency(
+        self, stage: str, duration_seconds: float
+    ) -> None:
+        self.waiting_queue_dfs_prefetch_latency_seconds.labels(
+            **self.labels, stage=stage
+        ).observe(max(0.0, duration_seconds))
+
+    def set_waiting_queue_dfs_prefetch_reserved_bytes(
+        self, *, active_bytes: int, ready_bytes: int
+    ) -> None:
+        self.waiting_queue_dfs_prefetch_reserved_bytes.labels(
+            **self.labels, state="active"
+        ).set(max(0, active_bytes))
+        self.waiting_queue_dfs_prefetch_reserved_bytes.labels(
+            **self.labels, state="ready"
+        ).set(max(0, ready_bytes))
 
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:

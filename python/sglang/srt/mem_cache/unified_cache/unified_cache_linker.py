@@ -100,6 +100,9 @@ class UnifiedCacheLinker(ABC):
     def cancel_host_prefetch(self, rid: str) -> None:
         """Cancel or retire a request-scoped host prefetch."""
 
+    def record_waiting_queue_prefetch_event(self, event: str) -> None:
+        """Record a low-cardinality waiting-queue prefetch event."""
+
     def abort_prepared_load(self, rid: str) -> None:
         """Release a session claimed by the normal load path."""
 
@@ -223,6 +226,11 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers.pop(rid, None)
         self.host_prefetch_hits.pop(rid, None)
         self.cache_linker.cancel_host_prefetch(rid)
+
+    def record_waiting_queue_prefetch_event(self, event: str) -> None:
+        recorder = getattr(self.cache_linker, "record_waiting_queue_prefetch_event", None)
+        if recorder is not None:
+            recorder(event)
 
     def prefetch_to_host(self, req: Req) -> bool:
         return self.prefetch_to_host_batch((req,))[0]
@@ -513,6 +521,8 @@ class UnifiedCacheLinkerWrapper:
                 self.cache_linker.cancel_host_prefetch(req.rid)
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
+            if status == "dfs_prefetched":
+                self.record_waiting_queue_prefetch_event("ready_consumed")
             prepared_from_host_prefetch = True
 
         device_hit_len = hit.device_hit_len

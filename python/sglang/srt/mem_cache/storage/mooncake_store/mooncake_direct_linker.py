@@ -803,11 +803,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "session_rid": self._host_prefetch_session_rid(rid, generation),
                 "object_sizes": object_sizes,
                 "reserved_bytes": estimated_bytes,
+                "queued_at": time.perf_counter(),
             }
 
         # Session creation can contact DFS. The scheduler only publishes the
         # work item; this worker owns both preparation and the DFS read.
         self.host_prefetch_queue.put((rid, queued_transfers))
+        self.record_waiting_queue_prefetch_event("submitted")
+        self._update_host_prefetch_reservation_metrics()
         return True
 
     def get_host_prefetch_status(self, rid: str) -> str | None:
@@ -843,24 +846,38 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return len(results) == len(keys) and all(result == 0 for result in results)
 
     def claim_ready_host_prefetch(self, rid: str) -> bool:
+        claim_started_at = time.perf_counter()
+        ready_at = None
+        claimed = False
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
-            if entry is None or entry.get("state") != "dfs_prefetched":
-                return False
-            session_rid = str(entry["session_rid"])
-            with self.session_lock:
-                if (
-                    rid in self.prepared_load_sessions
-                    or session_rid not in self.prepared_load_sessions
-                ):
-                    return False
-                self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
-                    session_rid
-                )
-            entry["state"] = "claimed"
-        return True
+            if entry is not None and entry.get("state") == "dfs_prefetched":
+                session_rid = str(entry["session_rid"])
+                with self.session_lock:
+                    if (
+                        rid not in self.prepared_load_sessions
+                        and session_rid in self.prepared_load_sessions
+                    ):
+                        self.prepared_load_sessions[rid] = (
+                            self.prepared_load_sessions.pop(session_rid)
+                        )
+                        entry["state"] = "claimed"
+                        ready_at = entry.get("ready_at")
+                        claimed = True
+        if ready_at is not None:
+            self._observe_host_prefetch_latency(
+                "ready", claim_started_at - float(ready_at)
+            )
+        self._observe_host_prefetch_latency(
+            "claim", time.perf_counter() - claim_started_at
+        )
+        self._update_host_prefetch_reservation_metrics()
+        return claimed
 
     def cancel_host_prefetch(self, rid: str) -> None:
+        update_metrics = False
+        session_to_abort = None
+        ready_unused = False
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is None:
@@ -869,9 +886,77 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             session_rid = str(entry["session_rid"])
             if state in {"preparing", "reading", "loading"}:
                 entry["cancelled"] = True
-                return
-            self.host_prefetch_entries.pop(rid, None)
-        self._abort_prepared_load_now(rid if state == "claimed" else session_rid)
+                update_metrics = True
+            else:
+                self.host_prefetch_entries.pop(rid, None)
+                update_metrics = True
+                ready_unused = state == "dfs_prefetched"
+                session_to_abort = rid if state == "claimed" else session_rid
+        if update_metrics:
+            self._update_host_prefetch_reservation_metrics()
+        if ready_unused:
+            self.record_waiting_queue_prefetch_event("ready_unused")
+        if session_to_abort is not None:
+            self._abort_prepared_load_now(session_to_abort)
+
+    def record_waiting_queue_prefetch_event(self, event: str) -> None:
+        collector = getattr(self, "storage_metrics_collector", None)
+        if collector is None:
+            return
+        try:
+            collector.increment_waiting_queue_dfs_prefetch_event(event)
+        except BaseException:
+            logger.warning(
+                "Failed to record waiting-queue DFS-prefetch event metric.",
+                exc_info=True,
+            )
+
+    def _observe_host_prefetch_latency(self, stage: str, duration: float) -> None:
+        collector = getattr(self, "storage_metrics_collector", None)
+        if collector is None:
+            return
+        try:
+            collector.observe_waiting_queue_dfs_prefetch_latency(stage, duration)
+        except BaseException:
+            logger.warning(
+                "Failed to record waiting-queue DFS-prefetch latency metric.",
+                exc_info=True,
+            )
+
+    def _update_host_prefetch_reservation_metrics(self) -> None:
+        collector = getattr(self, "storage_metrics_collector", None)
+        if collector is None:
+            return
+        with self.host_prefetch_lock:
+            active_bytes = sum(
+                int(entry.get("reserved_bytes", 0))
+                for entry in self.host_prefetch_entries.values()
+                if entry.get("state")
+                in {
+                    "queued",
+                    "preparing",
+                    "reading",
+                    "dfs_prefetched",
+                    "claimed",
+                    "loading",
+                }
+            )
+            ready_bytes = sum(
+                int(entry.get("reserved_bytes", 0))
+                for entry in self.host_prefetch_entries.values()
+                if entry.get("state") == "dfs_prefetched"
+            )
+        try:
+            # Duplicate DFS bytes cannot be attributed reliably from this
+            # request-scoped bookkeeping; expose reservation bytes instead.
+            collector.set_waiting_queue_dfs_prefetch_reserved_bytes(
+                active_bytes=active_bytes, ready_bytes=ready_bytes
+            )
+        except BaseException:
+            logger.warning(
+                "Failed to record waiting-queue DFS-prefetch reservation metric.",
+                exc_info=True,
+            )
 
     @staticmethod
     def _host_prefetch_session_rid(rid: str, generation: int) -> str:
@@ -884,15 +969,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if task is None:
                     return
                 rid, transfers = task
+                cancelled_before_prepare = False
                 with self.host_prefetch_lock:
                     entry = self.host_prefetch_entries.get(rid)
                     if entry is None or entry.get("transfers") is not transfers:
                         continue
+                    queued_at = float(entry.get("queued_at", time.perf_counter()))
                     session_rid = str(entry["session_rid"])
                     if entry.get("cancelled"):
                         self.host_prefetch_entries.pop(rid, None)
-                        continue
-                    entry["state"] = "preparing"
+                        cancelled_before_prepare = True
+                    else:
+                        entry["state"] = "preparing"
+                if cancelled_before_prepare:
+                    self._update_host_prefetch_reservation_metrics()
+                    continue
+                self._observe_host_prefetch_latency(
+                    "queue", time.perf_counter() - queued_at
+                )
+                self._update_host_prefetch_reservation_metrics()
 
                 try:
                     prepared = self.prepare_load(session_rid, transfers)
@@ -959,6 +1054,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         if within_budget:
                             current["reserved_bytes"] = dfs_estimated_bytes
                             current["state"] = "reading"
+                            current["read_started_at"] = time.perf_counter()
                 if cancelled:
                     self._finish_host_prefetch(
                         rid, entry, session_rid, "failed"
@@ -1001,6 +1097,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         outcome: str,
     ) -> None:
         keep_session = False
+        ready_at = time.perf_counter()
+        read_started_at = None
+        queued_at = None
         with self.host_prefetch_lock:
             current = self.host_prefetch_entries.get(rid)
             cancelled = bool(
@@ -1012,6 +1111,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 and not cancelled
             ):
                 current["state"] = outcome
+                queued_at = current.get("queued_at")
+                read_started_at = current.get("read_started_at")
+                if outcome in {"dfs_prefetched", "no_prefetch_needed"}:
+                    current["ready_at"] = ready_at
                 if outcome == "no_prefetch_needed":
                     current["reserved_bytes"] = 0
                 keep_session = outcome == "dfs_prefetched"
@@ -1021,6 +1124,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 elif outcome not in {"dfs_prefetched", "no_prefetch_needed"}:
                     current["state"] = "failed"
                     current["reserved_bytes"] = 0
+        if read_started_at is not None and outcome in {
+            "dfs_prefetched",
+            "no_prefetch_needed",
+        }:
+            self._observe_host_prefetch_latency(
+                "read", ready_at - float(read_started_at)
+            )
+        if queued_at is not None and outcome == "no_prefetch_needed":
+            self._observe_host_prefetch_latency(
+                "ready", ready_at - float(queued_at)
+            )
+        self._update_host_prefetch_reservation_metrics()
         if not keep_session:
             self._abort_prepared_load_now(session_rid)
 
@@ -1050,11 +1165,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._rollback_session_refs_locked(keys)
 
     def abort_prepared_load(self, rid: str) -> None:
+        removed_prefetch_entry = False
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is not None and entry.get("state") in {"claimed", "loading"}:
                 self.host_prefetch_entries.pop(rid, None)
+                removed_prefetch_entry = True
         self._abort_prepared_load_now(rid)
+        if removed_prefetch_entry:
+            self._update_host_prefetch_reservation_metrics()
 
     def cancel_queued_load(self, rid: str) -> bool:
         getattr(self, "pending_load_tokens", {}).pop(rid, None)
@@ -1437,6 +1556,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.abort_prepared_load(rid)
         with self.host_prefetch_lock:
             self.host_prefetch_entries.clear()
+        self._update_host_prefetch_reservation_metrics()
         while True:
             try:
                 self.offload_results.get_nowait()

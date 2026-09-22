@@ -548,6 +548,10 @@ class UnifiedRadixCache(BasePrefixCache):
             return [False] * len(reqs)
         return self.linker.prefetch_to_host_batch(reqs)
 
+    def record_waiting_queue_prefetch_event(self, event: str) -> None:
+        if self.linker is not None:
+            self.linker.record_waiting_queue_prefetch_event(event)
+
     def get_waiting_queue_prefetch_admission_states(
         self, rids: Sequence[str]
     ) -> list[str]:
