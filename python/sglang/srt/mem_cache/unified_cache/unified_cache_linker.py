@@ -100,6 +100,10 @@ class UnifiedCacheLinker(ABC):
     def cancel_host_prefetch(self, rid: str) -> None:
         """Cancel or retire a request-scoped host prefetch."""
 
+    def try_cancel_queued_host_prefetch(self, rid: str) -> bool:
+        """Atomically cancel a host prefetch only if it has not started."""
+        return False
+
     def record_waiting_queue_prefetch_event(self, event: str) -> None:
         """Record a low-cardinality waiting-queue prefetch event."""
 
@@ -209,10 +213,21 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
-    def get_host_prefetch_admission_state(self, rid: str) -> str:
+    def get_host_prefetch_admission_state(
+        self, rid: str, *, cancel_queued: bool = False
+    ) -> str:
+        if cancel_queued and self.cache_linker.try_cancel_queued_host_prefetch(rid):
+            self.hit_markers.pop(rid, None)
+            self.host_prefetch_hits.pop(rid, None)
+            return "cancelled"
         tracked = rid in self.host_prefetch_hits
         status = self.cache_linker.get_host_prefetch_status(rid)
-        if status in {"queued", "preparing", "reading"}:
+        if status == "queued":
+            # A queued worker item has not created a Mooncake session or
+            # started native DFS I/O, so best-effort admission may still
+            # cancel it without competing with the normal ReadPlan load.
+            return "queued"
+        if status in {"preparing", "reading"}:
             return "pending"
         if tracked and status == "dfs_prefetched":
             return "dfs_prefetched"
@@ -523,7 +538,12 @@ class UnifiedCacheLinkerWrapper:
                 return self.load_back(req)
             if status == "dfs_prefetched":
                 self.record_waiting_queue_prefetch_event("ready_consumed")
-            prepared_from_host_prefetch = True
+            # ``no_prefetch_needed`` means the worker found no DFS-backed keys
+            # and already released its speculative session.  Only a completed
+            # DFS prefetch transfers a live prepared session to this load; the
+            # no-op outcome must continue through the normal revalidation and
+            # session-preparation path below.
+            prepared_from_host_prefetch = status == "dfs_prefetched"
 
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes

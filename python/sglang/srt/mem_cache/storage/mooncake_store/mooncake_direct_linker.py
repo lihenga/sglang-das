@@ -636,7 +636,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         new_keys.append(key)
                 existing_by_rid[rid] = existing
 
+            existing_keys = [key for key in key_users if key not in new_key_set]
+
             try:
+                refresh = getattr(self.storage.store, "batch_get_session_refresh", None)
+                if existing_keys and callable(refresh):
+                    refresh_results = list(refresh(existing_keys))
+                    if len(refresh_results) != len(existing_keys) or any(
+                        result != 0 for result in refresh_results
+                    ):
+                        return False
                 if new_keys and self.host_prefetch_enabled:
                     results, sources = (
                         self.storage.store.batch_get_session_start_with_sources(
@@ -949,6 +958,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.record_waiting_queue_prefetch_event("ready_unused")
         if session_to_abort is not None:
             self._abort_prepared_load_now(session_to_abort)
+
+    def try_cancel_queued_host_prefetch(self, rid: str) -> bool:
+        """Cancel admission-raced work only while it is still queued."""
+        with self.host_prefetch_lock:
+            entry = self.host_prefetch_entries.get(rid)
+            if entry is None or entry.get("state") != "queued":
+                return False
+            self.host_prefetch_entries.pop(rid)
+        self._update_host_prefetch_reservation_metrics()
+        return True
 
     def record_waiting_queue_prefetch_event(self, event: str) -> None:
         collector = getattr(self, "storage_metrics_collector", None)

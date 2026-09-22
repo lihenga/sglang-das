@@ -3577,17 +3577,18 @@ class Scheduler(
             and self.schedule_policy == "fcfs"
             and self.ps.pp_size == 1
         )
-        waiting_queue_prefetch_states = (
-            self.tree_cache.get_waiting_queue_prefetch_admission_states(
-                [req.rid for req in self.waiting_queue]
-            )
-            if waiting_queue_prefetch_enabled
-            else None
-        )
         waiting_queue_prefetch_policy = getattr(
             self.server_args,
             "mooncake_waiting_queue_dfs_prefetch_policy",
             "wait_complete",
+        )
+        waiting_queue_prefetch_states = (
+            self.tree_cache.get_waiting_queue_prefetch_admission_states(
+                [req.rid for req in self.waiting_queue],
+                cancel_queued=waiting_queue_prefetch_policy == "best_effort",
+            )
+            if waiting_queue_prefetch_enabled
+            else None
         )
         pending_prefetch_skipped = 0
 
@@ -3615,25 +3616,25 @@ class Scheduler(
             abandoned_prefetch = False
             if waiting_queue_prefetch_enabled:
                 prefetch_state = waiting_queue_prefetch_states[req_index]
-                if prefetch_state == "pending":
-                    if waiting_queue_prefetch_policy == "best_effort":
-                        # A global pending verdict means at least one rank is
-                        # still reading. Cancel the request-scoped marker on
-                        # every rank before rematching through the normal
-                        # external path below.
-                        self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
-                        self.tree_cache.record_waiting_queue_prefetch_event(
-                            "cancelled_for_admission"
-                        )
-                        self.tree_cache.record_waiting_queue_prefetch_event(
-                            "fallback_load"
-                        )
-                    else:
-                        pending_prefetch_skipped += 1
-                        self.tree_cache.record_waiting_queue_prefetch_event(
-                            "pending_skipped"
-                        )
-                        continue
+                if prefetch_state == "cancelled":
+                    # Best-effort cancellation happened atomically before the
+                    # batched rank-wide state reduction. No native DFS work can
+                    # race the normal page-wise ReadPlan load.
+                    self.tree_cache.record_waiting_queue_prefetch_event(
+                        "cancelled_for_admission"
+                    )
+                    self.tree_cache.record_waiting_queue_prefetch_event(
+                        "fallback_load"
+                    )
+                elif prefetch_state in {"queued", "pending"}:
+                    # QUEUED under wait_complete and active native DFS work
+                    # both wait. Native work cannot be interrupted safely, so
+                    # never start a competing page-wise ReadPlan read.
+                    pending_prefetch_skipped += 1
+                    self.tree_cache.record_waiting_queue_prefetch_event(
+                        "pending_skipped"
+                    )
+                    continue
                 elif prefetch_state == "terminal":
                     abandoned_prefetch = True
                     self.tree_cache.record_waiting_queue_prefetch_event(

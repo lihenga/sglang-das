@@ -553,7 +553,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.record_waiting_queue_prefetch_event(event)
 
     def get_waiting_queue_prefetch_admission_states(
-        self, rids: Sequence[str]
+        self, rids: Sequence[str], *, cancel_queued: bool = False
     ) -> list[str]:
         """Return rank-wide admission states for queued DFS prefetches.
 
@@ -567,7 +567,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         state_names = (
             "not_tracked",
+            "queued",
             "pending",
+            "cancelled",
             "dfs_prefetched",
             "no_prefetch_needed",
             "terminal",
@@ -578,7 +580,9 @@ class UnifiedRadixCache(BasePrefixCache):
             local_state = (
                 "not_tracked"
                 if self.linker is None
-                else self.linker.get_host_prefetch_admission_state(rid)
+                else self.linker.get_host_prefetch_admission_state(
+                    rid, cancel_queued=cancel_queued
+                )
             )
             state_index = state_to_index.get(local_state)
             if state_index is not None:
@@ -587,26 +591,43 @@ class UnifiedRadixCache(BasePrefixCache):
 
         states = []
         for row in counts:
-            not_tracked, pending, dfs_prefetched, no_prefetch_needed, terminal = (
-                int(value) for value in row
-            )
-            # PENDING wins: an in-flight native read owns its private session
-            # and must finish before any rank may use the normal load path.
-            if pending:
+            (
+                not_tracked,
+                queued,
+                pending,
+                cancelled,
+                dfs_prefetched,
+                no_prefetch_needed,
+                terminal,
+            ) = (int(value) for value in row)
+            completed = dfs_prefetched + no_prefetch_needed
+            # Once any rank has entered session preparation or native DFS I/O,
+            # every rank must wait. Cancelling that request cannot interrupt
+            # the native read and would make ReadPlan issue a competing read.
+            if pending or (queued and completed):
                 state = "pending"
+            elif (
+                terminal
+                or (not_tracked and (queued or cancelled or completed))
+                or (cancelled and (queued or completed))
+            ):
+                state = "terminal"
+            elif cancelled:
+                state = "cancelled"
+            elif queued:
+                # All participating ranks are still before session creation;
+                # best-effort admission may cancel this work without duplicate
+                # DFS I/O and fall back to the batched page-wise ReadPlan path.
+                state = "queued"
+            elif dfs_prefetched:
+                state = "dfs_prefetched"
+            elif no_prefetch_needed:
+                state = "no_prefetch_needed"
+            elif not_tracked:
+                state = "not_tracked"
             else:
-                completed = dfs_prefetched + no_prefetch_needed
-                if terminal or (not_tracked and completed):
-                    state = "terminal"
-                elif dfs_prefetched:
-                    state = "dfs_prefetched"
-                elif no_prefetch_needed:
-                    state = "no_prefetch_needed"
-                elif not_tracked:
-                    state = "not_tracked"
-                else:
-                    # Unknown or inconsistent local states fail closed.
-                    state = "terminal"
+                # Unknown or inconsistent local states fail closed.
+                state = "terminal"
             states.append(state)
         return states
 
