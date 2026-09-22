@@ -581,31 +581,60 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def _prepare_expanded_load(
         self, rid: str, expanded: list[PoolTransfer]
     ) -> bool:
-        keys = []
-        seen = set()
-        for transfer in expanded:
-            component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                list(transfer.keys), transfer
-            )
-            for key in self.storage._tag_keys(component_keys):
-                if key not in seen:
-                    seen.add(key)
-                    keys.append(key)
-        if not keys:
-            return False
+        return self._prepare_expanded_load_batch([(rid, expanded)])
+
+    def _prepare_expanded_load_batch(
+        self, request_transfers: list[tuple[str, list[PoolTransfer]]]
+    ) -> bool:
+        """Prepare all sessions needed by one queued load batch."""
+        request_keys: list[tuple[str, list[str]]] = []
+        seen_rids = set()
+        for rid, expanded in request_transfers:
+            if rid in seen_rids:
+                continue
+            seen_rids.add(rid)
+            keys = []
+            seen = set()
+            for transfer in expanded:
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                for key in self.storage._tag_keys(component_keys):
+                    if key not in seen:
+                        seen.add(key)
+                        keys.append(key)
+            if not keys:
+                return False
+            request_keys.append((rid, keys))
+
+        if not request_keys:
+            return True
 
         with self.session_lock:
-            if rid in self.prepared_load_sessions:
+            pending = [
+                (rid, keys)
+                for rid, keys in request_keys
+                if rid not in self.prepared_load_sessions
+            ]
+            if not pending:
                 return True
-            acquired = []
+
+            existing_by_rid: dict[str, list[str]] = {}
+            key_users: dict[str, list[str]] = {}
             new_keys = []
-            for key in keys:
-                if key in self.session_refcounts:
-                    self.session_refcounts[key] += 1
-                    self.session_sources.setdefault(key, "unknown")
-                    acquired.append(key)
-                else:
-                    new_keys.append(key)
+            new_key_index = {}
+            new_key_set = set()
+            for rid, keys in pending:
+                existing = []
+                for key in keys:
+                    key_users.setdefault(key, []).append(rid)
+                    if key in self.session_refcounts:
+                        existing.append(key)
+                    elif key not in new_key_set:
+                        new_key_set.add(key)
+                        new_key_index[key] = len(new_keys)
+                        new_keys.append(key)
+                existing_by_rid[rid] = existing
 
             try:
                 if new_keys and self.host_prefetch_enabled:
@@ -626,25 +655,47 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     sources = []
             except BaseException:
                 logger.warning(
-                    "Mooncake get session start raised for rid=%s", rid, exc_info=True
+                    "Mooncake get session start raised for load batch.",
+                    exc_info=True,
                 )
-                self._rollback_session_refs_locked(acquired)
                 return False
 
             failed = len(results) != len(new_keys) or any(
                 result != 0 for result in results
             )
-            for index, key in enumerate(new_keys):
-                if index < len(results) and results[index] == 0:
-                    self.session_refcounts[key] = 1
-                    source = sources[index] if index < len(sources) else "unknown"
-                    self.session_sources[key] = str(source).lower()
-                    acquired.append(key)
             if failed:
-                self._rollback_session_refs_locked(acquired)
+                successful_new_keys = [
+                    key
+                    for index, key in enumerate(new_keys)
+                    if index < len(results) and results[index] == 0
+                ]
+                if successful_new_keys:
+                    try:
+                        self.storage.store.batch_get_session_end(
+                            successful_new_keys
+                        )
+                    except BaseException:
+                        logger.warning(
+                            "Mooncake get session cleanup failed for %d keys.",
+                            len(successful_new_keys),
+                            exc_info=True,
+                        )
                 return False
 
-            self.prepared_load_sessions[rid] = acquired
+            for key, users in key_users.items():
+                if key in new_key_set:
+                    self.session_refcounts[key] = len(users)
+                    index = new_key_index[key]
+                    source = sources[index] if index < len(sources) else "unknown"
+                    self.session_sources[key] = str(source).lower()
+                else:
+                    self.session_refcounts[key] += len(users)
+                    self.session_sources.setdefault(key, "unknown")
+
+            for rid, keys in pending:
+                acquired = existing_by_rid[rid]
+                acquired.extend(key for key in keys if key in new_key_set)
+                self.prepared_load_sessions[rid] = acquired
         return True
 
     @staticmethod
@@ -1240,13 +1291,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         success = False
         maybe_fail = arm_load_failure_injection(self.tp_rank)
         try:
-            for rid, transfers in request_transfers:
-                with self.session_lock:
-                    prepared = rid in self.prepared_load_sessions
-                if not prepared and not self._prepare_expanded_load(rid, transfers):
-                    raise RuntimeError(
-                        f"Mooncake get session preparation failed for rid={rid}."
-                    )
+            # The range and page-wise paths below aggregate all requests in
+            # this load batch, so session preparation must use the same key
+            # batch instead of issuing one Master query per request.
+            if not self._prepare_expanded_load_batch(request_transfers):
+                raise RuntimeError(
+                    "Mooncake get session preparation failed for load batch."
+                )
             if getattr(self, "read_plan_enabled", False):
                 self.load_with_read_plan(counter_index, request_transfers)
                 return True
