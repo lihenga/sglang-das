@@ -414,6 +414,37 @@ class EagerRunner(BaseRunner):
                 forward_batch,
                 **model_kwargs,
             )
+            if isinstance(hidden_states, PPProxyTensors):
+                output_shapes = {
+                    name: tuple(value.shape)
+                    for name, value in hidden_states.tensors.items()
+                    if isinstance(value, torch.Tensor)
+                }
+            elif isinstance(hidden_states, torch.Tensor):
+                output_shapes = tuple(hidden_states.shape)
+            elif isinstance(hidden_states, (tuple, list)):
+                output_shapes = [
+                    (
+                        tuple(value.shape)
+                        if isinstance(value, torch.Tensor)
+                        else type(value).__name__
+                    )
+                    for value in hidden_states
+                ]
+            else:
+                output_shapes = type(hidden_states).__name__
+            logger.warning(
+                "CP-v2 model output: pp_rank=%s cp_rank=%s tp_rank=%s "
+                "rids=%s extend_seq_lens=%s expected_local_tokens=%s "
+                "output_shapes=%s",
+                parallel.pp_rank,
+                parallel.attn_cp_rank,
+                parallel.attn_tp_rank,
+                getattr(forward_batch, "rids", None),
+                getattr(forward_batch, "extend_seq_lens_cpu", None),
+                sharded_positions.shape[0],
+                output_shapes,
+            )
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:

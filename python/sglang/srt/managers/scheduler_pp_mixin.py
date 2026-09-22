@@ -73,6 +73,43 @@ if TYPE_CHECKING:
 
 PPTransferStatus = Tuple[List[str], List[str]]
 PPReleasePayload = Union[List[str], PPTransferStatus]
+_PP_PROXY_DEBUG_KEY = "__pp_proxy_debug__"
+
+
+def _pp_req_debug_info(req: Optional[Req]) -> Optional[dict]:
+    if req is None:
+        return None
+    extend_range = getattr(req, "extend_range", None)
+    prefix_indices = getattr(req, "prefix_indices", None)
+    return {
+        "rid": req.rid,
+        "extend_start": getattr(extend_range, "start", None),
+        "extend_end": getattr(extend_range, "end", None),
+        "prefix_len": len(prefix_indices) if prefix_indices is not None else None,
+    }
+
+
+def _pp_batch_debug_info(batch: Optional[ScheduleBatch]) -> Optional[dict]:
+    if batch is None:
+        return None
+    return {
+        "reqs": [_pp_req_debug_info(req) for req in batch.reqs],
+        "extend_lens": batch.extend_lens,
+        "extend_num_tokens": batch.extend_num_tokens,
+        "contains_last_prefill_chunk": batch.contains_last_prefill_chunk,
+        "forward_mode": str(batch.forward_mode),
+    }
+
+
+def _pp_batch_chunk_signature(batch_info: Optional[dict]) -> Optional[list]:
+    if batch_info is None:
+        return None
+    reqs = batch_info.get("reqs")
+    if reqs is None or any(
+        req["extend_start"] is None or req["extend_end"] is None for req in reqs
+    ):
+        return None
+    return [(req["rid"], req["extend_start"], req["extend_end"]) for req in reqs]
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -194,7 +231,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(cur_batch, mb_id)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -241,6 +278,8 @@ class SchedulerPPMixin:
                                 self._pp_prepare_proxy_tensor_dict_for_send(result),
                                 async_send=True,
                                 msg_type="proxy",
+                                batch=cur_batch,
+                                mb_id=mb_id,
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -328,6 +367,8 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                chunked_before = _pp_req_debug_info(self.chunked_req)
+                running_before = _pp_batch_debug_info(self.running_batch)
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
@@ -335,6 +376,21 @@ class SchedulerPPMixin:
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                parallel = get_parallel()
+                logger.warning(
+                    "PP prefill plan: mb_id=%s pp_rank=%s cp_rank=%s tp_rank=%s "
+                    "chunked_before=%s chunked_after=%s running_before=%s "
+                    "selected_batch=%s waiting_queue_len=%s",
+                    mb_id,
+                    parallel.pp_rank,
+                    parallel.attn_cp_rank,
+                    parallel.attn_tp_rank,
+                    chunked_before,
+                    _pp_req_debug_info(self.chunked_req),
+                    running_before,
+                    _pp_batch_debug_info(batch),
+                    len(self.waiting_queue),
+                )
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -342,7 +398,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(cur_batch, mb_id)
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -423,6 +479,8 @@ class SchedulerPPMixin:
                             self._pp_prepare_proxy_tensor_dict_for_send(result),
                             async_send=True,
                             msg_type="proxy",
+                            batch=cur_batch,
+                            mb_id=mb_id,
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -502,7 +560,7 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if not cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors(cur_batch, mb_id)
 
                 # early send output if possible
                 if get_parallel().pp_async_batch_depth > 0:
@@ -612,6 +670,8 @@ class SchedulerPPMixin:
                             self._pp_prepare_proxy_tensor_dict_for_send(result),
                             async_send=True,
                             msg_type="proxy",
+                            batch=cur_batch,
+                            mb_id=mb_id,
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -649,6 +709,8 @@ class SchedulerPPMixin:
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
+        self._pp_proxy_send_seq = 0
+        self._pp_proxy_recv_seq = 0
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
@@ -1195,6 +1257,8 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        batch: Optional[ScheduleBatch] = None,
+        mb_id: Optional[int] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1202,16 +1266,31 @@ class SchedulerPPMixin:
                 "PP send: using default untyped message. "
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
+        # The source proxy may be reused by the model runner. Keep transport
+        # metadata out of its tensor dictionary.
+        tensor_dict = dict(tensor_dict)
         tensor_dict["__msg_type__"] = msg_type
         if msg_type == "proxy":
             parallel = get_parallel()
+            send_seq = self._pp_proxy_send_seq
+            self._pp_proxy_send_seq += 1
+            source_meta = {
+                "send_seq": send_seq,
+                "mb_id": mb_id,
+                "pp_rank": parallel.pp_rank,
+                "cp_rank": parallel.attn_cp_rank,
+                "tp_rank": parallel.attn_tp_rank,
+                "batch": _pp_batch_debug_info(batch),
+            }
+            tensor_dict[_PP_PROXY_DEBUG_KEY] = source_meta
             logger.warning(
                 "PP proxy send: pp_rank=%s cp_rank=%s tp_rank=%s async=%s "
-                "keys=%s shapes=%s dtypes=%s devices=%s",
+                "source_meta=%s keys=%s shapes=%s dtypes=%s devices=%s",
                 parallel.pp_rank,
                 parallel.attn_cp_rank,
                 parallel.attn_tp_rank,
                 async_send,
+                source_meta,
                 sorted(tensor_dict.keys()),
                 {
                     name: tuple(value.shape)
@@ -1272,20 +1351,55 @@ class SchedulerPPMixin:
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
-    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+    def _pp_recv_proxy_tensors(
+        self: Scheduler,
+        batch: Optional[ScheduleBatch] = None,
+        mb_id: Optional[int] = None,
+    ) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             tensor_dict = self._pp_recv_typed_dict(
                 expected_kind="proxy",
                 all_gather_group=self.attn_tp_group,
             )
+            source_meta = tensor_dict.pop(_PP_PROXY_DEBUG_KEY, None)
+            local_batch = _pp_batch_debug_info(batch)
+            recv_seq = self._pp_proxy_recv_seq
+            self._pp_proxy_recv_seq += 1
+            source_batch = (
+                source_meta.get("batch") if isinstance(source_meta, dict) else None
+            )
+            source_signature = _pp_batch_chunk_signature(source_batch)
+            local_signature = _pp_batch_chunk_signature(local_batch)
+            chunk_match = (
+                source_signature == local_signature
+                if source_signature is not None and local_signature is not None
+                else None
+            )
             parallel = get_parallel()
+            if chunk_match is False:
+                logger.error(
+                    "PP proxy chunk mismatch: pp_rank=%s cp_rank=%s "
+                    "mb_id=%s recv_seq=%s source_meta=%s local_batch=%s",
+                    parallel.pp_rank,
+                    parallel.attn_cp_rank,
+                    mb_id,
+                    recv_seq,
+                    source_meta,
+                    local_batch,
+                )
             logger.warning(
                 "PP proxy recv: pp_rank=%s cp_rank=%s tp_rank=%s "
-                "keys=%s shapes=%s dtypes=%s devices=%s",
+                "mb_id=%s recv_seq=%s source_meta=%s local_batch=%s "
+                "chunk_match=%s keys=%s shapes=%s dtypes=%s devices=%s",
                 parallel.pp_rank,
                 parallel.attn_cp_rank,
                 parallel.attn_tp_rank,
+                mb_id,
+                recv_seq,
+                source_meta,
+                local_batch,
+                chunk_match,
                 sorted(tensor_dict.keys()),
                 {
                     name: tuple(value.shape)
@@ -1533,6 +1647,23 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                parallel = get_parallel()
+                logger.warning(
+                    "PP batch launch: mb_id=%s pp_rank=%s cp_rank=%s tp_rank=%s "
+                    "batch=%s incoming_proxy_shapes=%s",
+                    mb_id,
+                    parallel.pp_rank,
+                    parallel.attn_cp_rank,
+                    parallel.attn_tp_rank,
+                    _pp_batch_debug_info(cur_batch),
+                    {
+                        name: tuple(value.shape)
+                        for name, value in pp_proxy_tensors.tensors.items()
+                        if isinstance(value, torch.Tensor)
+                    }
+                    if pp_proxy_tensors is not None
+                    else None,
+                )
                 if cur_batch.spec_algorithm.is_dspark():
                     self.model_worker.set_pp_proxy_tensors_for_next_forward(
                         pp_proxy_tensors
@@ -1553,7 +1684,7 @@ class SchedulerPPMixin:
                         "PP proxy produced: mb_id=%s pp_rank=%s cp_rank=%s "
                         "tp_rank=%s rids=%s shapes=%s dtypes=%s "
                         "schedule_extend_num_tokens=%s schedule_extend_lens=%s "
-                        "forward_mode=%s",
+                        "forward_mode=%s batch=%s can_run_cuda_graph=%s",
                         mb_id,
                         parallel.pp_rank,
                         parallel.attn_cp_rank,
@@ -1572,6 +1703,8 @@ class SchedulerPPMixin:
                         cur_batch.extend_num_tokens,
                         cur_batch.extend_lens,
                         getattr(cur_batch, "forward_mode", None),
+                        _pp_batch_debug_info(cur_batch),
+                        result.can_run_cuda_graph,
                     )
                 set_time_batch(
                     cur_batch.reqs,
