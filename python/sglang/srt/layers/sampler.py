@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
-_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend", "lightop"}
 
 
 class Sampler(nn.Module):
@@ -83,6 +83,15 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
+
+        if get_exec().kernel.sampling_backend == "lightop":
+            # Fail at startup if the installed LightOp lacks sampling support.
+            from lightop.sampling import (  # noqa: F401
+                top_k_top_p_sampling_from_probs,
+                top_p_sampling_from_probs,
+            )
+
+            logger.info("Using LightOp Top-K/Top-P sampling backend.")
 
         self.output_logprob_processor = OutputLogprobProcessor()
 
@@ -256,9 +265,18 @@ class Sampler(nn.Module):
     ) -> torch.Tensor:
         """Sample from probability distribution (after softmax).
 
-        Used for standard sampling with flashinfer/pytorch backends.
+        Used for standard sampling with flashinfer/pytorch/lightop backends.
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
         """
+        backend = get_exec().kernel.sampling_backend
+        if backend == "lightop" and sampling_info.sampling_seed is None:
+            return top_k_top_p_min_p_sampling_from_probs_lightop(
+                probs,
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                sampling_info.need_min_p_sampling,
+            )
         if simple_sampling_case:
             batch_next_token_ids = sampling_from_probs_torch(
                 probs,
@@ -266,7 +284,6 @@ class Sampler(nn.Module):
                 positions=positions,
             )
         else:
-            backend = get_exec().kernel.sampling_backend
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None
@@ -284,8 +301,10 @@ class Sampler(nn.Module):
                         sampling_info.top_ps,
                         filter_apply_order="joint",
                     )
-            elif backend == "pytorch":
+            elif backend in ("pytorch", "lightop"):
                 # A slower fallback implementation with torch native operations.
+                # LightOp requests with per-request seeds retain SGLang's
+                # position-based deterministic sampler (no torch.multinomial).
                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                     probs,
                     sampling_info.top_ks,
@@ -564,6 +583,58 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     )
 
 
+def _filter_top_k_top_p_min_p_probs(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+):
+    """Apply the joint Top-K/Top-P mask, then Min-P, without renormalizing."""
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[
+        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    if need_min_p_sampling:
+        min_p_thresholds = probs_sort[:, 0] * min_ps
+        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    return probs_sort, probs_idx
+
+
+def top_k_top_p_min_p_sampling_from_probs_lightop(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+):
+    from lightop.sampling import (
+        top_k_top_p_sampling_from_probs,
+        top_p_sampling_from_probs,
+    )
+
+    if need_min_p_sampling:
+        # Min-P must follow the original joint mask: removing low probabilities
+        # before Top-P would change its cumulative-mass boundary.
+        probs_sort, probs_idx = _filter_top_k_top_p_min_p_probs(
+            probs, top_ks, top_ps, min_ps, True
+        )
+        probs_sort = probs_sort.float()
+        probs_sort /= probs_sort.sum(dim=-1, keepdim=True)
+        sampled_index = top_p_sampling_from_probs(probs_sort.contiguous(), 1.0)
+        return probs_idx.gather(1, sampled_index.long().view(-1, 1)).view(-1).int()
+
+    return top_k_top_p_sampling_from_probs(
+        probs.contiguous(),
+        top_k=top_ks.clamp(max=probs.shape[-1]),
+        top_p=top_ps,
+        filter_apply_order="joint",
+    )
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -578,21 +649,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     When sampling_seed is not None, deterministic inference will be enabled, it will sample
     with the sampling_seed of each request.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
         assert (
             sampling_seed is None
         ), "With sampling seed, multinomial_with_seed will provide wrong results"
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    probs_sort, probs_idx = _filter_top_k_top_p_min_p_probs(
+        probs, top_ks, top_ps, min_ps, need_min_p_sampling
+    )
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)

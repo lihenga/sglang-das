@@ -125,7 +125,7 @@ def _resolve_speculative_algorithm_alias(*args, **kwargs):
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "lightop"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
     SAMPLING_BACKEND_CHOICES.add("token_oracle")
 
