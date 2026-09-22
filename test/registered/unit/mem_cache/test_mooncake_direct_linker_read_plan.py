@@ -2,7 +2,7 @@ import threading
 import types
 import unittest
 from queue import Queue
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import torch
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -52,6 +52,78 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
 
         self.assertIs(success, True)
         linker.load_with_read_plan.assert_called_once_with(7, [])
+
+    def test_load_batch_uses_one_h2d_call_for_two_request_transfers(self):
+        """A scheduler/admission load batch must share one H2D range call."""
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.read_plan_enabled = False
+        linker.tp_rank = 0
+        linker.num_layers = 1
+        linker.enable_page_wise_load = False
+        linker.page_wise_load_threshold = 128
+        linker._prepare_expanded_load_batch = Mock(return_value=True)
+        linker.abort_prepared_load = Mock()
+        linker.layer_done_counter = types.SimpleNamespace(
+            complete=Mock(), fail=Mock()
+        )
+
+        pool = Mock()
+        pool.prepare_locations.side_effect = lambda indices: [int(v) for v in indices]
+        pool.get_prepared_layer_range_meta.side_effect = (
+            lambda locations, _layer: (
+                [[100 + location] for location in locations],
+                [[4 + location - 1] for location in locations],
+                [[0] for _ in locations],
+            )
+        )
+        store = Mock()
+        store.batch_get_into_multi_buffer_ranges.return_value = [4, 5]
+        linker.pools = {PoolName.KV: pool}
+        linker.storage = types.SimpleNamespace(
+            store=store,
+            _get_hybrid_page_component_keys=lambda keys, _transfer: (keys, 1),
+            _tag_keys=lambda keys: list(keys),
+        )
+
+        request_transfers = [
+            (
+                "rid-1",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        host_indices=torch.tensor([1]),
+                        keys=["key-1"],
+                    )
+                ],
+            ),
+            (
+                "rid-2",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        host_indices=torch.tensor([2]),
+                        keys=["key-2"],
+                    )
+                ],
+            ),
+        ]
+
+        success = linker.load_layer_wise(7, request_transfers)
+
+        self.assertTrue(success)
+        store.batch_get_into_multi_buffer_ranges.assert_called_once()
+        keys, ptrs, sizes, offsets = (
+            store.batch_get_into_multi_buffer_ranges.call_args.args
+        )
+        self.assertEqual(keys, ["key-1", "key-2"])
+        self.assertEqual(ptrs, [[101], [102]])
+        self.assertEqual(sizes, [[4], [5]])
+        self.assertEqual(offsets, [[0], [0]])
+        linker.layer_done_counter.complete.assert_called_once_with(7, 0)
+        self.assertEqual(
+            linker.abort_prepared_load.call_args_list,
+            [call("rid-1"), call("rid-2")],
+        )
 
     def test_layout_expands_packed_layer_mapping(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -122,12 +194,11 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
 
-    def test_host_prefetch_worker_batches_native_reads(self):
+    def test_host_prefetch_worker_keeps_native_reads_per_request(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.host_prefetch_lock = threading.Lock()
         linker.session_lock = threading.Lock()
         linker.host_prefetch_queue = Queue()
-        linker.host_prefetch_batch_limit = 3
         linker.host_prefetch_limit = 3
         linker.host_prefetch_max_bytes = 1 << 20
         linker.host_prefetch_entries = {}
@@ -135,7 +206,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker.session_sources = {}
         linker.session_refcounts = {}
         store = Mock()
-        store.batch_get_session_prefetch.return_value = [0, 0]
+        store.batch_get_session_prefetch.side_effect = lambda keys: [0] * len(keys)
         linker.storage = types.SimpleNamespace(store=store)
         linker._update_host_prefetch_reservation_metrics = Mock()
         linker._observe_host_prefetch_latency = Mock()
@@ -174,13 +245,18 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertFalse(worker.is_alive())
         linker.host_prefetch_queue.join()
 
-        store.batch_get_session_prefetch.assert_called_once_with(["key-1", "key-2"])
+        self.assertEqual(
+            [call.args[0] for call in store.batch_get_session_prefetch.call_args_list],
+            [["key-1"], ["key-2"], ["key-1"]],
+        )
+        self.assertTrue(linker.claim_ready_host_prefetch("rid-1"))
+        self.assertTrue(linker.claim_ready_host_prefetch("rid-2"))
         self.assertEqual(
             [
                 linker.host_prefetch_entries[rid]["state"]
                 for rid in ("rid-1", "rid-2", "rid-3")
             ],
-            ["dfs_prefetched", "dfs_prefetched", "dfs_prefetched"],
+            ["claimed", "claimed", "dfs_prefetched"],
         )
 
     def test_queued_host_prefetch_cancel_is_atomic(self):

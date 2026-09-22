@@ -1159,6 +1159,13 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        # Requests submitted by one receive/admission pass share a prefetch
+        # wave.  DFS itself remains request-scoped; the wave is only an
+        # admission barrier so a fast READY request cannot trigger a singleton
+        # H2D load while a sibling request from the same submission is still
+        # doing native DFS work.
+        self._waiting_queue_prefetch_wave_by_rid: Dict[str, int] = {}
+        self._waiting_queue_prefetch_wave_next_id = 0
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -2052,8 +2059,11 @@ class Scheduler(
                 self._pending_waiting_queue_prefetch_reqs = None
 
         if owns_prefetch_batch and active_prefetch_batch:
-            self.tree_cache.prefetch_external_linker_to_host_batch(
+            submitted = self.tree_cache.prefetch_external_linker_to_host_batch(
                 active_prefetch_batch
+            )
+            self._register_waiting_queue_prefetch_wave(
+                active_prefetch_batch, submitted
             )
 
         self.flush_wrapper.check_pending()
@@ -2898,6 +2908,81 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
+    def _register_waiting_queue_prefetch_wave(
+        self, reqs: List[Req], submitted: List[bool]
+    ) -> None:
+        """Record the receive-batch boundary used for prefetch admission.
+
+        The native DFS worker still receives one request per queue item.  This
+        bookkeeping only prevents a request that is already ready from being
+        admitted before another successfully submitted sibling in the same
+        scheduler receive batch has reached a terminal prefetch state.
+        """
+        if not reqs or submitted is None:
+            return
+        submitted_rids = [
+            req.rid
+            for req, is_submitted in zip(reqs, submitted)
+            if bool(is_submitted)
+        ]
+        if not submitted_rids:
+            return
+
+        next_wave_id = getattr(
+            self, "_waiting_queue_prefetch_wave_next_id", 0
+        )
+        self._waiting_queue_prefetch_wave_next_id = next_wave_id + 1
+        wave_by_rid = getattr(
+            self, "_waiting_queue_prefetch_wave_by_rid", None
+        )
+        if wave_by_rid is None:
+            wave_by_rid = self._waiting_queue_prefetch_wave_by_rid = {}
+        for rid in submitted_rids:
+            wave_by_rid[rid] = next_wave_id
+
+    def _waiting_queue_prefetch_blocked_waves(
+        self, waiting_queue: List[Req], prefetch_states: List[str]
+    ) -> Set[int]:
+        """Return waves with at least one queued/native-DFS request.
+
+        Requests that have disappeared from ``waiting_queue`` are retired
+        lazily here, which also covers aborts and other queue removals.  The
+        rank-wide state API maps terminal, cancelled, and not-tracked rows to
+        non-blocking states, so only active ``queued``/``pending`` work can
+        hold a ready sibling.
+        """
+        wave_by_rid = getattr(
+            self, "_waiting_queue_prefetch_wave_by_rid", None
+        )
+        if not wave_by_rid:
+            return set()
+
+        waiting_rids = {req.rid for req in waiting_queue}
+        for rid in list(wave_by_rid):
+            if rid not in waiting_rids:
+                wave_by_rid.pop(rid, None)
+
+        states_by_rid = {
+            req.rid: state
+            for req, state in zip(waiting_queue, prefetch_states)
+        }
+        return {
+            wave_id
+            for rid, wave_id in wave_by_rid.items()
+            if states_by_rid.get(rid) in {"queued", "pending"}
+        }
+
+    def _waiting_queue_prefetch_request_is_blocked(
+        self, rid: str, prefetch_state: str, blocked_waves: Set[int]
+    ) -> bool:
+        wave_id = getattr(
+            self, "_waiting_queue_prefetch_wave_by_rid", {}
+        ).get(rid)
+        return wave_id in blocked_waves and prefetch_state in {
+            "dfs_prefetched",
+            "no_prefetch_needed",
+        }
+
     def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
         if (
             getattr(
@@ -2919,7 +3004,8 @@ class Scheduler(
                 self, "_pending_waiting_queue_prefetch_reqs", None
             )
             if pending_prefetch_reqs is None:
-                self.tree_cache.prefetch_external_linker_to_host(req)
+                submitted = self.tree_cache.prefetch_external_linker_to_host(req)
+                self._register_waiting_queue_prefetch_wave([req], [submitted])
             else:
                 pending_prefetch_reqs.append(req)
 
@@ -3020,6 +3106,7 @@ class Scheduler(
 
     def _release_aborted_request(self, rid: str) -> None:
         """Drop the cache-side state an aborted request left behind."""
+        getattr(self, "_waiting_queue_prefetch_wave_by_rid", {}).pop(rid, None)
         if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
             self.tree_cache.release_aborted_request(rid)
 
@@ -3590,6 +3677,16 @@ class Scheduler(
             if waiting_queue_prefetch_enabled
             else None
         )
+        blocked_prefetch_waves = (
+            self._waiting_queue_prefetch_blocked_waves(
+                self.waiting_queue, waiting_queue_prefetch_states
+            )
+            if waiting_queue_prefetch_enabled
+            else set()
+        )
+        prefetch_wave_by_rid = getattr(
+            self, "_waiting_queue_prefetch_wave_by_rid", {}
+        )
         pending_prefetch_skipped = 0
 
         # Get requests from the waiting queue to a new prefill batch
@@ -3616,6 +3713,19 @@ class Scheduler(
             abandoned_prefetch = False
             if waiting_queue_prefetch_enabled:
                 prefetch_state = waiting_queue_prefetch_states[req_index]
+                if self._waiting_queue_prefetch_request_is_blocked(
+                    req.rid, prefetch_state, blocked_prefetch_waves
+                ):
+                    # Keep a fast sibling in the receive-batch wave until all
+                    # active native DFS work in that wave has reached a
+                    # terminal state.  This preserves the scheduler's normal
+                    # can_run_list/H2D batch boundary without delaying DFS
+                    # itself or waiting for an unrelated request.
+                    pending_prefetch_skipped += 1
+                    self.tree_cache.record_waiting_queue_prefetch_event(
+                        "pending_skipped"
+                    )
+                    continue
                 if prefetch_state == "cancelled":
                     # Best-effort cancellation happened atomically before the
                     # batched rank-wide state reduction. No native DFS work can
@@ -3730,6 +3840,8 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        for req in can_run_list:
+            prefetch_wave_by_rid.pop(req.rid, None)
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
