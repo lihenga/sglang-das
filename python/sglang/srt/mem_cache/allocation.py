@@ -37,7 +37,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     support_triton,
 )
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import is_pin_memory_available, pin_host_metadata
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -312,8 +312,13 @@ def alloc_for_extend(
         ]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    pin_metadata = pin_host_metadata(batch.device)
+    prefix_lens_cpu = torch.tensor(
+        batch.prefix_lens, dtype=torch.int64, pin_memory=pin_metadata
+    )
+    extend_lens_cpu = torch.tensor(
+        batch.extend_lens, dtype=torch.int64, pin_memory=pin_metadata
+    )
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
@@ -321,7 +326,9 @@ def alloc_for_extend(
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
-    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_cpu = torch.tensor(
+        req_pool_indices, dtype=torch.int64, pin_memory=pin_metadata
+    )
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
