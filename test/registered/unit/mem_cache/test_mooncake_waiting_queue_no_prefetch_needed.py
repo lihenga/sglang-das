@@ -86,10 +86,14 @@ class TestNoPrefetchNeededRevalidation(CustomTestCase):
 
 
 class _Cache:
-    """Records the admission reductions; ``peer_min`` is the other ranks' MIN."""
+    """Records the admission reductions.
 
-    def __init__(self, peer_min=1):
-        self.peer_min = peer_min
+    ``peer_mins[i]`` is the other ranks' MIN for the i-th reduction (ready,
+    valid, claimed); reductions beyond the list see no failing peer.
+    """
+
+    def __init__(self, peer_mins=()):
+        self.peer_mins = list(peer_mins)
         self.reductions = []
         self.page_size = 1
         self.tree_core = types.SimpleNamespace(
@@ -104,7 +108,9 @@ class _Cache:
     def _all_reduce_attn_groups(self, tensor, op):
         assert op == torch.distributed.ReduceOp.MIN
         local = int(tensor.item())
-        tensor.fill_(min(local, self.peer_min))
+        stage = len(self.reductions)
+        peer = self.peer_mins[stage] if stage < len(self.peer_mins) else 1
+        tensor.fill_(min(local, peer))
         self.reductions.append(local)
 
 
@@ -132,8 +138,8 @@ def _no_prefetch_linker(valid):
 
 
 class TestLoadBackNoPrefetchNeeded(CustomTestCase):
-    def _load_back(self, cache_linker, peer_min=1):
-        cache = _Cache(peer_min=peer_min)
+    def _load_back(self, cache_linker, peer_mins=()):
+        cache = _Cache(peer_mins=peer_mins)
         wrapper = _wrapper(cache, cache_linker)
         req = types.SimpleNamespace(rid="rid", last_node="node")
         wrapper.load_back(req)
@@ -162,11 +168,25 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
 
     def test_peer_failure_overrides_local_success(self):
         cache_linker = _no_prefetch_linker(True)
-        cache = self._load_back(cache_linker, peer_min=0)
+        cache = self._load_back(cache_linker, peer_mins=[0])
         # ready is already 0 from the peer, so no rank reaches validation.
         self.assertEqual(cache.reductions, [1])
         cache_linker.revalidate_no_prefetch_needed.assert_not_called()
         cache_linker.abort_prepared_load.assert_not_called()
+
+    def test_peer_validation_failure_sends_every_status_to_the_normal_path(self):
+        # Ready passes on every rank, then a peer fails validation: both a
+        # local no_prefetch_needed and a local dfs_prefetched rank must drop
+        # their prefetch and take the normal path, claiming nothing.
+        dfs_linker = MagicMock()
+        dfs_linker.get_host_prefetch_status.return_value = "dfs_prefetched"
+        dfs_linker.revalidate_host_prefetch.return_value = True
+        for cache_linker in (_no_prefetch_linker(True), dfs_linker):
+            cache = self._load_back(cache_linker, peer_mins=[1, 0])
+            self.assertEqual(cache.reductions, [1, 1])
+            cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
+            cache_linker.claim_ready_host_prefetch.assert_not_called()
+            cache_linker.abort_prepared_load.assert_not_called()
 
 
 if __name__ == "__main__":

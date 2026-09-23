@@ -4,6 +4,7 @@ The linker decides once, before any prefetch worker starts, whether every
 rank can run the prefetch; the scheduler then reads only that decision.
 """
 
+import time
 import types
 import unittest
 from unittest import mock
@@ -169,11 +170,15 @@ class TestResolveHostPrefetch(CustomTestCase):
 
 def _gloo_rank(rank, world_size, port, unavailable_rank, flag_off_rank, results):
     """One rank of a CP x TP = 2 x 2 Gloo mesh running the real reduction."""
+    import datetime
+
+    # A misaligned reduction must fail fast instead of hanging the test.
     torch.distributed.init_process_group(
         "gloo",
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        timeout=datetime.timedelta(seconds=60),
     )
     try:
         # Every rank creates every subgroup in the same order.
@@ -203,12 +208,19 @@ class TestResolveHostPrefetchGloo(CustomTestCase):
         world_size = 4
         with mp.Manager() as manager:
             results = manager.dict()
-            mp.spawn(
+            context = mp.spawn(
                 _gloo_rank,
                 args=(world_size, port, unavailable_rank, flag_off_rank, results),
                 nprocs=world_size,
-                join=True,
+                join=False,
             )
+            deadline = time.monotonic() + 300
+            while not context.join(timeout=5):
+                if time.monotonic() > deadline:
+                    for process in context.processes:
+                        if process.is_alive():
+                            process.kill()
+                    self.fail("Gloo ranks did not finish; a reduction is misaligned")
             return [results[rank] for rank in range(world_size)]
 
     def test_all_ranks_ready(self):
