@@ -579,6 +579,19 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+def pin_host_metadata(device=None) -> bool:
+    """Whether host metadata should be staged in pinned memory for ``device``.
+
+    Metadata tensors are built on the host and then copied H2D with
+    ``non_blocking=True``. A pageable source silently makes that copy
+    synchronous: the host blocks until prior work on the stream drains, which
+    costs far more than the few bytes being copied. That is the behaviour on
+    HCU, so pin there and leave the pinning cost off every other backend,
+    where the extra pinned allocation is not known to pay for itself.
+    """
+    return is_hcu() and is_pin_memory_available(device)
+
+
 def get_dispatch_device_backend():
     if is_cuda_alike():
         dispatch_key = "CUDA"

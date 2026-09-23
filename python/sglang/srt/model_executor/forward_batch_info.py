@@ -69,7 +69,11 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    ceil_align,
+    is_pin_memory_available,
+    pin_host_metadata,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -88,11 +92,6 @@ _skip_attn_backend_init_warned = False
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_hcu = is_hcu()
-
-
-def _pin_host_metadata(device: Union[str, torch.device]) -> bool:
-    """Use pinned staging for HCU metadata copied on a busy stream."""
-    return _is_hcu and is_pin_memory_available(device)
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -723,13 +722,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_gpu = torch.tensor(
             global_num_tokens,
             dtype=torch.int64,
-            pin_memory=_pin_host_metadata(device),
+            pin_memory=pin_host_metadata(device),
         ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob,
             dtype=torch.int64,
-            pin_memory=_pin_host_metadata(device),
+            pin_memory=pin_host_metadata(device),
         ).to(device, non_blocking=True)
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
@@ -872,7 +871,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
-        pin_host_metadata = _pin_host_metadata(device)
+        pin_metadata = pin_host_metadata(device)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -896,7 +895,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.extend_input_logprob_token_ids is not None:
             extend_input_logprob_token_ids = batch.extend_input_logprob_token_ids
             if (
-                pin_host_metadata
+                pin_metadata
                 and extend_input_logprob_token_ids.device.type == "cpu"
                 and not extend_input_logprob_token_ids.is_pinned()
             ):
@@ -914,7 +913,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.num_token_non_padded = torch.tensor(
                 num_tokens,
                 dtype=torch.int32,
-                pin_memory=pin_host_metadata,
+                pin_memory=pin_metadata,
             ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
@@ -956,12 +955,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens,
                     dtype=torch.int32,
-                    pin_memory=pin_host_metadata,
+                    pin_memory=pin_metadata,
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens,
                     dtype=torch.int32,
-                    pin_memory=pin_host_metadata,
+                    pin_memory=pin_metadata,
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
