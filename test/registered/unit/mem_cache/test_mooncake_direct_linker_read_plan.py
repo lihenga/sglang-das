@@ -194,12 +194,13 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
 
-    def test_host_prefetch_worker_keeps_native_reads_per_request(self):
+    def test_host_prefetch_worker_batches_native_reads_across_requests(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.host_prefetch_lock = threading.Lock()
         linker.session_lock = threading.Lock()
         linker.host_prefetch_queue = Queue()
         linker.host_prefetch_limit = 3
+        linker.host_prefetch_debug_enabled = False
         linker.host_prefetch_max_bytes = 1 << 20
         linker.host_prefetch_entries = {}
         linker.prepared_load_sessions = {}
@@ -245,10 +246,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertFalse(worker.is_alive())
         linker.host_prefetch_queue.join()
 
-        self.assertEqual(
-            [call.args[0] for call in store.batch_get_session_prefetch.call_args_list],
-            [["key-1"], ["key-2"], ["key-1"]],
-        )
+        store.batch_get_session_prefetch.assert_called_once_with(["key-1", "key-2"])
         self.assertTrue(linker.claim_ready_host_prefetch("rid-1"))
         self.assertTrue(linker.claim_ready_host_prefetch("rid-2"))
         self.assertEqual(

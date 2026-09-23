@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
 from dataclasses import replace
@@ -290,6 +291,23 @@ class UnifiedRadixCache(BasePrefixCache):
                 reduced = True
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _log_waiting_queue_prefetch_boundary(
+        self, stage: str, phase: str, units: int
+    ) -> None:
+        linker = self.linker
+        if linker is None or not getattr(linker, "_prefetch_debug_enabled", False):
+            return
+        cache_linker = getattr(linker, "cache_linker", None)
+        logger.info(
+            "Mooncake prefetch boundary pid=%d cp_rank=%s stage=%s "
+            "phase=%s units=%d",
+            os.getpid(),
+            getattr(cache_linker, "attn_cp_rank", "unknown"),
+            stage,
+            phase,
+            units,
+        )
 
     def _barrier_attn_groups(self):
         waited = False
@@ -601,8 +619,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 "admission.scan", time.perf_counter() - scan_started, len(rids)
             )
             reduce_started = time.perf_counter()
+            self._log_waiting_queue_prefetch_boundary(
+                "admission.state_reduce", "BEGIN", len(rids)
+            )
         self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
         if debug:
+            self._log_waiting_queue_prefetch_boundary(
+                "admission.state_reduce", "END", len(rids)
+            )
             self.linker.record_waiting_queue_prefetch_debug(
                 "admission.state_reduce",
                 time.perf_counter() - reduce_started,
@@ -2865,7 +2889,14 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_count = torch.tensor(
             [self.linker.num_completed_loads()], dtype=torch.int, device="cpu"
         )
+        local_finish_count = int(finish_count[0].item())
+        self._log_waiting_queue_prefetch_boundary(
+            "drain_linker_loads.count_reduce", "BEGIN", local_finish_count
+        )
         self._all_reduce_attn_groups(finish_count, torch.distributed.ReduceOp.MIN)
+        self._log_waiting_queue_prefetch_boundary(
+            "drain_linker_loads.count_reduce", "END", int(finish_count[0].item())
+        )
         self._collect_failed_linker_loads(int(finish_count[0].item()))
         failed = self._failed_linker_rids
         self._failed_linker_rids = []
@@ -2886,7 +2917,13 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int,
             device="cpu",
         )
+        self._log_waiting_queue_prefetch_boundary(
+            "drain_linker_loads.verdict_reduce", "BEGIN", len(local_successes)
+        )
         self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        self._log_waiting_queue_prefetch_boundary(
+            "drain_linker_loads.verdict_reduce", "END", len(local_successes)
+        )
         failed = self.linker.commit_completed_loads(
             [bool(success) for success in successes.tolist()]
         )

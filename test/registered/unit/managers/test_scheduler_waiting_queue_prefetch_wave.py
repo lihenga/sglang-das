@@ -14,75 +14,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestSchedulerWaitingQueuePrefetchWave(unittest.TestCase):
+class TestSchedulerWaitingQueuePrefetchAdmission(unittest.TestCase):
     def _scheduler(self):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler._waiting_queue_prefetch_wave_by_rid = {}
-        scheduler._waiting_queue_prefetch_wave_next_id = 0
         return scheduler
 
-    def test_readiness_skew_waits_then_admits_wave_together(self):
-        scheduler = self._scheduler()
-        reqs = [SimpleNamespace(rid="rid-1"), SimpleNamespace(rid="rid-2")]
-
-        scheduler._register_waiting_queue_prefetch_wave(reqs, [True, True])
-        blocked = scheduler._waiting_queue_prefetch_blocked_waves(
-            reqs, ["dfs_prefetched", "pending"]
-        )
-
-        # The first request is ready, but it must not become a singleton
-        # admission/H2D batch while its sibling is still in native DFS work.
-        self.assertTrue(
-            scheduler._waiting_queue_prefetch_request_is_blocked(
-                "rid-1", "dfs_prefetched", blocked
-            )
-        )
-        self.assertEqual(
-            [
-                req.rid
-                for req, state in zip(reqs, ["dfs_prefetched", "pending"])
-                if not scheduler._waiting_queue_prefetch_request_is_blocked(
-                    req.rid, state, blocked
-                )
-                and state in {"dfs_prefetched", "no_prefetch_needed"}
-            ],
-            [],
-        )
-
-        blocked = scheduler._waiting_queue_prefetch_blocked_waves(
-            reqs, ["dfs_prefetched", "dfs_prefetched"]
-        )
-        admitted = [
-            req.rid
-            for req, state in zip(reqs, ["dfs_prefetched", "dfs_prefetched"])
-            if not scheduler._waiting_queue_prefetch_request_is_blocked(
-                req.rid, state, blocked
-            )
-        ]
-        self.assertEqual(admitted, ["rid-1", "rid-2"])
-
-    def test_terminal_and_untracked_tail_do_not_deadlock_ready_sibling(self):
-        scheduler = self._scheduler()
-        reqs = [SimpleNamespace(rid="rid-1"), SimpleNamespace(rid="rid-2")]
-        scheduler._register_waiting_queue_prefetch_wave(reqs, [True, True])
-
-        for tail_state in ("terminal", "cancelled", "not_tracked"):
-            blocked = scheduler._waiting_queue_prefetch_blocked_waves(
-                reqs, ["dfs_prefetched", tail_state]
-            )
-            self.assertEqual(blocked, set())
-
-    def test_failed_submission_is_not_added_to_wave(self):
-        scheduler = self._scheduler()
-        reqs = [SimpleNamespace(rid="rid-1"), SimpleNamespace(rid="rid-2")]
-        scheduler._register_waiting_queue_prefetch_wave(reqs, [True, False])
-
-        blocked = scheduler._waiting_queue_prefetch_blocked_waves(
-            reqs, ["dfs_prefetched", "pending"]
-        )
-        self.assertEqual(blocked, set())
-
-    def test_scheduler_defers_h2d_until_wave_is_ready(self):
+    def test_scheduler_admits_ready_request_while_sibling_dfs_is_pending(self):
         class Request:
             def __init__(self, rid):
                 self.rid = rid
@@ -196,16 +133,17 @@ class TestSchedulerWaitingQueuePrefetchWave(unittest.TestCase):
             first_batch, _ = scheduler._get_new_batch_prefill_raw(
                 prefill_delayer_single_pass=None, running_batch=running_batch
             )
-            self.assertIsNone(first_batch)
-            self.assertEqual(h2d_batches, [])
+            self.assertIsNotNone(first_batch)
+            self.assertEqual(h2d_batches, [["rid-1"]])
+            self.assertEqual([req.rid for req in scheduler.waiting_queue], ["rid-2"])
 
-            states[0] = ["dfs_prefetched", "dfs_prefetched"]
+            states[0] = ["dfs_prefetched"]
             second_batch, _ = scheduler._get_new_batch_prefill_raw(
                 prefill_delayer_single_pass=None, running_batch=running_batch
             )
 
         self.assertIsNotNone(second_batch)
-        self.assertEqual(h2d_batches, [["rid-1", "rid-2"]])
+        self.assertEqual(h2d_batches, [["rid-1"], ["rid-2"]])
         self.assertEqual(scheduler.waiting_queue, [])
 
 
