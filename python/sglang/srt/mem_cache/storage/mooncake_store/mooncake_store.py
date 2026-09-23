@@ -905,9 +905,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # caller has to intersect these sets across ranks.
         restorable = list(range(1, kv_pages + 1))
 
+        if not restorable:
+            return PoolTransferResult(0, hit_count, [])
+
+        # Build every pool's component keys first, then ask about all of them in
+        # one RPC: the pool count is small and building keys is cheap, the round
+        # trip is not. Both loops have to agree on offsets, so they must walk the
+        # pools in the same order.
+        prepared = []
+        all_component_keys: List[str] = []
         for transfer in pool_transfers or []:
-            if not restorable:
-                break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
@@ -922,7 +929,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
                 key_multiplier *= self.pp_size
             component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys)
+            start = len(all_component_keys)
+            all_component_keys.extend(component_keys)
+            prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
+
+        all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
+        for transfer, key_multiplier, start, end in prepared:
+            if not restorable:
+                break
+            ex = all_exists[start:end]
             if key_multiplier > 0:
                 page_exists = [
                     all(
@@ -1034,6 +1049,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pools may expose either one buffer or multiple buffers per object.  The
         object ranges recorded here allow the single, flattened put result to
         be converted back to the existing per-pool, per-page result format.
+
+        Buffer descriptors are built only after the existence query, and only
+        for the pages the store is missing. On a prefix-heavy workload most
+        pages are already present, so constructing their addresses up front
+        would be work discarded immediately.
         """
         all_key_strs: List[str] = []
         all_buffer_ptrs: List[Any] = []
@@ -1042,6 +1062,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             [] if self._can_use_group_semantics() else None
         )
         transfer_ranges = []
+        # Deferred metadata requests, one per pool. Filled in after the
+        # existence query so only missing pages pay for address construction.
+        buffer_requests = []
 
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
@@ -1056,25 +1079,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(
-                host_indices
-            )
-            if len(ptr_list) != len(key_strs):
-                ptr_list, element_size_list = self._pack_multi_buffer_meta(
-                    key_strs, ptr_list, element_size_list
-                )
-
-            if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
-                raise ValueError(
-                    "Mooncake v2 write metadata must align with component keys: "
-                    f"pool={transfer.name}, keys={len(key_strs)}, "
-                    f"ptrs={len(ptr_list)}, sizes={len(element_size_list)}"
-                )
 
             start = len(all_key_strs)
             all_key_strs.extend(key_strs)
-            all_buffer_ptrs.extend(ptr_list)
-            all_buffer_sizes.extend(element_size_list)
+            buffer_requests.append(
+                (
+                    transfer.name,
+                    host_pool,
+                    host_indices,
+                    key_strs,
+                    key_multiplier,
+                    start,
+                )
+            )
             if all_group_ids is not None:
                 all_group_ids.extend(
                     self._expand_group_ids(tagged_keys, key_multiplier)
@@ -1085,6 +1102,74 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if not all_key_strs:
             return {}
+
+        exist_result = self._batch_exist(all_key_strs)
+        if len(exist_result) != len(all_key_strs):
+            raise RuntimeError(
+                "Mooncake batch_is_exist returned an unexpected result count: "
+                f"expected={len(all_key_strs)}, actual={len(exist_result)}"
+            )
+
+        for (
+            pool_name,
+            host_pool,
+            host_indices,
+            key_strs,
+            key_multiplier,
+            start,
+        ) in buffer_requests:
+            object_indices = list(range(len(key_strs)))
+            # Only pages the store is missing need per-layer addresses. Zero
+            # placeholders keep result and group offsets aligned for the rest.
+            missing_pages = [
+                page
+                for page in range(len(key_strs) // key_multiplier)
+                if any(
+                    state != 1
+                    for state in exist_result[
+                        start + page * key_multiplier : start
+                        + (page + 1) * key_multiplier
+                    ]
+                )
+            ]
+            if not missing_pages:
+                all_buffer_ptrs.extend([0] * len(key_strs))
+                all_buffer_sizes.extend([0] * len(key_strs))
+                continue
+            if len(missing_pages) * key_multiplier < len(key_strs):
+                # Metadata generation consumes CPU indices anyway, so select the
+                # logical pages there rather than uploading a new index.
+                page_size = getattr(host_pool, "page_size", 1) or 1
+                host_indices = host_indices.detach().to(device="cpu")
+                host_indices = host_indices.reshape(-1, page_size)[
+                    missing_pages
+                ].reshape(-1)
+                object_indices = [
+                    page * key_multiplier + component
+                    for page in missing_pages
+                    for component in range(key_multiplier)
+                ]
+            selected_keys = [key_strs[i] for i in object_indices]
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(
+                host_indices
+            )
+            if len(ptr_list) != len(selected_keys):
+                ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                    selected_keys, ptr_list, element_size_list
+                )
+            if not (len(selected_keys) == len(ptr_list) == len(element_size_list)):
+                raise ValueError(
+                    "Mooncake v2 write metadata must align with component keys: "
+                    f"pool={pool_name}, keys={len(selected_keys)}, "
+                    f"ptrs={len(ptr_list)}, sizes={len(element_size_list)}"
+                )
+            pool_ptrs = [0] * len(key_strs)
+            pool_sizes = [0] * len(key_strs)
+            for index, ptr, size in zip(object_indices, ptr_list, element_size_list):
+                pool_ptrs[index] = ptr
+                pool_sizes[index] = size
+            all_buffer_ptrs.extend(pool_ptrs)
+            all_buffer_sizes.extend(pool_sizes)
 
         # batch_put_from_multi_buffers requires every object to use the same
         # vector-of-vectors representation. Normalize scalar entries only when
@@ -1098,13 +1183,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 list(size) if isinstance(size, Sequence) else [size]
                 for size in all_buffer_sizes
             ]
-
-        exist_result = self._batch_exist(all_key_strs)
-        if len(exist_result) != len(all_key_strs):
-            raise RuntimeError(
-                "Mooncake batch_is_exist returned an unexpected result count: "
-                f"expected={len(all_key_strs)}, actual={len(exist_result)}"
-            )
 
         io_results = [0 if state == 1 else -1 for state in exist_result]
         missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
