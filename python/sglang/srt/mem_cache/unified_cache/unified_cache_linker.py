@@ -79,6 +79,10 @@ class UnifiedCacheLinker(ABC):
         not here.
         """
 
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        """Whether waiting-queue host prefetch is enabled on every rank."""
+        return False
+
     def submit_host_prefetch(
         self, rid: str, transfers: list[PoolTransfer]
     ) -> bool:

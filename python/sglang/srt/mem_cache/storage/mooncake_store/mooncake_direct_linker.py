@@ -353,24 +353,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Mooncake ReadPlan enabled; address reuse=%s",
                 self.read_plan_reuse_ranges,
             )
-        if self.host_prefetch_enabled:
-            if not callable(
-                getattr(self.storage.store, "batch_get_session_prefetch", None)
-            ) or not callable(
-                getattr(self.storage.store, "batch_get_session_refresh", None)
-            ) or not callable(
-                getattr(
-                    self.storage.store,
-                    "batch_get_session_start_with_sources",
-                    None,
-                )
-            ):
-                raise RuntimeError(
-                    "Mooncake waiting-queue DFS prefetch requires a Mooncake "
-                    "package with batch_get_session_start_with_sources(), "
-                    "batch_get_session_prefetch(), and "
-                    "batch_get_session_refresh()."
-                )
+        self.host_prefetch_enabled = self._resolve_host_prefetch_enabled(
+            params, requested=self.host_prefetch_enabled
+        )
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
@@ -445,6 +430,81 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             name=f"mooncake-offload-tp{tp_rank}",
         )
         self.offload_thread.start()
+
+    def _local_host_prefetch_capability(self, requested: bool) -> tuple[bool, str]:
+        """Return whether this rank can run waiting-queue DFS prefetch."""
+        if not requested:
+            return False, "disabled by --mooncake-enable-waiting-queue-dfs-prefetch"
+        store = self.storage.store
+        missing = [
+            name
+            for name in (
+                "batch_get_session_start_with_sources",
+                "batch_get_session_prefetch",
+                "batch_get_session_refresh",
+                "dfs_prefetch_arena_available",
+            )
+            if not callable(getattr(store, name, None))
+        ]
+        if missing:
+            return False, "Mooncake package lacks " + ", ".join(missing)
+        try:
+            if store.dfs_prefetch_arena_available():
+                return True, "ready"
+            status = getattr(store, "dfs_prefetch_arena_status", None)
+            reason = status() if callable(status) else "unavailable"
+        except Exception as exc:
+            reason = f"arena query failed: {exc!r}"
+        return False, (
+            f"DFS prefetch arena unavailable ({reason}); set "
+            "MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES on prefill"
+        )
+
+    def _resolve_host_prefetch_enabled(
+        self, params: CacheInitParams, *, requested: bool
+    ) -> bool:
+        """Agree on waiting-queue prefetch once, before any worker starts.
+
+        Every rank that builds this linker takes part unconditionally, so the
+        scheduler's per-request prefetch collectives are entered by all ranks
+        or by none. The groups and their order match
+        ``UnifiedRadixCache._all_reduce_attn_groups``.
+        """
+        local_ok, reason = self._local_host_prefetch_capability(requested)
+        verdict = torch.tensor([int(local_ok)], dtype=torch.int)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            reduced = False
+            for group in (params.attn_cp_cache_group, params.attn_tp_cache_group):
+                if (
+                    group is not None
+                    and torch.distributed.get_world_size(group=group) > 1
+                ):
+                    torch.distributed.all_reduce(
+                        verdict, op=torch.distributed.ReduceOp.MIN, group=group
+                    )
+                    reduced = True
+            tp_group = params.tp_cache_group
+            if (
+                not reduced
+                and tp_group is not None
+                and torch.distributed.get_world_size(group=tp_group) > 1
+            ):
+                torch.distributed.all_reduce(
+                    verdict, op=torch.distributed.ReduceOp.MIN, group=tp_group
+                )
+        enabled = bool(verdict.item())
+        if requested and not enabled:
+            logger.warning(
+                "Mooncake waiting-queue DFS prefetch disabled on all ranks; "
+                "local status: %s (if ready, another rank is unavailable)",
+                reason,
+            )
+        elif enabled:
+            logger.info("Mooncake waiting-queue DFS prefetch enabled")
+        return enabled
+
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        return self.host_prefetch_enabled
 
     def register_buffers(self) -> None:
         seen = set()
