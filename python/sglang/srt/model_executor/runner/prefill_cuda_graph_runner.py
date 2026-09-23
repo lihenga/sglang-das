@@ -984,6 +984,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend = self.model_runner.attn_backend
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.prepare_prefill_shared_read_snapshot(
+                forward_batch, num_qo_tokens=num_tokens
+            )
             return
         metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
             forward_batch
