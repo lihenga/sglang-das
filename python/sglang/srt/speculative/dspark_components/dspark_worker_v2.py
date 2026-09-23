@@ -80,6 +80,7 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils.common import pin_host_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -719,10 +720,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
         device = self.device
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+        pin_metadata = pin_host_metadata(device)
+        ctx_lens = torch.tensor(
+            batch.extend_lens, dtype=torch.int32, pin_memory=pin_metadata
+        ).to(device, non_blocking=True)
         draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, device=device
-        )
+            batch.prefix_lens, dtype=torch.int32, pin_memory=pin_metadata
+        ).to(device, non_blocking=True)
         positions, _ = compute_position(
             self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
