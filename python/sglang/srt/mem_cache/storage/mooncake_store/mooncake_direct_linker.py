@@ -197,9 +197,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
-        self.page_wise_load_threshold = (
-            server_args.mooncake_page_wise_load_threshold
-        )
+        self.pp_size = params.pp_size
+        self.page_wise_load_threshold = server_args.mooncake_page_wise_load_threshold
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
         if self.page_wise_load_threshold <= 0:
             raise ValueError(
@@ -337,7 +336,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.pending_load_tokens: dict[str, int] = {}
+        self.load_sessions: dict[str, set[str]] = {}
+        self.load_session_refcounts: dict[str, int] = {}
+        self.load_session_lock = threading.Lock()
         self.gc_frozen = False
+        self.lookup_queue: Queue[tuple[str, list[PoolTransfer]] | None] = Queue()
+        self.completed_lookups: Queue[tuple[str, list[int]]] = Queue()
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
         ] = Queue()
@@ -348,7 +352,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tuple[list[PoolTransfer], int, float, object] | None
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
-        self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.started_at = time.monotonic()
+        self.stats: dict[str, int | float] = {
+            "lookup": 0,
+            "lookup_pages": 0,
+            "lookup_hit_pages": 0,
+            "lookup_seconds": 0.0,
+            "load": 0,
+            "load_seconds": 0.0,
+            "offload": 0,
+            "offload_tokens": 0,
+            "offload_seconds": 0.0,
+            "reserve_lock_seconds": 0.0,
+            "reserve_lock_max_seconds": 0.0,
+            "reserve_rpc_count": 0,
+            "reserve_rpc_seconds": 0.0,
+            "reserve_rpc_max_seconds": 0.0,
+            "load_ready_count": 0,
+            "load_ready_seconds": 0.0,
+            "load_ready_max_seconds": 0.0,
+        }
+        self.lookup_thread = threading.Thread(
+            target=self.lookup_thread_func,
+            daemon=True,
+            name=f"mooncake-lookup-tp{tp_rank}",
+        )
+        self.lookup_thread.start()
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
@@ -378,7 +407,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"error code: {result}."
                     )
 
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int] | None:
+        # PP0 must publish one canonical boundary during request handoff. Keep
+        # PP synchronous until that handoff can carry a delayed lookup result.
+        if self.pp_size > 1:
+            return self._lookup_now(rid, transfers)
+        self.lookup_queue.put((rid, transfers))
+        return None
+
+    def lookup_thread_func(self) -> None:
+        while True:
+            task = self.lookup_queue.get()
+            try:
+                if task is None:
+                    return
+                rid, transfers = task
+                try:
+                    restorable = self._lookup_now(rid, transfers)
+                except BaseException:
+                    logger.exception("Mooncake lookup failed: rid=%s", rid)
+                    restorable = []
+                self.completed_lookups.put((rid, restorable))
+            finally:
+                self.lookup_queue.task_done()
+
+    def _lookup_now(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        started = time.perf_counter()
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -391,14 +445,162 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         result = self.storage.batch_exists_v2(page_keys, expanded, query_all_pp=True)
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
-        if restorable:
-            logger.info(
-                "Mooncake direct linker lookup hit: rid=%s pages=%d candidates=%d",
-                rid,
-                restorable[-1],
-                len(restorable),
-            )
+        self.stats["lookup_pages"] += len(page_keys)
+        self.stats["lookup_hit_pages"] += restorable[-1] if restorable else 0
+        self.stats["lookup_seconds"] += time.perf_counter() - started
+        logger.debug(
+            "Mooncake direct linker lookup: rid=%s queried_pages=%d "
+            "pages=%d candidates=%d",
+            rid,
+            len(page_keys),
+            restorable[-1] if restorable else 0,
+            len(restorable),
+        )
         return restorable
+
+    def num_completed_lookups(self) -> int:
+        return self.completed_lookups.qsize()
+
+    def pop_completed_lookup(self) -> tuple[str, list[int]]:
+        return self.completed_lookups.get_nowait()
+
+    def _component_keys(self, transfers: list[PoolTransfer]) -> list[str]:
+        keys = []
+        for transfer in transfers:
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            keys.extend(self.storage._tag_keys(component_keys))
+        return list(dict.fromkeys(keys))
+
+    def reserve_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        # A ReadPlan owns its session lifecycle in C++; retain the existing
+        # cross-rank revalidation instead of nesting Python reservations.
+        if self.read_plan_enabled:
+            return self.revalidate_load(transfers)
+
+        local_reserved = False
+        try:
+            local_reserved = self._reserve_load_local(rid, transfers)
+        except BaseException:
+            logger.exception("Mooncake load reservation failed: rid=%s", rid)
+
+        valid = local_reserved
+        groups = getattr(self, "_load_revalidation_groups", ())
+        if groups:
+            # Layer-split keys can disappear independently. Every CP/TP rank
+            # must either reserve the common prefix or recompute it.
+            verdict = torch.tensor([int(valid)], dtype=torch.int)
+            for group in groups:
+                torch.distributed.all_reduce(
+                    verdict, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+            valid = bool(verdict.item())
+        if not valid and local_reserved:
+            self._release_load_session(rid)
+        return valid
+
+    def _reserve_load_local(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
+        keys = self._component_keys(expanded)
+        if not keys:
+            return False
+
+        lock_started = time.perf_counter()
+        with self.load_session_lock:
+            lock_seconds = time.perf_counter() - lock_started
+            self.stats["reserve_lock_seconds"] += lock_seconds
+            self.stats["reserve_lock_max_seconds"] = max(
+                self.stats["reserve_lock_max_seconds"], lock_seconds
+            )
+            if rid in self.load_sessions:
+                raise RuntimeError(
+                    f"Mooncake load session for rid={rid} already exists."
+                )
+            new_keys = [
+                key for key in keys if self.load_session_refcounts.get(key, 0) == 0
+            ]
+            results = []
+            if new_keys:
+                rpc_started = time.perf_counter()
+                try:
+                    results = list(self.storage.store.batch_get_session_start(new_keys))
+                finally:
+                    rpc_seconds = time.perf_counter() - rpc_started
+                    self.stats["reserve_rpc_count"] += 1
+                    self.stats["reserve_rpc_seconds"] += rpc_seconds
+                    self.stats["reserve_rpc_max_seconds"] = max(
+                        self.stats["reserve_rpc_max_seconds"], rpc_seconds
+                    )
+            if len(results) != len(new_keys) or any(result != 0 for result in results):
+                started = [key for key, result in zip(new_keys, results) if result == 0]
+                self._end_load_sessions(started)
+                logger.info(
+                    "Mooncake load reservation missed after lookup: rid=%s, "
+                    "keys=%d, failed=%d",
+                    rid,
+                    len(keys),
+                    len(new_keys) - len(started),
+                )
+                return False
+
+            reserved = set(keys)
+            self.load_sessions[rid] = reserved
+            for key in reserved:
+                self.load_session_refcounts[key] = (
+                    self.load_session_refcounts.get(key, 0) + 1
+                )
+        return True
+
+    def _end_load_sessions(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        try:
+            result = self.storage.store.batch_get_session_end(keys)
+        except BaseException:
+            logger.exception("Mooncake get session cleanup failed: keys=%d", len(keys))
+            return
+        if result not in (0, None):
+            logger.warning(
+                "Mooncake get session cleanup failed: keys=%d, result=%s",
+                len(keys),
+                result,
+            )
+
+    def _release_load_session_locked(
+        self, rid: str, *, keep: set[str] | None = None
+    ) -> None:
+        keys = self.load_sessions.pop(rid, None)
+        if keys is None:
+            return
+        keep = keep or set()
+        retained = keys & keep
+        if retained:
+            self.load_sessions[rid] = retained
+
+        ending = []
+        for key in keys - retained:
+            refs = self.load_session_refcounts[key] - 1
+            if refs == 0:
+                del self.load_session_refcounts[key]
+                ending.append(key)
+            else:
+                self.load_session_refcounts[key] = refs
+        self._end_load_sessions(ending)
+
+    def _release_load_session(self, rid: str) -> None:
+        with self.load_session_lock:
+            self._release_load_session_locked(rid)
+
+    def release_load_reservation(self, rid: str) -> None:
+        self._release_load_session(rid)
+
+    def _release_all_load_sessions(self) -> None:
+        with self.load_session_lock:
+            for rid in list(self.load_sessions):
+                self._release_load_session_locked(rid)
 
     def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
         valid = self._revalidate_load_local(transfers)
@@ -468,9 +670,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             transfers, allow_partial=True, allow_missing_kv=True
         )
         if not expanded:
+            self._release_load_session(rid)
             return False
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
+        if not self.read_plan_enabled:
+            actual_keys = set(self._component_keys(expanded))
+            with self.load_session_lock:
+                reserved_keys = self.load_sessions.get(rid)
+                if reserved_keys is None or not actual_keys <= reserved_keys:
+                    self._release_load_session_locked(rid)
+                    return False
+                self._release_load_session_locked(rid, keep=actual_keys)
         self.pending_loads[rid] = expanded
         logical_pages = {
             page_key for transfer in expanded for page_key in transfer.keys
@@ -483,7 +694,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def cancel_queued_load(self, rid: str) -> bool:
         getattr(self, "pending_load_tokens", {}).pop(rid, None)
-        return self.pending_loads.pop(rid, None) is not None
+        if self.pending_loads.pop(rid, None) is None:
+            return False
+        self._release_load_session(rid)
+        return True
 
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()
@@ -522,7 +736,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counter_index, pending, ready_event = task
                 success = False
                 try:
-                    ready_event.synchronize()
+                    ready_started = time.perf_counter()
+                    try:
+                        ready_event.synchronize()
+                    finally:
+                        ready_seconds = time.perf_counter() - ready_started
+                        self.stats["load_ready_count"] += 1
+                        self.stats["load_ready_seconds"] += ready_seconds
+                        self.stats["load_ready_max_seconds"] = max(
+                            self.stats["load_ready_max_seconds"], ready_seconds
+                        )
                     success = self.load_layer_wise(
                         counter_index, list(pending.values())
                     )
@@ -530,6 +753,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
+                    for rid in pending:
+                        self._release_load_session(rid)
                     self._finish_prefetch_metrics(list(pending), success is True)
                     self.completed_loads.put((list(pending), success))
             finally:
@@ -538,7 +763,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> bool:
-        started = []
+        started_at = time.perf_counter()
         success = False
         maybe_fail = arm_load_failure_injection(self.tp_rank)
         try:
@@ -558,40 +783,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
-            for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                failed = [key for key, code in zip(keys, result) if code != 0]
-                if failed:
-                    # Master-side eviction (memory watermark) can expire a
-                    # replica between the match-time lookup and this call.
-                    # Session start re-queries the master, so retry the batch
-                    # once before giving up.
-                    logger.warning(
-                        "Mooncake get session start partial failure "
-                        "(keys=%d, failed=%d), retrying once: results=%s",
-                        len(keys),
-                        len(failed),
-                        result,
-                    )
-                    result = self.storage.store.batch_get_session_start(keys)
-                    failed = [key for key, code in zip(keys, result) if code != 0]
-                if failed:
-                    failed_get_cache = getattr(self.storage, "failed_get_cache", None)
-                    if failed_get_cache is not None:
-                        failed_get_cache.update_batch([], failed)
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"failed={len(failed)}, results={result}"
-                    )
-                started.append(keys)
 
             if self.enable_page_wise_load and any(
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
             ):
-                self._load_page_wise(
-                    counter_index, batches, started, maybe_fail
-                )
+                self._load_page_wise(counter_index, batches, [], maybe_fail)
                 success = True
                 return success
 
@@ -627,13 +824,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
-            for keys in started:
-                try:
-                    self.storage.store.batch_get_session_end(keys)
-                except BaseException as error:
-                    self.layer_done_counter.fail(counter_index, error)
-                    logger.exception("Mooncake layer-wise load session cleanup failed")
-                    success = False
+            self.stats["load_seconds"] += time.perf_counter() - started_at
         return success
 
     def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
@@ -666,9 +857,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 exc_info=True,
             )
 
-    def _load_page_wise(
-        self, counter_index: int, batches, started, maybe_fail
-    ) -> None:
+    def _load_page_wise(self, counter_index: int, batches, started, maybe_fail) -> None:
         """Load all layer ranges for each page before exposing the data."""
         all_keys: list[str] = []
         all_ptrs: list[list[int]] = []
@@ -680,9 +869,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
@@ -725,9 +912,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         expected = [sum(item) for item in all_sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
-            pool_counts = {
-                str(name): len(keys) for name, (keys, _) in batches.items()
-            }
+            pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
             raise RuntimeError(
                 "Mooncake aggregated range get failed for "
                 f"pools={pool_counts}, complete_page: transferred={result}, "
@@ -744,9 +929,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         for layer in range(self.num_layers):
             self.layer_done_counter.complete(counter_index, layer)
 
-    def _prepare_read_plan_layouts(
-        self, request_transfers: list[list[PoolTransfer]]
-    ):
+    def _prepare_read_plan_layouts(self, request_transfers: list[list[PoolTransfer]]):
         # Consolidate index copies once per pool, preserving request/key order.
         # Each component describes (base, row stride, byte count, source offset).
         # Locations may be non-contiguous; Mooncake expands addresses in C++.
@@ -771,9 +954,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 buffer_indices = (
                     ()
                     if mapped is None
-                    else (mapped,)
-                    if isinstance(mapped, int)
-                    else tuple(mapped)
+                    else (mapped,) if isinstance(mapped, int) else tuple(mapped)
                 )
                 layout.append(
                     [
@@ -851,6 +1032,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                 self.offload_results.put(False)
             finally:
+                if task is not None:
+                    _, tokens, started, _ = task
+                    self.stats["offload_tokens"] += tokens
+                    self.stats["offload_seconds"] += time.perf_counter() - started
                 self.offload_queue.task_done()
 
     def _log_l4_backup_metric(
@@ -875,11 +1060,31 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self.offload_results.get_nowait()
 
+    def debug_snapshot(self) -> dict[str, int | float]:
+        return {
+            "uptime_s": round(time.monotonic() - self.started_at, 1),
+            "lookup_queue": self.lookup_queue.qsize(),
+            "lookup_done": self.completed_lookups.qsize(),
+            "load_queue": self.load_queue.qsize(),
+            "load_done": self.completed_loads.qsize(),
+            "offload_queue": self.offload_queue.qsize(),
+            "offload_done": self.offload_results.qsize(),
+            **self.stats,
+            **getattr(self.storage, "hybrid_put_stats", {}),
+        }
+
     def reset(self) -> None:
         self.pending_loads.clear()
         getattr(self, "pending_load_tokens", {}).clear()
+        self.lookup_queue.join()
         self.load_queue.join()
         self.offload_queue.join()
+        self._release_all_load_sessions()
+        while True:
+            try:
+                self.completed_lookups.get_nowait()
+            except Empty:
+                break
         while True:
             try:
                 self.offload_results.get_nowait()
@@ -894,8 +1099,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def close(self) -> None:
         self.reset()
+        self.lookup_queue.put(None)
         self.load_queue.put(None)
         self.offload_queue.put(None)
+        self.lookup_thread.join()
         self.load_thread.join()
         self.offload_thread.join()
         logger.info("Mooncake direct linker stats: %s", self.stats)

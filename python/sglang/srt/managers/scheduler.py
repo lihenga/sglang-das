@@ -3551,6 +3551,10 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            if self.tree_cache.is_external_lookup_pending(req.rid):
+                # The external backend is probing this request off-thread.
+                # Keep scanning so ready requests can still fill the batch.
+                continue
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"

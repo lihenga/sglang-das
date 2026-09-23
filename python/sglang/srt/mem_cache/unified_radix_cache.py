@@ -352,6 +352,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    def is_external_lookup_pending(self, req_id: str) -> bool:
+        return self.linker is not None and self.linker.has_pending_lookup(req_id)
+
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
@@ -769,6 +772,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        if self.linker is not None:
+            self.linker.release_request(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             # release_session has run the tree-lock release this needs.
             self._reclaim_failed_linker_chain(req.rid)
@@ -2655,8 +2660,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
+            self.linker.maybe_log_debug_stats()
             finish_counts = torch.tensor(
                 [
+                    self.linker.cache_linker.num_completed_lookups(),
                     self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
                 ],
@@ -2664,7 +2671,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            lookup_count, load_count, offload_count = map(int, finish_counts.tolist())
+            self.linker.drain_lookups(lookup_count)
             self._collect_failed_linker_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
@@ -2885,8 +2893,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Compress-only HiCache: SWA is never offloaded, so a host-restored
         # prefix carries no SWA at all.
         unified_compress_only_hicache = (
-            self.cache_controller is not None
-            and not self.tree_core.has_swa_host_pool
+            self.cache_controller is not None and not self.tree_core.has_swa_host_pool
         )
         # unified_kv layout: SWA lives in a per-request ring keyed by
         # (state_slot, pos), so another request's slots are not reusable.
