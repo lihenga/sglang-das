@@ -23,6 +23,7 @@ import os
 import signal
 import sys
 import time
+import threading
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
@@ -447,6 +448,12 @@ class Scheduler(
         self.enable_overlap_mlx = (
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
+        # Background worker thread for non-overlap forward overlap
+        self._bg_work_event = threading.Event()
+        self._bg_stop_flag = False
+        self._bg_thread = threading.Thread(target=self._bg_worker_loop, daemon=True)
+        self._bg_thread.start()
+
         self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
@@ -2005,6 +2012,25 @@ class Scheduler(
         """
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
+
+    def _bg_worker_loop(self):
+        """Background thread loop. Blocks on _bg_work_event; when set,
+        repeatedly calls process_input_and_resolve_bootstrap until cleared."""
+        while not self._bg_stop_flag:
+            # Block until main thread sets the event
+            self._bg_work_event.wait()
+            if self._bg_stop_flag:
+                return
+            # Do useful work while the event is set
+            try:
+                # add your action here
+                #self.process_input_and_resolve_bootstrap()
+                time.sleep(0.1)
+                logger.info("bg_worker_loop: processed requests")
+            except Exception:
+                logger.warning("bg_worker_loop: exception during work", exc_info=True)
+            # Small yield to avoid burning CPU
+            #self._bg_work_event.clear()
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -4054,8 +4080,12 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                # set event start work
+                self._bg_work_event.set()
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(batch)
+                # Stop background thread, let it block again.
+                self._bg_work_event.clear()
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4079,9 +4109,13 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                # set event start work
+                self._bg_work_event.set()
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                # Stop background thread, let it block again.
+                self._bg_work_event.clear()
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
