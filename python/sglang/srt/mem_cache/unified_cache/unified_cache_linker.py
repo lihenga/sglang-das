@@ -97,6 +97,10 @@ class UnifiedCacheLinker(ABC):
         """Refresh the prepared session without copying into device memory."""
         return False
 
+    def revalidate_no_prefetch_needed(self, rid: str) -> bool:
+        """Check that a prefetch finished without DFS reads is still loadable."""
+        return False
+
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         """Transfer a READY speculative session to the normal load path."""
         return False
@@ -449,16 +453,23 @@ class UnifiedCacheLinkerWrapper:
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
 
-            if status == "no_prefetch_needed":
-                locally_valid = True
-            else:
-                try:
+            # Every rank must reach the reduction below, so any local failure,
+            # including an exception, becomes a local False.
+            try:
+                if status == "no_prefetch_needed":
+                    # Its session was released while queued; re-check that
+                    # the keys survived so eviction falls back to the normal
+                    # path instead of failing the later load.
+                    locally_valid = self.cache_linker.revalidate_no_prefetch_needed(
+                        req.rid
+                    )
+                else:
                     locally_valid = (
                         status == "dfs_prefetched"
                         and self.cache_linker.revalidate_host_prefetch(req.rid)
                     )
-                except BaseException:
-                    locally_valid = False
+            except BaseException:
+                locally_valid = False
             valid = torch.tensor(int(locally_valid), dtype=torch.int)
             cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
             if int(valid.item()) == 0:

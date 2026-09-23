@@ -902,6 +902,46 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return len(results) == len(keys) and all(result == 0 for result in results)
 
+    def revalidate_no_prefetch_needed(self, rid: str) -> bool:
+        """Re-check the keys of a request that needed no DFS prefetch.
+
+        The worker released its session on finding no DFS keys, so nothing
+        pins the objects while the request waits for admission. Returning
+        False sends every rank back to the normal path, whose revalidation
+        degrades an evicted prefix to a cache miss.
+        """
+        with self.host_prefetch_lock:
+            entry = self.host_prefetch_entries.get(rid)
+            if (
+                entry is None
+                or entry.get("state") != "no_prefetch_needed"
+                or entry.get("cancelled")
+            ):
+                return False
+            keys = list(entry.get("no_prefetch_keys", ()))
+        if not keys:
+            return False
+        try:
+            exist = list(self.storage._batch_exist(keys))
+        except BaseException:
+            logger.warning(
+                "Mooncake waiting-queue existence check failed for rid=%s",
+                rid,
+                exc_info=True,
+            )
+            return False
+        missing = len(keys) - sum(1 for state in exist if state == 1)
+        if len(exist) != len(keys) or missing:
+            logger.warning(
+                "Mooncake waiting-queue keys changed while queued for rid=%s: "
+                "missing=%d/%d, falling back to the normal load path",
+                rid,
+                missing,
+                len(keys),
+            )
+            return False
+        return True
+
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
@@ -992,7 +1032,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 ]
                 if not dfs_keys:
                     self._finish_host_prefetch(
-                        rid, entry, session_rid, "no_prefetch_needed"
+                        rid, entry, session_rid, "no_prefetch_needed", keys=keys
                     )
                     continue
 
@@ -1059,6 +1099,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         entry: dict[str, object],
         session_rid: str,
         outcome: str,
+        *,
+        keys: list[str] | None = None,
     ) -> None:
         keep_session = False
         with self.host_prefetch_lock:
@@ -1071,9 +1113,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 and outcome in {"dfs_prefetched", "no_prefetch_needed"}
                 and not cancelled
             ):
-                current["state"] = outcome
                 if outcome == "no_prefetch_needed":
+                    # The session is released below; keep the keys so
+                    # admission can re-check them (see
+                    # revalidate_no_prefetch_needed). Published together with
+                    # the state under the same lock.
+                    current["no_prefetch_keys"] = list(keys or ())
                     current["reserved_bytes"] = 0
+                current["state"] = outcome
                 keep_session = outcome == "dfs_prefetched"
             if current is entry:
                 if cancelled:

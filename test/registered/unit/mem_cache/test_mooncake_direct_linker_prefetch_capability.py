@@ -22,7 +22,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=180, suite="base-a-test-cpu")
 
 _LINKER_LOGGER = "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker"
 
@@ -165,6 +165,60 @@ class TestResolveHostPrefetch(CustomTestCase):
             )
         self.assertFalse(enabled)
         self.assertEqual(len(fake.calls), 1)
+
+
+def _gloo_rank(rank, world_size, port, unavailable_rank, flag_off_rank, results):
+    """One rank of a CP x TP = 2 x 2 Gloo mesh running the real reduction."""
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        # Every rank creates every subgroup in the same order.
+        cp_groups = [torch.distributed.new_group([0, 1]), torch.distributed.new_group([2, 3])]
+        tp_groups = [torch.distributed.new_group([0, 2]), torch.distributed.new_group([1, 3])]
+        params = _params(cp=cp_groups[rank // 2], tp=tp_groups[rank % 2])
+        store = _Store(available=rank != unavailable_rank, status="not configured")
+        enabled = _linker(store)._resolve_host_prefetch_enabled(
+            params, requested=rank != flag_off_rank
+        )
+        # A follow-up collective proves no rank is left blocked or skewed.
+        torch.distributed.barrier()
+        results[rank] = enabled
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class TestResolveHostPrefetchGloo(CustomTestCase):
+    def _run(self, *, unavailable_rank=-1, flag_off_rank=-1):
+        import socket
+
+        import torch.multiprocessing as mp
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        world_size = 4
+        with mp.Manager() as manager:
+            results = manager.dict()
+            mp.spawn(
+                _gloo_rank,
+                args=(world_size, port, unavailable_rank, flag_off_rank, results),
+                nprocs=world_size,
+                join=True,
+            )
+            return [results[rank] for rank in range(world_size)]
+
+    def test_all_ranks_ready(self):
+        self.assertEqual(self._run(), [True] * 4)
+
+    def test_one_rank_without_arena_disables_every_rank(self):
+        self.assertEqual(self._run(unavailable_rank=3), [False] * 4)
+
+    def test_one_rank_with_flag_off_disables_every_rank(self):
+        self.assertEqual(self._run(flag_off_rank=1), [False] * 4)
 
 
 def _scheduler(*, flag, tree_cache):
