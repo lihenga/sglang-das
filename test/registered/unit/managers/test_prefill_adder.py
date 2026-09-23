@@ -483,6 +483,83 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
+    def test_chunked_admission_uses_current_chunk_kv_budget(self):
+        page_size = 64
+        chunk_size = 16_384
+        available_tokens = 110_000
+        prompt_tokens = 131_074
+        self.mock_token_allocator.available_size.return_value = available_tokens
+
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=chunk_size,
+        )
+        req = self.create_mock_req("long_chunked", priority=0, max_new_tokens=1)
+        req.full_untruncated_fill_ids = list(range(prompt_tokens))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.swa_host_hit_length = 0
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(req.extend_range, Range(0, chunk_size))
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(
+            adder.rem_total_tokens,
+            available_tokens - chunk_size - page_size,
+        )
+
+    def test_non_chunked_admission_still_requires_full_request_budget(self):
+        self.mock_token_allocator.available_size.return_value = 110_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_chunk_tokens=None,
+        )
+        req = self.create_mock_req("long_non_chunked", priority=0, max_new_tokens=1)
+        req.full_untruncated_fill_ids = list(range(131_074))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.swa_host_hit_length = 0
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_chunked_admission_accounts_for_host_load_back(self):
+        self.mock_token_allocator.available_size.return_value = 20_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_chunk_tokens=16_384,
+        )
+        req = self.create_mock_req("chunked_host_hit", priority=0, max_new_tokens=1)
+        req.full_untruncated_fill_ids = list(range(131_074))
+        req.host_hit_length = 10_000
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,

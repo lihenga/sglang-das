@@ -1262,6 +1262,7 @@ class PrefillAdder:
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,
+                mamba_gap_reserve=mamba_gap_reserve,
                 host_hit_length=req.host_hit_length,
                 swa_host_hit_length=req.swa_host_hit_length,
                 truncation_align_size=truncation_align_size,
@@ -1328,6 +1329,7 @@ class PrefillAdder:
                     admission = self._select_prefill_admission(
                         req,
                         total_tokens=total_tokens,
+                        mamba_gap_reserve=mamba_gap_reserve,
                         host_hit_length=0,
                         swa_host_hit_length=0,
                         truncation_align_size=truncation_align_size,
@@ -1349,6 +1351,7 @@ class PrefillAdder:
         req: Req,
         *,
         total_tokens: int,
+        mamba_gap_reserve: int,
         host_hit_length: int,
         swa_host_hit_length: int,
         truncation_align_size: Optional[int],
@@ -1357,9 +1360,6 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices) + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
-
-        if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
 
         chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
@@ -1422,6 +1422,22 @@ class PrefillAdder:
             is_chunked = True
             max_new_tokens = 0
             tile_tokens = extend_len
+
+        # A middle chunk only materializes this pass's extend range. Requiring
+        # room for the entire prompt here can make PP stages disagree when
+        # their local cache pressure differs, even though every stage can fit
+        # the configured chunk. Host-hit tokens are included because load-back
+        # also materializes them in the device KV pool during this admission.
+        admission_tokens = total_tokens
+        if is_chunked:
+            admission_tokens = (
+                host_hit_length
+                + self.ceil_paged_tokens(extend_len)
+                + self.page_size
+                + mamba_gap_reserve
+            )
+        if admission_tokens >= self.rem_total_tokens:
+            return AddReqResult.NO_TOKEN
 
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
             return verdict
