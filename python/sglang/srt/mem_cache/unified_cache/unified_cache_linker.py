@@ -19,12 +19,15 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -42,6 +45,8 @@ from sglang.srt.mem_cache.unified_cache.components import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
@@ -58,8 +63,8 @@ class UnifiedCacheLinker(ABC):
     layer_done_counter: object
 
     @abstractmethod
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
-        """Return every prefix length (in pages) that is fully restorable.
+    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int] | None:
+        """Return restorable prefix lengths, or queue an asynchronous lookup.
 
         A length is included only when *all* pools satisfy their hit policy at
         that exact boundary (contiguous prefix pools, plus each trailing-window
@@ -68,8 +73,29 @@ class UnifiedCacheLinker(ABC):
         and generally non-contiguous -- returning just the local maximum would
         let the tree pick a length that is invalid on another rank.
 
-        Local to this rank; the tree intersects the sets across ranks.
+        Local to this rank; the tree intersects the sets across ranks. An
+        asynchronous backend returns ``None`` and later publishes the result
+        through :meth:`pop_completed_lookup`.
         """
+
+    def num_completed_lookups(self) -> int:
+        """Return the number of asynchronous lookup results ready to consume."""
+        return 0
+
+    def pop_completed_lookup(self) -> tuple[str, list[int]]:
+        """Consume the oldest asynchronous lookup result."""
+        raise NotImplementedError
+
+    def debug_snapshot(self) -> dict[str, int | float]:
+        """Return lightweight cumulative and queue diagnostics."""
+        return {}
+
+    def reserve_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Reserve a restorable snapshot before publishing device slots."""
+        return True
+
+    def release_load_reservation(self, rid: str) -> None:
+        """Release a reservation when admission aborts before queuing a load."""
 
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -134,12 +160,21 @@ class ExternalCacheHitMarker(NamedTuple):
     prefix_key: RadixKey
     tail_hashes: list[str]
     device_hit_len: int
+    swa_host_hit_length: int
+    mamba_host_hit_length: int
 
 
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
     publish_node_ids: list[NodeId]
+
+
+class _PendingLookup(NamedTuple):
+    prefix_key: RadixKey
+    tail_hashes: list[str]
+    device_hit_len: int
+    transfers: list[PoolTransfer]
 
 
 class UnifiedCacheLinkerWrapper:
@@ -154,6 +189,10 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker = cache_linker
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # Preserve one asynchronous lookup across scheduler passes. Completed
+        # results are consumed for one admission attempt and then refreshed.
+        self.pending_lookups: dict[str, _PendingLookup] = {}
+        self.lookup_results: dict[str, ExternalCacheHitMarker | None] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA
         # completes. The anchor is the request's node before the load, so a
         # failed load can walk back exactly the chain it published.
@@ -168,9 +207,31 @@ class UnifiedCacheLinkerWrapper:
         self.taken_loads: list[tuple[list[str], bool]] = []
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        self._last_debug_log = time.monotonic()
 
         cache.tree_core.enable_external_cache_linker = True
-        cache.write_through_threshold = 1
+        write_through_threshold = (
+            envs.SGLANG_EXTERNAL_LINKER_WRITE_THROUGH_THRESHOLD.get()
+        )
+        if write_through_threshold < 1:
+            raise ValueError(
+                "SGLANG_EXTERNAL_LINKER_WRITE_THROUGH_THRESHOLD must be at least 1"
+            )
+        cache.write_through_threshold = write_through_threshold
+
+    def maybe_log_debug_stats(self) -> None:
+        now = time.monotonic()
+        if now - self._last_debug_log < 30:
+            return
+        self._last_debug_log = now
+        logger.info(
+            "External cache linker stats: pending_lookup=%d, pending_load=%d, "
+            "pending_offload=%d, backend=%s",
+            len(self.pending_lookups),
+            len(self.pending_loads),
+            len(self.pending_offloads),
+            self.cache_linker.debug_snapshot(),
+        )
 
     @property
     def layer_done_counter(self) -> object:
@@ -179,12 +240,71 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def has_pending_lookup(self, rid: str) -> bool:
+        return rid in self.pending_lookups
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
-        page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
+
+        # PP propagates PP0's absolute external boundary during request handoff.
+        # Keep that lookup synchronous until the pipeline has an async result
+        # broadcast protocol of its own.
+        if cache.pp_size > 1:
+            return self._match_pp_sync(key, req, result, device_hit_len)
+
+        rid = req.rid
+        if device_hit_len >= len(key):
+            self.pending_lookups.pop(rid, None)
+            self.lookup_results.pop(rid, None)
+            self.hit_markers.pop(rid, None)
+            return result
+        if rid in self.lookup_results:
+            cached = self.lookup_results.pop(rid)
+            return self._apply_lookup_result(req, key, result, cached)
+        if rid in self.pending_lookups:
+            return result
+
+        self.hit_markers.pop(rid, None)
+        tail_hashes = self._tail_hashes(key, result, device_hit_len)
+        if not tail_hashes:
+            return result
+
+        lookup_transfers = []
+        for component in cache._components_tuple:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, tail_hashes
+            )
+            if transfer is None:
+                return result
+            lookup_transfers.append(transfer)
+
+        pending = _PendingLookup(
+            prefix_key=key,
+            tail_hashes=tail_hashes,
+            device_hit_len=device_hit_len,
+            transfers=lookup_transfers,
+        )
+        restorable = self.cache_linker.lookup(rid, lookup_transfers)
+        if restorable is None:
+            self.pending_lookups[rid] = pending
+            return result
+
+        self._complete_lookup(rid, pending, restorable)
+        completed = self.lookup_results.pop(rid)
+        return self._apply_lookup_result(req, key, result, completed)
+
+    def _match_pp_sync(
+        self,
+        key: RadixKey,
+        req: Req,
+        result: MatchResult,
+        device_hit_len: int,
+    ) -> MatchResult:
+        cache = self.cache
+        page = cache.page_size
         self.hit_markers.pop(req.rid, None)
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
@@ -218,8 +338,16 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if known_hit_len is None:
+            restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+            if restorable is None:
+                logger.warning(
+                    "External linker returned an asynchronous PP lookup; "
+                    "falling back to the local device prefix for rid=%s",
+                    req.rid,
+                )
+                restorable = []
             hit_pages = self._sync_restorable_prefix(
-                self.cache_linker.lookup(req.rid, lookup_transfers),
+                restorable,
                 num_pages=len(tail_hashes),
                 device_hit_pages=0,
             )
@@ -244,7 +372,134 @@ class UnifiedCacheLinkerWrapper:
             prefix_key=key[: device_hit_len + hit_tokens],
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
+            swa_host_hit_length=swa_host_hit_length,
+            mamba_host_hit_length=mamba_host_hit_length,
         )
+        return result._replace(
+            last_host_node=result.best_match_node,
+            host_hit_length=hit_tokens,
+            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            mamba_host_hit_length=max(
+                result.mamba_host_hit_length, mamba_host_hit_length
+            ),
+        )
+
+    def drain_lookups(self, count: int) -> None:
+        """Publish the common prefix of completed per-rank lookup results."""
+        completed = []
+        for _ in range(count):
+            rid, restorable = self.cache_linker.pop_completed_lookup()
+            pending = self.pending_lookups.pop(rid, None)
+            if pending is not None:
+                completed.append((rid, pending, restorable))
+
+        if not completed:
+            return
+
+        offsets = [0]
+        for _, pending, _ in completed:
+            offsets.append(offsets[-1] + len(pending.tail_hashes) + 1)
+        masks = torch.zeros(offsets[-1], dtype=torch.int)
+        for row, (_, pending, restorable) in enumerate(completed):
+            num_pages = len(pending.tail_hashes)
+            for pages in restorable:
+                if 0 < pages <= num_pages:
+                    masks[offsets[row] + pages] = 1
+        self.cache._all_reduce_attn_groups(masks, torch.distributed.ReduceOp.MIN)
+
+        for row, (rid, pending, _) in enumerate(completed):
+            common = masks[offsets[row] : offsets[row + 1]].nonzero()
+            hit_pages = 0 if common.numel() == 0 else int(common[-1].item())
+            self._publish_lookup_result(rid, pending, hit_pages)
+
+    def _complete_lookup(
+        self, rid: str, pending: _PendingLookup, restorable: list[int]
+    ) -> None:
+        hit_pages = self._sync_restorable_prefix(
+            restorable,
+            num_pages=len(pending.tail_hashes),
+            device_hit_pages=0,
+        )
+        self._publish_lookup_result(rid, pending, hit_pages)
+
+    def _publish_lookup_result(
+        self, rid: str, pending: _PendingLookup, hit_pages: int
+    ) -> None:
+        if hit_pages == 0:
+            self.hit_markers.pop(rid, None)
+            self.lookup_results[rid] = None
+            return
+
+        page = self.cache.page_size
+        by_pool = {transfer.name: transfer for transfer in pending.transfers}
+        swa_transfer = by_pool.get(PoolName.SWA)
+        swa_host_hit_length = (
+            min(len(swa_transfer.keys), hit_pages) * page
+            if swa_transfer is not None
+            else 0
+        )
+        marker = ExternalCacheHitMarker(
+            prefix_key=pending.prefix_key[: pending.device_hit_len + hit_pages * page],
+            tail_hashes=list(pending.tail_hashes[:hit_pages]),
+            device_hit_len=pending.device_hit_len,
+            swa_host_hit_length=swa_host_hit_length,
+            mamba_host_hit_length=(1 if PoolName.MAMBA in by_pool else 0),
+        )
+        self.lookup_results[rid] = marker
+        self.hit_markers[rid] = marker
+
+    def _apply_lookup_result(
+        self,
+        req: Req,
+        key: RadixKey,
+        result: MatchResult,
+        marker: ExternalCacheHitMarker | None,
+    ) -> MatchResult:
+        rid = req.rid
+        if marker is None:
+            self.hit_markers.pop(rid, None)
+            return result
+
+        page = self.cache.page_size
+        device_hit_len = int(result.device_indices.numel())
+        cached_prefix_len = len(marker.prefix_key)
+        if device_hit_len >= cached_prefix_len:
+            self.hit_markers.pop(rid, None)
+            return result
+
+        # The local device prefix may advance while the remote lookup runs.
+        if marker.prefix_key.match(key, page_size=page) != cached_prefix_len:
+            self.hit_markers.pop(rid, None)
+            return self.match(key, req, result)
+        tail_hashes = self._tail_hashes(marker.prefix_key, result, device_hit_len)
+        if not tail_hashes:
+            self.hit_markers.pop(rid, None)
+            return result
+
+        lookup_transfers = []
+        for component in self.cache._components_tuple:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, tail_hashes
+            )
+            if transfer is None:
+                self.hit_markers.pop(rid, None)
+                return result
+            lookup_transfers.append(transfer)
+        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+        swa_transfer = by_pool.get(PoolName.SWA)
+        swa_host_hit_length = (
+            len(swa_transfer.keys) * page if swa_transfer is not None else 0
+        )
+        mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+
+        marker = marker._replace(
+            tail_hashes=tail_hashes,
+            device_hit_len=device_hit_len,
+            swa_host_hit_length=swa_host_hit_length,
+            mamba_host_hit_length=mamba_host_hit_length,
+        )
+        self.hit_markers[rid] = marker
+        hit_tokens = len(tail_hashes) * page
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
@@ -324,14 +579,17 @@ class UnifiedCacheLinkerWrapper:
                 return empty_indices, req.last_node
             component_transfers.append((component, transfer))
 
-        # Keys can be evicted remotely (master memory-watermark eviction)
-        # between the match-time lookup and this load-back; a stale hit would
-        # then fail the async layer-wise session fatally. Re-check existence
-        # here so the request degrades to a plain cache miss instead.
-        revalidate = getattr(self.cache_linker, "revalidate_load", None)
-        if revalidate is not None and not revalidate(
-            [transfer for _, transfer in component_transfers]
-        ):
+        # Hold every matched object from admission through the queued load.
+        # This closes the lookup/load eviction window without publishing
+        # device slots for a snapshot that can no longer be restored.
+        try:
+            reserved = self.cache_linker.reserve_load(
+                req.rid, [transfer for _, transfer in component_transfers]
+            )
+        except BaseException:
+            logger.exception("External cache load reservation failed: rid=%s", req.rid)
+            reserved = False
+        if not reserved:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
                 req,
@@ -342,12 +600,16 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        prepared_transfers = self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
-        )
+        try:
+            prepared_transfers = self._update_load(
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+        except BaseException:
+            self.cache_linker.release_load_reservation(req.rid)
+            raise
 
         if cache.pp_size > 1:
             # Load into request-owned slots. The existing PP result ring delays
@@ -357,6 +619,7 @@ class UnifiedCacheLinkerWrapper:
                     req.rid, req.last_node, prepared_transfers, anchor=req.last_node
                 )
             except BaseException:
+                self.cache_linker.release_load_reservation(req.rid)
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT,
                     req,
@@ -378,24 +641,34 @@ class UnifiedCacheLinkerWrapper:
             ),
             None,
         )
-        insert_result = cache.insert(
-            InsertParams(
-                key=hit.prefix_key,
-                value=prefix_indices,
-                mamba_value=(
-                    mamba_transfer.device_indices[:1]
-                    if mamba_transfer is not None
-                    else None
-                ),
-                prev_prefix_len=device_hit_len,
-                swa_evicted_seqlen=(
-                    req.kv.swa_evicted_seqlen if req.kv is not None else 0
-                ),
-                chunked=True,
-                priority=getattr(req, "priority", 0) or 0,
-                track_adopted_ranges=True,
+        try:
+            insert_result = cache.insert(
+                InsertParams(
+                    key=hit.prefix_key,
+                    value=prefix_indices,
+                    mamba_value=(
+                        mamba_transfer.device_indices[:1]
+                        if mamba_transfer is not None
+                        else None
+                    ),
+                    prev_prefix_len=device_hit_len,
+                    swa_evicted_seqlen=(
+                        req.kv.swa_evicted_seqlen if req.kv is not None else 0
+                    ),
+                    chunked=True,
+                    priority=getattr(req, "priority", 0) or 0,
+                    track_adopted_ranges=True,
+                )
             )
-        )
+        except BaseException:
+            self.cache_linker.release_load_reservation(req.rid)
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+            raise
         if mamba_transfer is not None and insert_result.mamba_exist:
             cache.req_to_token_pool.mamba_allocator.free(
                 mamba_transfer.device_indices[:1]
@@ -405,19 +678,27 @@ class UnifiedCacheLinkerWrapper:
             insert_result.last_device_node, req.last_node
         )
         assert canonical_tail.numel() == len(tail_hashes) * cache.page_size
-        load_transfers = self._update_load(
-            ExternalLinkerLoadPhase.COMMIT,
-            req,
-            component_transfers,
-            prefix_len,
-            insert_result=insert_result,
-            canonical_full=canonical_tail,
-        )
+        try:
+            load_transfers = self._update_load(
+                ExternalLinkerLoadPhase.COMMIT,
+                req,
+                component_transfers,
+                prefix_len,
+                insert_result=insert_result,
+                canonical_full=canonical_tail,
+            )
+        except BaseException:
+            self.cache_linker.release_load_reservation(req.rid)
+            raise
 
         anchor = req.last_node
-        self._queue_load(
-            req.rid, insert_result.last_device_node, load_transfers, anchor=anchor
-        )
+        try:
+            self._queue_load(
+                req.rid, insert_result.last_device_node, load_transfers, anchor=anchor
+            )
+        except BaseException:
+            self.cache_linker.release_load_reservation(req.rid)
+            raise
 
         node = cache.resolve_node_handle(insert_result.last_device_node)
         while node.id != anchor:
@@ -433,6 +714,9 @@ class UnifiedCacheLinkerWrapper:
         anchor: NodeId,
     ) -> None:
         if not transfers:
+            # A concurrent insert can adopt every page after reservation. No
+            # backend load will run in that case, so release the snapshot here.
+            self.cache_linker.release_load_reservation(rid)
             return
         assert rid not in self.pending_loads
         lock_params = self.cache.inc_lock_ref(node_id).to_dec_params()
@@ -688,6 +972,8 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self.pending_lookups.clear()
+        self.lookup_results.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
@@ -709,6 +995,8 @@ class UnifiedCacheLinkerWrapper:
         # failed_chains is deliberately untouched: the chain outlives the
         # request's linker state, and cache_finished_req is what frees it.
         self.hit_markers.pop(rid, None)
+        self.pending_lookups.pop(rid, None)
+        self.lookup_results.pop(rid, None)
         # Only a load that has not started can be cancelled here. One already
         # in flight keeps its pending_loads entry and its lock until
         # commit_completed_loads retires the batch, which the linkers guarantee
@@ -716,6 +1004,11 @@ class UnifiedCacheLinkerWrapper:
         if self.cache_linker.cancel_queued_load(rid):
             node_id, lock_params, _anchor = self.pending_loads.pop(rid)
             self.cache.dec_lock_ref(node_id, lock_params)
+        elif rid not in self.pending_loads:
+            # No load was handed to the worker, so this is a reservation made
+            # before a later prepare/queue failure. An in-flight load must keep
+            # its session until the worker publishes its completion.
+            self.cache_linker.release_load_reservation(rid)
 
     def close(self) -> None:
         self.cache_linker.close()

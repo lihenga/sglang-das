@@ -40,6 +40,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker.read_plan_enabled = True
         linker.tp_rank = 0
         linker.load_with_read_plan = Mock()
+        linker.stats = {"load_seconds": 0.0}
 
         success = linker.load_layer_wise(7, [])
 
