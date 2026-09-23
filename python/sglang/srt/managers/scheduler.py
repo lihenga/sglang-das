@@ -2017,6 +2017,14 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        prefetch_debug = bool(
+            getattr(
+                getattr(self.tree_cache, "linker", None),
+                "_prefetch_debug_enabled",
+                False,
+            )
+        )
+        dispatch_started = time.perf_counter() if prefetch_debug else 0.0
         if get_mm().mm_feature_transport == "cuda_vmm":
             for recv_req in recv_reqs:
                 self._materialize_cuda_vmm_inputs(recv_req)
@@ -2057,11 +2065,24 @@ class Scheduler(
         finally:
             if owns_prefetch_batch:
                 self._pending_waiting_queue_prefetch_reqs = None
+            if prefetch_debug:
+                self.tree_cache.record_waiting_queue_prefetch_debug(
+                    "scheduler.receive_dispatch",
+                    time.perf_counter() - dispatch_started,
+                    len(recv_reqs),
+                )
 
         if owns_prefetch_batch and active_prefetch_batch:
+            submit_started = time.perf_counter() if prefetch_debug else 0.0
             submitted = self.tree_cache.prefetch_external_linker_to_host_batch(
                 active_prefetch_batch
             )
+            if prefetch_debug:
+                self.tree_cache.record_waiting_queue_prefetch_debug(
+                    "scheduler.submit_batch",
+                    time.perf_counter() - submit_started,
+                    len(active_prefetch_batch),
+                )
             self._register_waiting_queue_prefetch_wave(
                 active_prefetch_batch, submitted
             )
@@ -2999,7 +3020,20 @@ class Scheduler(
             and not is_retracted
             and req.prefill_attempt_count == 0
         ):
+            prefetch_debug = bool(
+                getattr(
+                    getattr(self.tree_cache, "linker", None),
+                    "_prefetch_debug_enabled",
+                    False,
+                )
+            )
+            match_started = time.perf_counter() if prefetch_debug else 0.0
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            if prefetch_debug:
+                self.tree_cache.record_waiting_queue_prefetch_debug(
+                    "scheduler.early_match",
+                    time.perf_counter() - match_started,
+                )
             pending_prefetch_reqs = getattr(
                 self, "_pending_waiting_queue_prefetch_reqs", None
             )
@@ -3669,6 +3703,20 @@ class Scheduler(
             "mooncake_waiting_queue_dfs_prefetch_policy",
             "wait_complete",
         )
+        linker_prefetch_debug = bool(
+            getattr(
+                getattr(self.tree_cache, "linker", None),
+                "_prefetch_debug_enabled",
+                False,
+            )
+        )
+        waiting_queue_prefetch_debug = (
+            waiting_queue_prefetch_enabled and linker_prefetch_debug
+        )
+        if linker_prefetch_debug:
+            self.tree_cache.record_waiting_queue_prefetch_debug(
+                "admission.waiting_queue_size", units=len(self.waiting_queue)
+            )
         waiting_queue_prefetch_states = (
             self.tree_cache.get_waiting_queue_prefetch_admission_states(
                 [req.rid for req in self.waiting_queue],
@@ -3677,6 +3725,21 @@ class Scheduler(
             if waiting_queue_prefetch_enabled
             else None
         )
+        if waiting_queue_prefetch_debug:
+            for state in (
+                "not_tracked",
+                "queued",
+                "pending",
+                "cancelled",
+                "dfs_prefetched",
+                "no_prefetch_needed",
+                "terminal",
+            ):
+                count = waiting_queue_prefetch_states.count(state)
+                if count:
+                    self.tree_cache.record_waiting_queue_prefetch_debug(
+                        f"admission.state.{state}", units=count
+                    )
         blocked_prefetch_waves = (
             self._waiting_queue_prefetch_blocked_waves(
                 self.waiting_queue, waiting_queue_prefetch_states
@@ -3722,6 +3785,10 @@ class Scheduler(
                     # can_run_list/H2D batch boundary without delaying DFS
                     # itself or waiting for an unrelated request.
                     pending_prefetch_skipped += 1
+                    if waiting_queue_prefetch_debug:
+                        self.tree_cache.record_waiting_queue_prefetch_debug(
+                            "admission.wave_blocked"
+                        )
                     self.tree_cache.record_waiting_queue_prefetch_event(
                         "pending_skipped"
                     )
@@ -3741,6 +3808,10 @@ class Scheduler(
                     # both wait. Native work cannot be interrupted safely, so
                     # never start a competing page-wise ReadPlan read.
                     pending_prefetch_skipped += 1
+                    if waiting_queue_prefetch_debug:
+                        self.tree_cache.record_waiting_queue_prefetch_debug(
+                            "admission.pending_blocked"
+                        )
                     self.tree_cache.record_waiting_queue_prefetch_event(
                         "pending_skipped"
                     )
@@ -3768,7 +3839,13 @@ class Scheduler(
                 # speculative state and rematch via the normal external path.
                 self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
 
+            match_started = time.perf_counter() if linker_prefetch_debug else 0.0
             req.init_next_round_input(self.tree_cache)
+            if linker_prefetch_debug:
+                self.tree_cache.record_waiting_queue_prefetch_debug(
+                    "scheduler.admission_match",
+                    time.perf_counter() - match_started,
+                )
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"

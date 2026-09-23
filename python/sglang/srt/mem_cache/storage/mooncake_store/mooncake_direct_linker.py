@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -129,8 +130,9 @@ class LayerWiseLoadCounter:
 class ReadPlanLoadCounter:
     """Publish one Mooncake ReadPlan; wait for each layer without holding the GIL."""
 
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, record_wait=None):
         self.num_layers = num_layers
+        self.record_wait = record_wait
         self.producer_index = self.consumer_index = -1
         self.plans: dict[int, Future] = {}
         # Batch indices already logged: one line per failed plan, not per layer.
@@ -157,6 +159,7 @@ class ReadPlanLoadCounter:
         future = self.plans.get(index)
         if future is None:
             return
+        wait_started = time.perf_counter() if self.record_wait is not None else 0.0
         try:
             future.result().wait(threshold)
         except BaseException as error:
@@ -177,6 +180,13 @@ class ReadPlanLoadCounter:
             # layer's activations alive until the failed plan is retired.
             error.__traceback__ = None
         finally:
+            if self.record_wait is not None:
+                self.record_wait(
+                    "load.read_plan_wait_first"
+                    if threshold == 0
+                    else "load.read_plan_wait_other",
+                    time.perf_counter() - wait_started,
+                )
             if threshold == self.num_layers - 1:
                 self.plans.pop(index, None)
                 self.reported.discard(index)
@@ -233,6 +243,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         self.tp_rank = tp_rank
+        self.attn_cp_rank = params.attn_cp_rank
+        self.pp_rank = params.pp_rank
+        self.dp_rank = getattr(params, "dp_rank", None)
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
@@ -284,6 +297,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             storage_suffix,
         )
         self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
+        self.host_prefetch_debug_enabled = (
+            os.environ.get("SGLANG_MOONCAKE_PREFETCH_DEBUG", "0") == "1"
+        )
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
         )
@@ -392,7 +408,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         self.register_buffers()
         if self.read_plan_enabled:
-            self.layer_done_counter = ReadPlanLoadCounter(self.num_layers)
+            self.layer_done_counter = ReadPlanLoadCounter(
+                self.num_layers,
+                record_wait=(
+                    self.record_waiting_queue_prefetch_debug
+                    if self.host_prefetch_debug_enabled
+                    else None
+                ),
+            )
         else:
             self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
@@ -406,6 +429,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.session_sources: dict[str, str] = {}
         self.session_lock = threading.Lock()
         self.host_prefetch_lock = threading.Lock()
+        self._host_prefetch_debug_lock = threading.Lock()
+        self._host_prefetch_debug_stats: dict[str, list[float]] = {}
+        self._host_prefetch_debug_since = time.perf_counter()
         self.host_prefetch_entries: dict[str, dict[str, object]] = {}
         self.host_prefetch_generation = 0
         self.host_prefetch_queue: Queue[
@@ -413,7 +439,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = Queue()
         self.gc_frozen = False
         self.load_queue: Queue[
-            tuple[int, dict[str, list[PoolTransfer]], object] | None
+            tuple[int, dict[str, list[PoolTransfer]], object, float] | None
         ] = Queue()
         # (rids, success) per started load batch. Pushed from a finally so a
         # failed batch still releases the tree-side locks it pinned.
@@ -610,7 +636,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not request_keys:
             return True
 
+        lock_started = time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
         with self.session_lock:
+            if self.host_prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug(
+                    "session.prepare_lock_wait", time.perf_counter() - lock_started
+                )
             pending = [
                 (rid, keys)
                 for rid, keys in request_keys
@@ -641,24 +672,47 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 refresh = getattr(self.storage.store, "batch_get_session_refresh", None)
                 if existing_keys and callable(refresh):
-                    refresh_results = list(refresh(existing_keys))
+                    refresh_started = (
+                        time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+                    )
+                    try:
+                        refresh_results = list(refresh(existing_keys))
+                    finally:
+                        if self.host_prefetch_debug_enabled:
+                            self.record_waiting_queue_prefetch_debug(
+                                "session.prepare_refresh",
+                                time.perf_counter() - refresh_started,
+                                len(existing_keys),
+                            )
                     if len(refresh_results) != len(existing_keys) or any(
                         result != 0 for result in refresh_results
                     ):
                         return False
-                if new_keys and self.host_prefetch_enabled:
-                    results, sources = (
-                        self.storage.store.batch_get_session_start_with_sources(
-                            new_keys
-                        )
+                if new_keys:
+                    start_started = (
+                        time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
                     )
-                    results = list(results)
-                    sources = list(sources)
-                elif new_keys:
-                    results = list(
-                        self.storage.store.batch_get_session_start(new_keys)
-                    )
-                    sources = ["unknown"] * len(results)
+                    try:
+                        if self.host_prefetch_enabled:
+                            results, sources = (
+                                self.storage.store.batch_get_session_start_with_sources(
+                                    new_keys
+                                )
+                            )
+                            results = list(results)
+                            sources = list(sources)
+                        else:
+                            results = list(
+                                self.storage.store.batch_get_session_start(new_keys)
+                            )
+                            sources = ["unknown"] * len(results)
+                    finally:
+                        if self.host_prefetch_debug_enabled:
+                            self.record_waiting_queue_prefetch_debug(
+                                "session.prepare_start",
+                                time.perf_counter() - start_started,
+                                len(new_keys),
+                            )
                 else:
                     results = []
                     sources = []
@@ -818,18 +872,34 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             (transfer for transfer in transfers if transfer.name == PoolName.KV), None
         )
         if kv_transfer is None or not kv_transfer.keys:
+            if self.host_prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug("reject.no_kv")
             return False
+        estimate_started = (
+            time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+        )
         object_sizes = self._get_host_prefetch_object_sizes(transfers)
         if object_sizes is None:
+            if self.host_prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug("reject.size_estimate")
             return False
 
         alignment = self._mooncake_dfs_alignment()
         estimated_bytes = self._estimate_pinned_arena_capacity(
             list(object_sizes.values()), alignment
         )
+        if self.host_prefetch_debug_enabled:
+            self.record_waiting_queue_prefetch_debug(
+                "submit.estimate",
+                time.perf_counter() - estimate_started,
+                len(object_sizes),
+            )
         if not estimated_bytes or estimated_bytes > self.host_prefetch_max_bytes:
+            if self.host_prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug("reject.single_request_bytes")
             return False
 
+        reject_reason = None
         with self.host_prefetch_lock:
             active = sum(
                 entry.get("state")
@@ -847,28 +917,37 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 int(entry.get("reserved_bytes", 0))
                 for entry in self.host_prefetch_entries.values()
             )
-            if (
-                rid in self.host_prefetch_entries
-                or active >= self.host_prefetch_limit
-                or reserved_bytes + estimated_bytes > self.host_prefetch_max_bytes
-            ):
-                return False
-            self.host_prefetch_generation += 1
-            generation = self.host_prefetch_generation
-            queued_transfers = list(transfers)
-            self.host_prefetch_entries[rid] = {
-                "state": "queued",
-                "cancelled": False,
-                "transfers": queued_transfers,
-                "session_rid": self._host_prefetch_session_rid(rid, generation),
-                "object_sizes": object_sizes,
-                "reserved_bytes": estimated_bytes,
-                "queued_at": time.perf_counter(),
-            }
+            if rid in self.host_prefetch_entries:
+                reject_reason = "duplicate_rid"
+            elif active >= self.host_prefetch_limit:
+                reject_reason = "active_requests"
+            elif reserved_bytes + estimated_bytes > self.host_prefetch_max_bytes:
+                reject_reason = "active_bytes"
+            else:
+                self.host_prefetch_generation += 1
+                generation = self.host_prefetch_generation
+                queued_transfers = list(transfers)
+                self.host_prefetch_entries[rid] = {
+                    "state": "queued",
+                    "cancelled": False,
+                    "transfers": queued_transfers,
+                    "session_rid": self._host_prefetch_session_rid(rid, generation),
+                    "object_sizes": object_sizes,
+                    "reserved_bytes": estimated_bytes,
+                    "queued_at": time.perf_counter(),
+                }
+        if reject_reason is not None:
+            if self.host_prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug(f"reject.{reject_reason}")
+            return False
 
         # Session creation can contact DFS. The scheduler only publishes the
         # work item; this worker owns both preparation and the DFS read.
         self.host_prefetch_queue.put((rid, queued_transfers))
+        if self.host_prefetch_debug_enabled:
+            self.record_waiting_queue_prefetch_debug(
+                "submit.accepted_bytes", units=estimated_bytes
+            )
         self.record_waiting_queue_prefetch_event("submitted")
         self._update_host_prefetch_reservation_metrics()
         return True
@@ -894,6 +973,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             keys = list(self.prepared_load_sessions.get(session_rid, ()))
         if not keys:
             return False
+        refresh_started = (
+            time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+        )
         try:
             results = list(self.storage.store.batch_get_session_refresh(keys))
         except BaseException:
@@ -903,7 +985,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 exc_info=True,
             )
             return False
-        return len(results) == len(keys) and all(result == 0 for result in results)
+        finally:
+            if self.host_prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug(
+                    "claim.refresh",
+                    time.perf_counter() - refresh_started,
+                    len(keys),
+                )
+        valid = len(results) == len(keys) and all(
+            result == 0 for result in results
+        )
+        if self.host_prefetch_debug_enabled and not valid:
+            self.record_waiting_queue_prefetch_debug("claim.refresh_failed")
+        return valid
 
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         claim_started_at = time.perf_counter()
@@ -928,6 +1022,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._observe_host_prefetch_latency(
                 "ready", claim_started_at - float(ready_at)
             )
+            if self.host_prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug(
+                    "claim.ready_wait", claim_started_at - float(ready_at)
+                )
         self._observe_host_prefetch_latency(
             "claim", time.perf_counter() - claim_started_at
         )
@@ -980,6 +1078,72 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Failed to record waiting-queue DFS-prefetch event metric.",
                 exc_info=True,
             )
+
+    def record_waiting_queue_prefetch_debug(
+        self, stage: str, duration: float = 0.0, units: int = 0
+    ) -> None:
+        """Emit bounded per-rank timing summaries when explicitly enabled."""
+        if not self.host_prefetch_debug_enabled:
+            return
+        snapshot = None
+        now = time.perf_counter()
+        with self._host_prefetch_debug_lock:
+            stats = self._host_prefetch_debug_stats.setdefault(stage, [0, 0.0, 0.0, 0])
+            stats[0] += 1
+            elapsed_us = max(0.0, duration) * 1e6
+            stats[1] += elapsed_us
+            stats[2] = max(stats[2], elapsed_us)
+            stats[3] += units
+            if now - self._host_prefetch_debug_since >= 10.0:
+                snapshot = self._take_host_prefetch_debug_snapshot_locked(now)
+        if snapshot is not None:
+            logger.info(
+                "Mooncake prefetch debug pid=%d dp_rank=%s pp_rank=%d "
+                "cp_rank=%d tp_rank=%d %s",
+                os.getpid(),
+                self.dp_rank,
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.tp_rank,
+                snapshot,
+            )
+
+    def _take_host_prefetch_debug_snapshot_locked(self, now: float) -> str:
+        result = {
+            "window_s": round(now - self._host_prefetch_debug_since, 3),
+            "stages": {
+                stage: {
+                    "n": int(values[0]),
+                    "total_us": round(values[1]),
+                    "max_us": round(values[2]),
+                    "units": int(values[3]),
+                }
+                for stage, values in sorted(self._host_prefetch_debug_stats.items())
+            },
+        }
+        self._host_prefetch_debug_stats = {}
+        self._host_prefetch_debug_since = now
+        return json.dumps(result, sort_keys=True)
+
+    def _flush_host_prefetch_debug(self) -> None:
+        if not self.host_prefetch_debug_enabled:
+            return
+        with self._host_prefetch_debug_lock:
+            if not self._host_prefetch_debug_stats:
+                return
+            snapshot = self._take_host_prefetch_debug_snapshot_locked(
+                time.perf_counter()
+            )
+        logger.info(
+            "Mooncake prefetch debug pid=%d dp_rank=%s pp_rank=%d "
+            "cp_rank=%d tp_rank=%d %s",
+            os.getpid(),
+            self.dp_rank,
+            self.pp_rank,
+            self.attn_cp_rank,
+            self.tp_rank,
+            snapshot,
+        )
 
     def _observe_host_prefetch_latency(self, stage: str, duration: float) -> None:
         collector = getattr(self, "storage_metrics_collector", None)
@@ -1058,11 +1222,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if cancelled_before_prepare:
                     self._update_host_prefetch_reservation_metrics()
                     continue
-                self._observe_host_prefetch_latency(
-                    "queue", time.perf_counter() - queued_at
-                )
+                queue_wait = time.perf_counter() - queued_at
+                self._observe_host_prefetch_latency("queue", queue_wait)
+                if self.host_prefetch_debug_enabled:
+                    self.record_waiting_queue_prefetch_debug(
+                        "worker.queue_wait", queue_wait
+                    )
                 self._update_host_prefetch_reservation_metrics()
 
+                prepare_started = (
+                    time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+                )
                 try:
                     prepared = self.prepare_load(session_rid, transfers)
                 except BaseException:
@@ -1073,6 +1243,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         exc_info=True,
                     )
                     prepared = False
+                if self.host_prefetch_debug_enabled:
+                    self.record_waiting_queue_prefetch_debug(
+                        "worker.prepare", time.perf_counter() - prepare_started
+                    )
                 with self.session_lock:
                     keys = list(self.prepared_load_sessions.get(session_rid, ()))
                 if not prepared or not keys:
@@ -1140,6 +1314,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                     continue
 
+                dfs_started = (
+                    time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+                )
                 try:
                     results = list(
                         self.storage.store.batch_get_session_prefetch(dfs_keys)
@@ -1154,6 +1331,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         exc_info=True,
                     )
                     success = False
+                if self.host_prefetch_debug_enabled:
+                    self.record_waiting_queue_prefetch_debug(
+                        "worker.native_prefetch",
+                        time.perf_counter() - dfs_started,
+                        len(dfs_keys),
+                    )
                 self._finish_host_prefetch(
                     rid,
                     entry,
@@ -1210,6 +1393,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "ready", ready_at - float(queued_at)
             )
         self._update_host_prefetch_reservation_metrics()
+        if self.host_prefetch_debug_enabled:
+            self.record_waiting_queue_prefetch_debug(
+                "worker.outcome.cancelled" if cancelled else f"worker.outcome.{outcome}"
+            )
         if not keep_session:
             self._abort_prepared_load_now(session_rid)
 
@@ -1224,6 +1411,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             else:
                 self.session_refcounts[key] = count - 1
         if to_end:
+            end_started = (
+                time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+            )
             try:
                 self.storage.store.batch_get_session_end(to_end)
             except BaseException:
@@ -1232,9 +1422,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     len(to_end),
                     exc_info=True,
                 )
+            finally:
+                if self.host_prefetch_debug_enabled:
+                    self.record_waiting_queue_prefetch_debug(
+                        "session.end", time.perf_counter() - end_started, len(to_end)
+                    )
 
     def _abort_prepared_load_now(self, rid: str) -> None:
+        lock_started = time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
         with self.session_lock:
+            if self.host_prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug(
+                    "session.end_lock_wait", time.perf_counter() - lock_started
+                )
             keys = self.prepared_load_sessions.pop(rid, [])
             self._rollback_session_refs_locked(keys)
 
@@ -1280,7 +1480,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         counter_index = self.layer_done_counter.update_producer()
         ready_event = device_module.Event()
         ready_event.record()
-        self.load_queue.put((counter_index, pending, ready_event))
+        self.load_queue.put(
+            (counter_index, pending, ready_event, time.perf_counter())
+        )
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -1290,10 +1492,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, pending, ready_event = task
+                counter_index, pending, ready_event, queued_at = task
+                if self.host_prefetch_debug_enabled:
+                    self.record_waiting_queue_prefetch_debug(
+                        "load.queue_wait", time.perf_counter() - queued_at
+                    )
                 success = False
+                batch_started = (
+                    time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+                )
                 try:
+                    wait_started = (
+                        time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+                    )
                     ready_event.synchronize()
+                    if self.host_prefetch_debug_enabled:
+                        self.record_waiting_queue_prefetch_debug(
+                            "load.ready_event_wait", time.perf_counter() - wait_started
+                        )
                     success = self.load_layer_wise(
                         counter_index, list(pending.items())
                     )
@@ -1301,6 +1517,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
+                    if self.host_prefetch_debug_enabled:
+                        self.record_waiting_queue_prefetch_debug(
+                            "load.batch_worker",
+                            time.perf_counter() - batch_started,
+                            len(pending),
+                        )
+                        self.record_waiting_queue_prefetch_debug(
+                            "load.batch_keys",
+                            units=sum(
+                                len(transfer.keys)
+                                for transfers in pending.values()
+                                for transfer in transfers
+                            ),
+                        )
+                        if not success:
+                            self.record_waiting_queue_prefetch_debug(
+                                "load.batch_failed"
+                            )
                     self._finish_prefetch_metrics(list(pending), success is True)
                     self.completed_loads.put((list(pending), success))
             finally:
@@ -1317,12 +1551,35 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             # The range and page-wise paths below aggregate all requests in
             # this load batch, so session preparation must use the same key
             # batch instead of issuing one Master query per request.
-            if not self._prepare_expanded_load_batch(request_transfers):
+            prepare_started = (
+                time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+            )
+            try:
+                prepared = self._prepare_expanded_load_batch(request_transfers)
+            finally:
+                if self.host_prefetch_debug_enabled:
+                    self.record_waiting_queue_prefetch_debug(
+                        "load.prepare",
+                        time.perf_counter() - prepare_started,
+                        len(request_transfers),
+                    )
+            if not prepared:
                 raise RuntimeError(
                     "Mooncake get session preparation failed for load batch."
                 )
+            read_started = (
+                time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+            )
             if getattr(self, "read_plan_enabled", False):
-                self.load_with_read_plan(counter_index, request_transfers)
+                try:
+                    self.load_with_read_plan(counter_index, request_transfers)
+                finally:
+                    if self.host_prefetch_debug_enabled:
+                        self.record_waiting_queue_prefetch_debug(
+                            "load.read_plan_submit",
+                            time.perf_counter() - read_started,
+                            len(request_transfers),
+                        )
                 return True
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for _rid, transfers in request_transfers:
@@ -1341,7 +1598,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
             ):
-                self._load_page_wise(counter_index, batches, maybe_fail)
+                pagewise_started = (
+                    time.perf_counter() if self.host_prefetch_debug_enabled else 0.0
+                )
+                try:
+                    self._load_page_wise(counter_index, batches, maybe_fail)
+                finally:
+                    if self.host_prefetch_debug_enabled:
+                        self.record_waiting_queue_prefetch_debug(
+                            "load.pagewise_native",
+                            time.perf_counter() - pagewise_started,
+                            sum(len(keys) for keys, _ in batches.values()),
+                        )
                 success = True
                 return success
 
@@ -1642,6 +1910,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             except Empty:
                 break
         self.layer_done_counter.reset()
+        self._flush_host_prefetch_debug()
 
     def close(self) -> None:
         self.reset()

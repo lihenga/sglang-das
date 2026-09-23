@@ -552,6 +552,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self.linker.record_waiting_queue_prefetch_event(event)
 
+    def record_waiting_queue_prefetch_debug(
+        self, stage: str, duration: float = 0.0, units: int = 0
+    ) -> None:
+        if self.linker is not None:
+            self.linker.record_waiting_queue_prefetch_debug(stage, duration, units)
+
     def get_waiting_queue_prefetch_admission_states(
         self, rids: Sequence[str], *, cancel_queued: bool = False
     ) -> list[str]:
@@ -564,6 +570,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         if not rids:
             return []
+
+        debug = self.linker is not None and self.linker._prefetch_debug_enabled
+        scan_started = time.perf_counter() if debug else 0.0
 
         state_names = (
             "not_tracked",
@@ -587,7 +596,18 @@ class UnifiedRadixCache(BasePrefixCache):
             state_index = state_to_index.get(local_state)
             if state_index is not None:
                 counts[row, state_index] = 1
+        if debug:
+            self.linker.record_waiting_queue_prefetch_debug(
+                "admission.scan", time.perf_counter() - scan_started, len(rids)
+            )
+            reduce_started = time.perf_counter()
         self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
+        if debug:
+            self.linker.record_waiting_queue_prefetch_debug(
+                "admission.state_reduce",
+                time.perf_counter() - reduce_started,
+                len(rids),
+            )
 
         states = []
         for row in counts:

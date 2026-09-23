@@ -19,6 +19,7 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
@@ -107,6 +108,11 @@ class UnifiedCacheLinker(ABC):
     def record_waiting_queue_prefetch_event(self, event: str) -> None:
         """Record a low-cardinality waiting-queue prefetch event."""
 
+    def record_waiting_queue_prefetch_debug(
+        self, stage: str, duration: float = 0.0, units: int = 0
+    ) -> None:
+        """Record an opt-in per-rank diagnostic sample."""
+
     def abort_prepared_load(self, rid: str) -> None:
         """Release a session claimed by the normal load path."""
 
@@ -183,6 +189,9 @@ class UnifiedCacheLinkerWrapper:
     ):
         self.cache = cache
         self.cache_linker = cache_linker
+        self._prefetch_debug_enabled = bool(
+            getattr(cache_linker, "host_prefetch_debug_enabled", False)
+        )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Waiting-queue prefetches retain the original hit until admission can
@@ -247,6 +256,14 @@ class UnifiedCacheLinkerWrapper:
         if recorder is not None:
             recorder(event)
 
+    def record_waiting_queue_prefetch_debug(
+        self, stage: str, duration: float = 0.0, units: int = 0
+    ) -> None:
+        if self._prefetch_debug_enabled:
+            self.cache_linker.record_waiting_queue_prefetch_debug(
+                stage, duration, units
+            )
+
     def prefetch_to_host(self, req: Req) -> bool:
         return self.prefetch_to_host_batch((req,))[0]
 
@@ -254,6 +271,8 @@ class UnifiedCacheLinkerWrapper:
         if not reqs:
             return []
 
+        debug = self._prefetch_debug_enabled
+        started = time.perf_counter() if debug else 0.0
         hits = []
         transfers_by_req = []
         eligible = torch.zeros(len(reqs), dtype=torch.int)
@@ -277,11 +296,31 @@ class UnifiedCacheLinkerWrapper:
             transfers_by_req.append(transfers)
             eligible[index] = int(locally_eligible)
 
+        if debug:
+            self.record_waiting_queue_prefetch_debug(
+                "submit.build_transfers", time.perf_counter() - started, len(reqs)
+            )
+            reduce_started = time.perf_counter()
         self.cache._all_reduce_attn_groups(eligible, torch.distributed.ReduceOp.MIN)
+        if debug:
+            self.record_waiting_queue_prefetch_debug(
+                "submit.eligibility_reduce",
+                time.perf_counter() - reduce_started,
+                len(reqs),
+            )
         globally_eligible = [bool(int(value)) for value in eligible]
+        if debug:
+            self.record_waiting_queue_prefetch_debug(
+                "submit.eligible_requests", units=sum(globally_eligible)
+            )
         if not any(globally_eligible):
+            if debug:
+                self.record_waiting_queue_prefetch_debug(
+                    "submit.none_eligible", units=len(reqs)
+                )
             return [False] * len(reqs)
 
+        submit_started = time.perf_counter() if debug else 0.0
         submitted = torch.zeros(len(reqs), dtype=torch.int)
         for index, req in enumerate(reqs):
             if not globally_eligible[index]:
@@ -295,10 +334,25 @@ class UnifiedCacheLinkerWrapper:
             except BaseException:
                 submitted[index] = 0
 
+        if debug:
+            self.record_waiting_queue_prefetch_debug(
+                "submit.backend", time.perf_counter() - submit_started, len(reqs)
+            )
+            reduce_started = time.perf_counter()
         self.cache._all_reduce_attn_groups(
             submitted, torch.distributed.ReduceOp.MIN
         )
+        if debug:
+            self.record_waiting_queue_prefetch_debug(
+                "submit.submitted_reduce",
+                time.perf_counter() - reduce_started,
+                len(reqs),
+            )
         globally_submitted = [bool(int(value)) for value in submitted]
+        if debug:
+            self.record_waiting_queue_prefetch_debug(
+                "submit.accepted_requests", units=sum(globally_submitted)
+            )
         for index, req in enumerate(reqs):
             if not globally_eligible[index]:
                 continue
@@ -394,11 +448,26 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if known_hit_len is None:
+            lookup_started = time.perf_counter() if self._prefetch_debug_enabled else 0.0
+            restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+            if self._prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug(
+                    "match.remote_lookup",
+                    time.perf_counter() - lookup_started,
+                    len(tail_hashes),
+                )
+            sync_started = time.perf_counter() if self._prefetch_debug_enabled else 0.0
             hit_pages = self._sync_restorable_prefix(
-                self.cache_linker.lookup(req.rid, lookup_transfers),
+                restorable,
                 num_pages=len(tail_hashes),
                 device_hit_pages=0,
             )
+            if self._prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug(
+                    "match.prefix_reduce",
+                    time.perf_counter() - sync_started,
+                    len(tail_hashes),
+                )
             if cache.pp_size > 1:
                 req.external_cache_hit_length = device_hit_len + hit_pages * page
         else:
@@ -527,10 +596,19 @@ class UnifiedCacheLinkerWrapper:
                 ],
                 dtype=torch.int,
             )
+            reduce_started = (
+                time.perf_counter() if self._prefetch_debug_enabled else 0.0
+            )
             cache._all_reduce_attn_groups(
                 verdicts, torch.distributed.ReduceOp.MIN
             )
+            if self._prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug(
+                    "claim.verdict_reduce", time.perf_counter() - reduce_started
+                )
             if int(verdicts.min().item()) == 0:
+                if self._prefetch_debug_enabled:
+                    self.record_waiting_queue_prefetch_debug("claim.fallback")
                 # cancel_host_prefetch also rolls a locally claimed session
                 # back when another rank fails the claim.
                 self.cache_linker.cancel_host_prefetch(req.rid)
@@ -572,11 +650,25 @@ class UnifiedCacheLinkerWrapper:
         # then fail the async layer-wise session fatally. Re-check existence
         # here so the request degrades to a plain cache miss instead.
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
-        if (
-            not prepared_from_host_prefetch
-            and revalidate is not None
-            and not revalidate([transfer for _, transfer in component_transfers])
-        ):
+        revalidated = True
+        if not prepared_from_host_prefetch and revalidate is not None:
+            revalidate_started = (
+                time.perf_counter() if self._prefetch_debug_enabled else 0.0
+            )
+            try:
+                revalidated = revalidate(
+                    [transfer for _, transfer in component_transfers]
+                )
+            finally:
+                if self._prefetch_debug_enabled:
+                    self.record_waiting_queue_prefetch_debug(
+                        "load.revalidate",
+                        time.perf_counter() - revalidate_started,
+                        len(tail_hashes),
+                    )
+        if not revalidated:
+            if self._prefetch_debug_enabled:
+                self.record_waiting_queue_prefetch_debug("load.revalidate_failed")
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
                 req,
