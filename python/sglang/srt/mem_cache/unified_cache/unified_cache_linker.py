@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+import threading
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -160,6 +161,16 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+class PreparedHostPrefetch(NamedTuple):
+    """Immutable request-local work for the scheduler's background prefetch round."""
+
+    rid: str
+    locally_eligible: bool
+    transfers: tuple[PoolTransfer, ...]
+    cache_linker: UnifiedCacheLinker
+    cancelled: threading.Event
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -181,6 +192,12 @@ class UnifiedCacheLinkerWrapper:
         # Waiting-queue prefetches retain the original hit until admission can
         # rematch it. The backend owns the private session and readiness state.
         self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] = {}
+        # Submission work is prepared and committed only by the scheduler
+        # thread. The background worker receives a snapshot and never touches
+        # this dict or the cache tree.
+        self.pending_host_prefetch_submissions: dict[
+            str, tuple[PreparedHostPrefetch, ExternalCacheHitMarker]
+        ] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA
         # completes. The anchor is the request's node before the load, so a
         # failed load can walk back exactly the chain it published.
@@ -207,6 +224,8 @@ class UnifiedCacheLinkerWrapper:
         return rid in self.hit_markers
 
     def get_host_prefetch_admission_state(self, rid: str) -> str:
+        if rid in self.pending_host_prefetch_submissions:
+            return "pending"
         tracked = rid in self.host_prefetch_hits
         status = self.cache_linker.get_host_prefetch_status(rid)
         if status in {"queued", "preparing", "reading"}:
@@ -222,7 +241,70 @@ class UnifiedCacheLinkerWrapper:
     def cancel_waiting_queue_prefetch(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
         self.host_prefetch_hits.pop(rid, None)
+        pending = self.pending_host_prefetch_submissions.pop(rid, None)
+        if pending is not None:
+            pending[0].cancelled.set()
         self.cache_linker.cancel_host_prefetch(rid)
+
+    def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
+        """Build a request-local snapshot without issuing any collectives."""
+        hit = self.hit_markers.get(req.rid)
+        transfers = []
+        locally_eligible = hit is not None
+        if hit is not None:
+            try:
+                for component in self.cache._components_tuple:
+                    transfer = component.build_external_linker_transfer(
+                        LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+                    )
+                    if transfer is None:
+                        locally_eligible = False
+                        break
+                    # LOOKUP transfers are CPU metadata only. Copy their
+                    # mutable key lists so the worker owns its snapshot.
+                    transfers.append(
+                        PoolTransfer(
+                            name=transfer.name,
+                            host_indices=transfer.host_indices,
+                            device_indices=transfer.device_indices,
+                            keys=(list(transfer.keys) if transfer.keys is not None else None),
+                            hit_policy=transfer.hit_policy,
+                            nodes_to_load=transfer.nodes_to_load,
+                            indices_from_pool=transfer.indices_from_pool,
+                        )
+                    )
+            except Exception:
+                locally_eligible = False
+
+        job = PreparedHostPrefetch(
+            rid=req.rid,
+            locally_eligible=locally_eligible,
+            transfers=tuple(transfers),
+            cache_linker=self.cache_linker,
+            cancelled=threading.Event(),
+        )
+        if hit is not None:
+            self.pending_host_prefetch_submissions[req.rid] = (job, hit)
+        return job
+
+    def complete_host_prefetch_submission(
+        self, job: PreparedHostPrefetch, submitted: bool
+    ) -> bool:
+        """Commit a background result if this is still the live request."""
+        pending = self.pending_host_prefetch_submissions.get(job.rid)
+        if pending is None or pending[0] is not job:
+            if submitted:
+                job.cache_linker.cancel_host_prefetch(job.rid)
+            return False
+
+        del self.pending_host_prefetch_submissions[job.rid]
+        hit = pending[1]
+        if submitted and not job.cancelled.is_set():
+            self.host_prefetch_hits[job.rid] = hit
+            return True
+        if submitted:
+            job.cache_linker.cancel_host_prefetch(job.rid)
+        return False
 
     def prefetch_to_host(self, req: Req) -> bool:
         hit = self.hit_markers.get(req.rid)
@@ -868,6 +950,9 @@ class UnifiedCacheLinkerWrapper:
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        for job, _hit in self.pending_host_prefetch_submissions.values():
+            job.cancelled.set()
+        self.pending_host_prefetch_submissions.clear()
         self.cache_linker.reset()
         self.hit_markers.clear()
         self.host_prefetch_hits.clear()
@@ -892,8 +977,7 @@ class UnifiedCacheLinkerWrapper:
         # failed_chains is deliberately untouched: the chain outlives the
         # request's linker state, and cache_finished_req is what frees it.
         self.hit_markers.pop(rid, None)
-        self.host_prefetch_hits.pop(rid, None)
-        self.cache_linker.cancel_host_prefetch(rid)
+        self.cancel_waiting_queue_prefetch(rid)
         # Only a load that has not started can be cancelled here. One already
         # in flight keeps its pending_loads entry and its lock until
         # commit_completed_loads retires the batch, which the linkers guarantee
