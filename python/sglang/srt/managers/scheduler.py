@@ -20,8 +20,10 @@ import dataclasses
 import faulthandler
 import logging
 import os
+import queue
 import signal
 import sys
+import threading
 import time
 from array import array
 from collections import deque
@@ -1413,6 +1415,16 @@ class Scheduler(
             and self.schedule_policy == "fcfs"
             and self.ps.pp_size == 1
         )
+        if self.enable_waiting_queue_dfs_prefetch:
+            self._waiting_queue_prefetch_jobs = queue.Queue()
+            self._waiting_queue_prefetch_acks = queue.Queue()
+            self._waiting_queue_prefetch_stop = threading.Event()
+            self._waiting_queue_prefetch_worker = threading.Thread(
+                target=self._waiting_queue_prefetch_worker_loop,
+                name=f"waiting-queue-prefetch-{self.ps.tp_rank}",
+                daemon=True,
+            )
+            self._waiting_queue_prefetch_worker.start()
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
         # method — the PrefillBootstrapQueue's KVManager below registers to it
@@ -1802,6 +1814,7 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        self._stop_waiting_queue_prefetch_worker()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -2892,6 +2905,92 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
+    def _waiting_queue_prefetch_worker_loop(self) -> None:
+        """Submit immutable local prefetch snapshots without scheduler collectives."""
+        while True:
+            job = self._waiting_queue_prefetch_jobs.get()
+            if job is None:
+                return
+
+            submitted = False
+            error = None
+            if (
+                job.locally_eligible
+                and not job.cancelled.is_set()
+                and not self._waiting_queue_prefetch_stop.is_set()
+            ):
+                try:
+                    submitted = job.cache_linker.submit_host_prefetch(
+                        job.rid, list(job.transfers)
+                    )
+                except BaseException as exc:
+                    error = exc
+            self._waiting_queue_prefetch_acks.put((job, submitted, error))
+
+    def _drain_waiting_queue_prefetch_acks(self) -> None:
+        """Commit local submit results on the scheduler thread before admission."""
+        while True:
+            try:
+                job, submitted, error = self._waiting_queue_prefetch_acks.get_nowait()
+            except queue.Empty:
+                return
+
+            if error is not None:
+                logger.error(
+                    "Failed to submit local waiting-queue DFS prefetch for rid=%s",
+                    job.rid,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                try:
+                    job.cache_linker.cancel_host_prefetch(job.rid)
+                except BaseException:
+                    logger.exception(
+                        "Failed to clean up local waiting-queue DFS prefetch for rid=%s",
+                        job.rid,
+                    )
+
+            try:
+                self.tree_cache.complete_external_linker_prefetch(job, submitted)
+            except BaseException:
+                logger.exception(
+                    "Failed to record local waiting-queue DFS prefetch for rid=%s",
+                    job.rid,
+                )
+                try:
+                    job.cache_linker.cancel_host_prefetch(job.rid)
+                except BaseException:
+                    logger.exception(
+                        "Failed to clean up local waiting-queue DFS prefetch for rid=%s",
+                        job.rid,
+                    )
+
+    def _stop_waiting_queue_prefetch_worker(self) -> None:
+        worker = getattr(self, "_waiting_queue_prefetch_worker", None)
+        if worker is None:
+            return
+
+        self._waiting_queue_prefetch_stop.set()
+        while True:
+            try:
+                job = self._waiting_queue_prefetch_jobs.get_nowait()
+            except queue.Empty:
+                break
+            if job is None:
+                continue
+            job.cancelled.set()
+            try:
+                self.tree_cache.complete_external_linker_prefetch(job, False)
+            except BaseException:
+                logger.exception(
+                    "Failed to retire queued waiting-queue DFS prefetch for rid=%s",
+                    job.rid,
+                )
+
+        self._waiting_queue_prefetch_jobs.put(None)
+        worker.join()
+        self._drain_waiting_queue_prefetch_acks()
+        self._waiting_queue_prefetch_worker = None
+
     def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
         if (
             self.enable_waiting_queue_dfs_prefetch
@@ -2901,25 +3000,10 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             job = self.tree_cache.prepare_external_linker_prefetch(req)
             if job is not None:
-                submitted = False
                 if job.locally_eligible and not job.cancelled.is_set():
-                    try:
-                        submitted = job.cache_linker.submit_host_prefetch(
-                            req.rid, list(job.transfers)
-                        )
-                    except BaseException:
-                        try:
-                            job.cache_linker.cancel_host_prefetch(req.rid)
-                        except BaseException:
-                            logger.exception(
-                                "Failed to clean up local waiting-queue DFS prefetch for rid=%s",
-                                req.rid,
-                            )
-                        logger.exception(
-                            "Failed to submit local waiting-queue DFS prefetch for rid=%s",
-                            req.rid,
-                        )
-                self.tree_cache.complete_external_linker_prefetch(job, submitted)
+                    self._waiting_queue_prefetch_jobs.put(job)
+                else:
+                    self.tree_cache.complete_external_linker_prefetch(job, False)
 
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -3465,6 +3549,7 @@ class Scheduler(
 
         waiting_queue_prefetch_states = {}
         if self.enable_waiting_queue_dfs_prefetch:
+            self._drain_waiting_queue_prefetch_acks()
             waiting_queue_prefetch_states = (
                 self.tree_cache.get_waiting_queue_prefetch_admission_states(
                     [req.rid for req in self.waiting_queue]
