@@ -1937,6 +1937,14 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _process_deferred_reqs(self):
+        if self._forward_deferred_reqs:
+            deferred_reqs, self._forward_deferred_reqs = (
+                self._forward_deferred_reqs,
+                [],
+            )
+            self.process_input_requests(deferred_reqs)
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1944,12 +1952,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            if self._forward_deferred_reqs:
-                deferred_reqs, self._forward_deferred_reqs = (
-                    self._forward_deferred_reqs,
-                    [],
-                )
-                self.process_input_requests(deferred_reqs)
+            self._process_deferred_reqs()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
