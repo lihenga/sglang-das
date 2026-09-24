@@ -20,11 +20,9 @@ import dataclasses
 import faulthandler
 import logging
 import os
-import queue
 import signal
 import sys
 import time
-import threading
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
@@ -106,10 +104,7 @@ from sglang.srt.disaggregation.utils import (
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import (
-    create_custom_parallel_group,
-    get_tp_group,
-)
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -406,11 +401,6 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
-    # A snapshot may arrive after another rank drained its queue. Keep it
-    # pending briefly for the matching snapshot, then retire it to the normal
-    # admission path instead of holding a request forever.
-    BG_PREFETCH_JOIN_GRACE_EPOCHS = 4
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -457,21 +447,6 @@ class Scheduler(
         self.enable_overlap_mlx = (
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
-        # The worker consumes immutable linker-prefetch snapshots. Per-iteration
-        # rounds keep every CP/TP participant in the same collective sequence,
-        # including rounds with no local jobs.
-        self._bg_prefetch_jobs: queue.Queue = queue.Queue()
-        self._bg_prefetch_acks: queue.Queue = queue.Queue()
-        self._bg_pending_prefetch_jobs = {}
-        self._bg_prefetch_join_age = {}
-        self._bg_condition = threading.Condition()
-        self._bg_requested_epoch = 0
-        self._bg_completed_epoch = 0
-        self._bg_error: Optional[BaseException] = None
-        self._bg_stop_flag = False
-        self._bg_thread = threading.Thread(target=self._bg_worker_loop, daemon=True)
-        self._bg_thread.start()
-
         self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
@@ -1438,25 +1413,6 @@ class Scheduler(
             and self.schedule_policy == "fcfs"
             and self.ps.pp_size == 1
         )
-        self._bg_attn_cp_cpu_group = None
-        self._bg_attn_tp_cpu_group = None
-        if self.enable_waiting_queue_dfs_prefetch:
-            # Every rank runs these two helpers in the same order. The helper
-            # gathers each rank's local subgroup membership on the default
-            # group, then creates all subgroups in a deterministic order.
-            # Runtime prefetch collectives use only these duplicate Gloo PGs.
-            for attr_name, group in (
-                ("_bg_attn_cp_cpu_group", self.attn_cp_cpu_group),
-                ("_bg_attn_tp_cpu_group", self.attn_tp_cpu_group),
-            ):
-                if torch.distributed.get_world_size(group=group) > 1:
-                    ranks = torch.distributed.get_process_group_ranks(group)
-                    setattr(
-                        self,
-                        attr_name,
-                        create_custom_parallel_group(ranks, backend="gloo"),
-                    )
-
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
         # method — the PrefillBootstrapQueue's KVManager below registers to it
@@ -2062,159 +2018,6 @@ class Scheduler(
         """
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
-
-    def _bg_worker_loop(self):
-        """Execute one deterministic external-prefetch round per scheduler step."""
-        while True:
-            with self._bg_condition:
-                self._bg_condition.wait_for(
-                    lambda: self._bg_stop_flag
-                    or self._bg_completed_epoch < self._bg_requested_epoch
-                )
-                if self._bg_stop_flag:
-                    return
-                epoch = self._bg_completed_epoch + 1
-
-            try:
-                if self.enable_waiting_queue_dfs_prefetch:
-                    self._run_bg_prefetch_round()
-            except BaseException as exc:
-                self._bg_error = exc
-                logger.exception("Background DFS prefetch round failed")
-                with self._bg_condition:
-                    self._bg_stop_flag = True
-                    self._bg_completed_epoch = epoch
-                    self._bg_condition.notify_all()
-                return
-
-            with self._bg_condition:
-                self._bg_completed_epoch = epoch
-                self._bg_condition.notify_all()
-
-    def _run_bg_prefetch_round(self) -> None:
-        """Run one CP/TP-ordered round over retained immutable job snapshots."""
-        while True:
-            try:
-                job = self._bg_prefetch_jobs.get_nowait()
-            except queue.Empty:
-                break
-            self._bg_pending_prefetch_jobs.setdefault(job.rid, job)
-
-        local_status = {
-            rid: (job.locally_eligible, job.cancelled.is_set())
-            for rid, job in self._bg_pending_prefetch_jobs.items()
-        }
-        rank_statuses = {torch.distributed.get_rank(): local_status}
-        # First propagate a fixed-width presence flag. Empty rounds can skip
-        # object serialization, while CP then TP reductions make the decision
-        # identical for every participant in the 2-D attention topology.
-        has_jobs = torch.tensor([int(bool(local_status))], dtype=torch.int)
-        self._all_reduce_bg_prefetch_groups(
-            has_jobs, op=torch.distributed.ReduceOp.MAX
-        )
-        if int(has_jobs.item()) == 0:
-            self._bg_prefetch_join_age.clear()
-            return
-
-        # Gathering per-rank snapshots lets every participant distinguish an
-        # ineligible request from one whose snapshot has not arrived yet.
-        for group in (self._bg_attn_cp_cpu_group, self._bg_attn_tp_cpu_group):
-            if group is None:
-                continue
-            gathered = [None] * torch.distributed.get_world_size(group=group)
-            torch.distributed.all_gather_object(gathered, rank_statuses, group=group)
-            merged_statuses = {}
-            for subgroup_statuses in gathered:
-                merged_statuses.update(subgroup_statuses)
-            rank_statuses = {
-                rank: merged_statuses[rank] for rank in sorted(merged_statuses)
-            }
-
-        all_rids = sorted(
-            {rid for statuses in rank_statuses.values() for rid in statuses}
-        )
-        for rid in all_rids:
-            self._bg_prefetch_join_age[rid] = (
-                self._bg_prefetch_join_age.get(rid, 0) + 1
-            )
-
-        for rid in all_rids:
-            rid_statuses = [statuses.get(rid) for statuses in rank_statuses.values()]
-            job = self._bg_pending_prefetch_jobs.get(rid)
-
-            # Any participant cancelling the request retires all retained
-            # snapshots immediately, including ranks that never saw a job.
-            if any(status is not None and status[1] for status in rid_statuses):
-                self._finish_bg_prefetch_job(rid, False)
-                continue
-
-            all_ranks_have_job = all(status is not None for status in rid_statuses)
-            if not all_ranks_have_job:
-                if self._bg_prefetch_join_age[rid] >= self.BG_PREFETCH_JOIN_GRACE_EPOCHS:
-                    self._finish_bg_prefetch_job(rid, False)
-                continue
-
-            if not all(status[0] for status in rid_statuses):
-                self._finish_bg_prefetch_job(rid, False)
-                continue
-
-            # The gathered snapshot guarantees every participant has an
-            # eligible job. Submit is local and may fail independently; every
-            # rank still enters the fixed-width result reduction.
-            assert job is not None
-            try:
-                submitted = job.cache_linker.submit_host_prefetch(
-                    rid, list(job.transfers)
-                )
-            except BaseException:
-                submitted = False
-            submitted = submitted and not job.cancelled.is_set()
-            globally_submitted = torch.tensor([int(submitted)], dtype=torch.int)
-            self._all_reduce_bg_prefetch_groups(globally_submitted)
-            submitted = int(globally_submitted.item()) == 1
-            if not submitted:
-                job.cache_linker.cancel_host_prefetch(rid)
-            self._finish_bg_prefetch_job(rid, submitted)
-
-        for rid in tuple(self._bg_prefetch_join_age):
-            if rid not in all_rids:
-                self._bg_prefetch_join_age.pop(rid, None)
-
-    def _finish_bg_prefetch_job(self, rid: str, submitted: bool) -> None:
-        job = self._bg_pending_prefetch_jobs.pop(rid, None)
-        self._bg_prefetch_join_age.pop(rid, None)
-        if job is not None:
-            self._bg_prefetch_acks.put((job, submitted))
-
-    def _all_reduce_bg_prefetch_groups(
-        self,
-        tensor: torch.Tensor,
-        op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.MIN,
-    ) -> None:
-        for group in (self._bg_attn_cp_cpu_group, self._bg_attn_tp_cpu_group):
-            if group is not None:
-                torch.distributed.all_reduce(tensor, op=op, group=group)
-
-    def _request_bg_prefetch_epoch(self) -> None:
-        if not self.enable_waiting_queue_dfs_prefetch:
-            return
-        if self._bg_error is not None:
-            raise RuntimeError("Background DFS prefetch is unusable") from self._bg_error
-        with self._bg_condition:
-            self._bg_requested_epoch += 1
-            self._bg_condition.notify()
-
-    def _drain_bg_prefetch_acks(self) -> None:
-        while True:
-            try:
-                job, submitted = self._bg_prefetch_acks.get_nowait()
-            except queue.Empty:
-                return
-            self.tree_cache.complete_external_linker_prefetch(job, submitted)
-
-    def _begin_scheduler_iteration(self) -> None:
-        self._drain_bg_prefetch_acks()
-        self._request_bg_prefetch_epoch()
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -3098,7 +2901,25 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             job = self.tree_cache.prepare_external_linker_prefetch(req)
             if job is not None:
-                self._bg_prefetch_jobs.put(job)
+                submitted = False
+                if job.locally_eligible and not job.cancelled.is_set():
+                    try:
+                        submitted = job.cache_linker.submit_host_prefetch(
+                            req.rid, list(job.transfers)
+                        )
+                    except BaseException:
+                        try:
+                            job.cache_linker.cancel_host_prefetch(req.rid)
+                        except BaseException:
+                            logger.exception(
+                                "Failed to clean up local waiting-queue DFS prefetch for rid=%s",
+                                req.rid,
+                            )
+                        logger.exception(
+                            "Failed to submit local waiting-queue DFS prefetch for rid=%s",
+                            req.rid,
+                        )
+                self.tree_cache.complete_external_linker_prefetch(job, submitted)
 
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -3455,7 +3276,6 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        self._begin_scheduler_iteration()
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:

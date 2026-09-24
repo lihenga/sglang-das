@@ -1,13 +1,10 @@
-"""Collective-order regression coverage for waiting-queue DFS prefetch."""
+"""Waiting-queue DFS prefetch submission and admission coverage."""
 
-import os
-import queue
 import socket
 import threading
-import time
 import unittest
+from unittest import mock
 
-import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -16,42 +13,97 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     PreparedHostPrefetch,
+    UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
 
 class _FakeLinker:
-    def __init__(self):
+    def __init__(self, *, fail_after_queue=False):
+        self.fail_after_queue = fail_after_queue
         self.submissions = []
         self.cancelled = []
+        self.statuses = {}
+        self.submit_thread_id = None
 
     def submit_host_prefetch(self, rid, transfers):
-        self.submissions.append(rid)
+        self.submissions.append((rid, transfers))
+        self.submit_thread_id = threading.get_ident()
+        self.statuses[rid] = "queued"
+        if self.fail_after_queue:
+            raise RuntimeError("submit failed after queueing")
         return True
+
+    def get_host_prefetch_status(self, rid):
+        return self.statuses.get(rid)
 
     def cancel_host_prefetch(self, rid):
         self.cancelled.append(rid)
+        self.statuses.pop(rid, None)
+
+
+class _FakeTreeCache:
+    def __init__(self, wrapper, job):
+        self.wrapper = wrapper
+        self.job = job
+        self.prepared = []
+        self.completed = []
+
+    def prepare_external_linker_prefetch(self, req):
+        self.prepared.append(req.rid)
+        return self.job
+
+    def complete_external_linker_prefetch(self, job, submitted):
+        self.completed.append((job.rid, submitted))
+        return self.wrapper.complete_host_prefetch_submission(job, submitted)
 
 
 class _FakeAdmissionLinker:
-    def __init__(self, rank):
+    def __init__(self, rank, world_size):
         self.rank = rank
+        self.world_size = world_size
 
     def get_host_prefetch_admission_state(self, rid):
-        states = {
-            0: {"a": "pending", "b": "terminal"},
-            1: {"a": "dfs_prefetched"},
-        }
-        return states[0 if self.rank == 0 else 1].get(rid, "not_tracked")
+        if rid == "complete":
+            return "dfs_prefetched"
+        if rid == "pending":
+            return "pending" if self.rank == 0 else "dfs_prefetched"
+        if rid == "missing":
+            return (
+                "not_tracked"
+                if self.rank == self.world_size - 1
+                else "dfs_prefetched"
+            )
+        if rid == "failed":
+            return "terminal" if self.rank == self.world_size - 1 else "dfs_prefetched"
+        return "not_tracked"
 
 
-def _distributed_round_worker(rank, world_size, port):
+def _assert_rank_wide_admission_states(rank, world_size, group):
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.attn_cp_group = group
+    cache.attn_tp_group = None
+    cache.tp_world_size = world_size
+    cache.tp_group = group
+    cache.linker = _FakeAdmissionLinker(rank, world_size)
+
+    scenarios = (
+        ("complete", ["complete"], "dfs_prefetched"),
+        ("pending", ["pending"], "pending"),
+        ("missing", ["missing"] if rank == 0 else [], "terminal"),
+        ("failed", ["failed"], "terminal"),
+    )
+    for rid, local_rids, expected in scenarios:
+        states = cache.get_waiting_queue_prefetch_admission_states(local_rids)
+        assert states == {rid: expected}, (world_size, rank, rid, states)
+
+
+def _admission_worker(rank, world_size, port):
     dist.init_process_group(
         backend="gloo",
         init_method=f"tcp://127.0.0.1:{port}",
@@ -59,187 +111,107 @@ def _distributed_round_worker(rank, world_size, port):
         world_size=world_size,
     )
     try:
-        ranks = list(range(world_size))
-        main_group = dist.new_group(ranks=ranks, backend="gloo")
-        bg_cp_group = create_custom_parallel_group(ranks, backend="gloo")
-        bg_tp_group = create_custom_parallel_group(ranks, backend="gloo")
-
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler._bg_prefetch_jobs = queue.Queue()
-        scheduler._bg_prefetch_acks = queue.Queue()
-        scheduler._bg_pending_prefetch_jobs = {}
-        scheduler._bg_prefetch_join_age = {}
-        scheduler._bg_attn_cp_cpu_group = bg_cp_group
-        scheduler._bg_attn_tp_cpu_group = bg_tp_group
-
-        linker = _FakeLinker()
-
-        def enqueue_job(rid):
-            job = PreparedHostPrefetch(
-                rid=rid,
-                locally_eligible=True,
-                transfers=(),
-                cache_linker=linker,
-                cancelled=threading.Event(),
-            )
-            scheduler._bg_prefetch_jobs.put(job)
-            return job
-
-        jobs = {}
-        local_jobs = ["a", "b", "c", "d"] if rank == 0 else ["a"]
-        for rid in local_jobs:
-            job = enqueue_job(rid)
-            jobs[rid] = job
-
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.attn_cp_group = main_group
-        cache.attn_tp_group = None
-        cache.tp_world_size = world_size
-        cache.tp_group = main_group
-        cache.linker = _FakeAdmissionLinker(rank)
-
-        start = threading.Barrier(2)
-        bg_errors = []
-
-        def run_background_round():
-            try:
-                start.wait()
-                if rank == 0:
-                    time.sleep(0.15)
-                scheduler._run_bg_prefetch_round()
-            except BaseException as exc:
-                bg_errors.append(exc)
-
-        bg_thread = threading.Thread(target=run_background_round)
-        bg_thread.start()
-        start.wait()
-        if rank != 0:
-            time.sleep(0.15)
-
-        # This scheduler-thread collective intentionally races the background
-        # protocol, but uses the original PG. Rank 0 enters it first while
-        # rank 1 enters the background protocol first.
-        states = cache.get_waiting_queue_prefetch_admission_states(
-            ["a", "b"] if rank == 0 else ["a"]
-        )
-        bg_thread.join(timeout=10)
-        assert not bg_thread.is_alive(), "background prefetch round did not finish"
-        assert not bg_errors, f"background prefetch failed: {bg_errors}"
-        assert states == {"a": "pending", "b": "terminal"}
-
-        acknowledgements = {}
-        while True:
-            try:
-                job, submitted = scheduler._bg_prefetch_acks.get_nowait()
-            except queue.Empty:
-                break
-            acknowledgements[job.rid] = submitted
-        expected = {"a": True}
-        assert acknowledgements == expected, (rank, acknowledgements)
-        assert linker.submissions == ["a"]
-
-        # Other ranks' b snapshots arrive after they drained epoch 1. Rank 0
-        # must retain b and submit it with them in epoch 2. Its cancelled d
-        # should retire globally even though they never had a d job.
-        if rank != 0:
-            jobs["b"] = enqueue_job("b")
-        else:
-            jobs["d"].cancelled.set()
-        dist.barrier()
-        scheduler._run_bg_prefetch_round()
-
-        acknowledgements = {}
-        while True:
-            try:
-                job, submitted = scheduler._bg_prefetch_acks.get_nowait()
-            except queue.Empty:
-                break
-            acknowledgements[job.rid] = submitted
-        expected = {"b": True, "d": False} if rank == 0 else {"b": True}
-        assert acknowledgements == expected, (rank, acknowledgements)
-        assert linker.submissions == ["a", "b"]
-
-        # c never appears on the other ranks, so the four-epoch grace expires
-        # it to the ordinary admission path instead of leaving it pending.
-        scheduler._run_bg_prefetch_round()
-        assert scheduler._bg_prefetch_acks.empty()
-        scheduler._run_bg_prefetch_round()
-        acknowledgements = {}
-        while True:
-            try:
-                job, submitted = scheduler._bg_prefetch_acks.get_nowait()
-            except queue.Empty:
-                break
-            acknowledgements[job.rid] = submitted
-        expected = {"c": False} if rank == 0 else {}
-        assert acknowledgements == expected, (rank, acknowledgements)
-
-        # Empty rounds synchronize presence flags but skip object gathers.
-        scheduler._run_bg_prefetch_round()
+        two_rank_group = dist.new_group(ranks=[0, 1], backend="gloo")
+        if rank < 2:
+            _assert_rank_wide_admission_states(rank, 2, two_rank_group)
         dist.barrier()
 
-        # Diagnostic only: measure one empty and one single-RID scheduler
-        # control round. These timings exclude real Mooncake I/O and use the
-        # synthetic two-rank Gloo groups above.
-        benchmark_rounds = 20
-        object_gather_calls = 0
-        original_all_gather_object = dist.all_gather_object
-
-        def count_object_gather(*args, **kwargs):
-            nonlocal object_gather_calls
-            object_gather_calls += 1
-            return original_all_gather_object(*args, **kwargs)
-
-        dist.all_gather_object = count_object_gather
+        _assert_rank_wide_admission_states(rank, world_size, dist.group.WORLD)
         dist.barrier()
-        started = time.perf_counter()
-        for _ in range(benchmark_rounds):
-            assert cache.get_waiting_queue_prefetch_admission_states([]) == {}
-            scheduler._run_bg_prefetch_round()
-        assert object_gather_calls == 0, object_gather_calls
-        idle_ms = (time.perf_counter() - started) * 1000 / benchmark_rounds
-        idle_ms = torch.tensor([idle_ms], dtype=torch.float64)
-        dist.all_reduce(idle_ms, op=dist.ReduceOp.MAX)
-
-        dist.barrier()
-        started = time.perf_counter()
-        for index in range(benchmark_rounds):
-            rid = f"bench-{index}"
-            enqueue_job(rid)
-            assert cache.get_waiting_queue_prefetch_admission_states([rid]) == {
-                rid: "not_tracked"
-            }
-            scheduler._run_bg_prefetch_round()
-            job, submitted = scheduler._bg_prefetch_acks.get_nowait()
-            assert job.rid == rid and submitted
-        assert object_gather_calls == benchmark_rounds * 3, object_gather_calls
-        dist.all_gather_object = original_all_gather_object
-        request_ms = (time.perf_counter() - started) * 1000 / benchmark_rounds
-        request_ms = torch.tensor([request_ms], dtype=torch.float64)
-        dist.all_reduce(request_ms, op=dist.ReduceOp.MAX)
-        if rank == 0:
-            print(
-                "BG_PREFETCH_GLOO_BENCH "
-                f"ranks={world_size} iterations={benchmark_rounds} "
-                f"idle_control_ms={idle_ms.item():.3f} "
-                f"single_rid_control_ms={request_ms.item():.3f}"
-            )
     finally:
         dist.destroy_process_group()
 
 
-class TestSchedulerBackgroundPrefetchCollectives(CustomTestCase):
-    def test_distinct_gloo_group_and_variable_request_counts(self):
-        if not dist.is_available() or not dist.is_gloo_available():
-            self.skipTest("Gloo process groups are unavailable")
+class TestSchedulerWaitingQueuePrefetch(CustomTestCase):
+    def _make_scheduler(self, *, fail_after_queue=False, locally_eligible=True):
+        rid = "request-1"
+        marker = object()
+        linker = _FakeLinker(fail_after_queue=fail_after_queue)
+        job = PreparedHostPrefetch(
+            rid=rid,
+            locally_eligible=locally_eligible,
+            transfers=("immutable-snapshot",),
+            cache_linker=linker,
+            cancelled=threading.Event(),
+        )
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache_linker = linker
+        wrapper.pending_host_prefetch_submissions = {rid: (job, marker)}
+        wrapper.host_prefetch_hits = {}
+        tree_cache = _FakeTreeCache(wrapper, job)
 
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_waiting_queue_dfs_prefetch = True
+        scheduler.enable_hicache_storage = False
+        scheduler.tree_cache = tree_cache
+
+        class Request:
+            def __init__(self):
+                self.prefill_attempt_count = 0
+                self.rid = rid
+
+            def init_next_round_input(self, cache, cow_mamba=False):
+                assert cache is tree_cache
+                assert cow_mamba is False
+
+        return scheduler, Request(), linker, wrapper, tree_cache
+
+    def test_enqueue_submits_snapshot_locally_before_returning(self):
+        scheduler, req, linker, wrapper, tree_cache = self._make_scheduler()
+        caller_thread = threading.get_ident()
+
+        with (
+            mock.patch.object(
+                dist, "all_reduce", side_effect=AssertionError("unexpected collective")
+            ),
+            mock.patch.object(
+                dist,
+                "all_gather_object",
+                side_effect=AssertionError("unexpected collective"),
+            ),
+        ):
+            scheduler._prefetch_kvcache(req)
+
+        assert tree_cache.prepared == [req.rid]
+        assert linker.submissions == [(req.rid, ["immutable-snapshot"])]
+        assert linker.submit_thread_id == caller_thread
+        assert tree_cache.completed == [(req.rid, True)]
+        assert req.rid in wrapper.host_prefetch_hits
+        assert wrapper.get_host_prefetch_admission_state(req.rid) == "pending"
+
+    def test_failed_local_submit_cancels_backend_session(self):
+        scheduler, req, linker, wrapper, tree_cache = self._make_scheduler(
+            fail_after_queue=True
+        )
+
+        with mock.patch("sglang.srt.managers.scheduler.logger.exception"):
+            scheduler._prefetch_kvcache(req)
+
+        assert linker.submissions == [(req.rid, ["immutable-snapshot"])]
+        assert linker.cancelled == [req.rid]
+        assert req.rid not in wrapper.host_prefetch_hits
+        assert req.rid not in wrapper.pending_host_prefetch_submissions
+        assert tree_cache.completed == [(req.rid, False)]
+
+    def test_ineligible_snapshot_is_not_submitted(self):
+        scheduler, req, linker, wrapper, tree_cache = self._make_scheduler(
+            locally_eligible=False
+        )
+
+        scheduler._prefetch_kvcache(req)
+
+        assert linker.submissions == []
+        assert req.rid not in wrapper.host_prefetch_hits
+        assert req.rid not in wrapper.pending_host_prefetch_submissions
+        assert tree_cache.completed == [(req.rid, False)]
+
+    def test_admission_is_consistent_for_two_and_eight_ranks(self):
+        world_size = 8
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-
-        world_size = int(os.environ.get("SGLANG_BG_PREFETCH_TEST_RANKS", "2"))
         mp.spawn(
-            _distributed_round_worker,
+            _admission_worker,
             args=(world_size, port),
             nprocs=world_size,
             join=True,

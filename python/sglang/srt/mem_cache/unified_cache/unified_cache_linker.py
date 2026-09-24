@@ -162,7 +162,7 @@ class ExternalCacheHitMarker(NamedTuple):
 
 
 class PreparedHostPrefetch(NamedTuple):
-    """Immutable request-local work for the scheduler's background prefetch round."""
+    """Immutable request-local transfer snapshot for host prefetch submission."""
 
     rid: str
     locally_eligible: bool
@@ -192,9 +192,9 @@ class UnifiedCacheLinkerWrapper:
         # Waiting-queue prefetches retain the original hit until admission can
         # rematch it. The backend owns the private session and readiness state.
         self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] = {}
-        # Submission work is prepared and committed only by the scheduler
-        # thread. The background worker receives a snapshot and never touches
-        # this dict or the cache tree.
+        # The scheduler thread owns this state and submits immutable snapshots.
+        # The backend worker owns the store calls and never touches this dict or
+        # the cache tree.
         self.pending_host_prefetch_submissions: dict[
             str, tuple[PreparedHostPrefetch, ExternalCacheHitMarker]
         ] = {}
@@ -290,7 +290,7 @@ class UnifiedCacheLinkerWrapper:
     def complete_host_prefetch_submission(
         self, job: PreparedHostPrefetch, submitted: bool
     ) -> bool:
-        """Commit a background result if this is still the live request."""
+        """Record the local submit result if this is still the live request."""
         pending = self.pending_host_prefetch_submissions.get(job.rid)
         if pending is None or pending[0] is not job:
             if submitted:
