@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from array import array
 from collections import deque
@@ -94,6 +95,30 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
+    "SGLANG_DAS_PREFETCH_TRACE", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def trace_disagg_prefill(
+    event: str, rid, bootstrap_room, rank, **state
+) -> None:
+    """Emit an opt-in, content-free timestamp for a disagg prefill request."""
+    if not DAS_PREFETCH_TRACE_ENABLED:
+        return
+    details = " ".join(f"{key}={value}" for key, value in state.items())
+    logger.info(
+        "DAS_PREFETCH_TRACE phase=%s rid=%s bootstrap_room=%s rank=%s "
+        "wall_ns=%d monotonic_ns=%d%s",
+        event,
+        rid if rid is not None else "-",
+        bootstrap_room if bootstrap_room is not None else "-",
+        rank if rank is not None else "-",
+        time.time_ns(),
+        time.monotonic_ns(),
+        f" {details}" if details else "",
+    )
 
 _is_npu = is_npu()
 
@@ -1101,6 +1126,34 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def _admit_prefill_bootstrapped_reqs(self: Scheduler) -> None:
+        """Move requests whose bootstrap is ready into the waiting queue."""
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        bootstrapped_reqs = bootstrap_queue.pop_bootstrapped()
+        if DAS_PREFETCH_TRACE_ENABLED:
+            for req in bootstrapped_reqs:
+                trace_disagg_prefill(
+                    "bootstrap_ready",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    bootstrap_pending=getattr(req, "pending_bootstrap", False),
+                    prefill_attempt=req.prefill_attempt_count,
+                    bootstrap_queue_size=len(bootstrap_queue.queue),
+                )
+        self.waiting_queue.extend(bootstrapped_reqs)
+        if DAS_PREFETCH_TRACE_ENABLED:
+            for req in bootstrapped_reqs:
+                trace_disagg_prefill(
+                    "waiting_queue_admit",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    waiting_queue_size=len(self.waiting_queue),
+                    bootstrap_queue_size=len(bootstrap_queue.queue),
+                    bootstrap_pending=getattr(req, "pending_bootstrap", False),
+                )
+
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -1161,6 +1214,17 @@ class SchedulerDisaggregationPrefillMixin:
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
+        if DAS_PREFETCH_TRACE_ENABLED and batch is not None:
+            for req in batch.reqs:
+                trace_disagg_prefill(
+                    "prefill_batch_scheduled",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    batch_size=len(batch.reqs),
+                    waiting_queue_size=len(self.waiting_queue),
+                    prefill_attempt=req.prefill_attempt_count,
+                )
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
@@ -1180,9 +1244,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            self._admit_prefill_bootstrapped_reqs()
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -1219,9 +1281,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            self._admit_prefill_bootstrapped_reqs()
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(

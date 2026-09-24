@@ -92,9 +92,11 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
+    DAS_PREFETCH_TRACE_ENABLED,
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
+    trace_disagg_prefill,
 )
 from sglang.srt.disaggregation.utils import (
     EXTERNAL_KV_LOAD_ERR_TYPE,
@@ -1447,6 +1449,7 @@ class Scheduler(
         self._ingress_tp_cpu_group = self.tp_cpu_group
         self._forward_launch_executor = None
         self._forward_deferred_reqs = []
+        self._bg_prefetch_rooms = {} if DAS_PREFETCH_TRACE_ENABLED else None
         if self.enable_waiting_queue_dfs_prefetch:
             # Every rank creates groups in the same order. The helper
             # gathers each rank's local subgroup membership on the default
@@ -1943,7 +1946,30 @@ class Scheduler(
                 self._forward_deferred_reqs,
                 [],
             )
+            self._trace_prefill_reqs(
+                "forward_replay",
+                deferred_reqs,
+                deferred_count=len(deferred_reqs),
+            )
             self.process_input_requests(deferred_reqs)
+
+    def _trace_prefill_reqs(self, event: str, payloads, **state) -> None:
+        if not DAS_PREFETCH_TRACE_ENABLED:
+            return
+        for payload in payloads:
+            batch = getattr(payload, "batch", None)
+            requests = batch if isinstance(batch, (list, tuple)) else (payload,)
+            for req in requests:
+                rid = getattr(req, "rid", None)
+                if rid is None:
+                    continue
+                trace_disagg_prefill(
+                    event,
+                    rid,
+                    getattr(req, "bootstrap_room", None),
+                    self.ps.tp_rank,
+                    **state,
+                )
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -2135,17 +2161,39 @@ class Scheduler(
 
     def _run_bg_prefetch_round(self) -> None:
         """Run one CP/TP-ordered round over retained immutable job snapshots."""
+        epoch = self._bg_completed_epoch + 1
         while True:
             try:
                 job = self._bg_prefetch_jobs.get_nowait()
             except queue.Empty:
                 break
             self._bg_pending_prefetch_jobs.setdefault(job.rid, job)
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_job_dequeued",
+                    job.rid,
+                    self._bg_prefetch_rooms.get(job.rid),
+                    self.ps.tp_rank,
+                    epoch=epoch,
+                    locally_eligible=job.locally_eligible,
+                    transfer_count=len(job.transfers),
+                )
 
         local_status = {
             rid: (job.locally_eligible, job.cancelled.is_set())
             for rid, job in self._bg_pending_prefetch_jobs.items()
         }
+        if DAS_PREFETCH_TRACE_ENABLED:
+            for rid, (locally_eligible, cancelled) in local_status.items():
+                trace_disagg_prefill(
+                    "bg_prefetch_round_start",
+                    rid,
+                    self._bg_prefetch_rooms.get(rid),
+                    self.ps.tp_rank,
+                    epoch=epoch,
+                    locally_eligible=locally_eligible,
+                    cancelled=cancelled,
+                )
         rank_statuses = {torch.distributed.get_rank(): local_status}
         # First propagate a fixed-width presence flag. Empty rounds can skip
         # object serialization, while CP then TP reductions make the decision
@@ -2183,20 +2231,59 @@ class Scheduler(
         for rid in all_rids:
             rid_statuses = [statuses.get(rid) for statuses in rank_statuses.values()]
             job = self._bg_pending_prefetch_jobs.get(rid)
+            room = self._bg_prefetch_rooms.get(rid) if DAS_PREFETCH_TRACE_ENABLED else None
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_round_joined",
+                    rid,
+                    room,
+                    self.ps.tp_rank,
+                    epoch=epoch,
+                    rank_count=len(rank_statuses),
+                    has_local_job=job is not None,
+                    join_age=self._bg_prefetch_join_age[rid],
+                )
 
             # Any participant cancelling the request retires all retained
             # snapshots immediately, including ranks that never saw a job.
             if any(status is not None and status[1] for status in rid_statuses):
+                if DAS_PREFETCH_TRACE_ENABLED:
+                    trace_disagg_prefill(
+                        "bg_prefetch_submit_skipped",
+                        rid,
+                        room,
+                        self.ps.tp_rank,
+                        epoch=epoch,
+                        reason="cancelled",
+                    )
                 self._finish_bg_prefetch_job(rid, False)
                 continue
 
             all_ranks_have_job = all(status is not None for status in rid_statuses)
             if not all_ranks_have_job:
                 if self._bg_prefetch_join_age[rid] >= self.BG_PREFETCH_JOIN_GRACE_EPOCHS:
+                    if DAS_PREFETCH_TRACE_ENABLED:
+                        trace_disagg_prefill(
+                            "bg_prefetch_submit_skipped",
+                            rid,
+                            room,
+                            self.ps.tp_rank,
+                            epoch=epoch,
+                            reason="missing_rank_job",
+                        )
                     self._finish_bg_prefetch_job(rid, False)
                 continue
 
             if not all(status[0] for status in rid_statuses):
+                if DAS_PREFETCH_TRACE_ENABLED:
+                    trace_disagg_prefill(
+                        "bg_prefetch_submit_skipped",
+                        rid,
+                        room,
+                        self.ps.tp_rank,
+                        epoch=epoch,
+                        reason="ineligible_rank",
+                    )
                 self._finish_bg_prefetch_job(rid, False)
                 continue
 
@@ -2204,6 +2291,15 @@ class Scheduler(
             # eligible job. Submit is local and may fail independently; every
             # rank still enters the fixed-width result reduction.
             assert job is not None
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_submit_start",
+                    rid,
+                    room,
+                    self.ps.tp_rank,
+                    epoch=epoch,
+                    transfer_count=len(job.transfers),
+                )
             try:
                 submitted = job.cache_linker.submit_host_prefetch(
                     rid, list(job.transfers)
@@ -2211,9 +2307,27 @@ class Scheduler(
             except BaseException:
                 submitted = False
             submitted = submitted and not job.cancelled.is_set()
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_submit_local_result",
+                    rid,
+                    room,
+                    self.ps.tp_rank,
+                    epoch=epoch,
+                    submitted=submitted,
+                )
             globally_submitted = torch.tensor([int(submitted)], dtype=torch.int)
             self._all_reduce_bg_prefetch_groups(globally_submitted)
             submitted = int(globally_submitted.item()) == 1
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_submit_done",
+                    rid,
+                    room,
+                    self.ps.tp_rank,
+                    epoch=epoch,
+                    submitted=submitted,
+                )
             if not submitted:
                 job.cache_linker.cancel_host_prefetch(rid)
             self._finish_bg_prefetch_job(rid, submitted)
@@ -2226,6 +2340,14 @@ class Scheduler(
         job = self._bg_pending_prefetch_jobs.pop(rid, None)
         self._bg_prefetch_join_age.pop(rid, None)
         if job is not None:
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_ack_enqueued",
+                    rid,
+                    self._bg_prefetch_rooms.get(rid),
+                    self.ps.tp_rank,
+                    submitted=submitted,
+                )
             self._bg_prefetch_acks.put((job, submitted))
 
     def _all_reduce_bg_prefetch_groups(
@@ -2252,7 +2374,31 @@ class Scheduler(
                 job, submitted = self._bg_prefetch_acks.get_nowait()
             except queue.Empty:
                 return
-            self.tree_cache.complete_external_linker_prefetch(job, submitted)
+            room = (
+                self._bg_prefetch_rooms.pop(job.rid, None)
+                if DAS_PREFETCH_TRACE_ENABLED
+                else None
+            )
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_ack_received",
+                    job.rid,
+                    room,
+                    self.ps.tp_rank,
+                    submitted=submitted,
+                )
+            accepted = self.tree_cache.complete_external_linker_prefetch(
+                job, submitted
+            )
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_ack_applied",
+                    job.rid,
+                    room,
+                    self.ps.tp_rank,
+                    submitted=submitted,
+                    accepted=accepted,
+                )
 
     def _begin_scheduler_iteration(self) -> None:
         self._drain_bg_prefetch_acks()
@@ -2260,6 +2406,7 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
+        self._trace_prefill_reqs("scheduler_receive", recv_reqs)
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         if get_mm().mm_feature_transport == "cuda_vmm":
@@ -2805,6 +2952,13 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        if DAS_PREFETCH_TRACE_ENABLED:
+            trace_disagg_prefill(
+                "scheduler_dispatch",
+                recv_req.rid,
+                recv_req.bootstrap_room,
+                self.ps.tp_rank,
+            )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -3137,10 +3291,64 @@ class Scheduler(
             and not is_retracted
             and req.prefill_attempt_count == 0
         ):
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "radix_lookup_start",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    attempt=req.prefill_attempt_count,
+                )
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "radix_lookup_done",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    device_hit_tokens=len(req.prefix_indices),
+                    external_host_hit_tokens=req.host_hit_length,
+                )
+                trace_disagg_prefill(
+                    "radix_prefetch_prepare_start",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                )
             job = self.tree_cache.prepare_external_linker_prefetch(req)
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "radix_prefetch_prepare_done",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    job_created=job is not None,
+                    locally_eligible=(job.locally_eligible if job is not None else False),
+                    transfer_count=(len(job.transfers) if job is not None else 0),
+                )
             if job is not None:
+                if self._bg_prefetch_rooms is not None:
+                    self._bg_prefetch_rooms[job.rid] = req.bootstrap_room
+                if DAS_PREFETCH_TRACE_ENABLED:
+                    trace_disagg_prefill(
+                        "bg_prefetch_job_enqueue_start",
+                        job.rid,
+                        req.bootstrap_room,
+                        self.ps.tp_rank,
+                        requested_epoch=self._bg_requested_epoch,
+                        completed_epoch=self._bg_completed_epoch,
+                    )
                 self._bg_prefetch_jobs.put(job)
+                if DAS_PREFETCH_TRACE_ENABLED:
+                    trace_disagg_prefill(
+                        "bg_prefetch_job_enqueued",
+                        job.rid,
+                        req.bootstrap_room,
+                        self.ps.tp_rank,
+                        requested_epoch=self._bg_requested_epoch,
+                        completed_epoch=self._bg_completed_epoch,
+                        queue_size=self._bg_prefetch_jobs.qsize(),
+                    )
 
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -3197,9 +3405,28 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bootstrap_queue_add_start",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    queue_size=len(self.disagg_prefill_bootstrap_queue.queue),
+                    pending=getattr(req, "pending_bootstrap", False),
+                )
             added = self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bootstrap_queue_add_done",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    added=added,
+                    queue_size=len(self.disagg_prefill_bootstrap_queue.queue),
+                    pending=getattr(req, "pending_bootstrap", False),
+                )
             if added:
                 req.time_stats.set_prefill_bootstrap_queue_entry_time()
                 self._prefetch_kvcache(req, is_retracted=is_retracted)
@@ -4199,11 +4426,21 @@ class Scheduler(
 
             with self.device_module.StreamContext(self.schedule_stream):
                 recv_reqs = self.request_receiver.recv_requests()
+                self._trace_prefill_reqs(
+                    "scheduler_receive", recv_reqs, ingress="forward"
+                )
                 received_generate = False
                 for recv_req in recv_reqs:
                     # Once a control request is deferred, preserve input order.
                     if deferred_reqs:
                         deferred_reqs.append(recv_req)
+                        self._trace_prefill_reqs(
+                            "forward_defer",
+                            [recv_req],
+                            reason="ordered_after_deferred",
+                            deferred_count=len(deferred_reqs),
+                            forward_iter=self.forward_ct,
+                        )
                     elif (
                         isinstance(recv_req, TokenizedGenerateReqInput)
                         and can_prepare_now(recv_req)
@@ -4217,6 +4454,13 @@ class Scheduler(
                         received_generate = True
                     else:
                         deferred_reqs.append(recv_req)
+                        self._trace_prefill_reqs(
+                            "forward_defer",
+                            [recv_req],
+                            reason="unsupported_during_forward",
+                            deferred_count=len(deferred_reqs),
+                            forward_iter=self.forward_ct,
+                        )
                 if received_generate:
                     self._request_bg_prefetch_epoch()
             if not recv_reqs:
@@ -4226,6 +4470,12 @@ class Scheduler(
         # The old non-overlap path put forward and cache updates on one stream.
         # Keep that ordering when the forward runs on its own.
         self.schedule_stream.wait_stream(self.forward_stream)
+        self._trace_prefill_reqs(
+            "forward_deferred_for_replay",
+            deferred_reqs,
+            deferred_count=len(deferred_reqs),
+            forward_iter=self.forward_ct,
+        )
         self._forward_deferred_reqs.extend(deferred_reqs)
         return result
 
