@@ -1429,19 +1429,7 @@ class Scheduler(
                     timeout_s,
                 )
 
-        self.enable_waiting_queue_dfs_prefetch = (
-            getattr(
-                self.server_args,
-                "mooncake_enable_waiting_queue_dfs_prefetch",
-                False,
-            )
-            and self.server_args.enable_unified_cache_external_linker
-            and self.server_args.unified_cache_external_linker_backend == "mooncake"
-            and self.disaggregation_mode
-            in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
-            and self.schedule_policy == "fcfs"
-            and self.ps.pp_size == 1
-        )
+        self.enable_waiting_queue_dfs_prefetch = self._waiting_queue_prefetch_active()
         self._bg_attn_cp_cpu_group = None
         self._bg_attn_tp_cpu_group = None
         self._ingress_attn_cp_cpu_group = self.attn_cp_cpu_group
@@ -3284,6 +3272,23 @@ class Scheduler(
         # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
+
+    def _waiting_queue_prefetch_active(self) -> bool:
+        """Whether the configured waiting-queue prefetch is available on every rank."""
+        return (
+            getattr(
+                self.server_args,
+                "mooncake_enable_waiting_queue_dfs_prefetch",
+                False,
+            )
+            and self.server_args.enable_unified_cache_external_linker
+            and self.server_args.unified_cache_external_linker_backend == "mooncake"
+            and self.disaggregation_mode
+            in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
+            and self.schedule_policy == "fcfs"
+            and self.ps.pp_size == 1
+            and self.tree_cache.waiting_queue_prefetch_enabled()
+        )
 
     def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
         if (
