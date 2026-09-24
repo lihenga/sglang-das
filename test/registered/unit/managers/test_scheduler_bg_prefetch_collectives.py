@@ -6,6 +6,10 @@ import socket
 import threading
 import time
 import unittest
+from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -22,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.managers.scheduler import Scheduler
+import sglang.srt.managers.scheduler as scheduler_module
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -224,6 +229,98 @@ def _distributed_round_worker(rank, world_size, port):
                 f"idle_control_ms={idle_ms.item():.3f} "
                 f"single_rid_control_ms={request_ms.item():.3f}"
             )
+
+        # A request that appears only after DSPARK's non-overlap forward has
+        # started must reach scheduler-owned lookup before that forward returns.
+        ingress_group = create_custom_parallel_group(ranks, backend="gloo")
+        ingress_cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        ingress_cache.attn_cp_group = ingress_group
+        ingress_cache.attn_tp_group = None
+        ingress_cache.tp_group = ingress_group
+        ingress_cache.tp_world_size = world_size
+        forward_started = threading.Event()
+        times = {}
+
+        class FakeRequest:
+            mm_inputs = None
+            input_embeds = None
+            session_id = None
+            session_params = None
+            lora_id = None
+            positional_embed_overrides = None
+            sampling_params = SimpleNamespace()
+
+        class FakeReceiver:
+            def __init__(self):
+                self.sent = False
+
+            def recv_requests(self):
+                ready = (
+                    rank == 0
+                    and not self.sent
+                    and forward_started.is_set()
+                    and time.monotonic() - times["start"] >= 0.05
+                )
+                payload = [ready if rank == 0 else None]
+                dist.broadcast_object_list(payload, src=0, group=ingress_group)
+                if payload[0]:
+                    self.sent = True
+                    return [FakeRequest(), object()]
+                return []
+
+        def fake_forward(_batch):
+            times["start"] = time.monotonic()
+            forward_started.set()
+            # The model and ingress collectives run on different Gloo groups.
+            model_sync = torch.ones(1)
+            dist.all_reduce(model_sync, group=main_group)
+            time.sleep(0.35)
+            times["end"] = time.monotonic()
+            return "forward-result"
+
+        ingress_scheduler = Scheduler.__new__(Scheduler)
+        ingress_scheduler.enable_waiting_queue_dfs_prefetch = True
+        ingress_scheduler.enable_overlap = False
+        ingress_scheduler.device = "cpu"
+        ingress_scheduler.device_module = SimpleNamespace(
+            StreamContext=lambda _stream: nullcontext()
+        )
+        ingress_scheduler.forward_stream = SimpleNamespace(wait_stream=lambda _s: None)
+        ingress_scheduler.schedule_stream = SimpleNamespace(
+            wait_stream=lambda _stream: None, synchronize=lambda: None
+        )
+        ingress_scheduler.model_worker = SimpleNamespace(
+            forward_batch_generation=fake_forward
+        )
+        ingress_scheduler.tree_cache = ingress_cache
+        ingress_scheduler.request_receiver = FakeReceiver()
+        ingress_scheduler._request_bg_prefetch_epoch = lambda: None
+        ingress_scheduler._forward_deferred_reqs = []
+        ingress_scheduler.enable_hicache_storage = False
+        ingress_cache.prepare_external_linker_prefetch = lambda _req: None
+        linker = SimpleNamespace(
+            lookup=lambda: times.setdefault("lookup", time.monotonic())
+        )
+        prefetch_req = SimpleNamespace(
+            prefill_attempt_count=0,
+            init_next_round_input=lambda *_args, **_kwargs: linker.lookup(),
+        )
+        ingress_scheduler.handle_generate_request = lambda _req: (
+            ingress_scheduler._prefetch_kvcache(prefetch_req)
+        )
+        ingress_scheduler._forward_launch_executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            batch = SimpleNamespace(spec_algorithm=SimpleNamespace(is_none=lambda: False))
+            with patch.object(scheduler_module, "TokenizedGenerateReqInput", FakeRequest):
+                assert (
+                    ingress_scheduler._forward_with_waiting_queue_ingress(batch)
+                    == "forward-result"
+                )
+            assert times["start"] < times["lookup"] < times["end"], times
+            assert len(ingress_scheduler._forward_deferred_reqs) == 1
+        finally:
+            ingress_scheduler._forward_launch_executor.shutdown(wait=True)
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 

@@ -16,6 +16,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import contextvars
 import dataclasses
 import faulthandler
 import logging
@@ -27,6 +28,7 @@ import time
 import threading
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
@@ -1440,8 +1442,13 @@ class Scheduler(
         )
         self._bg_attn_cp_cpu_group = None
         self._bg_attn_tp_cpu_group = None
+        self._ingress_attn_cp_cpu_group = self.attn_cp_cpu_group
+        self._ingress_attn_tp_cpu_group = self.attn_tp_cpu_group
+        self._ingress_tp_cpu_group = self.tp_cpu_group
+        self._forward_launch_executor = None
+        self._forward_deferred_reqs = []
         if self.enable_waiting_queue_dfs_prefetch:
-            # Every rank runs these two helpers in the same order. The helper
+            # Every rank creates groups in the same order. The helper
             # gathers each rank's local subgroup membership on the default
             # group, then creates all subgroups in a deterministic order.
             # Runtime prefetch collectives use only these duplicate Gloo PGs.
@@ -1456,6 +1463,28 @@ class Scheduler(
                         attr_name,
                         create_custom_parallel_group(ranks, backend="gloo"),
                     )
+
+            # A forward launched on another Python thread can use the model's
+            # original CPU groups. Receive/lookup must never enter those groups
+            # concurrently, nor share the background prefetch round's groups.
+            for attr_name, group in (
+                ("_ingress_attn_cp_cpu_group", self.attn_cp_cpu_group),
+                ("_ingress_attn_tp_cpu_group", self.attn_tp_cpu_group),
+                ("_ingress_tp_cpu_group", self.tp_cpu_group),
+            ):
+                if group is not None and torch.distributed.get_world_size(group) > 1:
+                    ranks = torch.distributed.get_process_group_ranks(group)
+                    setattr(
+                        self,
+                        attr_name,
+                        create_custom_parallel_group(ranks, backend="gloo"),
+                    )
+            self.tree_cache.attn_cp_group = self._ingress_attn_cp_cpu_group
+            self.tree_cache.attn_tp_group = self._ingress_attn_tp_cpu_group
+            self.tree_cache.tp_group = self._ingress_tp_cpu_group
+            self._forward_launch_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="prefetch-forward"
+            )
 
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
@@ -1846,6 +1875,9 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        executor = getattr(self, "_forward_launch_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -1911,6 +1943,13 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+
+            if self._forward_deferred_reqs:
+                deferred_reqs, self._forward_deferred_reqs = (
+                    self._forward_deferred_reqs,
+                    [],
+                )
+                self.process_input_requests(deferred_reqs)
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -2361,11 +2400,11 @@ class Scheduler(
             mm_receiver=self.mm_receiver,
             ps=self.ps,
             tp_group=self.tp_group,
-            tp_cpu_group=self.tp_cpu_group,
+            tp_cpu_group=self._ingress_tp_cpu_group,
             attn_tp_group=self.attn_tp_group,
-            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_tp_cpu_group=self._ingress_attn_tp_cpu_group,
             attn_cp_group=self.attn_cp_group,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            attn_cp_cpu_group=self._ingress_attn_cp_cpu_group,
             world_group=self.world_group,
             server_args=self.server_args,
             model_config=self.model_config,
@@ -4112,6 +4151,81 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _forward_with_waiting_queue_ingress(self, batch, **fwd_kwargs):
+        if not self.enable_waiting_queue_dfs_prefetch:
+            return self.model_worker.forward_batch_generation(batch, **fwd_kwargs)
+
+        # Keep the scheduler as the sole owner of its sockets, requests, and
+        # radix tree. Only the model launch moves to another Python thread.
+        def launch_forward():
+            if self.device != "cpu":
+                self.device_module.set_device(self.tp_worker.gpu_id)
+            with DynamicGradMode(), self.device_module.StreamContext(
+                self.forward_stream
+            ):
+                self.forward_stream.wait_stream(self.schedule_stream)
+                return self.model_worker.forward_batch_generation(batch, **fwd_kwargs)
+
+        forward_context = contextvars.copy_context()
+        future = self._forward_launch_executor.submit(forward_context.run, launch_forward)
+        deferred_reqs = []
+
+        def can_prepare_now(req):
+            return (
+                req.mm_inputs is None
+                and req.input_embeds is None
+                and req.session_id is None
+                and req.session_params is None
+                and req.lora_id is None
+                and req.positional_embed_overrides is None
+                and all(
+                    getattr(req.sampling_params, name, None) is None
+                    for name in ("json_schema", "regex", "ebnf", "structural_tag")
+                )
+            )
+
+        while True:
+            # CP and TP ranks must enter the same number of receive broadcasts,
+            # even when their local model launch finishes at different times.
+            active = torch.tensor([int(not future.done())], dtype=torch.int)
+            self.tree_cache._all_reduce_attn_groups(
+                active, op=torch.distributed.ReduceOp.MAX
+            )
+            if not int(active.item()):
+                break
+
+            with self.device_module.StreamContext(self.schedule_stream):
+                recv_reqs = self.request_receiver.recv_requests()
+                received_generate = False
+                for recv_req in recv_reqs:
+                    # Once a control request is deferred, preserve input order.
+                    if deferred_reqs:
+                        deferred_reqs.append(recv_req)
+                    elif (
+                        isinstance(recv_req, TokenizedGenerateReqInput)
+                        and can_prepare_now(recv_req)
+                    ):
+                        self.handle_generate_request(recv_req)
+                        received_generate = True
+                    elif isinstance(recv_req, BatchTokenizedGenerateReqInput) and all(
+                        can_prepare_now(req) for req in recv_req
+                    ):
+                        self.handle_batch_generate_request(recv_req)
+                        received_generate = True
+                    else:
+                        deferred_reqs.append(recv_req)
+                if received_generate:
+                    self._request_bg_prefetch_epoch()
+            if not recv_reqs:
+                time.sleep(0.01)
+
+        result = future.result()
+        # The old non-overlap path put forward and cache updates on one stream.
+        # Keep that ordering when the forward runs on its own.
+        self.schedule_stream.wait_stream(self.forward_stream)
+        self._forward_deferred_reqs.extend(deferred_reqs)
+        return result
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -4251,7 +4365,7 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self._forward_with_waiting_queue_ingress(batch)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4275,9 +4389,7 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                batch_result = self._forward_with_waiting_queue_ingress(batch, **kwargs)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
