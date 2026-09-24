@@ -538,6 +538,13 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        """Rank-consistent switch resolved when the linker was built."""
+        return (
+            self.linker is not None
+            and self.linker.cache_linker.waiting_queue_prefetch_enabled()
+        )
+
     def prefetch_external_linker_to_host(self, req) -> bool:
         if self.linker is None:
             return False

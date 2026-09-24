@@ -2879,8 +2879,15 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
-        if (
+    def _waiting_queue_prefetch_active(self) -> bool:
+        """Whether waiting-queue DFS prefetch runs, identically on every rank.
+
+        The linker's switch folds every rank's Mooncake capability into the
+        user flag; the other conditions are scheduler-wide constants. The user
+        flag stays first so deployments without prefetch never touch the
+        tree cache here.
+        """
+        return (
             getattr(
                 self.server_args,
                 "mooncake_enable_waiting_queue_dfs_prefetch",
@@ -2892,6 +2899,12 @@ class Scheduler(
             in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
             and self.schedule_policy == "fcfs"
             and self.ps.pp_size == 1
+            and self.tree_cache.waiting_queue_prefetch_enabled()
+        )
+
+    def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
+        if (
+            self._waiting_queue_prefetch_active()
             and not is_retracted
             and req.prefill_attempt_count == 0
         ):
@@ -3560,20 +3573,7 @@ class Scheduler(
                     break
 
             abandoned_prefetch = False
-            if (
-                getattr(
-                    self.server_args,
-                    "mooncake_enable_waiting_queue_dfs_prefetch",
-                    False,
-                )
-                and self.server_args.enable_unified_cache_external_linker
-                and self.server_args.unified_cache_external_linker_backend
-                == "mooncake"
-                and self.disaggregation_mode
-                in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
-                and self.schedule_policy == "fcfs"
-                and self.ps.pp_size == 1
-            ):
+            if self._waiting_queue_prefetch_active():
                 prefetch_state = (
                     self.tree_cache.get_waiting_queue_prefetch_admission_state(
                         req.rid
