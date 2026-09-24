@@ -123,13 +123,13 @@ class TestLocalCapability(CustomTestCase):
 class TestResolveHostPrefetch(CustomTestCase):
     def test_single_process_uses_local_verdict(self):
         linker = _linker(_Store())
-        self.assertTrue(linker._resolve_host_prefetch_enabled(_params(), requested=True))
+        self.assertTrue(
+            linker._resolve_host_prefetch_enabled(_params(), requested=True)
+        )
 
         linker = _linker(_Store(available=False, status="not configured"))
         with self.assertLogs(_LINKER_LOGGER, level="WARNING") as logs:
-            enabled = linker._resolve_host_prefetch_enabled(
-                _params(), requested=True
-            )
+            enabled = linker._resolve_host_prefetch_enabled(_params(), requested=True)
         self.assertFalse(enabled)
         self.assertIn("not configured", logs.output[0])
 
@@ -144,7 +144,10 @@ class TestResolveHostPrefetch(CustomTestCase):
         # Same groups and order as UnifiedRadixCache._all_reduce_attn_groups.
         self.assertEqual(
             fake.calls,
-            [(cp, torch.distributed.ReduceOp.MIN), (tp, torch.distributed.ReduceOp.MIN)],
+            [
+                (cp, torch.distributed.ReduceOp.MIN),
+                (tp, torch.distributed.ReduceOp.MIN),
+            ],
         )
 
     def test_reduction_falls_back_to_full_tp_group(self):
@@ -182,8 +185,14 @@ def _gloo_rank(rank, world_size, port, unavailable_rank, flag_off_rank, results)
     )
     try:
         # Every rank creates every subgroup in the same order.
-        cp_groups = [torch.distributed.new_group([0, 1]), torch.distributed.new_group([2, 3])]
-        tp_groups = [torch.distributed.new_group([0, 2]), torch.distributed.new_group([1, 3])]
+        cp_groups = [
+            torch.distributed.new_group([0, 1]),
+            torch.distributed.new_group([2, 3]),
+        ]
+        tp_groups = [
+            torch.distributed.new_group([0, 2]),
+            torch.distributed.new_group([1, 3]),
+        ]
         params = _params(cp=cp_groups[rank // 2], tp=tp_groups[rank % 2])
         store = _Store(available=rank != unavailable_rank, status="not configured")
         enabled = _linker(store)._resolve_host_prefetch_enabled(
@@ -253,7 +262,11 @@ class TestSchedulerPrefetchSwitch(CustomTestCase):
         tree_cache.waiting_queue_prefetch_enabled.side_effect = AssertionError(
             "tree cache must not be consulted without the user flag"
         )
-        self.assertFalse(_scheduler(flag=False, tree_cache=tree_cache)._waiting_queue_prefetch_active())
+        self.assertFalse(
+            _scheduler(
+                flag=False, tree_cache=tree_cache
+            )._waiting_queue_prefetch_active()
+        )
 
     def test_follows_resolved_linker_switch(self):
         tree_cache = MagicMock()

@@ -36,7 +36,9 @@ def _linker(exist=None, error=None):
             raise error
         return [exist.get(key, 0) for key in keys]
 
-    linker.storage = types.SimpleNamespace(_batch_exist=MagicMock(side_effect=batch_exist))
+    linker.storage = types.SimpleNamespace(
+        _batch_exist=MagicMock(side_effect=batch_exist)
+    )
     return linker
 
 
