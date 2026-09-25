@@ -280,6 +280,7 @@ def _distributed_round_worker(rank, world_size, port):
 
         ingress_scheduler = Scheduler.__new__(Scheduler)
         ingress_scheduler.enable_waiting_queue_dfs_prefetch = True
+        ingress_scheduler._forward_ingress_enabled = True
         ingress_scheduler.enable_overlap = False
         ingress_scheduler.device = "cpu"
         ingress_scheduler.device_module = SimpleNamespace(
