@@ -102,7 +102,8 @@ class _Cache:
             empty_match_result=types.SimpleNamespace(device_indices="empty")
         )
         # One component that cannot build a transfer stops load_back right
-        # after the prefetch decision, before any device-side work.
+        # after the prefetch decision, before any device-side work; its
+        # failure is the last reduction (construction agreement, local 0).
         component = MagicMock()
         component.build_external_linker_transfer.return_value = None
         self._components_tuple = (component,)
@@ -151,28 +152,31 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         cache_linker = _no_prefetch_linker(True)
         cache = self._load_back(cache_linker)
         cache_linker.revalidate_no_prefetch_needed.assert_called_once_with("rid")
-        # ready, valid, claimed; the prepared path then owns the abort.
-        self.assertEqual(cache.reductions, [1, 1, 1])
+        # ready, valid, claimed, construction; the prepared path then owns
+        # the abort.
+        self.assertEqual(cache.reductions, [1, 1, 1, 0])
         cache_linker.abort_prepared_load.assert_called_once_with("rid")
 
     def test_evicted_keys_fall_back_to_the_normal_path(self):
         cache_linker = _no_prefetch_linker(False)
         cache = self._load_back(cache_linker)
-        self.assertEqual(cache.reductions, [1, 0])
+        # ready, valid, then the normal path's construction.
+        self.assertEqual(cache.reductions, [1, 0, 0])
         cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
         cache_linker.abort_prepared_load.assert_not_called()
 
     def test_check_error_still_joins_the_reduction(self):
         cache_linker = _no_prefetch_linker(RuntimeError("boom"))
         cache = self._load_back(cache_linker)
-        self.assertEqual(cache.reductions, [1, 0])
+        self.assertEqual(cache.reductions, [1, 0, 0])
         cache_linker.abort_prepared_load.assert_not_called()
 
     def test_peer_failure_overrides_local_success(self):
         cache_linker = _no_prefetch_linker(True)
         cache = self._load_back(cache_linker, peer_mins=[0])
-        # ready is already 0 from the peer, so no rank reaches validation.
-        self.assertEqual(cache.reductions, [1])
+        # ready is already 0 from the peer, so no rank reaches validation;
+        # the normal path then agrees on construction.
+        self.assertEqual(cache.reductions, [1, 0])
         cache_linker.revalidate_no_prefetch_needed.assert_not_called()
         cache_linker.abort_prepared_load.assert_not_called()
 
@@ -185,7 +189,7 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         dfs_linker.revalidate_host_prefetch.return_value = True
         for cache_linker in (_no_prefetch_linker(True), dfs_linker):
             cache = self._load_back(cache_linker, peer_mins=[1, 0])
-            self.assertEqual(cache.reductions, [1, 1])
+            self.assertEqual(cache.reductions, [1, 1, 0])
             cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
             cache_linker.claim_ready_host_prefetch.assert_not_called()
             cache_linker.abort_prepared_load.assert_not_called()

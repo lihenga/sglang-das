@@ -19,9 +19,10 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-import threading
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -47,6 +48,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExternalLinkerLoadError(RuntimeError):
@@ -583,23 +587,49 @@ class UnifiedCacheLinkerWrapper:
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
-        # Build per-component linker transfers.
+        # Build per-component linker transfers. Building allocates device
+        # slots and can fail on one rank alone; every rank must agree before
+        # revalidate_load or the load, whose collectives a rank that returned
+        # alone would skip.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
-            if transfer is None:
-                if prepared_from_host_prefetch:
-                    self.cache_linker.abort_prepared_load(req.rid)
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+        constructed = True
+        interrupt: BaseException | None = None
+        try:
+            for component in cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
                 )
-                return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
+                if transfer is None:
+                    constructed = False
+                    break
+                component_transfers.append((component, transfer))
+        except BaseException as error:
+            logger.warning(
+                "External KV load transfer construction failed for rid=%s",
+                req.rid,
+                exc_info=True,
+            )
+            constructed = False
+            if not isinstance(error, Exception):
+                # KeyboardInterrupt / SystemExit: still take part in the
+                # agreement and free what was built, then re-raise.
+                interrupt = error
+        all_constructed = torch.tensor(int(constructed), dtype=torch.int)
+        cache._all_reduce_attn_groups(all_constructed, torch.distributed.ReduceOp.MIN)
+        if int(all_constructed.item()) == 0:
+            # Each rank frees what it built; a component frees its own slots
+            # when it fails after allocating.
+            if prepared_from_host_prefetch:
+                self.cache_linker.abort_prepared_load(req.rid)
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+            if interrupt is not None:
+                raise interrupt
+            return empty_indices, req.last_node
 
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would
