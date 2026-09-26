@@ -50,6 +50,11 @@ class BuildStop(BaseException):
     """A non-Exception interruption raised while building."""
 
 
+class ReachedPrepare(Exception):
+    """Raised by the fake components at PREPARE: load_back got past every
+    agreement and would start loading."""
+
+
 class FakeComponent:
     """A persistent allocator: one unit per built transfer, ABORT frees it."""
 
@@ -72,13 +77,17 @@ class FakeComponent:
         )
 
     def update_external_linker_load(self, phase, req, full, transfer, prefix_len, **_):
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            raise ReachedPrepare()
         assert phase == ExternalLinkerLoadPhase.ABORT
         self.allocated -= 1
 
 
-def _prefetch_backend(other_holder):
+def _prefetch_backend(other_holder, claim="ok"):
     """A real Mooncake linker holding one ready prefetch session for "r";
-    only the native store calls are stubbed."""
+    only the native store calls are stubbed. claim="fail" makes the real
+    claim return False (the RID already holds another prepared session);
+    claim="raise" makes it raise."""
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.host_prefetch_lock = threading.Lock()
     linker.session_lock = threading.Lock()
@@ -95,6 +104,15 @@ def _prefetch_backend(other_holder):
     linker.session_sources = {"k0": "dfs"}
     if other_holder:
         linker.prepared_load_sessions["other"] = ["k0"]
+    if claim == "fail":
+        linker.prepared_load_sessions["r"] = ["k9"]
+        linker.session_refcounts["k9"] = 1
+    if claim == "raise":
+
+        def raising_claim(rid):
+            raise RuntimeError("claim failed")
+
+        linker.claim_ready_host_prefetch = raising_claim
     ended = []
     linker.storage = types.SimpleNamespace(
         store=types.SimpleNamespace(
@@ -105,24 +123,34 @@ def _prefetch_backend(other_holder):
     return linker, ended
 
 
-def _session_released(linker, ended, other_holder):
-    if linker.host_prefetch_entries or "r" in linker.prepared_load_sessions:
+def _session_released(linker, ended, other_holder, claim="ok"):
+    if linker.host_prefetch_entries or SESSION in linker.prepared_load_sessions:
         return False
-    if SESSION in linker.prepared_load_sessions:
+    if claim == "fail":
+        # The session that made the claim fail belongs to someone else.
+        if linker.prepared_load_sessions.get("r") != ["k9"]:
+            return False
+        return linker.session_refcounts == {"k9": 1} and ended == [["k0"]]
+    if "r" in linker.prepared_load_sessions:
         return False
     if other_holder:
         return linker.session_refcounts == {"k0": 1} and ended == []
     return linker.session_refcounts == {} and ended == [["k0"]]
 
 
-# scenario -> (path, {rank: (component index, failure)}, other session holder)
+# scenario -> (path, {rank: (component index, failure)}, other session holder,
+#              {rank: claim behaviour})
 SCENARIOS = {
-    "normal_second_component_none": ("normal", {3: (1, "none")}, False),
-    "normal_first_component_raises": ("normal", {1: (0, "raise")}, False),
-    "prefetch_one_rank_fails": ("prefetch", {2: (0, "none")}, False),
-    "prefetch_second_component_raises": ("prefetch", {0: (1, "raise")}, False),
-    "prefetch_fails_with_other_holder": ("prefetch", {2: (0, "none")}, True),
-    "all_built": ("normal", {}, False),
+    "normal_second_component_none": ("normal", {3: (1, "none")}, False, {}),
+    "normal_first_component_raises": ("normal", {1: (0, "raise")}, False, {}),
+    "prefetch_one_rank_fails": ("prefetch", {2: (0, "none")}, False, {}),
+    "prefetch_second_component_raises": ("prefetch", {0: (1, "raise")}, False, {}),
+    "prefetch_fails_with_other_holder": ("prefetch", {2: (0, "none")}, True, {}),
+    "prefetch_claim_fails_one_rank": ("prefetch", {}, False, {1: "fail"}),
+    "prefetch_build_and_claim_fail": ("prefetch", {1: (0, "none")}, False, {3: "fail"}),
+    "prefetch_claim_raises_one_rank": ("prefetch", {}, False, {2: "raise"}),
+    "prefetch_all_built": ("prefetch", {}, False, {}),
+    "all_built": ("normal", {}, False, {}),
 }
 
 
@@ -142,7 +170,7 @@ def _cache(cp_group, tp_group, components, reductions):
     all_reduce = cache._all_reduce_attn_groups
 
     def counted(tensor, op):
-        reductions.append(int(tensor.item()))
+        reductions.append(tensor.tolist() if tensor.numel() > 1 else int(tensor.item()))
         all_reduce(tensor, op)
 
     cache._all_reduce_attn_groups = counted
@@ -176,44 +204,62 @@ def _rank(rank, world_size, port, results):
         # LayerSplit-style revalidation group: its MIN hangs if a rank skips it.
         reval = dist.new_group([0, 1, 2, 3], backend="gloo")
         out = {}
-        for name, (path, failures, other_holder) in SCENARIOS.items():
+        for name, (path, failures, other_holder, claims) in SCENARIOS.items():
             # One allocator pair for all repeats: a leak accumulates.
             components = [FakeComponent(PoolName.KV), FakeComponent(PoolName.SWA)]
             if rank in failures:
                 index, failure = failures[rank]
                 components[index].failure = failure
+            claim = claims.get(rank, "ok")
             reps = []
             for _ in range(REPEATS):
                 reductions = []
                 cache = _cache(cp[rank // 2], tp[rank % 2], components, reductions)
                 revalidated = []
+
+                def revalidate_load(transfers, _seen=revalidated):
+                    _seen.append(1)
+                    verdict = torch.ones(1, dtype=torch.int)
+                    dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=reval)
+                    return False  # stop right after it: a plain miss
+
                 if path == "prefetch":
-                    backend, ended = _prefetch_backend(other_holder)
+                    backend, ended = _prefetch_backend(other_holder, claim)
                 else:
                     backend, ended = MagicMock(), None
-
-                    def revalidate_load(transfers, _seen=revalidated):
-                        _seen.append(1)
-                        verdict = torch.ones(1, dtype=torch.int)
-                        dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=reval)
-                        return False  # stop right after it: a plain miss
-
-                    backend.revalidate_load = revalidate_load
+                backend.revalidate_load = revalidate_load
                 wrapper = _wrapper(cache, backend, path == "prefetch")
-                indices, node = wrapper.load_back(
-                    types.SimpleNamespace(rid="r", last_node="node")
-                )
+                try:
+                    indices, node = wrapper.load_back(
+                        types.SimpleNamespace(rid="r", last_node="node")
+                    )
+                    result = "miss" if indices.numel() == 0 and node == "node" else "?"
+                except ReachedPrepare:
+                    result = "prepare"
+                except RuntimeError as error:
+                    result = f"raised:{error}"
+                allocated = [c.allocated for c in components]
+                if result == "prepare":
+                    for c in components:  # the load owns them now
+                        c.allocated = 0
                 reps.append(
                     (
-                        int(indices.numel()) == 0 and node == "node",
-                        [c.allocated for c in components],
+                        result,
+                        allocated,
                         len(revalidated),
                         (
-                            _session_released(backend, ended, other_holder)
-                            if path == "prefetch"
+                            _session_released(backend, ended, other_holder, claim)
+                            if path == "prefetch" and result != "prepare"
                             else None
                         ),
                         len(reductions),
+                        (
+                            len(reductions[2])
+                            if path == "prefetch"
+                            and len(reductions) > 2
+                            and isinstance(reductions[2], list)
+                            else None
+                        ),
                     )
                 )
             out[name] = reps
@@ -245,19 +291,41 @@ class TestConstructionConsensus(CustomTestCase):
                     process.join(timeout=10)
             outcomes = [results[rank] for rank in range(4)]
 
-        # (miss, allocated, revalidations, session released, reductions)
+        # (result, allocated, revalidations, session released, reductions,
+        #  length of the third reduction)
+        miss_prefetch = ("miss", [0, 0], 0, True, 3, 2)
         expected = {
-            "normal_second_component_none": (True, [0, 0], 0, None, 1),
-            "normal_first_component_raises": (True, [0, 0], 0, None, 1),
-            # ready, valid, claimed, then construction.
-            "prefetch_one_rank_fails": (True, [0, 0], 0, True, 4),
-            "prefetch_second_component_raises": (True, [0, 0], 0, True, 4),
-            "prefetch_fails_with_other_holder": (True, [0, 0], 0, True, 4),
+            "normal_second_component_none": ("miss", [0, 0], 0, None, 1, None),
+            "normal_first_component_raises": ("miss", [0, 0], 0, None, 1, None),
+            # ready, valid, then [claimed, constructed] in one reduction.
+            "prefetch_one_rank_fails": miss_prefetch,
+            "prefetch_second_component_raises": miss_prefetch,
+            "prefetch_fails_with_other_holder": miss_prefetch,
+            # Everyone built, a claim failed: free, then the normal path builds
+            # again, agrees once more and reaches revalidate_load.
+            "prefetch_claim_fails_one_rank": ("miss", [0, 0], 1, True, 4, 2),
+            # A build failure wins: a miss without retrying the normal path.
+            "prefetch_build_and_claim_fail": miss_prefetch,
+            "prefetch_claim_raises_one_rank": miss_prefetch,
+            # Three reductions, built once, straight on to PREPARE.
+            "prefetch_all_built": ("prepare", [1, 1], 0, None, 3, 2),
             # Agreement passes, revalidate_load runs, then its miss frees all.
-            "all_built": (True, [0, 0], 1, None, 1),
+            "all_built": ("miss", [0, 0], 1, None, 1, None),
+        }
+        # The rank whose claim raised re-raises after the same cleanup.
+        overrides = {
+            ("prefetch_claim_raises_one_rank", 2): (
+                "raised:claim failed",
+                [0, 0],
+                0,
+                True,
+                3,
+                2,
+            )
         }
         for rank, out in enumerate(outcomes):
             for name, want in expected.items():
+                want = overrides.get((name, rank), want)
                 with self.subTest(rank=rank, scenario=name):
                     self.assertEqual(len(out[name]), REPEATS)
                     for rep, got in enumerate(out[name]):
@@ -268,10 +336,17 @@ class TestInterruptDuringConstruction(CustomTestCase):
     """A non-Exception interruption still joins the agreement and frees what
     was built before it is re-raised."""
 
-    def _load_back(self, prefetch):
+    def _load_back(
+        self,
+        prefetch,
+        second_failure="stop",
+        claim_error=None,
+        status="dfs_prefetched",
+        cancel_error=None,
+    ):
         reductions = []
         first, second = FakeComponent(PoolName.KV), FakeComponent(PoolName.SWA)
-        second.failure = "stop"
+        second.failure = second_failure
         cache = types.SimpleNamespace(
             page_size=1,
             tree_core=types.SimpleNamespace(
@@ -281,13 +356,19 @@ class TestInterruptDuringConstruction(CustomTestCase):
             ),
             _components_tuple=(first, second),
             _all_reduce_attn_groups=lambda tensor, op: reductions.append(
-                int(tensor.item())
+                tensor.tolist() if tensor.numel() > 1 else int(tensor.item())
             ),
         )
         backend = MagicMock()
-        backend.get_host_prefetch_status.return_value = "dfs_prefetched"
+        backend.get_host_prefetch_status.return_value = status
         backend.revalidate_host_prefetch.return_value = True
+        backend.revalidate_no_prefetch_needed.return_value = True
         backend.claim_ready_host_prefetch.return_value = True
+        if claim_error is not None:
+            backend.claim_ready_host_prefetch.side_effect = claim_error
+        if cancel_error is not None:
+            # Interrupted inside the claim step; the cleanup cancel succeeds.
+            backend.cancel_host_prefetch.side_effect = [cancel_error, None]
         wrapper = _wrapper(cache, backend, prefetch)
         with self.assertRaises(BuildStop):
             wrapper.load_back(types.SimpleNamespace(rid="r", last_node="node"))
@@ -301,9 +382,30 @@ class TestInterruptDuringConstruction(CustomTestCase):
 
     def test_prefetch_path(self):
         reductions, first, backend = self._load_back(prefetch=True)
-        self.assertEqual(reductions, [1, 1, 1, 0])
+        self.assertEqual(reductions, [1, 1, [1, 0]])
         self.assertEqual(first.allocated, 0)
-        backend.abort_prepared_load.assert_called_once_with("r")
+        backend.cancel_host_prefetch.assert_called_with("r")
+
+    def test_claim_interrupt_after_building(self):
+        # Built everything, then the claim is interrupted: this rank still
+        # joins the reduction (as not claimed and not constructed), frees what
+        # it built and re-raises.
+        reductions, first, backend = self._load_back(
+            prefetch=True, second_failure=None, claim_error=BuildStop()
+        )
+        self.assertEqual(reductions, [1, 1, [0, 0]])
+        self.assertEqual(first.allocated, 0)
+        backend.cancel_host_prefetch.assert_called_with("r")
+
+    def test_no_prefetch_needed_cancel_interrupt(self):
+        reductions, first, backend = self._load_back(
+            prefetch=True,
+            second_failure=None,
+            status="no_prefetch_needed",
+            cancel_error=BuildStop(),
+        )
+        self.assertEqual(reductions, [1, 1, [0, 0]])
+        self.assertEqual(first.allocated, 0)
 
 
 class TestComponentRollback(CustomTestCase):

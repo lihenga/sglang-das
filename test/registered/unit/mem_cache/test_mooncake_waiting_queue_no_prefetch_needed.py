@@ -102,18 +102,21 @@ class _Cache:
             empty_match_result=types.SimpleNamespace(device_indices="empty")
         )
         # One component that cannot build a transfer stops load_back right
-        # after the prefetch decision, before any device-side work; its
-        # failure is the last reduction (construction agreement, local 0).
+        # after the prefetch decision, before any device-side work. On the
+        # prefetched path construction joins the claim reduction as
+        # [claimed, constructed]; on the normal path it is its own reduction.
         component = MagicMock()
         component.build_external_linker_transfer.return_value = None
         self._components_tuple = (component,)
 
     def _all_reduce_attn_groups(self, tensor, op):
         assert op == torch.distributed.ReduceOp.MIN
-        local = int(tensor.item())
+        # A scalar or a vector verdict; peers are injected element-wise.
+        local = tensor.tolist() if tensor.numel() > 1 else int(tensor.item())
         stage = len(self.reductions)
-        peer = self.peer_mins[stage] if stage < len(self.peer_mins) else 1
-        tensor.fill_(min(local, peer))
+        peer = self.peer_mins[stage] if stage < len(self.peer_mins) else None
+        if peer is not None:
+            tensor.copy_(torch.minimum(tensor, torch.tensor(peer, dtype=tensor.dtype)))
         self.reductions.append(local)
 
 
@@ -152,10 +155,11 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         cache_linker = _no_prefetch_linker(True)
         cache = self._load_back(cache_linker)
         cache_linker.revalidate_no_prefetch_needed.assert_called_once_with("rid")
-        # ready, valid, claimed, construction; the prepared path then owns
-        # the abort.
-        self.assertEqual(cache.reductions, [1, 1, 1, 0])
-        cache_linker.abort_prepared_load.assert_called_once_with("rid")
+        # ready, valid, then [claimed, constructed] in one reduction; the
+        # failed construction ends in a miss and retires the prefetch.
+        self.assertEqual(cache.reductions, [1, 1, [1, 0]])
+        cache_linker.cancel_host_prefetch.assert_called_with("rid")
+        cache_linker.abort_prepared_load.assert_not_called()
 
     def test_evicted_keys_fall_back_to_the_normal_path(self):
         cache_linker = _no_prefetch_linker(False)

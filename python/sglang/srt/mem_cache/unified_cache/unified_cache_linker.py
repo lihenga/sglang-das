@@ -524,6 +524,37 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> device, then insert ----
 
+    def _build_load_transfers(
+        self, req: Req, tail_hashes
+    ) -> tuple[list[tuple[TreeComponent, PoolTransfer]], bool, BaseException | None]:
+        """Build every component's LOAD transfer on this rank only.
+
+        Building allocates device slots and can fail on one rank alone, so the
+        caller must agree on the returned flag with the other ranks before any
+        later collective, and on failure ABORT the transfers returned here (a
+        component frees slots it could not hand over). A non-Exception
+        interruption is returned rather than raised so that this rank still
+        joins that agreement; the caller re-raises it after cleanup.
+        """
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
+        try:
+            for component in self.cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
+                )
+                if transfer is None:
+                    return component_transfers, False, None
+                component_transfers.append((component, transfer))
+        except BaseException as error:
+            logger.warning(
+                "External KV load transfer construction failed for rid=%s",
+                req.rid,
+                exc_info=True,
+            )
+            interrupt = None if isinstance(error, Exception) else error
+            return component_transfers, False, interrupt
+        return component_transfers, True, None
+
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
@@ -532,7 +563,8 @@ class UnifiedCacheLinkerWrapper:
             return empty_indices, req.last_node
 
         prepared_from_host_prefetch = False
-        if self.host_prefetch_hits.pop(req.rid, None) is not None:
+        prefetched = self.host_prefetch_hits.pop(req.rid, None) is not None
+        if prefetched:
             status = self.cache_linker.get_host_prefetch_status(req.rid)
             locally_complete = status in {"dfs_prefetched", "no_prefetch_needed"}
             ready = torch.tensor(int(locally_complete), dtype=torch.int)
@@ -566,70 +598,73 @@ class UnifiedCacheLinkerWrapper:
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
 
-            if status == "no_prefetch_needed":
-                self.cache_linker.cancel_host_prefetch(req.rid)
-                claimed = True
-            else:
-                claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
-            claimed_all = torch.tensor(int(claimed), dtype=torch.int)
-            cache._all_reduce_attn_groups(
-                claimed_all, torch.distributed.ReduceOp.MIN
-            )
-            if int(claimed_all.item()) == 0:
-                # cancel_host_prefetch also rolls a locally claimed session
-                # back when another rank fails the claim.
-                self.cache_linker.cancel_host_prefetch(req.rid)
-                self.hit_markers[req.rid] = hit
-                return self.load_back(req)
-            prepared_from_host_prefetch = True
-
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
-        # Build per-component linker transfers. Building allocates device
-        # slots and can fail on one rank alone; every rank must agree before
-        # revalidate_load or the load, whose collectives a rank that returned
-        # alone would skip.
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        constructed = True
-        interrupt: BaseException | None = None
-        try:
-            for component in cache._components_tuple:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOAD, None, tail_hashes
+        if prefetched:
+            # Build before claiming so that the claim reduction also carries
+            # the construction verdict: one reduction instead of two.
+            component_transfers, constructed, interrupt = self._build_load_transfers(
+                req, tail_hashes
+            )
+            claim_error: BaseException | None = None
+            try:
+                if status == "no_prefetch_needed":
+                    self.cache_linker.cancel_host_prefetch(req.rid)
+                    claimed = True
+                else:
+                    claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
+            except BaseException as error:
+                # Still join the reduction below, then re-raise after cleanup.
+                # Reporting "not constructed" sends every rank to the miss exit
+                # rather than to a normal-path retry this rank would not join.
+                claimed, constructed, claim_error = False, False, error
+            verdict = torch.tensor([int(claimed), int(constructed)], dtype=torch.int)
+            cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+            claimed_all, constructed_all = (int(value) for value in verdict)
+            if not (claimed_all and constructed_all):
+                # Free the device slots first so a failing cancel cannot skip
+                # it; cancel_host_prefetch also rolls a locally claimed
+                # session back.
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    component_transfers,
+                    prefix_len,
                 )
-                if transfer is None:
-                    constructed = False
-                    break
-                component_transfers.append((component, transfer))
-        except BaseException as error:
-            logger.warning(
-                "External KV load transfer construction failed for rid=%s",
-                req.rid,
-                exc_info=True,
+                self.cache_linker.cancel_host_prefetch(req.rid)
+                pending = interrupt if interrupt is not None else claim_error
+                if pending is not None:
+                    raise pending
+                if not constructed_all:
+                    # Building failed somewhere: a miss, as on the normal path.
+                    return empty_indices, req.last_node
+                # Every rank built but a claim failed: retry the normal path,
+                # which builds again and agrees on its own construction.
+                self.hit_markers[req.rid] = hit
+                return self.load_back(req)
+            prepared_from_host_prefetch = True
+        else:
+            component_transfers, constructed, interrupt = self._build_load_transfers(
+                req, tail_hashes
             )
-            constructed = False
-            if not isinstance(error, Exception):
-                # KeyboardInterrupt / SystemExit: still take part in the
-                # agreement and free what was built, then re-raise.
-                interrupt = error
-        all_constructed = torch.tensor(int(constructed), dtype=torch.int)
-        cache._all_reduce_attn_groups(all_constructed, torch.distributed.ReduceOp.MIN)
-        if int(all_constructed.item()) == 0:
-            # Each rank frees what it built; a component frees its own slots
-            # when it fails after allocating.
-            if prepared_from_host_prefetch:
-                self.cache_linker.abort_prepared_load(req.rid)
-            self._update_load(
-                ExternalLinkerLoadPhase.ABORT,
-                req,
-                component_transfers,
-                prefix_len,
+            all_constructed = torch.tensor(int(constructed), dtype=torch.int)
+            cache._all_reduce_attn_groups(
+                all_constructed, torch.distributed.ReduceOp.MIN
             )
-            if interrupt is not None:
-                raise interrupt
-            return empty_indices, req.last_node
+            if int(all_constructed.item()) == 0:
+                # Each rank frees what it built; a component frees its own
+                # slots when it fails after allocating.
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    component_transfers,
+                    prefix_len,
+                )
+                if interrupt is not None:
+                    raise interrupt
+                return empty_indices, req.last_node
 
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would
