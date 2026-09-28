@@ -885,10 +885,11 @@ class PrefillBootstrapQueue:
         pd_hidden_state(req).owner_direct_sent = False
         return True
 
-    def add(self, req: Req, num_kv_heads: int) -> None:
+    def add(self, req: Req, num_kv_heads: int) -> bool:
         if not self.create_sender(req, num_kv_heads):
-            return
+            return False
         self.queue.append(req)
+        return True
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -1225,6 +1226,7 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
+        self._begin_scheduler_iteration()
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -1249,6 +1251,8 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            self._process_deferred_reqs()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2037,8 +2041,9 @@ class SchedulerDisaggregationPrefillMixin:
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+        # Also covers the external KV linker: a waiting-queue prefetch taken
+        # at arrival would otherwise keep its budget slot and pinned session.
+        self._release_aborted_request(req.rid)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
