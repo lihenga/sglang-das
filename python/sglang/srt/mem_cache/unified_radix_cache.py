@@ -592,11 +592,21 @@ class UnifiedRadixCache(BasePrefixCache):
             groups.append(self.tp_group)
 
         all_rids = list(dict.fromkeys(rids))
-        has_rids = torch.tensor([int(bool(all_rids))], dtype=torch.int)
+        # Share one monotonic timestamp through the same admission collective
+        # as queue presence. Scheduler ranks then make identical deadline
+        # decisions even when their local loops reach this point at different
+        # times.
+        has_rids = torch.tensor(
+            [int(bool(all_rids)), time.monotonic_ns() // 1_000_000],
+            dtype=torch.int64,
+        )
         self._all_reduce_attn_groups(
             has_rids, torch.distributed.ReduceOp.MAX
         )
-        if int(has_rids.item()) == 0:
+        self.last_waiting_queue_prefetch_admission_time_ms = int(
+            has_rids[1].item()
+        )
+        if int(has_rids[0].item()) == 0:
             return {}
 
         for group in groups:

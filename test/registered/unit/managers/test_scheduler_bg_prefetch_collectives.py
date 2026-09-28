@@ -133,6 +133,15 @@ def _distributed_round_worker(rank, world_size, port):
         assert not bg_thread.is_alive(), "background prefetch round did not finish"
         assert not bg_errors, f"background prefetch failed: {bg_errors}"
         assert states == {"a": "pending", "b": "terminal"}
+        admission_time = torch.tensor(
+            [cache.last_waiting_queue_prefetch_admission_time_ms],
+            dtype=torch.int64,
+        )
+        peer_admission_times = [
+            torch.zeros_like(admission_time) for _ in range(world_size)
+        ]
+        dist.all_gather(peer_admission_times, admission_time, group=main_group)
+        assert len({int(value.item()) for value in peer_admission_times}) == 1
 
         acknowledgements = {}
         while True:

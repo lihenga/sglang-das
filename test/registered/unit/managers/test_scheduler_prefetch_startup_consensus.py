@@ -93,6 +93,21 @@ class TestSingleRank(CustomTestCase):
                 )
         self.assertEqual(s._waiting_queue_prefill_batch_size, 27)
         self.assertEqual(s._waiting_queue_partial_batch_idle_rounds, 2)
+        self.assertEqual(s._waiting_queue_partial_batch_wait_ms, 0)
+
+    def test_wall_clock_wait_supersedes_idle_rounds(self):
+        s = _scheduler()
+        with envs.SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE.override(27):
+            with envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS.override(2):
+                with envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_WAIT_MS.override(
+                    100
+                ):
+                    self.assertEqual(
+                        s._resolve_prefetch_startup_switches(None), (True, True)
+                    )
+        self.assertEqual(s._waiting_queue_prefill_batch_size, 27)
+        self.assertEqual(s._waiting_queue_partial_batch_idle_rounds, 0)
+        self.assertEqual(s._waiting_queue_partial_batch_wait_ms, 100)
 
 
 # Per-rank settings for a 4-rank world laid out as two attention domains
@@ -135,6 +150,24 @@ CASES = {
         ],
         "raise",
     ),
+    "partial_batch_wait_split": (
+        [
+            {"wait_ms": 100},
+            {"wait_ms": 100},
+            {"wait_ms": 200},
+            {"wait_ms": 100},
+        ],
+        "raise",
+    ),
+    "wall_clock_wait_ignores_idle_round_split": (
+        [
+            {"wait_ms": 100, "idle_rounds": 1},
+            {"wait_ms": 100, "idle_rounds": 2},
+            {"wait_ms": 100, "idle_rounds": 3},
+            {"wait_ms": 100, "idle_rounds": 4},
+        ],
+        (True, True),
+    ),
     # The supplemental poll never runs outside a PD prefill with pp_size == 1:
     # a disagreeing or invalid value there must not stop the server.
     "decode_final_poll_split": (
@@ -176,6 +209,9 @@ def _gloo_rank(rank, world_size, port, case, results):
     )
     os.environ["SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS"] = str(
         settings.pop("idle_rounds", 0)
+    )
+    os.environ["SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_WAIT_MS"] = str(
+        settings.pop("wait_ms", 0)
     )
     torch.distributed.init_process_group(
         "gloo",

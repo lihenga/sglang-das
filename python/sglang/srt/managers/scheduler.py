@@ -1190,7 +1190,9 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         self._waiting_queue_prefill_batch_size = 0
         self._waiting_queue_partial_batch_idle_rounds = 0
+        self._waiting_queue_partial_batch_wait_ms = 0
         self._waiting_queue_partial_batch_idle_count = 0
+        self._waiting_queue_partial_batch_deadline_ms = None
         self._waiting_queue_partial_batch_last_queued_ids = None
         self._waiting_queue_partial_batch_last_eligible_ids = None
         # The running decoding batch for continuous batching
@@ -3378,12 +3380,16 @@ class Scheduler(
 
         prefill_batch_size = 0
         partial_batch_idle_rounds = 0
+        partial_batch_wait_ms = 0
         if prefetch_local:
             prefill_batch_size = max(
                 0, envs.SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE.get()
             )
             partial_batch_idle_rounds = max(
                 0, envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS.get()
+            )
+            partial_batch_wait_ms = max(
+                0, envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_WAIT_MS.get()
             )
 
         flags = torch.tensor(
@@ -3397,6 +3403,8 @@ class Scheduler(
                 -prefill_batch_size,
                 partial_batch_idle_rounds,
                 -partial_batch_idle_rounds,
+                partial_batch_wait_ms,
+                -partial_batch_wait_ms,
             ],
             dtype=torch.int64,
         )
@@ -3414,6 +3422,8 @@ class Scheduler(
             prefill_batch_size_neg_max,
             partial_batch_idle_min,
             partial_batch_idle_neg_max,
+            partial_batch_wait_min,
+            partial_batch_wait_neg_max,
         ) = (int(value) for value in flags)
         if not final_poll_valid or final_poll_min != -neg_final_poll_max:
             raise ValueError(
@@ -3425,15 +3435,22 @@ class Scheduler(
         enabled = bool(prefetch)
         prefill_batch_size_max = -prefill_batch_size_neg_max
         partial_batch_idle_max = -partial_batch_idle_neg_max
-        if enabled and (
+        partial_batch_wait_max = -partial_batch_wait_neg_max
+        batching_settings_mismatch = (
             prefill_batch_size_min != prefill_batch_size_max
-            or partial_batch_idle_min != partial_batch_idle_max
-        ):
+            or partial_batch_wait_min != partial_batch_wait_max
+            or (
+                partial_batch_wait_min == 0
+                and partial_batch_idle_min != partial_batch_idle_max
+            )
+        )
+        if enabled and batching_settings_mismatch:
             raise ValueError(
                 "SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE and "
-                "SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS must "
+                "SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_WAIT_MS must "
                 "match on every scheduler rank when waiting-queue DFS "
-                "prefetch is enabled."
+                "prefetch is enabled; IDLE_ROUNDS must also match when "
+                "WAIT_MS is zero."
             )
         if prefetch_local and not enabled:
             # Before any job exists: keep the linker consistent with the world.
@@ -3452,12 +3469,18 @@ class Scheduler(
             prefill_batch_size_min if enabled else 0
         )
         self._waiting_queue_partial_batch_idle_rounds = (
-            partial_batch_idle_min if enabled else 0
+            partial_batch_idle_min
+            if enabled and partial_batch_wait_min == 0
+            else 0
+        )
+        self._waiting_queue_partial_batch_wait_ms = (
+            partial_batch_wait_min if enabled else 0
         )
         return enabled, forward_ingress
 
     def _reset_waiting_queue_partial_batch_idle_state(self) -> None:
         self._waiting_queue_partial_batch_idle_count = 0
+        self._waiting_queue_partial_batch_deadline_ms = None
         self._waiting_queue_partial_batch_last_queued_ids = None
         self._waiting_queue_partial_batch_last_eligible_ids = None
 
@@ -3473,7 +3496,10 @@ class Scheduler(
         if (
             not self.enable_waiting_queue_dfs_prefetch
             or self._waiting_queue_prefill_batch_size <= 0
-            or self._waiting_queue_partial_batch_idle_rounds <= 0
+            or (
+                self._waiting_queue_partial_batch_wait_ms <= 0
+                and self._waiting_queue_partial_batch_idle_rounds <= 0
+            )
         ):
             return False
 
@@ -3485,14 +3511,6 @@ class Scheduler(
             for rid, state in waiting_queue_prefetch_states.items()
             if state != "pending"
         )
-        progress = (
-            self._waiting_queue_partial_batch_last_queued_ids is None
-            or queued_ids != self._waiting_queue_partial_batch_last_queued_ids
-            or eligible_ids != self._waiting_queue_partial_batch_last_eligible_ids
-        )
-        self._waiting_queue_partial_batch_last_queued_ids = queued_ids
-        self._waiting_queue_partial_batch_last_eligible_ids = eligible_ids
-
         # The configured request limit is another safety bound on the target.
         target = self._waiting_queue_prefill_batch_size
         prefill_max_requests = get_schedule().prefill_max_requests
@@ -3505,14 +3523,37 @@ class Scheduler(
             self._reset_waiting_queue_partial_batch_idle_state()
             return False
 
+        if len(eligible_ids) >= target:
+            self._reset_waiting_queue_partial_batch_idle_state()
+            return False
+
+        if self._waiting_queue_partial_batch_wait_ms > 0:
+            now_ms = self.tree_cache.last_waiting_queue_prefetch_admission_time_ms
+            if self._waiting_queue_partial_batch_deadline_ms is None:
+                self._waiting_queue_partial_batch_deadline_ms = (
+                    now_ms + self._waiting_queue_partial_batch_wait_ms
+                )
+            if now_ms < self._waiting_queue_partial_batch_deadline_ms:
+                # A nonempty waiting queue bypasses on_idle's sleep. Yield
+                # briefly instead of polling the admission collective flat out.
+                time.sleep(0.001)
+                return True
+            # Keep the expired deadline until a batch is admitted or the
+            # queue empties; a failed admission must not start another wait.
+            return False
+
+        progress = (
+            self._waiting_queue_partial_batch_last_queued_ids is None
+            or queued_ids != self._waiting_queue_partial_batch_last_queued_ids
+            or eligible_ids != self._waiting_queue_partial_batch_last_eligible_ids
+        )
+        self._waiting_queue_partial_batch_last_queued_ids = queued_ids
+        self._waiting_queue_partial_batch_last_eligible_ids = eligible_ids
+
         if progress:
             self._waiting_queue_partial_batch_idle_count = 0
         else:
             self._waiting_queue_partial_batch_idle_count += 1
-
-        if len(eligible_ids) >= target:
-            self._reset_waiting_queue_partial_batch_idle_state()
-            return False
 
         if (
             self._waiting_queue_partial_batch_idle_count

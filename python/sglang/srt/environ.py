@@ -661,9 +661,11 @@ class Envs:
     # Waiting-queue DFS prefill batching, active only when Mooncake DFS prefetch
     # is enabled. A positive batch size caps requests per prefill forward; a
     # positive idle-round count bounds how long an underfull queue is held.
-    # Zero disables each limit.
+    # A positive wall-clock wait supersedes the idle-round count; zero keeps
+    # the legacy idle-round behavior.
     SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE = EnvInt(0)
     SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS = EnvInt(0)
+    SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_WAIT_MS = EnvInt(0)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
