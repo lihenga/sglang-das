@@ -1188,6 +1188,11 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        self._waiting_queue_prefill_batch_size = 0
+        self._waiting_queue_partial_batch_idle_rounds = 0
+        self._waiting_queue_partial_batch_idle_count = 0
+        self._waiting_queue_partial_batch_last_queued_ids = None
+        self._waiting_queue_partial_batch_last_eligible_ids = None
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -3345,11 +3350,10 @@ class Scheduler(
         scheduler rank joins this one reduction unconditionally: a rank whose
         own flags, Mooncake capability or KV canary mode disagree turns the
         feature off everywhere instead of skipping the group creation alone.
-        The same reduction requires SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS to be
-        on or off everywhere (positive values may differ); otherwise ranks
-        would disagree on the supplemental poll collective. That poll only runs
+        The same reduction checks the final-poll switch and makes the DFS
+        prefill batching limits identical across ranks. The final poll only runs
         on a PD prefill with pp_size == 1 (final chunks are recorded only
-        there), so other roles do not read the variable and report it off.
+        there), so other roles do not read its variable and report it off.
         """
 
         prefetch_local = (
@@ -3372,6 +3376,16 @@ class Scheduler(
             except Exception:
                 final_poll_on, final_poll_valid = False, False
 
+        prefill_batch_size = 0
+        partial_batch_idle_rounds = 0
+        if prefetch_local:
+            prefill_batch_size = max(
+                0, envs.SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE.get()
+            )
+            partial_batch_idle_rounds = max(
+                0, envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS.get()
+            )
+
         flags = torch.tensor(
             [
                 int(prefetch_local),
@@ -3379,6 +3393,10 @@ class Scheduler(
                 int(final_poll_on),
                 -int(final_poll_on),
                 int(final_poll_valid),
+                prefill_batch_size,
+                -prefill_batch_size,
+                partial_batch_idle_rounds,
+                -partial_batch_idle_rounds,
             ],
             dtype=torch.int64,
         )
@@ -3386,9 +3404,17 @@ class Scheduler(
             torch.distributed.all_reduce(
                 flags, op=torch.distributed.ReduceOp.MIN, group=group
             )
-        prefetch, ingress, final_poll_min, neg_final_poll_max, final_poll_valid = (
-            int(value) for value in flags
-        )
+        (
+            prefetch,
+            ingress,
+            final_poll_min,
+            neg_final_poll_max,
+            final_poll_valid,
+            prefill_batch_size_min,
+            prefill_batch_size_neg_max,
+            partial_batch_idle_min,
+            partial_batch_idle_neg_max,
+        ) = (int(value) for value in flags)
         if not final_poll_valid or final_poll_min != -neg_final_poll_max:
             raise ValueError(
                 "SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS must be valid and either "
@@ -3397,6 +3423,18 @@ class Scheduler(
             )
 
         enabled = bool(prefetch)
+        prefill_batch_size_max = -prefill_batch_size_neg_max
+        partial_batch_idle_max = -partial_batch_idle_neg_max
+        if enabled and (
+            prefill_batch_size_min != prefill_batch_size_max
+            or partial_batch_idle_min != partial_batch_idle_max
+        ):
+            raise ValueError(
+                "SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE and "
+                "SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS must "
+                "match on every scheduler rank when waiting-queue DFS "
+                "prefetch is enabled."
+            )
         if prefetch_local and not enabled:
             # Before any job exists: keep the linker consistent with the world.
             self.tree_cache.disable_waiting_queue_prefetch()
@@ -3410,7 +3448,80 @@ class Scheduler(
                 "Waiting-queue DFS prefetch runs without receiving requests "
                 "during forward because KV canary is enabled."
             )
+        self._waiting_queue_prefill_batch_size = (
+            prefill_batch_size_min if enabled else 0
+        )
+        self._waiting_queue_partial_batch_idle_rounds = (
+            partial_batch_idle_min if enabled else 0
+        )
         return enabled, forward_ingress
+
+    def _reset_waiting_queue_partial_batch_idle_state(self) -> None:
+        self._waiting_queue_partial_batch_idle_count = 0
+        self._waiting_queue_partial_batch_last_queued_ids = None
+        self._waiting_queue_partial_batch_last_eligible_ids = None
+
+    def _should_delay_waiting_queue_partial_batch(
+        self,
+        waiting_queue_prefetch_states: Dict[str, str],
+    ) -> bool:
+        """Wait briefly for more DFS-prefetched requests before a partial batch.
+
+        The admission-state map already contains the same rank-wide request set
+        used to decide which queued requests can be admitted.
+        """
+        if (
+            not self.enable_waiting_queue_dfs_prefetch
+            or self._waiting_queue_prefill_batch_size <= 0
+            or self._waiting_queue_partial_batch_idle_rounds <= 0
+        ):
+            return False
+
+        # The admission-state query has already returned the union of queued
+        # request IDs and their rank-wide states for this CP/TP group.
+        queued_ids = frozenset(waiting_queue_prefetch_states)
+        eligible_ids = frozenset(
+            rid
+            for rid, state in waiting_queue_prefetch_states.items()
+            if state != "pending"
+        )
+        progress = (
+            self._waiting_queue_partial_batch_last_queued_ids is None
+            or queued_ids != self._waiting_queue_partial_batch_last_queued_ids
+            or eligible_ids != self._waiting_queue_partial_batch_last_eligible_ids
+        )
+        self._waiting_queue_partial_batch_last_queued_ids = queued_ids
+        self._waiting_queue_partial_batch_last_eligible_ids = eligible_ids
+
+        # The configured request limit is another safety bound on the target.
+        target = self._waiting_queue_prefill_batch_size
+        prefill_max_requests = get_schedule().prefill_max_requests
+        if prefill_max_requests is not None:
+            target = min(target, max(0, prefill_max_requests))
+        if self.chunked_req is not None:
+            target = 0
+
+        if not eligible_ids or target == 0:
+            self._reset_waiting_queue_partial_batch_idle_state()
+            return False
+
+        if progress:
+            self._waiting_queue_partial_batch_idle_count = 0
+        else:
+            self._waiting_queue_partial_batch_idle_count += 1
+
+        if len(eligible_ids) >= target:
+            self._reset_waiting_queue_partial_batch_idle_state()
+            return False
+
+        if (
+            self._waiting_queue_partial_batch_idle_count
+            < self._waiting_queue_partial_batch_idle_rounds
+        ):
+            return True
+
+        self._reset_waiting_queue_partial_batch_idle_state()
+        return False
 
     def _prefetch_kvcache(self, req: Req, *, is_retracted: bool = False):
         if (
@@ -4054,6 +4165,7 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            self._reset_waiting_queue_partial_batch_idle_state()
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -4066,6 +4178,7 @@ class Scheduler(
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
             )
         ):
+            self._reset_waiting_queue_partial_batch_idle_state()
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
@@ -4079,6 +4192,7 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            self._reset_waiting_queue_partial_batch_idle_state()
             return None, running_batch
 
         # Get priority queue
@@ -4088,6 +4202,12 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
+            self._reset_waiting_queue_partial_batch_idle_state()
+            return None, running_batch
+
+        if self._should_delay_waiting_queue_partial_batch(
+            waiting_queue_prefetch_states
+        ):
             return None, running_batch
 
         # Determine chunked_prefill_size for this batch
@@ -4106,6 +4226,20 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        prefill_max_requests = get_schedule().prefill_max_requests
+        if (
+            self.enable_waiting_queue_dfs_prefetch
+            and self._waiting_queue_prefill_batch_size > 0
+        ):
+            prefill_max_requests = (
+                self._waiting_queue_prefill_batch_size
+                if prefill_max_requests is None
+                else min(
+                    prefill_max_requests,
+                    self._waiting_queue_prefill_batch_size,
+                )
+            )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -4118,7 +4252,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
-            prefill_max_requests=get_schedule().prefill_max_requests,
+            prefill_max_requests=prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
@@ -4255,6 +4389,8 @@ class Scheduler(
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None, running_batch
+
+        self._reset_waiting_queue_partial_batch_idle_state()
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
