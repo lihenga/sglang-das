@@ -84,34 +84,25 @@ class TestSingleRank(CustomTestCase):
         with envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.override(0.5):
             self.assertEqual(s._resolve_prefetch_startup_switches(None), (True, True))
 
-    def test_prefill_batching_limits_are_resolved(self):
+    def test_prefill_batching_is_fixed_and_ignores_legacy_limits(self):
         s = _scheduler()
-        with envs.SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE.override(27):
-            with envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS.override(2):
-                self.assertEqual(
-                    s._resolve_prefetch_startup_switches(None), (True, True)
-                )
-        self.assertEqual(s._waiting_queue_prefill_batch_size, 27)
-        self.assertEqual(s._waiting_queue_partial_batch_idle_rounds, 2)
-        self.assertEqual(s._waiting_queue_partial_batch_wait_ms, 0)
-
-    def test_wall_clock_wait_supersedes_idle_rounds(self):
-        s = _scheduler()
-        with envs.SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE.override(27):
+        with envs.SGLANG_MOONCAKE_PREFETCH_PREFILL_BATCH_SIZE.override(3):
             with envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_IDLE_ROUNDS.override(2):
                 with envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_WAIT_MS.override(
-                    100
+                    5000
                 ):
                     self.assertEqual(
                         s._resolve_prefetch_startup_switches(None), (True, True)
                     )
-        self.assertEqual(s._waiting_queue_prefill_batch_size, 27)
-        self.assertEqual(s._waiting_queue_partial_batch_idle_rounds, 0)
-        self.assertEqual(s._waiting_queue_partial_batch_wait_ms, 100)
+
+    def test_legacy_wall_clock_wait_is_ignored(self):
+        s = _scheduler()
+        with envs.SGLANG_MOONCAKE_PREFETCH_PARTIAL_BATCH_WAIT_MS.override(100):
+            self.assertEqual(s._resolve_prefetch_startup_switches(None), (True, True))
 
 
 # Per-rank settings for a 4-rank world laid out as two attention domains
-# {0, 1} and {2, 3}. Each case: (settings per rank, expected result or "raise").
+# {0, 1} and {2, 3}. Each case: (settings per rank, expected result).
 CASES = {
     "all_on": ([{}] * 4, (True, True)),
     "one_domain_lacks_capability": (
@@ -141,23 +132,23 @@ CASES = {
         [{"final_poll": 400.1}, {"final_poll": 400.9}, {"final_poll": 1.0}, {}],
         (True, True),
     ),
-    "batching_settings_split": (
+    "batching_settings_split_ignored": (
         [
             {"batch_size": 27, "idle_rounds": 2},
             {"batch_size": 27, "idle_rounds": 2},
             {"batch_size": 28, "idle_rounds": 3},
             {"batch_size": 27, "idle_rounds": 2},
         ],
-        "raise",
+        (True, True),
     ),
-    "partial_batch_wait_split": (
+    "partial_batch_wait_split_ignored": (
         [
             {"wait_ms": 100},
             {"wait_ms": 100},
             {"wait_ms": 200},
             {"wait_ms": 100},
         ],
-        "raise",
+        (True, True),
     ),
     "wall_clock_wait_ignores_idle_round_split": (
         [
