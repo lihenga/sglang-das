@@ -202,6 +202,9 @@ class UnifiedCacheLinkerWrapper:
         if device_hit_len >= len(key):
             return result
 
+        if getattr(self.cache_linker, "skip_lookup_for_benchmark", False):
+            return result
+
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
             return result

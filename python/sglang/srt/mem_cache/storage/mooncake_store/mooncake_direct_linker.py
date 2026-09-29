@@ -32,6 +32,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
@@ -197,6 +198,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
+        mode = envs.SGLANG_TEST_MOONCAKE_DIRECT_LINKER_MODE.get()
+        self.skip_lookup_for_benchmark = mode in (1, 3)
+        self.skip_offload_for_benchmark = mode in (1, 2)
         self.page_wise_load_threshold = (
             server_args.mooncake_page_wise_load_threshold
         )
@@ -811,6 +815,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
+        if self.skip_offload_for_benchmark:
+            self.freeze_gc_once()
+            self.offload_results.put(True)
+            return True
         self.freeze_gc_once()
         if not self.offload_owner:
             self.offload_results.put(True)

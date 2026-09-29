@@ -407,6 +407,8 @@ class Envs:
     # Ranks honouring the above: unset/"all", or e.g. "0,3". An asymmetric
     # case is what exercises the MIN-reduce into a group-wide abort.
     SGLANG_TEST_LINKER_LOAD_FAILURE_RANKS = EnvStr(None)
+    # Mooncake direct-linker A/B mode: 0=production, 1=R00, 2=R10, 3=R01.
+    SGLANG_TEST_MOONCAKE_DIRECT_LINKER_MODE = EnvInt(0)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
 
