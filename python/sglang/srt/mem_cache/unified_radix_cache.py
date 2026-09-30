@@ -2963,6 +2963,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
         return bool(self._stranded_linker_nodes or self.linker.failed_chains)
 
+    def retry_stranded_failed_linker_chains(self) -> None:
+        """Retry reclaiming detached failed-load chains that still have owners."""
+        if self.linker is None or not self._stranded_linker_nodes:
+            return
+        self._reclaim_failed_linker_chain("")
+
     def is_on_failed_linker_chain(self, node_id: Optional[NodeId]) -> bool:
         if self.linker is None or node_id is None:
             return False
