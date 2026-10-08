@@ -234,6 +234,9 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
+from sglang.srt.managers.scheduler_components.kv_capacity_observer import (
+    ScheduleKVCapacityObserver,
+)
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
@@ -662,6 +665,8 @@ class Scheduler(
         self.init_dp_attn_adapter()
 
         self.init_pool_stats_observer()
+
+        self.init_kv_capacity_observer()
 
         self.init_invariant_checker()
 
@@ -2240,6 +2245,12 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
         )
 
+    def init_kv_capacity_observer(self) -> None:
+        self.kv_capacity_observer = ScheduleKVCapacityObserver.create(
+            tree_cache=self.tree_cache,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
+
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
             is_hybrid_swa=self.is_hybrid_swa,
@@ -3320,6 +3331,12 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        capacity_before = (
+            self.kv_capacity_observer.snapshot()
+            if self.kv_capacity_observer is not None
+            else None
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
@@ -3365,7 +3382,13 @@ class Scheduler(
         )
 
         if ret:
-            set_schedule_time_batch(ret)
+            capacity_attrs = None
+            if self.kv_capacity_observer is not None:
+                capacity_attrs = self.kv_capacity_observer.timeline_attrs(
+                    capacity_before,
+                    self.kv_capacity_observer.snapshot(),
+                )
+            set_schedule_time_batch(ret, attrs=capacity_attrs)
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 

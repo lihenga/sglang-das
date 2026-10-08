@@ -3,11 +3,14 @@ import tempfile
 import types
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_TENANT_ID,
+    MooncakeMemoryUsage,
+    MooncakeStore,
     MooncakeStoreConfig,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -89,6 +92,64 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
         should_split_heads=False,
         extra_config=extra_config,
     )
+
+
+class TestMooncakeMemoryUsage(unittest.TestCase):
+    def setUp(self):
+        self.store = object.__new__(MooncakeStore)
+        self.store.config = SimpleNamespace(
+            master_server_address="127.0.0.1:50051",
+            master_metrics_port=9003,
+        )
+
+    def test_master_admin_url_supports_ipv4_hostname_and_ipv6(self):
+        cases = (
+            ("127.0.0.1:50051", "http://127.0.0.1:9003/memory_usage"),
+            ("master.local:50051", "http://master.local:9003/memory_usage"),
+            ("[2001:db8::1]:50051", "http://[2001:db8::1]:9003/memory_usage"),
+        )
+        for address, expected in cases:
+            with self.subTest(address=address):
+                self.store.config.master_server_address = address
+                self.assertEqual(
+                    self.store._master_admin_url("/memory_usage"), expected
+                )
+
+    @mock.patch(
+        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.requests.get"
+    )
+    def test_get_memory_usage_validates_and_returns_response(self, get):
+        response = get.return_value
+        response.json.return_value = {
+            "used_bytes": 100,
+            "available_bytes": 300,
+            "capacity_bytes": 400,
+        }
+
+        usage = self.store.get_memory_usage(timeout=0.125)
+
+        self.assertEqual(usage, MooncakeMemoryUsage(100, 300, 400))
+        get.assert_called_once_with(
+            "http://127.0.0.1:9003/memory_usage", timeout=0.125
+        )
+        response.raise_for_status.assert_called_once_with()
+
+    @mock.patch(
+        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.requests.get"
+    )
+    def test_get_memory_usage_rejects_malformed_values(self, get):
+        invalid_payloads = (
+            {},
+            {"used_bytes": True, "available_bytes": 0, "capacity_bytes": 1},
+            {"used_bytes": -1, "available_bytes": 2, "capacity_bytes": 1},
+            {"used_bytes": 1, "available_bytes": 2, "capacity_bytes": 4},
+            {"used_bytes": 2, "available_bytes": 1, "capacity_bytes": 1},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                get.return_value.json.return_value = payload
+                with self.assertRaises(ValueError):
+                    self.store.get_memory_usage()
 
 
 class TestMooncakeTenantConfig(unittest.TestCase):

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -50,6 +51,14 @@ if TYPE_CHECKING:
 
 class ExternalLinkerLoadError(RuntimeError):
     """A recoverable external-cache load failure for the current batch."""
+
+
+@dataclass(frozen=True, slots=True)
+class KVCapacitySnapshot:
+    available_slots: int
+    capacity_slots: int
+    available_bytes: int
+    capacity_bytes: int
 
 
 class UnifiedCacheLinker(ABC):
@@ -114,6 +123,14 @@ class UnifiedCacheLinker(ABC):
     def pop_completed_offload(self) -> bool:
         """Consume the oldest completed offload and return its result."""
 
+    def get_kv_capacity_snapshot(self) -> KVCapacitySnapshot | None:
+        """Return the external store's logical KV capacity when supported."""
+        return None
+
+    def get_local_kv_bytes_per_slot(self) -> int | None:
+        """Return this rank's physical bytes per logical KV token slot."""
+        return None
+
     @abstractmethod
     def reset(self) -> None:
         """Quiesce all transfers and reset backend state before returning."""
@@ -175,6 +192,12 @@ class UnifiedCacheLinkerWrapper:
     @property
     def layer_done_counter(self) -> object:
         return self.cache_linker.layer_done_counter
+
+    def get_kv_capacity_snapshot(self) -> KVCapacitySnapshot | None:
+        return self.cache_linker.get_kv_capacity_snapshot()
+
+    def get_local_kv_bytes_per_slot(self) -> int | None:
+        return self.cache_linker.get_local_kv_bytes_per_slot()
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers

@@ -121,6 +121,13 @@ def _get_mooncake_client_http_setup_kwargs(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class MooncakeMemoryUsage:
+    used_bytes: int
+    available_bytes: int
+    capacity_bytes: int
+
+
 @dataclass
 class MooncakeStoreConfig:
     local_hostname: str
@@ -667,9 +674,38 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if buf is not None:
                 yield buf
 
+    def _master_admin_url(self, path: str) -> str:
+        master_server_address = self.config.master_server_address
+        master_server_ip = (
+            master_server_address[1:].split("]", 1)[0]
+            if master_server_address.startswith("[")
+            else master_server_address.rsplit(":", 1)[0]
+        )
+        host = f"[{master_server_ip}]" if ":" in master_server_ip else master_server_ip
+        return f"http://{host}:{self.config.master_metrics_port}{path}"
+
+    def get_memory_usage(self, timeout: float = 0.5) -> MooncakeMemoryUsage:
+        response = requests.get(self._master_admin_url("/memory_usage"), timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+        try:
+            usage = MooncakeMemoryUsage(
+                used_bytes=payload["used_bytes"],
+                available_bytes=payload["available_bytes"],
+                capacity_bytes=payload["capacity_bytes"],
+            )
+        except (KeyError, TypeError) as error:
+            raise ValueError("Mooncake memory usage response is malformed") from error
+        values = (usage.used_bytes, usage.available_bytes, usage.capacity_bytes)
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError(f"Invalid Mooncake memory usage values: {usage}")
+        expected_available_bytes = max(usage.capacity_bytes - usage.used_bytes, 0)
+        if usage.available_bytes != expected_available_bytes:
+            raise ValueError(f"Inconsistent Mooncake memory usage values: {usage}")
+        return usage
+
     def check_server(self):
-        master_server_ip = self.config.master_server_address.split(":")[0]
-        segments_url = f"http://{master_server_ip}:{self.config.master_metrics_port}/get_all_segments"
+        segments_url = self._master_admin_url("/get_all_segments")
         start_time = time.perf_counter()
 
         check_result = False

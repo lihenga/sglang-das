@@ -1227,7 +1227,9 @@ class EncoderReqTimeStats(ReqTimeStatsBase):
             )
 
 
-def set_schedule_time_batch(batch: ScheduleBatch):
+def set_schedule_time_batch(
+    batch: ScheduleBatch, attrs: Optional[Dict[str, Any]] = None
+):
     # only for tracing
     if not get_global_tracing_enabled():
         return
@@ -1235,6 +1237,8 @@ def set_schedule_time_batch(batch: ScheduleBatch):
     ts = time.perf_counter()
     bid = uuid.uuid4().hex[:8]
     _attrs = {"bid": bid, "batch_size": len(batch.reqs)}
+    if attrs:
+        _attrs.update(attrs)
     if batch.forward_mode.is_decode():
         _attrs["forward_mode"] = "decode"
     elif batch.forward_mode.is_prefill():

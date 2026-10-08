@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    KVCapacitySnapshot,
     UnifiedCacheLinker,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -274,6 +275,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             storage_suffix = f"{self.pool_group.storage_layout_tag}_{storage_suffix}"
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
+        self._local_kv_bytes_per_slot = self._compute_kv_bytes_per_slot()
+        storage_rank_count = (
+            (1 if rank_replicated else tp_size)
+            * params.attn_cp_size
+            * params.pp_size
+        )
+        self._cluster_kv_bytes_per_slot = (
+            self._local_kv_bytes_per_slot * storage_rank_count
+        )
+        self._capacity_warning_logged = False
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
@@ -361,6 +372,42 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             name=f"mooncake-offload-tp{tp_rank}",
         )
         self.offload_thread.start()
+
+    def _compute_kv_bytes_per_slot(self) -> int:
+        bytes_per_page = 0
+        for pool in self.pools.values():
+            for component in pool.buffer_meta:
+                for _, _, size in component:
+                    bytes_per_page += size
+        if bytes_per_page <= 0 or bytes_per_page % self.page_size:
+            raise ValueError(
+                "Mooncake direct linker page bytes must be a positive multiple "
+                f"of page_size: bytes={bytes_per_page}, page_size={self.page_size}"
+            )
+        return bytes_per_page // self.page_size
+
+    def get_local_kv_bytes_per_slot(self) -> int:
+        return self._local_kv_bytes_per_slot
+
+    def get_kv_capacity_snapshot(self) -> KVCapacitySnapshot | None:
+        try:
+            usage = self.storage.get_memory_usage()
+        except Exception:
+            if not self._capacity_warning_logged:
+                logger.warning(
+                    "Failed to query Mooncake cluster memory capacity; "
+                    "L3 capacity will be absent from schedule timeline events.",
+                    exc_info=True,
+                )
+                self._capacity_warning_logged = True
+            return None
+        self._capacity_warning_logged = False
+        return KVCapacitySnapshot(
+            available_slots=usage.available_bytes // self._cluster_kv_bytes_per_slot,
+            capacity_slots=usage.capacity_bytes // self._cluster_kv_bytes_per_slot,
+            available_bytes=usage.available_bytes,
+            capacity_bytes=usage.capacity_bytes,
+        )
 
     def register_buffers(self) -> None:
         seen = set()

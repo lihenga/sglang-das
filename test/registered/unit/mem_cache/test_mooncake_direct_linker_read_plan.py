@@ -9,10 +9,68 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
     ReadPlanLoadCounter,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+    MooncakeMemoryUsage,
+)
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    KVCapacitySnapshot,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class TestMooncakeDirectLinkerCapacity(CustomTestCase):
+    def test_computes_bytes_per_slot_from_all_pool_components(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.page_size = 4
+        linker.pools = {
+            PoolName.KV: types.SimpleNamespace(
+                buffer_meta=[[(0, 0, 16), (0, 0, 32)], [(0, 0, 48)]]
+            )
+        }
+
+        self.assertEqual(linker._compute_kv_bytes_per_slot(), 24)
+
+    def test_converts_cluster_bytes_to_complete_logical_slots(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.storage = types.SimpleNamespace(
+            get_memory_usage=lambda: MooncakeMemoryUsage(
+                used_bytes=1000,
+                available_bytes=3000,
+                capacity_bytes=4000,
+            )
+        )
+        linker._cluster_kv_bytes_per_slot = 80
+        linker._capacity_warning_logged = False
+
+        self.assertEqual(
+            linker.get_kv_capacity_snapshot(),
+            KVCapacitySnapshot(
+                available_slots=37,
+                capacity_slots=50,
+                available_bytes=3000,
+                capacity_bytes=4000,
+            ),
+        )
+
+    def test_capacity_query_failure_is_fail_open_and_warns_once(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.storage = types.SimpleNamespace(
+            get_memory_usage=Mock(side_effect=TimeoutError("admin timeout"))
+        )
+        linker._cluster_kv_bytes_per_slot = 80
+        linker._capacity_warning_logged = False
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="WARNING",
+        ) as logs:
+            self.assertIsNone(linker.get_kv_capacity_snapshot())
+            self.assertIsNone(linker.get_kv_capacity_snapshot())
+
+        self.assertEqual(len(logs.output), 1)
 
 
 class TestMooncakeDirectLinkerReadPlan(CustomTestCase):

@@ -21,6 +21,33 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class TestScheduleTimeBatch(CustomTestCase):
+    def test_merges_capacity_attrs_into_single_schedule_event(self):
+        time_stats = mock.Mock()
+        batch = mock.Mock()
+        batch.reqs = [mock.Mock(time_stats=time_stats)]
+        batch.forward_mode.is_decode.return_value = True
+        batch.forward_mode.is_prefill.return_value = False
+        batch.forward_mode.is_prebuilt.return_value = False
+
+        with mock.patch.object(rts, "get_global_tracing_enabled", return_value=True):
+            rts.set_schedule_time_batch(
+                batch,
+                attrs={
+                    "l1_kv_available_slots_before": 100,
+                    "l1_kv_available_slots_after": 90,
+                },
+            )
+
+        time_stats.set_last_scheduled_time.assert_called_once()
+        forward_mode, _, attrs = time_stats.set_last_scheduled_time.call_args.args
+        self.assertIs(forward_mode, batch.forward_mode)
+        self.assertEqual(attrs["batch_size"], 1)
+        self.assertEqual(attrs["forward_mode"], "decode")
+        self.assertEqual(attrs["l1_kv_available_slots_before"], 100)
+        self.assertEqual(attrs["l1_kv_available_slots_after"], 90)
+
+
 class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
     def test_two_hop_round_trip(self):
         src = rts.SchedulerReqTimeStats()
