@@ -19,8 +19,11 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -46,6 +49,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExternalLinkerLoadError(RuntimeError):
@@ -136,6 +142,14 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+class _PendingLookup(NamedTuple):
+    rid: str
+    key: RadixKey
+    device_hit_len: int
+    num_pages: int
+    future: Future
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -154,6 +168,21 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker = cache_linker
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self.async_lookup_enabled = getattr(cache_linker, "async_lookup_enabled", False)
+        self.async_lookup_workers = getattr(cache_linker, "async_lookup_workers", 1)
+        self.lookup_executor = (
+            ThreadPoolExecutor(
+                max_workers=self.async_lookup_workers,
+                thread_name_prefix="mooncake-lookup",
+            )
+            if self.async_lookup_enabled
+            else None
+        )
+        self.pending_lookups: dict[str, _PendingLookup] = {}
+        # Keep cancelled/stale entries in FIFO until all ranks retire them.
+        self.lookup_queue: deque[_PendingLookup] = deque()
+        self.lookup_results: dict[str, tuple[_PendingLookup, int]] = {}
+
         # Loads in flight, each pinning its inserted endpoint until DMA
         # completes. The anchor is the request's node before the load, so a
         # failed load can walk back exactly the chain it published.
@@ -179,6 +208,84 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def has_pending_lookup(self, rid: str) -> bool:
+        return rid in self.pending_lookups
+
+    def wait_pending_lookups(self) -> int:
+        # Freeze this scheduling round's probes. Waiting in FIFO order does
+        # not serialize the queries: they were already submitted to the pool.
+        # Publishing a ready prefix would split one prefill batch into several
+        # smaller forwards depending on worker completion timing.
+        pending = tuple(self.lookup_queue)
+        for lookup in pending:
+            try:
+                lookup.future.result()
+            except Exception:
+                # drain_lookups logs failures and publishes them as cache misses
+                # on the scheduler thread, after the whole cohort has finished.
+                pass
+        return len(pending)
+
+    def drain_lookups(self, count: int) -> None:
+        if not count:
+            return
+        completed = [self.lookup_queue.popleft() for _ in range(count)]
+        offsets = [0]
+        for pending in completed:
+            offsets.append(offsets[-1] + pending.num_pages + 1)
+        mask = torch.zeros(offsets[-1], dtype=torch.int)
+        for index, pending in enumerate(completed):
+            try:
+                restorable = pending.future.result()
+            except Exception:
+                logger.exception("Mooncake async lookup failed: rid=%s", pending.rid)
+                restorable = []
+            for pages in restorable:
+                if 0 < pages <= pending.num_pages:
+                    mask[offsets[index] + pages] = 1
+        self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
+        for index, pending in enumerate(completed):
+            # Identity also protects a new request reusing a cancelled rid.
+            if self.pending_lookups.get(pending.rid) is not pending:
+                continue
+            self.pending_lookups.pop(pending.rid)
+            common = mask[offsets[index] : offsets[index + 1]].nonzero()
+            pages = int(common[-1].item()) if common.numel() else 0
+            self.lookup_results[pending.rid] = (pending, pages)
+
+    @staticmethod
+    def _same_lookup(
+        pending: _PendingLookup, key: RadixKey, device_hit_len: int
+    ) -> bool:
+        old = pending.key
+        return (
+            pending.device_hit_len == device_hit_len
+            and len(old) == len(key)
+            and old.extra_key == key.extra_key
+            and old.cache_salt == key.cache_salt
+            and old.is_bigram == key.is_bigram
+            and (
+                old.token_ids is key.token_ids
+                or old.raw_token_ids() == key.raw_token_ids()
+            )
+        )
+
+    def _reset_lookups(self, *, close: bool = False) -> None:
+        if self.lookup_executor is not None:
+            # Join before storage.reset/close; workers must not outlive pools.
+            self.lookup_executor.shutdown(wait=True)
+            self.lookup_executor = (
+                None
+                if close
+                else ThreadPoolExecutor(
+                    max_workers=self.async_lookup_workers,
+                    thread_name_prefix="mooncake-lookup",
+                )
+            )
+        self.pending_lookups.clear()
+        self.lookup_queue.clear()
+        self.lookup_results.clear()
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -200,7 +307,25 @@ class UnifiedCacheLinkerWrapper:
             req.external_cache_hit_length = device_hit_len
 
         if device_hit_len >= len(key):
+            self.pending_lookups.pop(req.rid, None)
+            self.lookup_results.pop(req.rid, None)
             return result
+
+        completed_lookup = None
+        if self.async_lookup_enabled:
+            pending = self.pending_lookups.get(req.rid)
+            if pending is not None:
+                if self._same_lookup(pending, key, device_hit_len):
+                    return result
+                self.pending_lookups.pop(req.rid)
+            completed_lookup = self.lookup_results.get(req.rid)
+            if completed_lookup is not None and not self._same_lookup(
+                completed_lookup[0], key, device_hit_len
+            ):
+                self.lookup_results.pop(req.rid)
+                completed_lookup = None
+            if completed_lookup is not None and completed_lookup[1] == 0:
+                return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
@@ -218,11 +343,24 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if known_hit_len is None:
-            hit_pages = self._sync_restorable_prefix(
-                self.cache_linker.lookup(req.rid, lookup_transfers),
-                num_pages=len(tail_hashes),
-                device_hit_pages=0,
-            )
+            if self.async_lookup_enabled:
+                if completed_lookup is None:
+                    future = self.lookup_executor.submit(
+                        self.cache_linker.lookup_in_worker, req.rid, lookup_transfers
+                    )
+                    pending = _PendingLookup(
+                        req.rid, key[:], device_hit_len, len(tail_hashes), future
+                    )
+                    self.pending_lookups[req.rid] = pending
+                    self.lookup_queue.append(pending)
+                    return result
+                hit_pages = completed_lookup[1]
+            else:
+                hit_pages = self._sync_restorable_prefix(
+                    self.cache_linker.lookup(req.rid, lookup_transfers),
+                    num_pages=len(tail_hashes),
+                    device_hit_pages=0,
+                )
             if cache.pp_size > 1:
                 req.external_cache_hit_length = device_hit_len + hit_pages * page
         else:
@@ -300,6 +438,7 @@ class UnifiedCacheLinkerWrapper:
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
+        self.lookup_results.pop(req.rid, None)
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return empty_indices, req.last_node
@@ -686,6 +825,7 @@ class UnifiedCacheLinkerWrapper:
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        self._reset_lookups()
         self.cache_linker.reset()
         self.hit_markers.clear()
         self._release_pending_locks()
@@ -706,6 +846,8 @@ class UnifiedCacheLinkerWrapper:
         self.taken_loads.clear()
 
     def release_request(self, rid: str) -> None:
+        self.pending_lookups.pop(rid, None)
+        self.lookup_results.pop(rid, None)
         # failed_chains is deliberately untouched: the chain outlives the
         # request's linker state, and cache_finished_req is what frees it.
         self.hit_markers.pop(rid, None)
@@ -718,5 +860,6 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def close(self) -> None:
+        self._reset_lookups(close=True)
         self.cache_linker.close()
         self._release_pending_locks()

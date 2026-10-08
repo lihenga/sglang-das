@@ -749,6 +749,10 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    # Run Direct L3 prefix probes off the scheduler thread (PP1 only).
+    SGLANG_MOONCAKE_ASYNC_LOOKUP = EnvBool(False)
+    # Concurrent request probes per rank; only used with async lookup enabled.
+    SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS = EnvInt(1)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
