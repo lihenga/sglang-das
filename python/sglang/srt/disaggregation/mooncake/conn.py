@@ -224,6 +224,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            self._transfer_completion_condition = threading.Condition()
             self.start_prefill_thread()
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
@@ -291,6 +292,43 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._init_staging_allocator()
                 self._staging_handler = None
             self.start_decode_thread()
+
+    def _notify_transfer_waiters(self) -> None:
+        condition = getattr(self, "_transfer_completion_condition", None)
+        if condition is not None:
+            with condition:
+                condition.notify_all()
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        super().update_status(bootstrap_room, status)
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self._notify_transfer_waiters()
+
+    def wait_for_transfer_rooms(
+        self, bootstrap_rooms: Set[int], timeout_s: float
+    ) -> bool:
+        """Wait briefly for final rooms so the scheduler can poll before forward."""
+        if not bootstrap_rooms or timeout_s <= 0:
+            return False
+
+        def all_terminal() -> bool:
+            # Mirror MooncakeKVSender.poll(): Success is set before the worker
+            # finishes the chunk, so it only counts once nothing is outstanding.
+            for room in bootstrap_rooms:
+                status = self.request_status.get(room)
+                if status not in (None, KVPoll.Success, KVPoll.Failed):
+                    return False
+                if (
+                    status == KVPoll.Success
+                    and self._staging_outstanding.get(room, 0) > 0
+                ):
+                    return False
+            return True
+
+        with self._transfer_completion_condition:
+            return self._transfer_completion_condition.wait_for(
+                all_terminal, timeout=timeout_s
+            )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1861,6 +1899,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._notify_transfer_waiters()
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2138,6 +2177,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
+                self._notify_transfer_waiters()
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
