@@ -59,6 +59,8 @@ def fused_experts_impl_int8_marlin_wrapper(
     shared_output: Optional[torch.Tensor] = None,
     i_q: Optional[torch.Tensor] = None,
     i_s: Optional[torch.Tensor] = None,
+    gelu_clamp: Optional[float] = None,
+    gelu_smooth_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return fused_experts_impl_int8_marlin(
         hidden_states,
@@ -88,6 +90,8 @@ def fused_experts_impl_int8_marlin_wrapper(
         shared_output=shared_output,
         i_q=i_q,
         i_s=i_s,
+        gelu_clamp=gelu_clamp,
+        gelu_smooth_scale=gelu_smooth_scale,
     )
 
 
@@ -119,6 +123,8 @@ def fused_experts_impl_int8_marlin_fake(
     shared_output: Optional[torch.Tensor] = None,
     i_q: Optional[torch.Tensor] = None,
     i_s: Optional[torch.Tensor] = None,
+    gelu_clamp: Optional[float] = None,
+    gelu_smooth_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -442,6 +448,14 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
     #         shared_output=shared_output,
     #         routed_scaling_factor=routed_scaling_factor)
 
+    @staticmethod
+    def _get_gelu_params(
+        activation: str,
+    ) -> tuple[Optional[float], Optional[torch.Tensor]]:
+        from sglang.srt.layers.moe.moe_runner.lightop import get_lightop_gelu_params
+
+        return get_lightop_gelu_params(activation)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -467,6 +481,9 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             else 1.0
         )
 
+        gelu_clamp, gelu_smooth_scale = self._get_gelu_params(
+            layer.moe_runner_config.activation
+        )
         output = torch.ops.sglang.fused_experts_impl_int8_marlin(
             x,
             layer.w13_weight,
@@ -475,6 +492,8 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             topk_ids=topk_ids,
             inplace=True,
             activation=layer.moe_runner_config.activation,
+            gelu_clamp=gelu_clamp,
+            gelu_smooth_scale=gelu_smooth_scale,
             apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
             use_int8_w8a8=True,
             per_channel_quant=True,
@@ -508,6 +527,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             else 1.0
         )
 
+        gelu_clamp, gelu_smooth_scale = self._get_gelu_params(activation)
         output = torch.ops.sglang.fused_experts_impl_int8_marlin(
             x,
             layer.w13_weight,
@@ -516,6 +536,8 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             topk_ids=topk_ids,
             inplace=True,
             activation=activation,
+            gelu_clamp=gelu_clamp,
+            gelu_smooth_scale=gelu_smooth_scale,
             apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
             use_int8_w8a8=True,
             per_channel_quant=True,

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -141,6 +142,25 @@ def process_weights_after_loading_lightop(layer: torch.nn.Module) -> None:
     layer.w2_weight = Parameter(w2_weight, requires_grad=False)
 
 
+def get_lightop_gelu_params(
+    activation: str,
+) -> tuple[Optional[float], Optional[torch.Tensor]]:
+    if activation != "gelu" or os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") != "1":
+        return None, None
+    from tokenflow.models.sparkv1.ops.activation import (
+        current_spark_v1_down_smooth_module,
+        current_spark_v1_gelu_clamp,
+    )
+
+    module = current_spark_v1_down_smooth_module()
+    smooth_scale = (
+        getattr(module, "routed_down_input_smooth_scale", None)
+        if module is not None
+        else None
+    )
+    return current_spark_v1_gelu_clamp(), smooth_scale
+
+
 def get_lightop_quant_info(layer: torch.nn.Module) -> LightOpMoeQuantInfo:
     return LightOpMoeQuantInfo(
         w13_weight=layer.w13_weight,
@@ -168,6 +188,9 @@ class LightOpRunnerCore(MoeRunnerCore):
             else 1.0
         )
 
+        gelu_clamp, gelu_smooth_scale = get_lightop_gelu_params(
+            self.config.activation
+        )
         output = torch.ops.sglang.fused_experts_impl_int8_marlin(
             runner_input.hidden_states,
             quant_info.w13_weight,
@@ -176,6 +199,8 @@ class LightOpRunnerCore(MoeRunnerCore):
             topk_ids=runner_input.topk_ids,
             inplace=self.config.inplace,
             activation=self.config.activation,
+            gelu_clamp=gelu_clamp,
+            gelu_smooth_scale=gelu_smooth_scale,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
             use_int8_w8a8=True,
             per_channel_quant=True,
