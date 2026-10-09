@@ -5027,6 +5027,16 @@ class Scheduler(
             # result processors is skipped by all of them, so it would leak its
             # KV and never answer. update_finish_state promotes it instead.
             req.skip_radix_cache_insert = True
+            if os.environ.get("SGLANG_MOONCAKE_SESSION_DIAGNOSTICS", "1") == "1":
+                logger.warning(
+                    "KVSESSION event=p_load_abort_marked pid=%s rid=%s room=%s "
+                    "sender_present=%s chunked=%s",
+                    os.getpid(),
+                    req.rid,
+                    req.bootstrap_room,
+                    req.disagg_kv_sender is not None,
+                    req is self.chunked_req,
+                )
             req.to_finish = FINISH_ABORT(
                 message,
                 HTTPStatus.INTERNAL_SERVER_ERROR,

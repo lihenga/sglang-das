@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -3376,6 +3377,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     # (A prefill-initiated failure has already stopped writing ->
                     # immediate release below.)
                     self._defer_release(decode_req)
+                    if os.environ.get("SGLANG_MOONCAKE_SESSION_DIAGNOSTICS", "1") == "1":
+                        logger.warning(
+                            "KVSESSION event=d_failure_release_deferred pid=%s rid=%s "
+                            "room=%s hold_timeout_s=%s",
+                            os.getpid(),
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                            self.deferred_kv_release_timeout,
+                        )
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
                 else:
@@ -3384,6 +3394,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self._release_pd_hidden_rows(decode_req)
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
+                    if os.environ.get("SGLANG_MOONCAKE_SESSION_DIAGNOSTICS", "1") == "1":
+                        logger.warning(
+                            "KVSESSION event=d_failure_release_done pid=%s rid=%s "
+                            "room=%s deferred=0",
+                            os.getpid(),
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                        )
                     indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -3471,6 +3489,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
+
+        if os.environ.get("SGLANG_MOONCAKE_SESSION_DIAGNOSTICS", "1") == "1":
+            logger.warning(
+                "KVSESSION event=d_failure_release_done pid=%s rid=%s room=%s deferred=1",
+                os.getpid(),
+                decode_req.req.rid,
+                room,
+            )
 
     def has_pending_deferred_releases(self) -> bool:
         return bool(self._deferred_releases)

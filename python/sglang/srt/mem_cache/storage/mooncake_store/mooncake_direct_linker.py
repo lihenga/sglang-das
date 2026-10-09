@@ -327,9 +327,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.session_min_remaining_ms = int(
             os.environ.get("SGLANG_MOONCAKE_SESSION_MIN_REMAINING_MS", "1000")
         )
+        self.session_diagnostics = (
+            os.environ.get("SGLANG_MOONCAKE_SESSION_DIAGNOSTICS", "1") == "1"
+        )
         if not 0 <= self.session_min_remaining_ms <= 3600000:
             raise ValueError(
                 "SGLANG_MOONCAKE_SESSION_MIN_REMAINING_MS must be in [0, 3600000]"
+            )
+        if self.session_diagnostics:
+            logger.info(
+                "KVSESSION event=python_diagnostics_enabled version=1 pid=%s "
+                "min_remaining_ms=%s native_ensure=%s",
+                os.getpid(),
+                self.session_min_remaining_ms,
+                callable(getattr(self.storage.store, "batch_get_session_ensure", None)),
             )
         if not callable(getattr(self.storage.store, "batch_get_session_ensure", None)):
             logger.warning(
@@ -968,7 +979,48 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return None
             return str(entry.get("state"))
 
-    def _ensure_load_sessions(self, rids: list[str]) -> bool:
+    def _record_session_ensure(self, phase, started, native_ms, lock_ms, ok, detail):
+        elapsed_ms = (time.monotonic() - started) * 1000
+        if not ok:
+            logger.warning(
+                "KVSESSION event=python_ensure_failure pid=%s phase=%s "
+                "total_ms=%.3f native_ms=%.3f lock_wait_ms=%.3f %s",
+                os.getpid(),
+                phase,
+                elapsed_ms,
+                native_ms,
+                lock_ms,
+                detail,
+            )
+        # One aggregate per phase per minute, rather than a line per successful
+        # request/key. Reuse the existing lock only for this small local update.
+        with self.session_lock:
+            stats = getattr(self, "_session_ensure_diagnostics", None)
+            if stats is None:
+                stats = self._session_ensure_diagnostics = {}
+            now = time.monotonic()
+            row = stats.setdefault(phase, [now, 0, 0, 0.0, 0.0, 0.0, 0.0])
+            row[1] += 1
+            row[2] += not ok
+            row[3] += elapsed_ms
+            row[4] = max(row[4], elapsed_ms)
+            row[5] += native_ms
+            row[6] += lock_ms
+            if now - row[0] < 60:
+                return
+            snapshot = tuple(row)
+            stats[phase] = [now, 0, 0, 0.0, 0.0, 0.0, 0.0]
+        logger.info(
+            "KVSESSION event=python_ensure_window pid=%s phase=%s "
+            "window_s=%.3f calls=%s failed_calls=%s total_ms=%.3f "
+            "max_ms=%.3f native_ms=%.3f lock_wait_ms=%.3f",
+            os.getpid(),
+            phase,
+            now - snapshot[0],
+            *snapshot[1:],
+        )
+
+    def _ensure_load_sessions(self, rids: list[str], phase: str = "load") -> bool:
         """Check leases before loading; native code queries only stale keys.
 
         Temporary references keep cancellation from ending/restarting a key
@@ -980,30 +1032,81 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ensure = getattr(self.storage.store, "batch_get_session_ensure", None)
         if not callable(ensure):
             return True  # Compatibility with older Mooncake wheels.
+        diagnostic = self.session_diagnostics
+        started = time.monotonic() if diagnostic else 0
+        lock_started = started
+        lock_ms = 0.0
         with self.session_lock:
+            if diagnostic:
+                lock_ms += (time.monotonic() - lock_started) * 1000
             sessions = {
                 rid: tuple(self.prepared_load_sessions.get(rid, ())) for rid in rids
             }
             if not all(sessions.values()):
+                if diagnostic:
+                    logger.warning(
+                        "KVSESSION event=python_ensure_failure pid=%s phase=%s "
+                        "reason=prepared_session_missing rids=%s lock_wait_ms=%.3f",
+                        os.getpid(),
+                        phase,
+                        rids[:4],
+                        lock_ms,
+                    )
                 return False
-            keys = list(dict.fromkeys(key for keys in sessions.values() for key in keys))
+            keys = list(
+                dict.fromkeys(key for keys in sessions.values() for key in keys)
+            )
             for key in keys:
                 self.session_refcounts[key] += 1
+        native_started = time.monotonic() if diagnostic else 0
+        native_ms = 0.0
+        detail = "reason=native_exception"
         try:
             results = list(
                 ensure(keys, getattr(self, "session_min_remaining_ms", 1000))
             )
             ok = len(results) == len(keys) and all(code == 0 for code in results)
+            if diagnostic:
+                detail = "reason=native_success"
+            if diagnostic and not ok:
+                sample = []
+                for i, code in enumerate(results):
+                    if code != 0:
+                        key = keys[i][:128] if i < len(keys) else "<extra>"
+                        sample.append((i, key, code))
+                        if len(sample) == 4:
+                            break
+                detail = (
+                    f"reason=native_result keys={len(keys)} results={len(results)} "
+                    f"failed_keys={sum(code != 0 for code in results)} "
+                    f"sample={sample}"
+                )
         except Exception:
             logger.warning("Mooncake session ensure failed", exc_info=True)
             ok = False
         finally:
+            if diagnostic:
+                native_ms = (time.monotonic() - native_started) * 1000
+                lock_started = time.monotonic()
             with self.session_lock:
+                if diagnostic:
+                    lock_ms += (time.monotonic() - lock_started) * 1000
                 still_owned = all(
                     tuple(self.prepared_load_sessions.get(rid, ())) == owned_keys
                     for rid, owned_keys in sessions.items()
                 )
                 self._rollback_session_refs_locked(keys)
+        if diagnostic:
+            if not still_owned:
+                detail += " ownership_changed=1"
+            self._record_session_ensure(
+                phase,
+                started,
+                native_ms,
+                lock_ms,
+                ok and still_owned,
+                f"rids={rids[:4]} {detail}",
+            )
         return ok and still_owned
 
     def revalidate_host_prefetch(self, rid: str) -> bool:
@@ -1019,7 +1122,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if callable(getattr(self.storage.store, "batch_get_session_ensure", None)):
             # The native lease deadline is authoritative for both private and
             # shared keys. No age-based skip can bypass a deleted native session.
-            return self._ensure_load_sessions([session_rid])
+            return self._ensure_load_sessions([session_rid], phase="admission")
         with self.session_lock:
             keys = list(self.prepared_load_sessions.get(session_rid, ()))
             # A key without a base (ever shared in this generation, or whose

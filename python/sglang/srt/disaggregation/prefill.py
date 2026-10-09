@@ -1726,6 +1726,19 @@ class SchedulerDisaggregationPrefillMixin:
                 # narrower than is_aborted() because a user abort already
                 # reaches decode via its own AbortReq.
                 if is_external_kv_load_failure(req):
+                    diagnostic = (
+                        os.environ.get("SGLANG_MOONCAKE_SESSION_DIAGNOSTICS", "1") == "1"
+                    )
+                    if diagnostic:
+                        logger.warning(
+                            "KVSESSION event=p_load_abort_processed pid=%s rid=%s "
+                            "room=%s sender_present=%s pending_bootstrap=%s",
+                            os.getpid(),
+                            req.rid,
+                            req.bootstrap_room,
+                            req.disagg_kv_sender is not None,
+                            req.pending_bootstrap,
+                        )
                     req.update_finish_state()
                     self.clear_pending_chunk_send(req)
                     if req.disagg_kv_sender is not None:
@@ -1737,6 +1750,13 @@ class SchedulerDisaggregationPrefillMixin:
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
                     self.output_streamer.stream_output([req], req.return_logprob)
+                    if diagnostic:
+                        logger.warning(
+                            "KVSESSION event=p_load_abort_finished pid=%s rid=%s room=%s",
+                            os.getpid(),
+                            req.rid,
+                            req.bootstrap_room,
+                        )
                     advance_logprob_pt(i, req)
                     continue
 

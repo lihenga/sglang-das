@@ -80,6 +80,7 @@ from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+_SESSION_DIAGNOSTICS = os.environ.get("SGLANG_MOONCAKE_SESSION_DIAGNOSTICS", "1") == "1"
 
 _is_hcu = is_hcu()
 _kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
@@ -2066,15 +2067,46 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        self._send_multipart_locked(
-            na.to_tcp(),
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
-        )
+        diagnostic = _SESSION_DIAGNOSTICS and status == KVPoll.Failed
+        started = time.monotonic() if diagnostic else 0
+        if diagnostic:
+            logger.warning(
+                "KVSESSION event=p_failure_send_attempt pid=%s room=%s "
+                "endpoint=%s prefill_rank=%s",
+                os.getpid(),
+                room,
+                na.to_tcp(),
+                prefill_rank,
+            )
+        # A returned send means queued locally, not acknowledged by Decode.
+        try:
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except Exception:
+            if diagnostic:
+                logger.exception(
+                    "KVSESSION event=p_failure_send_error pid=%s room=%s endpoint=%s",
+                    os.getpid(),
+                    room,
+                    na.to_tcp(),
+                )
+            raise
+        if diagnostic:
+            logger.warning(
+                "KVSESSION event=p_failure_send_queued pid=%s room=%s "
+                "endpoint=%s elapsed_ms=%.3f",
+                os.getpid(),
+                room,
+                na.to_tcp(),
+                (time.monotonic() - started) * 1000,
+            )
 
     def transfer_worker(
         self,
@@ -3014,6 +3046,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     handler.submit_last_scatter_async(bootstrap_room)
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
+                    if _SESSION_DIAGNOSTICS:
+                        logger.warning(
+                            "KVSESSION event=d_failure_received pid=%s room=%s "
+                            "prefill_rank=%s prior_status=%s tracked=%s",
+                            os.getpid(),
+                            bootstrap_room,
+                            prefill_rank,
+                            self.request_status.get(bootstrap_room),
+                            bootstrap_room in self.request_status,
+                        )
                     self.record_failure(
                         bootstrap_room,
                         "Failed to get kvcache from prefill instance, it might be dead",
@@ -3310,6 +3352,13 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
     def abort(self):
         super().abort()
+        if _SESSION_DIAGNOSTICS:
+            logger.warning(
+                "KVSESSION event=p_sender_abort_local pid=%s room=%s status=%s",
+                os.getpid(),
+                self.bootstrap_room,
+                self.conclude_state,
+            )
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
@@ -3525,9 +3574,28 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
+            if _SESSION_DIAGNOSTICS and status == KVPoll.Failed:
+                logger.warning(
+                    "KVSESSION event=d_failure_observed pid=%s room=%s",
+                    os.getpid(),
+                    self.bootstrap_room,
+                )
         elif status == KVPoll.WaitingForInput:
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
+                if _SESSION_DIAGNOSTICS:
+                    logger.warning(
+                        "KVSESSION event=d_waiting_timeout pid=%s room=%s "
+                        "waiting_s=%s abort_notified=%s",
+                        os.getpid(),
+                        self.bootstrap_room,
+                        (
+                            time.time() - self.init_time
+                            if self.init_time is not None
+                            else None
+                        ),
+                        self.abort_notified,
+                    )
                 return timeout_result
 
         return status

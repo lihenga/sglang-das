@@ -20,7 +20,9 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
@@ -51,6 +53,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+_SESSION_DIAGNOSTICS = os.environ.get("SGLANG_MOONCAKE_SESSION_DIAGNOSTICS", "1") == "1"
 
 
 class ExternalLinkerLoadError(RuntimeError):
@@ -637,8 +640,22 @@ class UnifiedCacheLinkerWrapper:
             except BaseException:
                 locally_valid = False
             valid = torch.tensor(int(locally_valid), dtype=torch.int)
+            consensus_started = time.monotonic() if _SESSION_DIAGNOSTICS else 0
             cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
-            if int(valid.item()) == 0:
+            valid_all = int(valid.item()) != 0
+            if _SESSION_DIAGNOSTICS:
+                record = getattr(self.cache_linker, "_record_session_ensure", None)
+                if record is not None:
+                    record(
+                        "admission_consensus",
+                        consensus_started,
+                        0,
+                        0,
+                        valid_all,
+                        f"rid={req.rid} room={req.bootstrap_room} "
+                        f"local_valid={locally_valid} prefetch_state={status}",
+                    )
+            if not valid_all:
                 self.cache_linker.cancel_host_prefetch(req.rid)
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
