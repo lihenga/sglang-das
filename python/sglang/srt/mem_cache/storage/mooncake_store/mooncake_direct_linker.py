@@ -9,6 +9,7 @@ from queue import Empty, Queue
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -283,6 +284,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.offload_owner,
             storage_suffix,
         )
+        self.async_lookup_enabled = envs.SGLANG_MOONCAKE_ASYNC_LOOKUP.get()
+        if self.async_lookup_enabled and params.pp_size != 1:
+            raise ValueError("SGLANG_MOONCAKE_ASYNC_LOOKUP currently requires PP1")
+        self.async_lookup_workers = 1
+        if self.async_lookup_enabled:
+            self.async_lookup_workers = envs.SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS.get()
+            if self.async_lookup_workers < 1:
+                raise ValueError("SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS must be >= 1")
+            logger.info(
+                "Mooncake asynchronous L3 lookup enabled (PP1, workers=%d)",
+                self.async_lookup_workers,
+            )
+        # This branch performs local metadata lookup on every rank. Distributed
+        # intersection is deliberately deferred to the scheduler thread.
+        self._async_lookup_owner = True
+
         self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
@@ -374,6 +391,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        return self._lookup_local(rid, transfers)
+
+    def lookup_in_worker(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        """Query local metadata only; the scheduler publishes cross-rank results."""
+        if not self._async_lookup_owner:
+            kv = next(t for t in transfers if t.name == PoolName.KV)
+            return list(range(1, len(kv.keys) + 1))
+        return self._lookup_local(rid, transfers)
+
+    def _lookup_local(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -584,9 +611,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
             ):
-                self._load_page_wise(
-                    counter_index, batches, started, maybe_fail
-                )
+                self._load_page_wise(counter_index, batches, started, maybe_fail)
                 success = True
                 return success
 
@@ -675,9 +700,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
