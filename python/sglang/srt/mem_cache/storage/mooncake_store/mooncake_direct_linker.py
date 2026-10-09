@@ -313,13 +313,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
         )
-        # Skip the admission-time lease refresh of a prefetched request whose
+        # Legacy-wheel fallback: skip admission-time refresh of a request whose
         # oldest session key was leased less than this many seconds ago. The
         # master never evicts a leased object, so the refresh only buys lease
         # time; 0 keeps the refresh unconditional. Must leave enough of the
         # deployment's lease TTL to cover admission through load completion.
         self.session_refresh_age_s = _session_refresh_age_config()
         self._disable_refresh_skip_for_groups()
+        # Native ensure uses the actual lease deadline, not a guessed TTL.
+        # Leave enough time for the load and scheduling jitter; this margin
+        # must be smaller than the Master's lease TTL. It adds no RPC for
+        # healthy sessions and does not move DFS prefetch onto the load path.
+        self.session_min_remaining_ms = int(
+            os.environ.get("SGLANG_MOONCAKE_SESSION_MIN_REMAINING_MS", "1000")
+        )
+        if not 0 <= self.session_min_remaining_ms <= 3600000:
+            raise ValueError(
+                "SGLANG_MOONCAKE_SESSION_MIN_REMAINING_MS must be in [0, 3600000]"
+            )
+        if not callable(getattr(self.storage.store, "batch_get_session_ensure", None)):
+            logger.warning(
+                "Mooncake lacks batch_get_session_ensure; shared-session recovery "
+                "is disabled. Upgrade Mooncake to enable recovery without "
+                "unconditional lease queries."
+            )
         self.host_prefetch_enabled = bool(
             getattr(
                 server_args,
@@ -951,6 +968,44 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return None
             return str(entry.get("state"))
 
+    def _ensure_load_sessions(self, rids: list[str]) -> bool:
+        """Check leases before loading; native code queries only stale keys.
+
+        Temporary references keep cancellation from ending/restarting a key
+        while ensure runs outside the Python lock. DFS prefetch still happens
+        on the waiting-queue workers, before admission.
+        """
+        if not rids:
+            return True
+        ensure = getattr(self.storage.store, "batch_get_session_ensure", None)
+        if not callable(ensure):
+            return True  # Compatibility with older Mooncake wheels.
+        with self.session_lock:
+            sessions = {
+                rid: tuple(self.prepared_load_sessions.get(rid, ())) for rid in rids
+            }
+            if not all(sessions.values()):
+                return False
+            keys = list(dict.fromkeys(key for keys in sessions.values() for key in keys))
+            for key in keys:
+                self.session_refcounts[key] += 1
+        try:
+            results = list(
+                ensure(keys, getattr(self, "session_min_remaining_ms", 1000))
+            )
+            ok = len(results) == len(keys) and all(code == 0 for code in results)
+        except Exception:
+            logger.warning("Mooncake session ensure failed", exc_info=True)
+            ok = False
+        finally:
+            with self.session_lock:
+                still_owned = all(
+                    tuple(self.prepared_load_sessions.get(rid, ())) == owned_keys
+                    for rid, owned_keys in sessions.items()
+                )
+                self._rollback_session_refs_locked(keys)
+        return ok and still_owned
+
     def revalidate_host_prefetch(self, rid: str) -> bool:
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
@@ -961,6 +1016,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             ):
                 return False
             session_rid = str(entry["session_rid"])
+        if callable(getattr(self.storage.store, "batch_get_session_ensure", None)):
+            # The native lease deadline is authoritative for both private and
+            # shared keys. No age-based skip can bypass a deleted native session.
+            return self._ensure_load_sessions([session_rid])
         with self.session_lock:
             keys = list(self.prepared_load_sessions.get(session_rid, ()))
             # A key without a base (ever shared in this generation, or whose
@@ -1339,6 +1398,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     raise RuntimeError(
                         f"Mooncake get session preparation failed for rid={rid}."
                     )
+            # Run after the load worker's device-event/queue waits, before any
+            # layer is published. Covers borrowed ReadPlans and both range paths.
+            if not self._ensure_load_sessions([rid for rid, _ in request_transfers]):
+                raise RuntimeError("Mooncake get session validation failed before load")
             if getattr(self, "read_plan_enabled", False):
                 self.load_with_read_plan(counter_index, request_transfers)
                 return True
