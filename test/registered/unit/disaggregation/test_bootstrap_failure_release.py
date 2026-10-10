@@ -86,6 +86,7 @@ class TestBootstrapFailureRelease(CustomTestCase):
 
 def _mooncake_linker(state):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
     linker.session_lock = threading.Lock()
     linker.prepared_load_sessions = {}
@@ -109,6 +110,7 @@ class TestReleaseFreesThePrefetch(CustomTestCase):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
         wrapper.cache = MagicMock()
         wrapper.cache_linker = cache_linker
+        wrapper._waiting_queue_prefetch_enabled = True
         hit = ExternalCacheHitMarker(
             prefix_key=None, tail_hashes=["h"], device_hit_len=0
         )
@@ -216,6 +218,7 @@ class TestReleaseAcrossBackgroundSubmitStages(CustomTestCase):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
         wrapper.cache = MagicMock()
         wrapper.cache_linker = self.linker
+        wrapper._waiting_queue_prefetch_enabled = True
         hit = ExternalCacheHitMarker(
             prefix_key=None, tail_hashes=[self.KEY], device_hit_len=0
         )

@@ -96,6 +96,7 @@ def _prefetch_backend(other_holder, claim="ok"):
     claim return False (the RID already holds another prepared session);
     claim="raise" makes it raise."""
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
     linker.session_lock = threading.Lock()
     linker.host_prefetch_entries = {
@@ -134,6 +135,7 @@ def _no_prefetch_needed_backend():
     """A real Mooncake linker whose "r" entry needed no DFS read: its session
     was already released, only the existence check of its keys is stubbed."""
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
     linker.session_lock = threading.Lock()
     linker.host_prefetch_entries = {
@@ -235,6 +237,7 @@ def _wrapper(cache, backend, prefetch):
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = cache
     wrapper.cache_linker = backend
+    wrapper._waiting_queue_prefetch_enabled = prefetch
     hit = ExternalCacheHitMarker(
         prefix_key=None, tail_hashes=["h0", "h1"], device_hit_len=0
     )
