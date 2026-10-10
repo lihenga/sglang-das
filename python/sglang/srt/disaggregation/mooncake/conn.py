@@ -248,6 +248,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.pd_hidden_events = PDHiddenEventManager(self)
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        self._final_poll_enabled = False
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -255,6 +256,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
             self.session_lock = threading.Lock()
+            self._final_poll_enabled = (
+                envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+            )
+            if self._final_poll_enabled:
+                self._transfer_completion_condition = threading.Condition()
             self.pd_hidden_events.init_prefill_state()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -521,6 +527,45 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 str(hidden_start).encode("ascii"),
             ]
         )
+
+    def _notify_transfer_waiters(self) -> None:
+        if not self._final_poll_enabled:
+            return
+        condition = getattr(self, "_transfer_completion_condition", None)
+        if condition is not None:
+            with condition:
+                condition.notify_all()
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        super().update_status(bootstrap_room, status)
+        if self._final_poll_enabled and status in (KVPoll.Success, KVPoll.Failed):
+            self._notify_transfer_waiters()
+
+    def wait_for_transfer_rooms(
+        self, bootstrap_rooms: Set[int], timeout_s: float
+    ) -> bool:
+        """Wait briefly for final rooms so the scheduler can poll before forward."""
+        if not self._final_poll_enabled or not bootstrap_rooms or timeout_s <= 0:
+            return False
+
+        def all_terminal() -> bool:
+            # Mirror MooncakeKVSender.poll(): Success is set before the worker
+            # finishes the chunk, so it only counts once nothing is outstanding.
+            for room in bootstrap_rooms:
+                status = self.request_status.get(room)
+                if status not in (None, KVPoll.Success, KVPoll.Failed):
+                    return False
+                if (
+                    status == KVPoll.Success
+                    and self._staging_outstanding.get(room, 0) > 0
+                ):
+                    return False
+            return True
+
+        with self._transfer_completion_condition:
+            return self._transfer_completion_condition.wait_for(
+                all_terminal, timeout=timeout_s
+            )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -2103,6 +2148,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self._final_poll_enabled:
+                        self._notify_transfer_waiters()
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2170,6 +2217,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding[kv_chunk.room] -= 1
                     if self._staging_outstanding[kv_chunk.room] <= 0:
                         self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self._final_poll_enabled:
+                        self._notify_transfer_waiters()
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
@@ -2644,6 +2693,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 ):
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                if self._final_poll_enabled:
+                    self._notify_transfer_waiters()
                 current_status = self.request_status.get(kv_chunk.room)
                 if current_status is not None and current_status != KVPoll.Failed:
                     kv_chunk.kv_sent = True

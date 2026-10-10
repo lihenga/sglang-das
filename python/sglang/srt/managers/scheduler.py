@@ -1330,6 +1330,44 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+    def _init_mooncake_final_poll_runtime(self) -> None:
+        """Agree on the final-chunk poll switch before event loops begin.
+
+        The supplemental poll joins collectives, so every rank must either run
+        it or skip it. Positive timeouts may differ because each rank waits
+        locally before joining the same extra poll.
+        """
+        timeout_ms = 0.0
+        poll_on = False
+        poll_valid = True
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.ps.pp_size == 1
+        ):
+            try:
+                timeout_ms = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
+                poll_on = timeout_ms > 0
+            except Exception:
+                poll_on, poll_valid = False, False
+
+        flags = torch.tensor(
+            [int(poll_on), -int(poll_on), int(poll_valid)], dtype=torch.int64
+        )
+        group = (
+            self.world_group.cpu_group if self.world_group.world_size > 1 else None
+        )
+        if group is not None:
+            torch.distributed.all_reduce(
+                flags, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+        poll_min, neg_poll_max, poll_valid = (int(value) for value in flags)
+        if not poll_valid or poll_min != -neg_poll_max:
+            raise ValueError(
+                "SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS must be valid and either "
+                "positive on every rank or <= 0 on every rank"
+            )
+        self._mooncake_final_poll_timeout_ms = timeout_ms if poll_on else 0.0
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1341,6 +1379,7 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )
+        self._init_mooncake_final_poll_runtime()
 
         # Dedicated Gloo group for epoch-tagged StepInfo/MLPSync all-gather.
         # Do not mix recv-control or model-forward collectives into it.
