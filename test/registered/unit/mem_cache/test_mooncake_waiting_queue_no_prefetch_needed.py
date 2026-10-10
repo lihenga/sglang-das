@@ -12,8 +12,13 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+)
+from sglang.srt.mem_cache.unified_cache.components import (
+    ExternalLinkerLoadPhase,
+    LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
@@ -105,7 +110,8 @@ class _Cache:
         # One component that cannot build a transfer stops load_back right
         # after the prefetch decision, before any device-side work. On the
         # prefetched path construction joins the claim reduction as
-        # [claimed, constructed]; on the normal path it is its own reduction.
+        # [claimed, constructed]; on the enabled normal fallback it is its own
+        # reduction. Disabled prefetch keeps rank-local construction.
         component = MagicMock()
         component.build_external_linker_transfer.return_value = None
         self._components_tuple = (component,)
@@ -215,19 +221,82 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
 
     def test_normal_load_skips_host_prefetch_map_pop(self):
         cache = _Cache()
+        first_component = MagicMock()
+        transfer = object()
+        first_component.build_external_linker_transfer.return_value = transfer
+        cache._components_tuple = (first_component, *cache._components_tuple)
         wrapper = self._wrapper(cache)
         wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
             prefix_key=None, tail_hashes=["h0"], device_hit_len=0
         )
         wrapper._build_load_transfers = MagicMock(return_value=([], False, None))
         wrapper._abort_disagreed_load = MagicMock()
+        wrapper._update_load = MagicMock()
         req = types.SimpleNamespace(rid="rid", last_node="node")
 
         indices, node = wrapper.load_back(req)
 
         self.assertEqual(indices, "empty")
         self.assertEqual(node, "node")
-        wrapper._build_load_transfers.assert_called_once_with(req, ["h0"])
+        first_component.build_external_linker_transfer.assert_called_once_with(
+            LinkerTransferPhase.LOAD, None, ["h0"]
+        )
+        wrapper._build_load_transfers.assert_not_called()
+        wrapper._abort_disagreed_load.assert_not_called()
+        wrapper._update_load.assert_called_once_with(
+            ExternalLinkerLoadPhase.ABORT, req, [(first_component, transfer)], 1
+        )
+        self.assertEqual(cache.reductions, [])
+
+    def test_normal_load_success_has_no_construction_reduction(self):
+        cache = _Cache()
+        cache.pp_size = 2
+        transfer = types.SimpleNamespace(name=PoolName.KV, device_indices="loaded")
+        component = cache._components_tuple[0]
+        component.build_external_linker_transfer.return_value = transfer
+        wrapper = self._wrapper(cache)
+        wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+            prefix_key=None, tail_hashes=["h0"], device_hit_len=0
+        )
+        wrapper.cache_linker.revalidate_load.return_value = True
+        wrapper._build_load_transfers = MagicMock()
+        wrapper._update_load = MagicMock(return_value=[transfer])
+        wrapper._queue_load = MagicMock()
+        req = types.SimpleNamespace(rid="rid", last_node="node")
+
+        self.assertEqual(wrapper.load_back(req), ("loaded", "node"))
+
+        wrapper._build_load_transfers.assert_not_called()
+        self.assertEqual(cache.reductions, [])
+        wrapper.cache_linker.revalidate_load.assert_called_once_with([transfer])
+        wrapper._update_load.assert_called_once_with(
+            ExternalLinkerLoadPhase.PREPARE, req, [(component, transfer)], 1
+        )
+        wrapper._queue_load.assert_called_once_with(
+            "rid", "node", [transfer], anchor="node"
+        )
+
+    def test_normal_load_build_error_propagates_without_consensus_or_abort(self):
+        cache = _Cache()
+        first_component = MagicMock()
+        first_component.build_external_linker_transfer.return_value = object()
+        error = RuntimeError("construction failed")
+        cache._components_tuple[0].build_external_linker_transfer.side_effect = error
+        cache._components_tuple = (first_component, *cache._components_tuple)
+        wrapper = self._wrapper(cache)
+        wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+            prefix_key=None, tail_hashes=["h0"], device_hit_len=0
+        )
+        wrapper._update_load = MagicMock()
+        req = types.SimpleNamespace(rid="rid", last_node="node")
+
+        with self.assertRaises(RuntimeError) as raised:
+            wrapper.load_back(req)
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(cache.reductions, [])
+        wrapper._update_load.assert_not_called()
+        wrapper.cache_linker.revalidate_load.assert_not_called()
 
     def test_release_skips_prefetch_cancel_helper_but_keeps_normal_cleanup(self):
         wrapper = self._wrapper(None)
@@ -269,6 +338,23 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
 
 
 class TestLoadBackNoPrefetchNeeded(CustomTestCase):
+    def test_enabled_normal_fallback_keeps_construction_consensus(self):
+        cache = _Cache(peer_mins=[0])
+        component = cache._components_tuple[0]
+        transfer = object()
+        component.build_external_linker_transfer.return_value = transfer
+        wrapper = _wrapper(cache, MagicMock())
+        wrapper.host_prefetch_hits.clear()
+        req = types.SimpleNamespace(rid="rid", last_node="node")
+
+        self.assertEqual(wrapper.load_back(req), ("empty", "node"))
+
+        self.assertEqual(cache.reductions, [1])
+        wrapper._update_load.assert_called_once_with(
+            ExternalLinkerLoadPhase.ABORT, req, [(component, transfer)], 1
+        )
+        wrapper.cache_linker.revalidate_load.assert_not_called()
+
     def _load_back(self, cache_linker, peer_mins=()):
         cache = _Cache(peer_mins=peer_mins)
         wrapper = _wrapper(cache, cache_linker)
