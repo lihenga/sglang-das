@@ -8,13 +8,8 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
-#include <hipcub/hipcub.hpp>
-namespace cub = hipcub;
-#else
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
-#endif
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>
 
@@ -60,12 +55,7 @@ template <typename T>
 __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
-  }
-#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
-  else if constexpr (std::is_same_v<T, __hip_bfloat16>) {
-#else
-  else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-#endif
+  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
     return __bfloat162float(x);
   } else {
     return static_cast<float>(x);

@@ -209,7 +209,14 @@ def is_hcu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_hcu_native_fp8_supported() -> bool:
-    return is_hcu() and is_gfx938_supported()
+    if not is_hcu():
+        return False
+    try:
+        gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+        return "gfx938" in gcn_arch
+    except Exception as e:
+        logger.warning("HCU native FP8 detection failed: %s", e)
+        return False
 
 
 @lru_cache(maxsize=1)
@@ -1066,15 +1073,6 @@ def is_gfx95_supported():
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
         return False
-
-
-@lru_cache(maxsize=1)
-def is_gfx938_supported():
-    """Whether the device is an AMD gfx938 GPU (BW1100/CDNA family)."""
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return "gfx938" in gcn_arch
-    return False
 
 
 @lru_cache(maxsize=1)
