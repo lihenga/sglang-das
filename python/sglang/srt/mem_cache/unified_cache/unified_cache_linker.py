@@ -19,9 +19,10 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -46,6 +47,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExternalLinkerLoadError(RuntimeError):
@@ -297,6 +301,59 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> device, then insert ----
 
+    def _build_load_transfers(
+        self, req: Req, tail_hashes
+    ) -> tuple[list[tuple[TreeComponent, PoolTransfer]], bool, Optional[BaseException]]:
+        """Build every component's LOAD transfer on this rank only.
+
+        Building allocates device slots and can fail on one rank alone, so the
+        caller must agree on the returned flag before any later collective.
+        A component returning None is an expected miss; an unexpected error is
+        returned so this rank still joins that agreement before re-raising.
+        """
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
+        try:
+            for component in self.cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
+                )
+                if transfer is None:
+                    return component_transfers, False, None
+                component_transfers.append((component, transfer))
+        except BaseException as error:
+            return component_transfers, False, error
+        return component_transfers, True, None
+
+    def _abort_disagreed_load(
+        self,
+        req: Req,
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]],
+        prefix_len: int,
+        pending: Optional[BaseException],
+    ) -> None:
+        """Free any transfers built locally after ranks agreed to abort."""
+        cleanup_error = None
+        try:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+            )
+        except BaseException as error:
+            cleanup_error = error
+        if pending is not None:
+            if cleanup_error is not None:
+                logger.error(
+                    "Cleaning up the failed load of rid=%s also failed",
+                    req.rid,
+                    exc_info=(
+                        type(cleanup_error),
+                        cleanup_error,
+                        cleanup_error.__traceback__,
+                    ),
+                )
+            raise pending
+        if cleanup_error is not None:
+            raise cleanup_error
+
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
@@ -308,21 +365,18 @@ class UnifiedCacheLinkerWrapper:
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
-        # Build per-component linker transfers.
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
+        component_transfers, constructed, build_error = self._build_load_transfers(
+            req, tail_hashes
+        )
+        all_constructed = torch.tensor(int(constructed), dtype=torch.int)
+        cache._all_reduce_attn_groups(
+            all_constructed, torch.distributed.ReduceOp.MIN
+        )
+        if int(all_constructed.item()) == 0:
+            self._abort_disagreed_load(
+                req, component_transfers, prefix_len, pending=build_error
             )
-            if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
-                )
-                return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
+            return empty_indices, req.last_node
 
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would
