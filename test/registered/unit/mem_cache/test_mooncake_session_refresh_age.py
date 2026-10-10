@@ -1,11 +1,13 @@
 """Admission may skip the lease refresh of a freshly leased prefetch session.
 
-``SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S`` lets ``revalidate_host_prefetch``
-trust a private session whose oldest key was leased less than that many
-seconds ago. The age is measured from a monotonic timestamp taken before the
-RPC that granted the lease, so it never understates the lease Mooncake sees.
+``SGLANG_MOONCAKE_SESSION_REFRESH_MAX_AGE_RATIO`` lets
+``revalidate_host_prefetch`` trust a private session whose oldest key was
+leased less than that fraction of Mooncake's lease TTL ago. The age is measured
+from a monotonic timestamp taken before the RPC that granted the lease, so it
+never understates the lease Mooncake sees.
 """
 
+import inspect
 import os
 import threading
 import types
@@ -17,6 +19,7 @@ from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
+from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -48,9 +51,9 @@ class _Clock:
         return self.now
 
 
-def _linker(age_s=5.0, refresh_results=None, refresh_error=None):
+def _linker(ratio=0.5, ttl_ms=10000, refresh_results=None, refresh_error=None):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-    linker.session_refresh_age_s = age_s
+    linker.session_refresh_max_age_ratio = ratio
     linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
     linker.host_prefetch_entries = {}
@@ -73,6 +76,7 @@ def _linker(age_s=5.0, refresh_results=None, refresh_error=None):
         batch_get_session_start_with_sources=MagicMock(side_effect=start),
         batch_get_session_refresh=MagicMock(side_effect=refresh),
         batch_get_session_end=MagicMock(return_value=0),
+        get_lease_ttl_ms=MagicMock(return_value=ttl_ms),
     )
     linker.storage = types.SimpleNamespace(
         store=store,
@@ -123,8 +127,149 @@ class TestSessionRefreshAge(CustomTestCase):
 
     def test_disabled_always_refreshes(self):
         clock = _Clock()
-        linker = _linker(age_s=0.0)
+        linker = _linker(ratio=0.0)
         _prefetched(linker, clock)
+        self.assertTrue(_revalidate(linker, clock))
+        linker.storage.store.batch_get_session_refresh.assert_called_once()
+        linker.storage.store.get_lease_ttl_ms.assert_not_called()
+
+    def test_skip_needs_age_strictly_below_the_limit(self):
+        # q = 0.5 of a 10000 ms TTL: the limit is 5 s.
+        for elapsed, skipped in ((4.999, True), (5.0, False), (5.001, False)):
+            clock = _Clock()
+            linker = _linker()
+            _prefetched(linker, clock)
+            clock.now += elapsed
+            with self.subTest(elapsed=elapsed):
+                self.assertTrue(_revalidate(linker, clock))
+                refresh = linker.storage.store.batch_get_session_refresh
+                self.assertEqual(refresh.called, not skipped)
+
+    def test_ttl_changes_resize_the_window_and_are_logged(self):
+        clock = _Clock()
+        linker = _linker()
+        _prefetched(linker, clock)
+        getter = linker.storage.store.get_lease_ttl_ms
+        clock.now = 104.0
+        with self.assertLogs(mooncake_direct_linker.logger, level="INFO") as logs:
+            self.assertTrue(_revalidate(linker, clock))
+            self.assertTrue(_revalidate(linker, clock))
+            getter.return_value = 6000
+            # 4 s is not below 0.5 * 6 s.
+            self.assertTrue(_revalidate(linker, clock))
+            getter.return_value = 10000
+            clock.now = 115.0
+            self.assertTrue(_revalidate(linker, clock))
+        self.assertEqual(linker.storage.store.batch_get_session_refresh.call_count, 2)
+        self.assertEqual(
+            [r.getMessage() for r in logs.records if "lease TTL" in r.getMessage()],
+            [f"Mooncake lease TTL: {ttl} ms" for ttl in (10000, 6000, 10000)],
+        )
+
+    def test_raised_ttl_never_skips_a_session_with_a_shorter_lease(self):
+        """Replays the 5 -> 15 -> 20 sequence of Mooncake's UpdateLeaseTtl test:
+        every reply leases a session and moves the client's TTL as that rule
+        does, so the getter and the Python bases follow the same events.
+        Refresh replies carry 20 s here, which leaves the TTL as it is."""
+        # (time s, session, its lease TTL in ms or None to check it, TTL in
+        #  effect, skipped with q = 0.5)
+        steps = (
+            (0.0, "a", 5000, 5000, None),
+            (14.9, "b", 15000, 5000, None),  # 15 s becomes the candidate
+            (20.0, "c", 20000, 5000, None),  # another TTL restarts the wait
+            (20.5, "c", None, 5000, True),
+            (40.0, "d", 20000, 20000, None),  # seen alone for 20 s: raised
+            (40.5, "b", None, 20000, False),  # 25.6 s old
+            (40.5, "d", None, 20000, True),
+            (41.0, "e", 5000, 5000, None),  # a smaller TTL applies at once
+            (41.5, "d", None, 5000, True),  # 1.5 s old, below 2.5 s
+        )
+        clock = _Clock(0.0)
+        linker = _linker()
+        store = linker.storage.store
+        leases = {}
+        for at, name, lease_ms, ttl_ms, skipped in steps:
+            clock.now = at
+            if lease_ms is not None:
+                _prefetched(linker, clock, rid=name, keys=(name,), session=name)
+                leases[name] = lease_ms
+                store.get_lease_ttl_ms.return_value = ttl_ms
+                continue
+            calls = store.batch_get_session_refresh.call_count
+            with self.subTest(at=at, session=name):
+                self.assertTrue(_revalidate(linker, clock, rid=name))
+                did_skip = store.batch_get_session_refresh.call_count == calls
+                self.assertEqual(did_skip, skipped)
+                if leases[name] < ttl_ms:
+                    self.assertFalse(did_skip)
+
+    def test_unusable_ttl_refreshes_and_keeps_bases_to_the_refresh(self):
+        for value in (0, -1, True, 10000.0, "10000", None, 2**64, RuntimeError()):
+            clock = _Clock()
+            linker = _linker()
+            getter = linker.storage.store.get_lease_ttl_ms
+            if isinstance(value, Exception):
+                getter.side_effect = value
+            else:
+                getter.return_value = value
+            _prefetched(linker, clock)
+            clock.now += 1.0
+            with self.subTest(value=value):
+                self.assertTrue(_revalidate(linker, clock))
+                linker.storage.store.batch_get_session_refresh.assert_called_once()
+                self.assertEqual(linker.session_lease_base, {"k0": 101.0, "k1": 101.0})
+
+    def test_missing_getter_refreshes_and_warns_once(self):
+        mooncake_direct_linker.print_warning_once.cache_clear()
+        clock = _Clock()
+        linker = _linker()
+        del linker.storage.store.get_lease_ttl_ms
+        _prefetched(linker, clock)
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertTrue(_revalidate(linker, clock))
+            self.assertTrue(_revalidate(linker, clock))
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(linker.storage.store.batch_get_session_refresh.call_count, 2)
+
+    def test_log_failure_does_not_change_the_decision(self):
+        kept = {"k0": 100.0, "k1": 100.0}
+        renewed = {"k0": 101.0, "k1": 101.0}
+        info = (mooncake_direct_linker.logger, "info")
+        warning = (common.logger, "warning")
+        # (getter TTL or None if missing, failing log call, refresh results,
+        #  refreshes, bases afterwards)
+        cases = (
+            (10000, info, None, 0, kept),
+            (None, warning, None, 1, renewed),
+            (None, warning, [0, 7], 1, {}),
+        )
+        for ttl_ms, (log, level), results, refreshes, bases in cases:
+            mooncake_direct_linker.print_warning_once.cache_clear()
+            clock = _Clock()
+            linker = _linker(ttl_ms=ttl_ms, refresh_results=results)
+            if ttl_ms is None:
+                del linker.storage.store.get_lease_ttl_ms
+            _prefetched(linker, clock)
+            clock.now += 1.0
+            with self.subTest(ttl_ms=ttl_ms, level=level, results=results):
+                with mock.patch.object(log, level, side_effect=RuntimeError("log")):
+                    self.assertEqual(_revalidate(linker, clock), results is None)
+                refresh = linker.storage.store.batch_get_session_refresh
+                self.assertEqual(refresh.call_count, refreshes)
+                self.assertEqual(linker.session_lease_base, bases)
+
+    def test_age_includes_the_getter_wait(self):
+        # 4.9 s old before the getter, 5.1 s once it returns: not below 5 s.
+        clock = _Clock()
+        linker = _linker()
+        _prefetched(linker, clock)
+        clock.now = 104.9
+
+        def slow_getter():
+            clock.now = 105.1
+            return 10000
+
+        linker.storage.store.get_lease_ttl_ms.side_effect = slow_getter
         self.assertTrue(_revalidate(linker, clock))
         linker.storage.store.batch_get_session_refresh.assert_called_once()
 
@@ -302,73 +447,75 @@ class TestSessionRefreshAge(CustomTestCase):
         self.assertEqual(linker.session_lease_base, {})
 
 
+_RATIO = "SGLANG_MOONCAKE_SESSION_REFRESH_MAX_AGE_RATIO"
+# PR20's age and declared TTL, and v5's ratio: none of them is read any more.
+_LEGACY = (
+    "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S",
+    "SGLANG_MOONCAKE_LEASE_TTL_S",
+    "SGLANG_MOONCAKE_SESSION_REFRESH_MIN_REMAINING_RATIO",
+)
+
+
 class TestSessionRefreshAgeConfig(CustomTestCase):
-    def _config(self, **env):
+    def _config(self, env):
         with mock.patch.dict(os.environ, env, clear=False):
-            for name in (
-                "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S",
-                "SGLANG_MOONCAKE_LEASE_TTL_S",
-            ):
+            for name in (_RATIO, *_LEGACY):
                 if name not in env:
                     os.environ.pop(name, None)
-            return mooncake_direct_linker._session_refresh_age_config()
+            return mooncake_direct_linker._session_refresh_skip_config()
 
-    def test_default_is_disabled(self):
-        self.assertEqual(self._config(), 0.0)
+    def test_ratio_values(self):
+        # (ratio variable or None if unset, ratio, warns)
+        cases = (
+            (None, 0.0, False),
+            ("0", 0.0, False),
+            ("-0.0", 0.0, False),
+            ("", 0.0, False),
+            ("0.5", 0.5, False),
+            ("0.999", 0.999, False),
+            ("1", 0.0, True),
+            ("2.5", 0.0, True),
+        )
+        for raw, expected, warns in cases:
+            env = {} if raw is None else {_RATIO: raw}
+            with self.subTest(env=env):
+                logs = self.assertLogs if warns else self.assertNoLogs
+                with logs(level="WARNING"):
+                    self.assertEqual(self._config(env), expected)
 
-    def test_age_below_ttl_is_kept(self):
-        self.assertEqual(self._config(SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S="5"), 5.0)
+    def test_legacy_variables_have_no_effect(self):
+        ratios = (({}, 0.0), ({_RATIO: "0"}, 0.0), ({_RATIO: "0.5"}, 0.5))
+        for ratio_env, expected in ratios:
+            for names in (*((name,) for name in _LEGACY), _LEGACY):
+                for value in ("5", "abc", "-1", "nan"):
+                    env = {**ratio_env, **dict.fromkeys(names, value)}
+                    with self.subTest(env=env), self.assertNoLogs(level="WARNING"):
+                        self.assertEqual(self._config(env), expected)
+        source = inspect.getsource(mooncake_direct_linker)
+        for name in _LEGACY:
+            self.assertNotIn(name, source)
 
-    def test_age_not_below_ttl_disables(self):
-        with self.assertLogs(level="WARNING"):
-            self.assertEqual(
-                self._config(
-                    SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S="8",
-                    SGLANG_MOONCAKE_LEASE_TTL_S="8",
-                ),
-                0.0,
-            )
-
-    def test_negative_age_is_rejected(self):
-        with self.assertRaises(ValueError):
-            self._config(SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S="-1")
-
-    def test_non_finite_values_are_rejected(self):
-        for env in (
-            {"SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S": "nan"},
-            {"SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S": "inf"},
-            {
-                "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S": "20",
-                "SGLANG_MOONCAKE_LEASE_TTL_S": "nan",
-            },
-            {
-                "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S": "20",
-                "SGLANG_MOONCAKE_LEASE_TTL_S": "inf",
-            },
-            {"SGLANG_MOONCAKE_LEASE_TTL_S": "0"},
-            {"SGLANG_MOONCAKE_LEASE_TTL_S": "-3"},
-        ):
-            with self.subTest(env=env), self.assertRaises(ValueError):
-                self._config(**env)
+    def test_invalid_values_are_rejected(self):
+        for raw in ("-0.1", "nan", "inf", "-inf", "abc"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                self._config({_RATIO: raw})
 
     def test_group_semantics_disable_skipping(self):
-        for grouped, expected in ((True, 0.0), (False, 5.0)):
-            linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-            linker.session_refresh_age_s = 5.0
-            linker.storage = types.SimpleNamespace(
-                _can_use_group_semantics=lambda grouped=grouped: grouped
-            )
+        for grouped in (True, False):
+            linker = _linker()
+            linker.storage._can_use_group_semantics = lambda g=grouped: g
             with self.subTest(grouped=grouped):
-                if grouped:
-                    with self.assertLogs(level="WARNING"):
-                        linker._disable_refresh_skip_for_groups()
-                else:
+                logs = self.assertLogs if grouped else self.assertNoLogs
+                with logs(level="WARNING"):
                     linker._disable_refresh_skip_for_groups()
-                self.assertEqual(linker.session_refresh_age_s, expected)
+                self.assertEqual(
+                    linker._session_refresh_max_age_s(), 0.0 if grouped else 5.0
+                )
 
     def test_class_defaults_disable_skipping(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-        self.assertEqual(linker.session_refresh_age_s, 0.0)
+        self.assertEqual(linker.session_refresh_max_age_ratio, 0.0)
+        self.assertFalse(hasattr(linker, "session_refresh_age_s"))
 
 
 if __name__ == "__main__":
