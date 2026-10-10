@@ -27,6 +27,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 def _linker(exist=None, error=None):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
     linker.host_prefetch_entries = {}
     linker._abort_prepared_load_now = MagicMock()
@@ -124,6 +125,7 @@ def _wrapper(cache, cache_linker):
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = cache
     wrapper.cache_linker = cache_linker
+    wrapper._waiting_queue_prefetch_enabled = True
     wrapper.hit_markers = {}
     wrapper.host_prefetch_hits = {}
     wrapper._update_load = MagicMock()
@@ -141,6 +143,129 @@ def _no_prefetch_linker(valid):
     else:
         cache_linker.revalidate_no_prefetch_needed.return_value = valid
     return cache_linker
+
+
+class TestCancelWaitingQueuePrefetch(CustomTestCase):
+    def _wrapper(self):
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache_linker = MagicMock()
+        wrapper._waiting_queue_prefetch_enabled = True
+        wrapper.hit_markers = {"rid": object()}
+        wrapper.host_prefetch_hits = {}
+        wrapper.pending_host_prefetch_submissions = {}
+        return wrapper
+
+    def test_untracked_request_does_not_cancel_backend_prefetch(self):
+        wrapper = self._wrapper()
+
+        wrapper.cancel_waiting_queue_prefetch("rid")
+
+        self.assertNotIn("rid", wrapper.hit_markers)
+        wrapper.cache_linker.cancel_host_prefetch.assert_not_called()
+
+    def test_tracked_host_prefetch_is_cancelled(self):
+        wrapper = self._wrapper()
+        wrapper.host_prefetch_hits["rid"] = object()
+
+        wrapper.cancel_waiting_queue_prefetch("rid")
+
+        self.assertNotIn("rid", wrapper.host_prefetch_hits)
+        wrapper.cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
+
+    def test_pending_submission_is_cancelled(self):
+        wrapper = self._wrapper()
+        job = types.SimpleNamespace(cancelled=threading.Event())
+        wrapper.pending_host_prefetch_submissions["rid"] = (job, object())
+
+        wrapper.cancel_waiting_queue_prefetch("rid")
+
+        self.assertTrue(job.cancelled.is_set())
+        self.assertNotIn("rid", wrapper.pending_host_prefetch_submissions)
+        wrapper.cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
+
+
+class _NoPrefetchMapAccess(dict):
+    def get(self, key, default=None):
+        raise AssertionError("disabled prefetch map must not be queried")
+
+    def pop(self, key, default=None):
+        raise AssertionError("disabled prefetch map must not be popped")
+
+
+class TestDisabledPrefetchMapFastPath(CustomTestCase):
+    def _wrapper(self, cache):
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache = cache
+        wrapper.cache_linker = MagicMock()
+        wrapper._waiting_queue_prefetch_enabled = False
+        wrapper.hit_markers = {}
+        wrapper.host_prefetch_hits = _NoPrefetchMapAccess()
+        wrapper.pending_host_prefetch_submissions = _NoPrefetchMapAccess()
+        return wrapper
+
+    def test_match_skips_host_prefetch_map_query(self):
+        cache = types.SimpleNamespace(page_size=1, pp_size=1)
+        wrapper = self._wrapper(cache)
+        req = types.SimpleNamespace(rid="rid")
+        result = types.SimpleNamespace(
+            device_indices=types.SimpleNamespace(numel=lambda: 0)
+        )
+
+        self.assertIs(wrapper.match([], req, result), result)
+
+    def test_normal_load_skips_host_prefetch_map_pop(self):
+        cache = _Cache()
+        wrapper = self._wrapper(cache)
+        wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+            prefix_key=None, tail_hashes=["h0"], device_hit_len=0
+        )
+        wrapper._build_load_transfers = MagicMock(return_value=([], False, None))
+        wrapper._abort_disagreed_load = MagicMock()
+        req = types.SimpleNamespace(rid="rid", last_node="node")
+
+        indices, node = wrapper.load_back(req)
+
+        self.assertEqual(indices, "empty")
+        self.assertEqual(node, "node")
+        wrapper._build_load_transfers.assert_called_once_with(req, ["h0"])
+
+    def test_release_skips_prefetch_cancel_helper_but_keeps_normal_cleanup(self):
+        wrapper = self._wrapper(None)
+        wrapper.hit_markers["rid"] = object()
+        wrapper.pending_loads = {}
+        wrapper.cache_linker.cancel_queued_load.return_value = False
+        wrapper.cancel_waiting_queue_prefetch = MagicMock(
+            side_effect=AssertionError("disabled prefetch helper called")
+        )
+
+        wrapper.release_request("rid")
+
+        self.assertNotIn("rid", wrapper.hit_markers)
+        wrapper.cancel_waiting_queue_prefetch.assert_not_called()
+        wrapper.cache_linker.cancel_queued_load.assert_called_once_with("rid")
+
+    def test_disabled_wrapper_allocates_no_prefetch_maps_and_resets(self):
+        cache = types.SimpleNamespace(
+            tree_core=types.SimpleNamespace(),
+            write_through_threshold=0,
+            _all_reduce_attn_groups=MagicMock(),
+        )
+        cache_linker = MagicMock()
+        cache_linker.waiting_queue_prefetch_enabled.return_value = False
+        wrapper = UnifiedCacheLinkerWrapper(cache, cache_linker)
+
+        self.assertIsNone(wrapper.host_prefetch_hits)
+        self.assertIsNone(wrapper.pending_host_prefetch_submissions)
+        self.assertEqual(
+            wrapper.get_host_prefetch_admission_state("rid"), "not_tracked"
+        )
+        self.assertFalse(wrapper.prefetch_to_host(object()))
+        cache_linker.get_host_prefetch_status.assert_not_called()
+        cache._all_reduce_attn_groups.assert_not_called()
+
+        wrapper.reset()
+
+        cache_linker.reset.assert_called_once()
 
 
 class TestLoadBackNoPrefetchNeeded(CustomTestCase):
