@@ -34,7 +34,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_memory, get_model
-from sglang.srt.utils import freeze_gc, get_device_module
+from sglang.srt.utils import freeze_gc, get_device_module, print_warning_once
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -58,29 +58,26 @@ def _storage_suffix(
     return "_".join(parts)
 
 
-def _session_refresh_age_config() -> float:
-    """Refresh-skip age in seconds from the environment.
+def _session_refresh_skip_config() -> float:
+    """Refresh-skip max age ratio from the environment.
 
-    The master's TTL is not visible to the client, so the deployment declares
-    it; an age that would not leave any of that TTL disables skipping.
+    The ratio is of the lease TTL that Mooncake reports; unset, empty or 0
+    disables skipping.
     """
-    age_s = float(os.environ.get("SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S", "0") or 0)
-    lease_ttl_s = float(os.environ.get("SGLANG_MOONCAKE_LEASE_TTL_S", "10") or 10)
-    if not math.isfinite(age_s) or age_s < 0:
+    ratio = float(os.environ.get("SGLANG_MOONCAKE_SESSION_REFRESH_MAX_AGE_RATIO") or 0)
+    if not math.isfinite(ratio) or ratio < 0:
         raise ValueError(
-            "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S must be a finite value >= 0"
+            "SGLANG_MOONCAKE_SESSION_REFRESH_MAX_AGE_RATIO must be a finite "
+            "value >= 0"
         )
-    if not math.isfinite(lease_ttl_s) or lease_ttl_s <= 0:
-        raise ValueError("SGLANG_MOONCAKE_LEASE_TTL_S must be a finite value > 0")
-    if age_s >= lease_ttl_s:
+    if ratio >= 1:
         logger.warning(
-            "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S=%.3f is not below the lease "
-            "TTL %.3f s; disabling refresh skipping",
-            age_s,
-            lease_ttl_s,
+            "SGLANG_MOONCAKE_SESSION_REFRESH_MAX_AGE_RATIO=%.3f leaves no "
+            "lease margin; disabling refresh skipping",
+            ratio,
         )
-        age_s = 0.0
-    return age_s
+        ratio = 0.0
+    return ratio
 
 
 class LayerWiseLoadCounter:
@@ -314,11 +311,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
         )
         # Skip the admission-time lease refresh of a prefetched request whose
-        # oldest session key was leased less than this many seconds ago. The
-        # master never evicts a leased object, so the refresh only buys lease
-        # time; 0 keeps the refresh unconditional. Must leave enough of the
-        # deployment's lease TTL to cover admission through load completion.
-        self.session_refresh_age_s = _session_refresh_age_config()
+        # oldest session key was leased less than this fraction of the lease
+        # TTL ago. The master never evicts a leased object, so the refresh only
+        # buys lease time; 0 keeps the refresh unconditional. Must leave enough
+        # of the lease TTL to cover admission through load completion.
+        self.session_refresh_max_age_ratio = _session_refresh_skip_config()
+        self.logged_lease_ttl_ms = 0
         self._disable_refresh_skip_for_groups()
         self.host_prefetch_enabled = bool(
             getattr(
@@ -469,12 +467,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_thread.start()
 
     # Defaults for instances built without __init__ (unit-test fixtures).
-    session_refresh_age_s = 0.0
+    session_refresh_max_age_ratio = 0.0
+    logged_lease_ttl_ms = 0
 
     def _disable_refresh_skip_for_groups(self) -> None:
         group_semantics = getattr(self.storage, "_can_use_group_semantics", None)
         if (
-            self.session_refresh_age_s > 0
+            self.session_refresh_max_age_ratio > 0
             and callable(group_semantics)
             and group_semantics()
         ):
@@ -482,10 +481,45 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             # left, yet every reply reports the full TTL: the client-side
             # deadline can run up to TTL/2 past the master's.
             logger.warning(
-                "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S is ignored with Mooncake "
+                "Mooncake session refresh skipping is disabled with Mooncake "
                 "group semantics"
             )
-            self.session_refresh_age_s = 0.0
+            self.session_refresh_max_age_ratio = 0.0
+
+    def _session_refresh_max_age_s(self) -> float:
+        """Session age below which admission may skip the lease refresh.
+
+        Taken from the lease TTL the Mooncake client has in effect, which it
+        lowers at once and raises only after a stable window; 0 (refresh)
+        while that TTL is unknown or unreadable.
+        """
+        ratio = self.session_refresh_max_age_ratio
+        if ratio <= 0:
+            return 0.0
+        getter = getattr(self.storage.store, "get_lease_ttl_ms", None)
+        if getter is None:
+            # A failing log handler must not turn the refresh into an abort.
+            try:
+                print_warning_once(
+                    "Mooncake package lacks get_lease_ttl_ms; admission always "
+                    "refreshes the session lease"
+                )
+            except Exception:
+                pass
+            return 0.0
+        try:
+            ttl_ms = getter()
+        except BaseException:
+            return 0.0
+        if type(ttl_ms) is not int or not 0 < ttl_ms < 2**64:
+            return 0.0
+        if ttl_ms != self.logged_lease_ttl_ms:
+            self.logged_lease_ttl_ms = ttl_ms
+            try:
+                logger.info("Mooncake lease TTL: %d ms", ttl_ms)
+            except Exception:
+                pass
+        return ratio * ttl_ms / 1000
 
     def _lease_bases(self) -> dict[str, float]:
         bases = getattr(self, "session_lease_base", None)
@@ -970,15 +1004,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not keys:
             return False
         oldest = None if None in bases else min(bases)
-        # Measure the age after acquiring session_lock: it may have been held
-        # across another request's session-start RPC, and that wait has used
-        # up lease too.
+        max_age_s = self._session_refresh_max_age_s() if private else 0.0
+        # Measure the age after acquiring session_lock and reading the TTL: the
+        # lock may have been held across another request's session-start RPC,
+        # and that wait has used up lease too.
         age = float("inf") if oldest is None else time.monotonic() - oldest
-        if (
-            self.session_refresh_age_s > 0
-            and private
-            and age < self.session_refresh_age_s
-        ):
+        if max_age_s > 0 and age < max_age_s:
             # Every key still holds at least TTL - age of master read lease,
             # during which the master neither evicts nor replaces it.
             return True
