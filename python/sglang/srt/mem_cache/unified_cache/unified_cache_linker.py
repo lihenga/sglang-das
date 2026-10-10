@@ -22,7 +22,9 @@ from __future__ import annotations
 import logging
 import threading
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -75,6 +77,12 @@ class UnifiedCacheLinker(ABC):
 
         Local to this rank; the tree intersects the sets across ranks.
         """
+
+    def lookup_in_worker(
+        self, rid: str, transfers: list[PoolTransfer]
+    ) -> list[int]:
+        """Perform the local portion of lookup without distributed collectives."""
+        return self.lookup(rid, transfers)
 
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -186,6 +194,14 @@ class PreparedHostPrefetch(NamedTuple):
     cancelled: threading.Event
 
 
+class _PendingLookup(NamedTuple):
+    rid: str
+    key: RadixKey
+    device_hit_len: int
+    num_pages: int
+    future: Future
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -204,6 +220,19 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker = cache_linker
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self.async_lookup_enabled = getattr(cache_linker, "async_lookup_enabled", False)
+        self.async_lookup_workers = getattr(cache_linker, "async_lookup_workers", 1)
+        self.lookup_executor = (
+            ThreadPoolExecutor(
+                max_workers=self.async_lookup_workers,
+                thread_name_prefix="mooncake-lookup",
+            )
+            if self.async_lookup_enabled
+            else None
+        )
+        self.pending_lookups: dict[str, _PendingLookup] = {}
+        self.lookup_queue: deque[_PendingLookup] = deque()
+        self.lookup_results: dict[str, tuple[_PendingLookup, int]] = {}
         # Waiting-queue prefetches retain the original hit until admission can
         # rematch it. The backend owns the private session and readiness state.
         self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] = {}
@@ -240,6 +269,76 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def has_pending_lookup(self, rid: str) -> bool:
+        return rid in self.pending_lookups
+
+    def wait_pending_lookups(self) -> int:
+        pending = tuple(self.lookup_queue)
+        for lookup in pending:
+            try:
+                lookup.future.result()
+            except Exception:
+                pass
+        return len(pending)
+
+    def drain_lookups(self, count: int) -> None:
+        if not count:
+            return
+        completed = [self.lookup_queue.popleft() for _ in range(count)]
+        offsets = [0]
+        for pending in completed:
+            offsets.append(offsets[-1] + pending.num_pages + 1)
+        mask = torch.zeros(offsets[-1], dtype=torch.int)
+        for index, pending in enumerate(completed):
+            try:
+                restorable = pending.future.result()
+            except Exception:
+                logger.exception("Mooncake async lookup failed: rid=%s", pending.rid)
+                restorable = []
+            for pages in restorable:
+                if 0 < pages <= pending.num_pages:
+                    mask[offsets[index] + pages] = 1
+        self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
+        for index, pending in enumerate(completed):
+            if self.pending_lookups.get(pending.rid) is not pending:
+                continue
+            self.pending_lookups.pop(pending.rid)
+            common = mask[offsets[index] : offsets[index + 1]].nonzero()
+            pages = int(common[-1].item()) if common.numel() else 0
+            self.lookup_results[pending.rid] = (pending, pages)
+
+    @staticmethod
+    def _same_lookup(
+        pending: _PendingLookup, key: RadixKey, device_hit_len: int
+    ) -> bool:
+        old = pending.key
+        return (
+            pending.device_hit_len == device_hit_len
+            and len(old) == len(key)
+            and old.extra_key == key.extra_key
+            and old.cache_salt == key.cache_salt
+            and old.is_bigram == key.is_bigram
+            and (
+                old.token_ids is key.token_ids
+                or old.raw_token_ids() == key.raw_token_ids()
+            )
+        )
+
+    def _reset_lookups(self, *, close: bool = False) -> None:
+        if self.lookup_executor is not None:
+            self.lookup_executor.shutdown(wait=True)
+            self.lookup_executor = (
+                None
+                if close
+                else ThreadPoolExecutor(
+                    max_workers=self.async_lookup_workers,
+                    thread_name_prefix="mooncake-lookup",
+                )
+            )
+        self.pending_lookups.clear()
+        self.lookup_queue.clear()
+        self.lookup_results.clear()
 
     def get_host_prefetch_admission_state(self, rid: str) -> str:
         if rid in self.pending_host_prefetch_submissions:
@@ -363,7 +462,12 @@ class UnifiedCacheLinkerWrapper:
         return True
 
     def has_pending_operations(self) -> bool:
-        return bool(self.pending_loads or self.pending_offloads)
+        return bool(
+            self.pending_loads
+            or self.pending_offloads
+            or self.pending_lookups
+            or self.lookup_queue
+        )
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -387,6 +491,8 @@ class UnifiedCacheLinkerWrapper:
             req.external_cache_hit_length = device_hit_len
 
         if device_hit_len >= len(key):
+            self.pending_lookups.pop(req.rid, None)
+            self.lookup_results.pop(req.rid, None)
             if prefetched_hit is not None:
                 self.cancel_waiting_queue_prefetch(req.rid)
             return result
@@ -449,13 +555,42 @@ class UnifiedCacheLinkerWrapper:
 
             self.cancel_waiting_queue_prefetch(req.rid)
 
+        completed_lookup = None
+        if self.async_lookup_enabled:
+            pending = self.pending_lookups.get(req.rid)
+            if pending is not None:
+                if self._same_lookup(pending, key, device_hit_len):
+                    return result
+                self.pending_lookups.pop(req.rid)
+            completed_lookup = self.lookup_results.get(req.rid)
+            if completed_lookup is not None and not self._same_lookup(
+                completed_lookup[0], key, device_hit_len
+            ):
+                self.lookup_results.pop(req.rid)
+                completed_lookup = None
+            if completed_lookup is not None and completed_lookup[1] == 0:
+                return result
+
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         if known_hit_len is None:
-            hit_pages = self._sync_restorable_prefix(
-                self.cache_linker.lookup(req.rid, lookup_transfers),
-                num_pages=len(tail_hashes),
-                device_hit_pages=0,
-            )
+            if self.async_lookup_enabled:
+                if completed_lookup is None:
+                    future = self.lookup_executor.submit(
+                        self.cache_linker.lookup_in_worker, req.rid, lookup_transfers
+                    )
+                    pending = _PendingLookup(
+                        req.rid, key[:], device_hit_len, len(tail_hashes), future
+                    )
+                    self.pending_lookups[req.rid] = pending
+                    self.lookup_queue.append(pending)
+                    return result
+                hit_pages = completed_lookup[1]
+            else:
+                hit_pages = self._sync_restorable_prefix(
+                    self.cache_linker.lookup(req.rid, lookup_transfers),
+                    num_pages=len(tail_hashes),
+                    device_hit_pages=0,
+                )
             if cache.pp_size > 1:
                 req.external_cache_hit_length = device_hit_len + hit_pages * page
         else:
@@ -609,6 +744,7 @@ class UnifiedCacheLinkerWrapper:
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
+        self.lookup_results.pop(req.rid, None)
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return empty_indices, req.last_node
@@ -1099,6 +1235,7 @@ class UnifiedCacheLinkerWrapper:
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        self._reset_lookups()
         for job, _hit in self.pending_host_prefetch_submissions.values():
             job.cancelled.set()
         self.pending_host_prefetch_submissions.clear()
@@ -1123,6 +1260,8 @@ class UnifiedCacheLinkerWrapper:
         self.taken_loads.clear()
 
     def release_request(self, rid: str) -> None:
+        self.pending_lookups.pop(rid, None)
+        self.lookup_results.pop(rid, None)
         # failed_chains is deliberately untouched: the chain outlives the
         # request's linker state, and cache_finished_req is what frees it.
         self.hit_markers.pop(rid, None)
@@ -1136,5 +1275,6 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def close(self) -> None:
+        self._reset_lookups(close=True)
         self.cache_linker.close()
         self._release_pending_locks()

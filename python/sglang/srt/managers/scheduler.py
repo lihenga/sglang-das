@@ -1313,7 +1313,6 @@ class Scheduler(
                 self.prefill_delayer = PrefillDelayer(
                     dp_size=self.ps.dp_size,
                     attn_tp_size=self.ps.attn_tp_size,
-                    attn_cp_size=self.ps.attn_cp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
                     server_args=self.server_args,
@@ -3994,22 +3993,6 @@ class Scheduler(
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
 
-            # The overlap loop reaches here before the previous Prefill result
-            # is processed.  Its final chunk already sampled one token, so a
-            # max_new_tokens=1 request is complete in the pending result even
-            # though req.finished() is not set yet.  Do not merge such requests
-            # into running_batch and launch a needless one-token decode.  Apart
-            # from wasted work, that lookahead can pair with a CP Prefill on a
-            # different attention-DP replica and force an expensive mixed
-            # full-TP forward.
-            if self.enable_overlap and last_batch.contains_last_prefill_chunk:
-                chunked_req_to_exclude.update(
-                    req
-                    for req in last_batch.reqs
-                    if req.inflight_middle_chunks <= 0
-                    and req.finishes_after_pending_token()
-                )
-
             # Filter batch
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
@@ -4136,7 +4119,10 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         waiting_queue_prefetch_states = {}
-        if self.enable_waiting_queue_dfs_prefetch:
+        enable_waiting_queue_dfs_prefetch = getattr(
+            self, "enable_waiting_queue_dfs_prefetch", False
+        )
+        if enable_waiting_queue_dfs_prefetch:
             waiting_queue_prefetch_states = (
                 self.tree_cache.get_waiting_queue_prefetch_admission_states(
                     [req.rid for req in self.waiting_queue]
@@ -4238,6 +4224,18 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
+        if self.enable_unified_cache_external_linker:
+            lookup_limit = max(0, self.get_num_allocatable_reqs(running_bs))
+            lookup_candidates = self.waiting_queue[:lookup_limit]
+            if enable_waiting_queue_dfs_prefetch:
+                lookup_candidates = [
+                    req
+                    for req in lookup_candidates
+                    if waiting_queue_prefetch_states.get(req.rid, "not_tracked")
+                    == "not_tracked"
+                ]
+            self.tree_cache.prepare_external_lookups(lookup_candidates)
+
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
@@ -4263,7 +4261,7 @@ class Scheduler(
                     break
 
             abandoned_prefetch = False
-            if self.enable_waiting_queue_dfs_prefetch:
+            if enable_waiting_queue_dfs_prefetch:
                 prefetch_state = waiting_queue_prefetch_states.get(
                     req.rid, "not_tracked"
                 )
@@ -4287,6 +4285,18 @@ class Scheduler(
                 self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.is_external_lookup_pending(req.rid)
+            ):
+                req.mamba_cow_src_index = None
+                req.mamba_needs_clear = False
+                if req.mamba_pool_idx is not None and not getattr(req, "session", None):
+                    self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
+                    req.mamba_pool_idx = None
+                continue
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"

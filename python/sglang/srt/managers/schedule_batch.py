@@ -1297,16 +1297,6 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def finishes_after_pending_token(self) -> bool:
-        """Whether one already-launched token will reach the length cap.
-
-        The overlap scheduler plans the next iteration before processing the
-        current forward result.  For a final Prefill chunk, that result already
-        contains one sampled token.  Requests at the cap must not be promoted
-        into a speculative one-token decode batch while that result is pending.
-        """
-        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
-
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
 
@@ -1345,8 +1335,6 @@ class Req(ReqDllmMixin):
         else:
             self._refresh_fill_ids()
 
-        input_len = len(self.full_untruncated_fill_ids)
-
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
         if (
@@ -1363,59 +1351,11 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        # Pass the full array with a raw-token cap (limit) instead of slicing,
-        # avoiding an O(context) copy per prefill-batch build.
-        token_ids_to_match = self.full_untruncated_fill_ids
-        key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
-
-        # SWA lives in a per-request ring that's not content-stable and is never
-        # stored in the radix tree, so a reused prefix carries stale SWA. Cap the
-        # match by the trailing sliding window so it gets re-prefilled, rewriting
-        # this request's SWA ring. No-op for other layouts.
-        reprefill_tail = 0
-        if tree_cache is not None:
-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-            if reprefill_tail:
-                capped = max(0, input_len - reprefill_tail)
-                key_limit = capped if key_limit is None else min(key_limit, capped)
-
-        # PP0 owns the canonical external-cache boundary. Apply it only while
-        # admitting the request; cache insertion performs its own rematch and
-        # must be allowed to see KV computed after that original boundary.
-        if (
-            tree_cache is not None
-            and self.external_cache_hit_length is not None
-            and getattr(tree_cache, "linker", None) is not None
-            and getattr(tree_cache, "pp_size", 1) > 1
-        ):
-            capped = min(input_len, self.external_cache_hit_length)
-            key_limit = capped if key_limit is None else min(key_limit, capped)
-
-        # Disable prefix caching when embed overrides are present: same token IDs
-        # with different override vectors must not share cached KV values.
-        if self.positional_embed_overrides is not None:
-            token_ids_to_match = array("q")
-            key_limit = None
-
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(
-                        token_ids=token_ids_to_match,
-                        extra_key=self.extra_key,
-                        limit=key_limit,
-                        cache_salt=self.cache_salt,
-                    ),
-                    req=self,
-                    cow_mamba=cow_mamba,
-                    # unified_kv's SWA is request-private and intentionally
-                    # absent from the tree. Match the reusable full-attention
-                    # prefix; the key_limit above leaves one SWA window to
-                    # re-prefill into this request's ring.
-                    return_full_match=bool(reprefill_tail),
-                )
+                self._prefix_match_params(tree_cache, cow_mamba)
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(
@@ -1462,6 +1402,50 @@ class Req(ReqDllmMixin):
                     self.multimodal_inputs.mrope_positions, len(self.output_ids)
                 )
             )
+
+    def prepare_external_lookup(
+        self, tree_cache: BasePrefixCache
+    ) -> Optional[MatchPrefixParams]:
+        if self.session is not None or self.is_dllm():
+            return None
+        self._refresh_fill_ids()
+        return self._prefix_match_params(tree_cache, cow_mamba=False)
+
+    def _prefix_match_params(
+        self, tree_cache: BasePrefixCache, cow_mamba: bool = False
+    ) -> MatchPrefixParams:
+        input_len = len(self.full_untruncated_fill_ids)
+        token_ids_to_match = self.full_untruncated_fill_ids
+        key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
+
+        reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+        if reprefill_tail:
+            capped = max(0, input_len - reprefill_tail)
+            key_limit = capped if key_limit is None else min(key_limit, capped)
+
+        if (
+            self.external_cache_hit_length is not None
+            and getattr(tree_cache, "linker", None) is not None
+            and getattr(tree_cache, "pp_size", 1) > 1
+        ):
+            capped = min(input_len, self.external_cache_hit_length)
+            key_limit = capped if key_limit is None else min(key_limit, capped)
+
+        if self.positional_embed_overrides is not None:
+            token_ids_to_match = array("q")
+            key_limit = None
+
+        return MatchPrefixParams(
+            key=RadixKey(
+                token_ids=token_ids_to_match,
+                extra_key=self.extra_key,
+                limit=key_limit,
+                cache_salt=self.cache_salt,
+            ),
+            req=self,
+            cow_mamba=cow_mamba,
+            return_full_match=bool(reprefill_tail),
+        )
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -2236,7 +2220,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
-    global_cp_num_tokens: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
@@ -3379,7 +3362,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
-            global_cp_num_tokens=self.global_cp_num_tokens,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,

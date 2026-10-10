@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -70,20 +71,11 @@ if _use_aiter_fp8_w8a8_moe:
         aiter_moe,
         get_aiter_moe_config,
     )
+if _use_aiter and not _is_hcu:
+    from aiter.ops.shuffle import shuffle_weight
+
+
 logger = logging.getLogger(__name__)
-
-
-def _should_use_aiter_runner() -> bool:
-    """Resolve AITER from the explicit backend before the legacy env switch.
-
-    ``SGLANG_USE_AITER`` controls the legacy auto-selection path.  An explicit
-    ``--moe-runner-backend aiter`` must nevertheless use AITER's weight
-    allocation/loading contract even when that broad switch is disabled.
-    """
-    backend = get_moe_runner_backend()
-    return backend.is_aiter() or (
-        backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
-    )
 
 
 def is_moe_prefill_or_normal():
@@ -199,7 +191,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            is_aiter_moe=_should_use_aiter_runner(),
+            is_aiter_moe=_use_aiter,
             is_concat=True,
             is_packed=False,
         )
@@ -445,14 +437,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and _should_use_aiter_runner()
-            and layer.moe_runner_config.gemm1_alpha is None
-            and layer.moe_runner_config.gemm1_clamp_limit is None
+            and _use_aiter
+            and not _is_hcu
         ):
-            # Keep this import lazy: explicit AITER MoE should not require the
-            # broad SGLANG_USE_AITER import surface during module import.
-            from aiter.ops.shuffle import shuffle_weight
-
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
@@ -470,7 +457,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             and _use_deepgemm_moe
             and _is_hcu
             and self.use_deepep
-            and not get_moe_runner_backend().is_deep_gemm()
         ):
             # SGLANG_USE_DEEPGEMM_MOE is process-wide, but DSpark may use a
             # standalone draft MoE alongside a DeepEP target MoE.  Repacking
@@ -613,8 +599,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
-            if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and (
-                _should_use_aiter_runner()
+            if (
+                will_use_aiter_moe()
+                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
@@ -622,7 +610,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         if (
             moe_runner_backend.is_aiter()
-            or moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
@@ -640,34 +627,33 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         i_q: Optional[torch.Tensor] = None,
         i_s: Optional[torch.Tensor] = None,
     ) -> CombineInput:
+
         x = dispatch_output.hidden_states
-        # DeepEP dispatch outputs carry their routed ids/weights directly and
-        # are consumed by the registered runner pre-permute.  Only the legacy
-        # standard-dispatch fallbacks below need a nested ``topk_output``.
-        topk_output = getattr(dispatch_output, "topk_output", None)
+        topk_output = dispatch_output.topk_output
+
         moe_runner_config = self.moe_runner_config
 
-        if self.runner.runner_backend.is_deep_gemm():
-            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
-                DeepGemmMoeQuantInfo,
+        if (
+            _is_hcu
+            and self.runner.runner_backend.is_aiter()
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        ):
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                get_aiter_w8a8_fp8_quant_info,
             )
 
-            if not getattr(layer, "_hcu_deepgemm_channel_fp8_packed", False):
-                raise RuntimeError(
-                    "HCU DeepGEMM weights were not packed after checkpoint loading"
+            assert not moe_runner_config.no_combine, "unsupported"
+            quant_info = get_aiter_w8a8_fp8_quant_info(layer)
+            combine_input = self.runner.run(dispatch_output, quant_info)
+            if bias is not None:
+                from sglang.srt.layers.moe.token_dispatcher import (
+                    StandardCombineInput,
                 )
-            quant_info = DeepGemmMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                block_shape=None,
-                logical_w13_shape=layer._hcu_deepgemm_logical_w13_shape,
-                logical_w2_shape=layer._hcu_deepgemm_logical_w2_shape,
-                hcu_packed=True,
-            )
-            return self.runner.run(dispatch_output, quant_info)
+
+                return StandardCombineInput(
+                    hidden_states=combine_input.hidden_states + bias
+                )
+            return combine_input
         elif self.runner.runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 AiterMoeQuantInfo,
@@ -675,17 +661,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             )
 
             assert not moe_runner_config.no_combine, "unsupported"
-            dispatcher = layer.dispatcher
-            # Standard EP exposes the actual global->local mapping as int32
-            # (-1 for remote experts). Its expert_mask_gpu is only a 0/1
-            # membership mask and must not be passed as an AITER expert_map.
-            # DeepEP has no local_expert_mapping; its bool sink mask remains
-            # the fallback and is converted by AiterRunnerCore.
-            expert_map = getattr(dispatcher, "aiter_expert_map_gpu", None)
-            if expert_map is None:
-                expert_map = getattr(dispatcher, "local_expert_mapping", None)
-            if expert_map is None:
-                expert_map = getattr(dispatcher, "expert_mask_gpu", None)
             quant_info = AiterMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -694,9 +669,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
-                # Standard EP keeps global expert ids for AITER; DeepEP uses a
-                # local sink slot for invalid (-1) dispatch entries.
-                expert_mask=expert_map,
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:

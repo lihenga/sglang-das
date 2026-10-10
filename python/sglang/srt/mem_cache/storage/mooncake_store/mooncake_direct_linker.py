@@ -389,6 +389,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.host_prefetch_enabled = self._resolve_host_prefetch_enabled(
             params, requested=self.host_prefetch_enabled
         )
+        self.async_lookup_enabled = envs.SGLANG_MOONCAKE_ASYNC_LOOKUP.get()
+        if self.async_lookup_enabled and params.pp_size != 1:
+            raise ValueError("SGLANG_MOONCAKE_ASYNC_LOOKUP currently requires PP1")
+        self.async_lookup_workers = 1
+        if self.async_lookup_enabled:
+            self.async_lookup_workers = envs.SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS.get()
+            if self.async_lookup_workers < 1:
+                raise ValueError("SGLANG_MOONCAKE_ASYNC_LOOKUP_WORKERS must be >= 1")
+            logger.info(
+                "Mooncake asynchronous L3 lookup enabled (PP1, workers=%d)",
+                self.async_lookup_workers,
+            )
+        # This branch performs local metadata lookup on every attention rank.
+        self._async_lookup_owner = True
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
@@ -590,6 +604,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        return self._lookup_local(rid, transfers)
+
+    def lookup_in_worker(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        """Query local metadata only; collectives remain on the scheduler thread."""
+        if not self._async_lookup_owner:
+            kv = next(t for t in transfers if t.name == PoolName.KV)
+            return list(range(1, len(kv.keys) + 1))
+        return self._lookup_local(rid, transfers)
+
+    def _lookup_local(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []

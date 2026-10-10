@@ -33,14 +33,6 @@
 
 namespace detail {
 
-#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
-// DTK's gfx936/gfx938 objects are compiled with a 256-thread launch bound. The
-// HIP kernels below are grid-stride kernels, so a 256-thread cap is valid.
-constexpr uint32_t kMaxActivationThreads = 256;
-#else
-constexpr uint32_t kMaxActivationThreads = 1024;
-#endif
-
 template <typename T>
 __device__ __forceinline__ float to_f32(const T& x) {
 #if USE_ROCM
@@ -100,7 +92,7 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input) {
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, detail::kMaxActivationThreads));
+    dim3 block(std::min(d / vec_size, 1024U));
 #if USE_ROCM
     sgl_hip::activation::act_and_mul_kernel<c_type, silu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
@@ -122,7 +114,7 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, detail::kMaxActivationThreads));
+    dim3 block(std::min(d / vec_size, 1024U));
 #if USE_ROCM
     sgl_hip::activation::act_and_mul_kernel<c_type, gelu_tanh>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
@@ -144,7 +136,7 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, detail::kMaxActivationThreads));
+    dim3 block(std::min(d / vec_size, 1024U));
 #if USE_ROCM
     sgl_hip::activation::act_and_mul_kernel<c_type, gelu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
@@ -168,7 +160,7 @@ void gelu_quick(at::Tensor& out, const at::Tensor& input) {
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, detail::kMaxActivationThreads));
+    dim3 block(std::min(d / vec_size, 1024U));
     sgl_hip::activation::act_only_kernel<c_type, gelu_quick_act>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 

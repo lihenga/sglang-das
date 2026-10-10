@@ -16,7 +16,6 @@
 # ==============================================================================
 """Fused operators for normalization layers."""
 
-import inspect
 import logging
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -60,9 +59,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_hcu = is_hcu()
-_use_hcu_lightop_gemma_rmsnorm = _is_hcu and get_bool_env_var(
-    "SGLANG_USE_LIGHTOP_GEMMA_RMSNORM"
-)
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
 
@@ -124,7 +120,7 @@ if _use_aiter:
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
-elif _is_hip and not _is_hcu:
+elif _is_hip:
     try:
         from vllm._custom_ops import fused_add_rms_norm, rms_norm
 
@@ -135,11 +131,6 @@ elif _is_hip and not _is_hcu:
 if _is_hcu:
     from lightop import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm_hcu
     from lightop import op
-
-if _use_hcu_lightop_gemma_rmsnorm:
-    from lightop import (
-        gemma_rms_norm_per_token_fp8_quant as gemma_rms_norm_fp8_quant_hcu,
-    )
 
 if _is_hip:
     try:
@@ -187,59 +178,6 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=None)
-def _fused_add_rms_norm_arity(op) -> Optional[int]:
-    """Return the Python wrapper arity for known vLLM RMSNorm ABIs."""
-    try:
-        parameters = inspect.signature(op).parameters.values()
-    except (TypeError, ValueError):
-        return None
-    positional = [
-        parameter
-        for parameter in parameters
-        if parameter.kind
-        in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    if any(parameter.kind == parameter.VAR_POSITIONAL for parameter in parameters):
-        return None
-    return len(positional) if len(positional) in (4, 6) else None
-
-
-def _call_vllm_fused_add_rms_norm(
-    op,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Call either the current in-place or legacy out-parameter vLLM ABI."""
-    arity = _fused_add_rms_norm_arity(op)
-    if arity == 4:
-        op(x, residual, weight, eps)
-        return x, residual
-
-    if arity == 6:
-        out = torch.empty_like(x)
-        residual_out = torch.empty_like(x)
-        op(out, x, residual_out, residual, weight, eps)
-        return out, residual_out
-
-    # Some extension wrappers do not expose an inspectable signature. A wrong
-    # argument count fails before kernel launch, so it is safe to probe the
-    # current ABI and fall back only on TypeError.
-    try:
-        op(x, residual, weight, eps)
-    except TypeError as current_abi_error:
-        out = torch.empty_like(x)
-        residual_out = torch.empty_like(x)
-        try:
-            op(out, x, residual_out, residual, weight, eps)
-        except TypeError:
-            raise current_abi_error
-        return out, residual_out
-    return x, residual
-
-
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
@@ -269,8 +207,7 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            attention_tensor_model_parallel_all_reduce,
-            moe_tensor_model_parallel_all_reduce,
+            tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
@@ -279,32 +216,24 @@ def _forward_with_allreduce_fusion(
 
         if use_attn_tp_group:
             world_size = get_parallel().attn_tp_size
-            allreduce_group = "attn_tp"
-            all_reduce = attention_tensor_model_parallel_all_reduce
         else:
-            world_size = get_parallel().moe_tp_size
-            allreduce_group = "moe_tp"
-            all_reduce = moe_tensor_model_parallel_all_reduce
+            if get_parallel().moe_ep_size > 1:
+                world_size = get_parallel().moe_ep_size
+            else:
+                world_size = get_parallel().moe_tp_size
 
         if world_size > 1:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
 
-            # The AITER communicator is independently selectable from the
-            # global AITER compute backend. MiniMax keeps SGLANG_USE_AITER=0
-            # for its LightOp dense FP8 path while still using AITER custom AR.
-            use_aiter_ar = _is_hip and get_exec().comm.enable_aiter_allreduce_fusion
-            if use_aiter_ar:
+            # Prefer AITER fused AR+RMSNorm when enabled on AMD.
+            if _use_aiter:
                 fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x,
-                    residual,
-                    weight,
-                    norm_module.variance_epsilon,
-                    group=allreduce_group,
+                    x, residual, weight, norm_module.variance_epsilon
                 )
                 if fused_result is not None:
                     return fused_result
-            elif not _is_hip:
+            else:
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -317,8 +246,8 @@ def _forward_with_allreduce_fusion(
                     return fused_result
 
             # For AITER route, preserve correctness when fused path is unavailable.
-            if use_aiter_ar:
-                x = all_reduce(x)
+            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
+                x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
@@ -374,10 +303,11 @@ def _forward_with_allreduce_fusion_quant_per_group(
 
     if use_attn_tp_group:
         world_size = get_parallel().attn_tp_size
-        allreduce_group = "attn_tp"
     else:
-        world_size = get_parallel().moe_tp_size
-        allreduce_group = "moe_tp"
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
+        else:
+            world_size = get_parallel().moe_tp_size
     if world_size <= 1:
         return None
 
@@ -386,12 +316,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
     # and drop this explicit post-kernel scale materialization.
     if not keep_bf16:
         result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-            x,
-            residual,
-            weight,
-            norm_module.variance_epsilon,
-            group_size,
-            group=allreduce_group,
+            x, residual, weight, norm_module.variance_epsilon, group_size
         )
         if result is not None:
             fp8_out, residual_out, scale_out = result
@@ -401,11 +326,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
 
         # Fallback: fused AR+RMSNorm then separate per-group quant.
         fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
-            x,
-            residual,
-            weight,
-            norm_module.variance_epsilon,
-            group=allreduce_group,
+            x, residual, weight, norm_module.variance_epsilon
         )
         if fused_result is None:
             return None
@@ -432,7 +353,6 @@ def _forward_with_allreduce_fusion_quant_per_group(
         norm_module.variance_epsilon,
         group_size,
         emit_bf16=True,
-        group=allreduce_group,
     )
     if result is not None and len(result) == 4:
         fp8_out, residual_out, scale_out, bf16_out = result
@@ -441,11 +361,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
         return (bf16_out, fp8_out, scale_out), residual_out
 
     fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
-        x,
-        residual,
-        weight,
-        norm_module.variance_epsilon,
-        group=allreduce_group,
+        x, residual, weight, norm_module.variance_epsilon
     )
     if fused_result is None:
         return None
@@ -809,8 +725,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # HCU uses LightOp directly; only generic ROCm depends on vLLM ops.
-        if not _is_hcu and not _has_vllm_rms_norm:
+        # Fallback to native implementation if vllm is not available
+        if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
@@ -830,9 +746,7 @@ class RMSNorm(BaseFusedOp):
             x = x.contiguous()
 
         if residual is not None:
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
-            if _is_hcu:
+            try:
                 op.fused_add_rms_norm_opt(
                     x,
                     residual,
@@ -840,18 +754,24 @@ class RMSNorm(BaseFusedOp):
                     self.variance_epsilon,
                 )
                 return x, residual
-            return _call_vllm_fused_add_rms_norm(
-                fused_add_rms_norm,
-                x,
-                residual,
-                self.weight.data,
-                self.variance_epsilon,
-            )
-        if _is_hcu:
-            out = torch.empty_like(x)
-            op.rms_norm_opt(out, x, self.weight.data, self.variance_epsilon)
-            return out
-        return rms_norm(x, self.weight.data, self.variance_epsilon)
+            except TypeError:
+                out = torch.empty_like(x)
+                residual_out = torch.empty_like(x)
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                fused_add_rms_norm(
+                    out,
+                    x,
+                    residual_out,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
+                return out, residual_out
+
+        out = torch.empty_like(x)
+        op.rms_norm_opt(out, x, self.weight.data, self.variance_epsilon)
+        return out
 
     def forward_musa(
         self,
@@ -1240,19 +1160,6 @@ class GemmaRMSNorm(BaseFusedOp):
                 )
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
-        if _is_hcu:
-            if not x.is_contiguous():
-                x = x.contiguous()
-            if residual is not None:
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                return gemma_fused_add_rmsnorm_hcu(
-                    x, residual, self.weight.data, self.variance_epsilon
-                )
-            out = torch.empty_like(x)
-            op.rms_norm_opt(out, x, self.gemma_weight, self.variance_epsilon)
-            return out
-
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
@@ -1262,22 +1169,28 @@ class GemmaRMSNorm(BaseFusedOp):
             return self.forward_native(x, residual, post_residual_addition)
         else:
             w = self.gemma_weight
-            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place).
-            # fused_add_rms_norm has both current four-argument and legacy
-            # six-argument wheel ABIs; the helper handles either contract.
+            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
+            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
             if not x.is_contiguous():
                 x = x.contiguous()
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                return _call_vllm_fused_add_rms_norm(
-                    fused_add_rms_norm,
-                    x,
-                    residual,
-                    w,
-                    self.variance_epsilon,
-                )
-            return rms_norm(x, w, self.variance_epsilon)
+                if _is_hcu:
+                    out, residual_out = gemma_fused_add_rmsnorm_hcu(
+                        x, residual, self.weight.data, self.variance_epsilon
+                    )
+                    return out, residual_out
+                else:
+                    out = torch.empty_like(x)
+                    residual_out = torch.empty_like(x)
+                    fused_add_rms_norm(
+                        out, x, residual_out, residual, w, self.variance_epsilon
+                    )
+                    return out, residual_out
+            out = torch.empty_like(x)
+            op.rms_norm_opt(out, x, w, self.variance_epsilon)
+            return out
 
     def forward_cpu(
         self,
@@ -1355,42 +1268,8 @@ class GemmaRMSNorm(BaseFusedOp):
             residual,
             post_residual_addition,
             self.gemma_weight,
-            use_attn_tp_group=use_attn_tp_group,
+            use_attn_tp_group=True,
         )
-
-    def forward_with_lightop_fp8_quant(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        post_residual_addition: Optional[torch.Tensor] = None,
-    ):
-        """Gemma RMSNorm + dynamic per-token OCP-FP8 quant for LightOp GEMM.
-
-        LightOp updates ``residual`` in place with ``x + residual`` when a
-        residual is supplied.  ``update_input=False`` avoids writing a BF16
-        normalized copy back to ``x`` because the following channel-FP8 GEMM
-        consumes only the returned ``(fp8, scale)`` tuple.
-        """
-        if not _use_hcu_lightop_gemma_rmsnorm:
-            raise RuntimeError(
-                "LightOp Gemma RMSNorm+FP8 quant requires "
-                "SGLANG_USE_LIGHTOP_GEMMA_RMSNORM=1 on HCU gfx93x"
-            )
-        if post_residual_addition is not None:
-            if residual is None:
-                residual = post_residual_addition
-            else:
-                residual = residual + post_residual_addition
-
-        quantized = gemma_rms_norm_fp8_quant_hcu(
-            x,
-            self.weight.data,
-            self.variance_epsilon,
-            fp8type=0,
-            residual=residual,
-            update_input=False,
-        )
-        return quantized if residual is None else (quantized, residual)
 
     def forward_with_allreduce_fusion_quant_per_group(
         self,

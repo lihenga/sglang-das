@@ -30,8 +30,6 @@ from sglang.srt.utils import (
     is_musa,
     log_info_on_rank0,
 )
-from sglang.srt.utils.common import get_bool_env_var
-
 _is_cuda = is_cuda()
 _is_hcu = is_hcu()
 _is_hip = is_hip()
@@ -391,7 +389,6 @@ class CustomAllreduce:
     def __del__(self):
         self.close()
 
-
 def dispatch_custom_allreduce(
     group: ProcessGroup,
     device: torch.device,
@@ -450,67 +447,6 @@ def dispatch_custom_allreduce(
             CustomAllreduce as AiterCustomAllreduce,
         )
 
-        class GraphSafeAiterCustomAllreduce(AiterCustomAllreduce):
-            """Run real collectives during graph warmup, before HIP capture."""
-
-            def _needs_real_graph_warmup(self) -> bool:
-                return (
-                    get_bool_env_var(
-                        "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
-                    )
-                    and self._IS_CAPTURING
-                    and not torch.cuda.is_current_stream_capturing()
-                    and not is_in_tc_piecewise_cuda_graph()
-                )
-
-            def custom_all_reduce(
-                self,
-                input: torch.Tensor,
-                use_new: bool = True,
-                open_fp8_quant: bool = False,
-            ):
-                if self._needs_real_graph_warmup():
-                    if self.disabled or not self.should_custom_ar(input):
-                        return None
-                    return self.all_reduce(
-                        input,
-                        use_new=use_new,
-                        open_fp8_quant=open_fp8_quant,
-                        registered_input=False,
-                    )
-                return super().custom_all_reduce(
-                    input,
-                    use_new=use_new,
-                    open_fp8_quant=open_fp8_quant,
-                )
-
-            def custom_fused_ar_rms(
-                self,
-                input: torch.Tensor,
-                residual_inp: torch.Tensor,
-                weight: torch.Tensor,
-                eps: float,
-                use_1stage: bool = False,
-            ):
-                if self._needs_real_graph_warmup():
-                    if self.disabled or not self.should_custom_ar(input):
-                        return None
-                    return self.fused_ar_rms(
-                        input,
-                        residual_inp,
-                        w=weight,
-                        eps=eps,
-                        registered=False,
-                        use_1stage=use_1stage,
-                    )
-                return super().custom_fused_ar_rms(
-                    input,
-                    residual_inp,
-                    weight,
-                    eps,
-                    use_1stage,
-                )
-
         transport = os.environ.get("AITER_AR_TRANSPORT", "ipc").lower()
         if transport == "ipc":
             hf_config = None
@@ -538,12 +474,10 @@ def dispatch_custom_allreduce(
             transport,
             enable_reg,
         )
-        constructor_kwargs = {"enable_register_for_capturing": enable_reg}
-        max_size = _aiter_max_size_bytes()
-        if max_size is not None:
-            constructor_kwargs["max_size"] = max_size
-            logger.info("[AR] AITER max workspace size: %d MiB", max_size >> 20)
-        return partial(GraphSafeAiterCustomAllreduce, **constructor_kwargs)
+        return partial(
+            AiterCustomAllreduce,
+            enable_register_for_capturing=enable_reg,
+        )
 
     if backend == "native":
         return _native()

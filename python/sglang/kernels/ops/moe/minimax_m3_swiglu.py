@@ -29,10 +29,7 @@ def _swiglu_oai_kernel(
     HAS_LIMIT: tl.constexpr,
     BLOCK_I: tl.constexpr,
 ):
-    # Long-prefill DeepEP buffers can exceed 4 GiB (for example
-    # 393216 x 6144 BF16).  Keep the row component of every pointer offset in
-    # 64 bits; Triton's program id is otherwise i32 and wraps at 4 GiB.
-    row = tl.program_id(0).to(tl.int64)
+    row = tl.program_id(0)
     pid_i = tl.program_id(1)
     cols = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
     mask = cols < n_inter
@@ -113,9 +110,7 @@ def _swiglu_oai_mxfp8_quant_kernel(
     HAS_LIMIT: tl.constexpr,
     BLOCK_I: tl.constexpr,
 ):
-    # See _swiglu_oai_kernel: the routed long-prefill buffer may exceed the
-    # 32-bit byte-offset range.
-    row = tl.program_id(0).to(tl.int64)
+    row = tl.program_id(0)
     pid_i = tl.program_id(1)
     cols = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
     mask = cols < n_inter

@@ -40,7 +40,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import add_prefix, is_hcu, is_hip, is_npu
+from sglang.srt.utils import is_hcu, is_hip, is_npu
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -126,9 +126,7 @@ def _get_dflash_layer_attention_params(
 
 
 class DFlashAttention(nn.Module):
-    def __init__(
-        self, config, layer_id: int, quant_config=None, prefix: str = ""
-    ) -> None:
+    def __init__(self, config, layer_id: int, quant_config=None) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
@@ -171,14 +169,14 @@ class DFlashAttention(nn.Module):
             total_num_kv_heads=self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn.qkv_proj", prefix),
+            prefix="qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn.o_proj", prefix),
+            prefix="o_proj",
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -439,7 +437,6 @@ class DFlashDecoderLayer(nn.Module):
         attention_conv: Optional[DFlashGroupedConv] = None,
         mlp_conv: Optional[DFlashGroupedConv] = None,
         quant_config=None,
-        prefix: str = "",
     ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
@@ -447,17 +444,10 @@ class DFlashDecoderLayer(nn.Module):
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.self_attn = self.attention_cls(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
+            config=config, layer_id=layer_id, quant_config=quant_config
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = DFlashMLP(
-            config=config,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
-        )
+        self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
         self.attention_conv = attention_conv
         self.mlp_conv = mlp_conv
@@ -549,7 +539,6 @@ class DFlashDraftModel(nn.Module):
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(num_layers)
             ]
@@ -750,15 +739,8 @@ class DFlashDraftModel(nn.Module):
 class DFlashLagunaAttention(DFlashAttention):
     """Laguna DFlash attention with the trained Laguna softplus gate."""
 
-    def __init__(
-        self, config, layer_id: int, quant_config=None, prefix: str = ""
-    ) -> None:
-        super().__init__(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
+    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+        super().__init__(config=config, layer_id=layer_id, quant_config=quant_config)
         hidden_size = int(config.hidden_size)
         total_num_heads = self.total_num_heads
         gating = normalize_gating(getattr(config, "gating", True))
@@ -777,7 +759,7 @@ class DFlashLagunaAttention(DFlashAttention):
                 g_out,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("self_attn.g_proj", prefix),
+                prefix="g_proj",
             )
 
     def apply_attention_output(
