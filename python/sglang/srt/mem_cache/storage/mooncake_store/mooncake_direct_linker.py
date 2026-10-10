@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.unified_cache import kv_session_trace as kv_trace
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
@@ -223,9 +224,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
-        self.page_wise_load_threshold = (
-            server_args.mooncake_page_wise_load_threshold
-        )
+        self.page_wise_load_threshold = server_args.mooncake_page_wise_load_threshold
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
         if self.page_wise_load_threshold <= 0:
             raise ValueError(
@@ -430,9 +429,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.host_prefetch_lock = threading.Lock()
         self.host_prefetch_entries: dict[str, dict[str, object]] = {}
         self.host_prefetch_generation = 0
-        self.host_prefetch_queue: Queue[
-            tuple[str, list[PoolTransfer]] | None
-        ] = Queue()
+        self.host_prefetch_queue: Queue[tuple[str, list[PoolTransfer]] | None] = Queue()
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -589,6 +586,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"error code: {result}."
                     )
 
+    @kv_trace.traced("lookup", rid_arg=0)
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
@@ -611,6 +609,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         return restorable
 
+    @kv_trace.traced("revalidate_load")
     def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
         valid = self._revalidate_load_local(transfers)
         groups = getattr(self, "_load_revalidation_groups", ())
@@ -625,6 +624,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             valid = bool(verdict.item())
         return valid
 
+    @kv_trace.traced("_revalidate_load_local")
     def _revalidate_load_local(self, transfers: list[PoolTransfer]) -> bool:
         """Re-check remote existence before the scheduler commits device
         slots to the async layer-wise load.
@@ -671,6 +671,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return True
 
+    @kv_trace.traced("load", rid_arg=0)
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
@@ -683,6 +684,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
+        if kv_trace.ENABLED:
+            if not hasattr(self, "_trace_load_enqueued"):
+                self._trace_load_enqueued = {}
+            self._trace_load_enqueued[rid] = time.monotonic()
+            kv_trace.event(self, "load.enqueue", rid)
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is not None and entry.get("state") == "claimed":
@@ -696,6 +702,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         pending_load_tokens[rid] = len(logical_pages) * self.page_size
         return True
 
+    @kv_trace.traced("prepare_load", rid_arg=0)
     def prepare_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Acquire key-indexed Mooncake sessions for a future range read."""
         expanded = self.pool_group.resolve_transfers(
@@ -705,9 +712,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return self._prepare_expanded_load(rid, expanded)
 
-    def _prepare_expanded_load(
-        self, rid: str, expanded: list[PoolTransfer]
-    ) -> bool:
+    @kv_trace.traced("_prepare_expanded_load", rid_arg=0)
+    def _prepare_expanded_load(self, rid: str, expanded: list[PoolTransfer]) -> bool:
         keys = []
         seen = set()
         for transfer in expanded:
@@ -721,8 +727,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not keys:
             return False
 
+        trace_lock_started = time.monotonic()
         with self.session_lock:
+            kv_trace.event(
+                self,
+                "prepare.lock",
+                rid,
+                wait_ms=(time.monotonic() - trace_lock_started) * 1000,
+            )
             if rid in self.prepared_load_sessions:
+                kv_trace.event(self, "prepare.reuse_request", rid, keys=len(keys))
                 return True
             acquired = []
             new_keys = []
@@ -739,6 +753,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 else:
                     new_keys.append(key)
 
+            kv_trace.keys(self, "prepare.shared_refs", rid, acquired)
+            kv_trace.event(
+                self,
+                "prepare.partition",
+                rid,
+                total=len(keys),
+                shared=len(acquired),
+                new=len(new_keys),
+                shared_action="reuse_without_native_validation",
+            )
             lease_base = time.monotonic()
             try:
                 if new_keys and self.host_prefetch_enabled:
@@ -750,9 +774,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     results = list(results)
                     sources = list(sources)
                 elif new_keys:
-                    results = list(
-                        self.storage.store.batch_get_session_start(new_keys)
-                    )
+                    results = list(self.storage.store.batch_get_session_start(new_keys))
                     sources = ["unknown"] * len(results)
                 else:
                     results = []
@@ -774,6 +796,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.session_sources[key] = str(source).lower()
                     self._lease_bases()[key] = lease_base
                     acquired.append(key)
+            kv_trace.keys(self, "prepare.acquired_refs", rid, acquired)
+            if kv_trace.ENABLED:
+                kv_trace.event(
+                    self,
+                    "prepare.results",
+                    rid,
+                    elapsed_ms=(time.monotonic() - lease_base) * 1000,
+                    codes={str(code): results.count(code) for code in set(results)},
+                    expected=len(new_keys),
+                    returned=len(results),
+                )
             if failed:
                 self._rollback_session_refs_locked(acquired)
                 return False
@@ -792,9 +825,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return 4096
 
     @staticmethod
-    def _estimate_pinned_arena_capacity(
-        object_sizes: list[int], alignment: int
-    ) -> int:
+    def _estimate_pinned_arena_capacity(object_sizes: list[int], alignment: int) -> int:
         """Conservatively mirror Mooncake's aligned DFS arena allocation."""
         arena_size = 0
         for object_size in object_sizes:
@@ -834,9 +865,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if not page_keys:
                     continue
                 component_keys, key_multiplier = (
-                    self.storage._get_hybrid_page_component_keys(
-                        page_keys, transfer
-                    )
+                    self.storage._get_hybrid_page_component_keys(page_keys, transfer)
                 )
                 pool = self.pools.get(transfer.name)
                 if pool is None or key_multiplier <= 0:
@@ -846,9 +875,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 # buffer sizes the same way MooncakeStore packs buffers into
                 # the component keys returned above.
                 page_buffer_sizes = [
-                    size
-                    for component in pool.buffer_meta
-                    for _, _, size in component
+                    size for component in pool.buffer_meta for _, _, size in component
                 ]
                 if (
                     not page_buffer_sizes
@@ -883,9 +910,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             return None
 
-    def submit_host_prefetch(
-        self, rid: str, transfers: list[PoolTransfer]
-    ) -> bool:
+    @kv_trace.traced("submit_host_prefetch", rid_arg=0)
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         if not self.host_prefetch_enabled:
             return False
         kv_transfer = next(
@@ -931,6 +957,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             generation = self.host_prefetch_generation
             queued_transfers = list(transfers)
             self.host_prefetch_entries[rid] = {
+                "trace_queued_at": time.monotonic(),
                 "state": "queued",
                 "cancelled": False,
                 "transfers": queued_transfers,
@@ -951,6 +978,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return None
             return str(entry.get("state"))
 
+    @kv_trace.traced("revalidate_host_prefetch", rid_arg=0)
     def revalidate_host_prefetch(self, rid: str) -> bool:
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
@@ -959,26 +987,65 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 or entry.get("state") != "dfs_prefetched"
                 or entry.get("cancelled")
             ):
+                kv_trace.event(
+                    self,
+                    "refresh.skipped",
+                    rid,
+                    reason="prefetch_state_not_ready",
+                    native_attempted=False,
+                    state=None if entry is None else entry.get("state"),
+                    cancelled=False if entry is None else bool(entry.get("cancelled")),
+                )
                 return False
             session_rid = str(entry["session_rid"])
+        lock_started = time.monotonic()
         with self.session_lock:
+            kv_trace.event(
+                self,
+                "refresh.lock",
+                rid,
+                wait_ms=(time.monotonic() - lock_started) * 1000,
+            )
             keys = list(self.prepared_load_sessions.get(session_rid, ()))
             # A key without a base (ever shared in this generation, or whose
             # refresh failed) counts as infinitely old.
             bases = [self._lease_bases().get(key) for key in keys]
             private = all(self.session_refcounts.get(key, 0) == 1 for key in keys)
         if not keys:
+            kv_trace.event(
+                self,
+                "refresh.skipped",
+                rid,
+                reason="no_prepared_keys",
+                native_attempted=False,
+            )
             return False
         oldest = None if None in bases else min(bases)
         # Measure the age after acquiring session_lock: it may have been held
         # across another request's session-start RPC, and that wait has used
         # up lease too.
         age = float("inf") if oldest is None else time.monotonic() - oldest
+        kv_trace.event(
+            self,
+            "refresh.decision",
+            rid,
+            session_rid=session_rid,
+            keys=len(keys),
+            private=private,
+            age_ms=None if math.isinf(age) else age * 1000,
+            unknown_bases=sum(base is None for base in bases),
+            threshold_s=self.session_refresh_age_s,
+            ready_wait_ms=(
+                time.monotonic() - entry.get("trace_ready_at", time.monotonic())
+            )
+            * 1000,
+        )
         if (
             self.session_refresh_age_s > 0
             and private
             and age < self.session_refresh_age_s
         ):
+            kv_trace.event(self, "refresh.skipped", rid, reason="fresh_private_session")
             # Every key still holds at least TTL - age of master read lease,
             # during which the master neither evicts nor replaces it.
             return True
@@ -993,6 +1060,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             results = []
         ok = len(results) == len(keys) and all(result == 0 for result in results)
+        if kv_trace.ENABLED:
+            kv_trace.event(
+                self,
+                "refresh.result",
+                rid,
+                ok=ok,
+                elapsed_ms=(time.monotonic() - lease_base) * 1000,
+                expected=len(keys),
+                returned=len(results),
+                codes={str(code): results.count(code) for code in set(results)},
+                next_path=(
+                    "claim_if_all_ranks_valid" if ok else "cancel_then_normal_load"
+                ),
+            )
         with self.session_lock:
             bases = self._lease_bases()
             for key in keys:
@@ -1005,6 +1086,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     bases[key] = lease_base
         return ok
 
+    @kv_trace.traced("revalidate_no_prefetch_needed", rid_arg=0)
     def revalidate_no_prefetch_needed(self, rid: str) -> bool:
         """Re-check the keys of a request that needed no DFS prefetch.
 
@@ -1045,6 +1127,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return True
 
+    @kv_trace.traced("claim_ready_host_prefetch", rid_arg=0)
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
@@ -1060,9 +1143,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
                     session_rid
                 )
+            kv_trace.event(self, "prefetch.claim", rid, session_rid=session_rid)
             entry["state"] = "claimed"
         return True
 
+    @kv_trace.traced("cancel_host_prefetch", rid_arg=0)
     def cancel_host_prefetch(self, rid: str) -> None:
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
@@ -1070,6 +1155,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return
             state = str(entry.get("state"))
             session_rid = str(entry["session_rid"])
+            kv_trace.event(
+                self,
+                "prefetch.cancel",
+                rid,
+                session_rid=session_rid,
+                state=state,
+                deferred=state in {"preparing", "reading", "loading"},
+            )
             if state in {"preparing", "reading", "loading"}:
                 entry["cancelled"] = True
                 return
@@ -1095,14 +1188,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if entry.get("cancelled"):
                         self.host_prefetch_entries.pop(rid, None)
                         continue
+                    kv_trace.event(
+                        self,
+                        "prefetch.dequeue",
+                        rid,
+                        session_rid=session_rid,
+                        queue_ms=(
+                            time.monotonic()
+                            - entry.get("trace_queued_at", time.monotonic())
+                        )
+                        * 1000,
+                    )
                     entry["state"] = "preparing"
 
                 try:
                     prepared = self.prepare_load(session_rid, transfers)
                 except BaseException:
                     logger.warning(
-                        "Mooncake waiting-queue session preparation failed "
-                        "for rid=%s",
+                        "Mooncake waiting-queue session preparation failed for rid=%s",
                         rid,
                         exc_info=True,
                     )
@@ -1110,29 +1213,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 with self.session_lock:
                     keys = list(self.prepared_load_sessions.get(session_rid, ()))
                 if not prepared or not keys:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
                     continue
 
                 with self.session_lock:
                     sources = {
-                        key: self.session_sources.get(key, "unknown")
-                        for key in keys
+                        key: self.session_sources.get(key, "unknown") for key in keys
                     }
                 object_sizes = entry.get("object_sizes", {})
                 if not isinstance(object_sizes, dict) or any(
                     key not in object_sizes for key in keys
                 ):
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
                     continue
-                dfs_keys = [
-                    key
-                    for key in keys
-                    if sources[key] in {"dfs", "unknown"}
-                ]
+                dfs_keys = [key for key in keys if sources[key] in {"dfs", "unknown"}]
                 if not dfs_keys:
                     self._finish_host_prefetch(
                         rid, entry, session_rid, "no_prefetch_needed", keys=keys
@@ -1163,20 +1257,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             current["reserved_bytes"] = dfs_estimated_bytes
                             current["state"] = "reading"
                 if cancelled:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
                     continue
                 if not within_budget:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
                     continue
 
                 try:
-                    results = list(
-                        self.storage.store.batch_get_session_prefetch(dfs_keys)
-                    )
+                    with kv_trace.scope(
+                        self,
+                        "prefetch.io",
+                        rid,
+                        session_rid=session_rid,
+                        keys=len(dfs_keys),
+                    ):
+                        results = list(
+                            self.storage.store.batch_get_session_prefetch(dfs_keys)
+                        )
                     success = len(results) == len(dfs_keys) and all(
                         result == 0 for result in results
                     )
@@ -1206,6 +1303,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         keys: list[str] | None = None,
     ) -> None:
         keep_session = False
+        kv_trace.event(
+            self,
+            "prefetch.finish",
+            rid,
+            session_rid=session_rid,
+            outcome=outcome,
+            cancelled=bool(entry.get("cancelled")),
+            since_submit_ms=(
+                time.monotonic() - entry.get("trace_queued_at", time.monotonic())
+            )
+            * 1000,
+        )
         with self.host_prefetch_lock:
             current = self.host_prefetch_entries.get(rid)
             cancelled = bool(
@@ -1223,6 +1332,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     # the state under the same lock.
                     current["no_prefetch_keys"] = list(keys or ())
                     current["reserved_bytes"] = 0
+                current["trace_ready_at"] = time.monotonic()
                 current["state"] = outcome
                 keep_session = outcome == "dfs_prefetched"
             if current is entry:
@@ -1245,9 +1355,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 to_end.append(key)
             else:
                 self.session_refcounts[key] = count - 1
+        kv_trace.keys(self, "release.remaining_refs", None, keys)
+        kv_trace.event(
+            self,
+            "release.partition",
+            requested=len(keys),
+            native_end_keys=len(to_end),
+            retained_refs=len(keys) - len(to_end),
+        )
         if to_end:
             try:
-                self.storage.store.batch_get_session_end(to_end)
+                rc = self.storage.store.batch_get_session_end(to_end)
+                kv_trace.event(self, "release.native_end", rc=rc, keys=len(to_end))
             except BaseException:
                 logger.warning(
                     "Mooncake get session cleanup failed for %d keys.",
@@ -1255,10 +1374,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     exc_info=True,
                 )
 
+    @kv_trace.traced("_abort_prepared_load_now", rid_arg=0)
     def _abort_prepared_load_now(self, rid: str) -> None:
         with self.session_lock:
             keys = self.prepared_load_sessions.pop(rid, [])
+            kv_trace.keys(self, "release.before_refs", rid, keys)
             self._rollback_session_refs_locked(keys)
+            kv_trace.event(
+                self,
+                "release.done",
+                rid,
+                request_remaining=rid in self.prepared_load_sessions,
+                live_requests=len(self.prepared_load_sessions),
+                live_keys=len(self.session_refcounts),
+            )
 
     def abort_prepared_load(self, rid: str) -> None:
         with self.host_prefetch_lock:
@@ -1267,9 +1396,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.host_prefetch_entries.pop(rid, None)
         self._abort_prepared_load_now(rid)
 
+    @kv_trace.traced("cancel_queued_load", rid_arg=0)
     def cancel_queued_load(self, rid: str) -> bool:
         getattr(self, "pending_load_tokens", {}).pop(rid, None)
         cancelled = self.pending_loads.pop(rid, None) is not None
+        if kv_trace.ENABLED:
+            getattr(self, "_trace_load_enqueued", {}).pop(rid, None)
         if cancelled:
             self.abort_prepared_load(rid)
         return cancelled
@@ -1298,6 +1430,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         counter_index = self.layer_done_counter.update_producer()
         ready_event = device_module.Event()
         ready_event.record()
+        if kv_trace.ENABLED:
+            kv_trace.event(
+                self, "load.dispatch", load_batch=counter_index, rids=list(pending)
+            )
         self.load_queue.put((counter_index, pending, ready_event))
         self.stats["load"] += len(pending)
         return counter_index
@@ -1311,19 +1447,48 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counter_index, pending, ready_event = task
                 success = False
                 try:
+                    event_started = time.monotonic()
+                    if kv_trace.ENABLED:
+                        queued = getattr(self, "_trace_load_enqueued", {})
+                        for rid in pending:
+                            since = queued.pop(rid, None)
+                            kv_trace.event(
+                                self,
+                                "load.dequeue",
+                                rid,
+                                load_batch=counter_index,
+                                queue_ms=(
+                                    None
+                                    if since is None
+                                    else (event_started - since) * 1000
+                                ),
+                            )
                     ready_event.synchronize()
-                    success = self.load_layer_wise(
-                        counter_index, list(pending.items())
+                    kv_trace.event(
+                        self,
+                        "load.gpu_event_ready",
+                        load_batch=counter_index,
+                        wait_ms=(time.monotonic() - event_started) * 1000,
                     )
+                    success = self.load_layer_wise(counter_index, list(pending.items()))
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
                     self._finish_prefetch_metrics(list(pending), success is True)
+                    if kv_trace.ENABLED:
+                        kv_trace.event(
+                            self,
+                            "load.complete",
+                            load_batch=counter_index,
+                            rids=list(pending),
+                            success=success,
+                        )
                     self.completed_loads.put((list(pending), success))
             finally:
                 self.load_queue.task_done()
 
+    @kv_trace.traced("load_layer_wise", batch_arg=1)
     def load_layer_wise(
         self,
         counter_index: int,
@@ -1335,6 +1500,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             for rid, transfers in request_transfers:
                 with self.session_lock:
                     prepared = rid in self.prepared_load_sessions
+                kv_trace.event(
+                    self,
+                    "load.session_path",
+                    rid,
+                    load_batch=counter_index,
+                    prepared=prepared,
+                    action="reuse_prepared" if prepared else "prepare_now",
+                )
                 if not prepared and not self._prepare_expanded_load(rid, transfers):
                     raise RuntimeError(
                         f"Mooncake get session preparation failed for rid={rid}."
@@ -1441,9 +1614,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
@@ -1486,9 +1657,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         expected = [sum(item) for item in all_sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
-            pool_counts = {
-                str(name): len(keys) for name, (keys, _) in batches.items()
-            }
+            pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
             raise RuntimeError(
                 "Mooncake aggregated range get failed for "
                 f"pools={pool_counts}, complete_page: transferred={result}, "
@@ -1525,9 +1694,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 buffer_indices = (
                     ()
                     if mapped is None
-                    else (mapped,)
-                    if isinstance(mapped, int)
-                    else tuple(mapped)
+                    else (mapped,) if isinstance(mapped, int) else tuple(mapped)
                 )
                 layout.append(
                     [
@@ -1542,12 +1709,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         return layouts
 
+    @kv_trace.traced("load_with_read_plan", batch_arg=1)
     def load_with_read_plan(
         self,
         counter_index: int,
         request_transfers: list[tuple[str, list[PoolTransfer]]],
     ) -> None:
+        layout_started = time.monotonic()
         layouts = self._prepare_read_plan_layouts(request_transfers)
+        kv_trace.event(
+            self,
+            "read_plan.layouts_ready",
+            load_batch=counter_index,
+            elapsed_ms=(time.monotonic() - layout_started) * 1000,
+        )
+        plan_started = time.monotonic()
         plan = self.storage.store.create_read_plan(
             layouts,
             self.num_layers,
@@ -1555,6 +1731,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             page_wise=self.enable_page_wise_load,
             borrowed_sessions=True,
             buffer_owners=self.pools,
+        )
+        kv_trace.event(
+            self,
+            "read_plan.created",
+            load_batch=counter_index,
+            elapsed_ms=(time.monotonic() - plan_started) * 1000,
         )
         self.layer_done_counter.bind(counter_index, plan)
         # run() and wait() release the GIL. Each layer becomes visible only after

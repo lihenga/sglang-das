@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache import kv_session_trace as kv_trace
 from sglang.srt.mem_cache.unified_cache.components import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
@@ -91,9 +92,7 @@ class UnifiedCacheLinker(ABC):
     def disable_waiting_queue_prefetch(self) -> None:
         """Turn waiting-queue host prefetch off before any job is submitted."""
 
-    def submit_host_prefetch(
-        self, rid: str, transfers: list[PoolTransfer]
-    ) -> bool:
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a request-scoped host prefetch without allocating device pages."""
         return False
 
@@ -253,6 +252,7 @@ class UnifiedCacheLinkerWrapper:
             return "not_tracked"
         return "terminal"
 
+    @kv_trace.traced("wrapper.cancel_waiting_queue_prefetch", rid_arg=0)
     def cancel_waiting_queue_prefetch(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
         self.host_prefetch_hits.pop(rid, None)
@@ -261,6 +261,7 @@ class UnifiedCacheLinkerWrapper:
             pending[0].cancelled.set()
         self.cache_linker.cancel_host_prefetch(rid)
 
+    @kv_trace.traced("wrapper.prepare_host_prefetch", rid_arg=0)
     def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
         """Build a request-local snapshot without issuing any collectives."""
         hit = self.hit_markers.get(req.rid)
@@ -282,7 +283,11 @@ class UnifiedCacheLinkerWrapper:
                             name=transfer.name,
                             host_indices=transfer.host_indices,
                             device_indices=transfer.device_indices,
-                            keys=(list(transfer.keys) if transfer.keys is not None else None),
+                            keys=(
+                                list(transfer.keys)
+                                if transfer.keys is not None
+                                else None
+                            ),
                             hit_policy=transfer.hit_policy,
                             nodes_to_load=transfer.nodes_to_load,
                             indices_from_pool=transfer.indices_from_pool,
@@ -361,6 +366,7 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- match: probe the remote store and report host_hit_length ----
 
+    @kv_trace.traced("wrapper.match", rid_arg=1)
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
         page = cache.page_size
@@ -404,9 +410,9 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         if prefetched_hit is not None:
-            expected_len = prefetched_hit.device_hit_len + len(
-                prefetched_hit.tail_hashes
-            ) * page
+            expected_len = (
+                prefetched_hit.device_hit_len + len(prefetched_hit.tail_hashes) * page
+            )
             current_prefix = key[:expected_len]
             same_prefix = (
                 current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
@@ -431,9 +437,11 @@ class UnifiedCacheLinkerWrapper:
                     host_hit_length=hit_tokens,
                     swa_host_hit_length=max(
                         result.swa_host_hit_length,
-                        min(len(swa_transfer.keys), hit_pages) * page
-                        if swa_transfer is not None
-                        else 0,
+                        (
+                            min(len(swa_transfer.keys), hit_pages) * page
+                            if swa_transfer is not None
+                            else 0
+                        ),
                     ),
                     mamba_host_hit_length=max(
                         result.mamba_host_hit_length,
@@ -600,21 +608,37 @@ class UnifiedCacheLinkerWrapper:
         if cleanup_error is not None:
             raise cleanup_error
 
+    @kv_trace.traced("wrapper.load_back", rid_arg=0)
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
+            kv_trace.event(
+                self.cache_linker, "load_back.miss", req.rid, reason="no_hit_marker"
+            )
             return empty_indices, req.last_node
 
         prepared_from_host_prefetch = False
         prefetched = self.host_prefetch_hits.pop(req.rid, None) is not None
         if prefetched:
             status = self.cache_linker.get_host_prefetch_status(req.rid)
+            kv_trace.event(self.cache_linker, "load_back.path", req.rid, path=status)
             locally_complete = status in {"dfs_prefetched", "no_prefetch_needed"}
             ready = torch.tensor(int(locally_complete), dtype=torch.int)
-            cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
+            with kv_trace.scope(
+                self.cache_linker, "admission.ready_collective", req.rid
+            ):
+                cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
             if int(ready.item()) == 0:
+                kv_trace.event(
+                    self.cache_linker,
+                    "load_back.fallback",
+                    req.rid,
+                    reason="prefetch_not_ready_on_all_ranks",
+                    local_ready=locally_complete,
+                    next_path="normal",
+                )
                 self.cache_linker.cancel_host_prefetch(req.rid)
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
@@ -637,8 +661,26 @@ class UnifiedCacheLinkerWrapper:
             except BaseException:
                 locally_valid = False
             valid = torch.tensor(int(locally_valid), dtype=torch.int)
-            cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
+            with kv_trace.scope(
+                self.cache_linker, "admission.revalidation_collective", req.rid
+            ):
+                cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
+            kv_trace.event(
+                self.cache_linker,
+                "load_back.revalidated",
+                req.rid,
+                local_valid=locally_valid,
+                all_valid=bool(valid.item()),
+                path=status,
+            )
             if int(valid.item()) == 0:
+                kv_trace.event(
+                    self.cache_linker,
+                    "load_back.fallback",
+                    req.rid,
+                    reason="prefetch_revalidation_failed",
+                    next_path="normal",
+                )
                 self.cache_linker.cancel_host_prefetch(req.rid)
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
@@ -666,8 +708,20 @@ class UnifiedCacheLinkerWrapper:
                 # rather than to a normal-path retry this rank would not join.
                 claimed, constructed, claim_error = False, False, error
             verdict = torch.tensor([int(claimed), int(constructed)], dtype=torch.int)
-            cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+            with kv_trace.scope(
+                self.cache_linker, "admission.claim_collective", req.rid
+            ):
+                cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
             claimed_all, constructed_all = (int(value) for value in verdict)
+            kv_trace.event(
+                self.cache_linker,
+                "load_back.claim",
+                req.rid,
+                local_claimed=claimed,
+                all_claimed=bool(claimed_all),
+                local_constructed=constructed,
+                all_constructed=bool(constructed_all),
+            )
             if not (claimed_all and constructed_all):
                 # Free the device slots, then cancel (which also rolls a
                 # locally claimed session back); a build or claim error is
@@ -685,6 +739,13 @@ class UnifiedCacheLinkerWrapper:
                     cancel_prefetch=True,
                     pending=build_error if build_error is not None else claim_error,
                 )
+                kv_trace.event(
+                    self.cache_linker,
+                    "load_back.fallback",
+                    req.rid,
+                    reason="claim_or_construction_failed",
+                    next_path="cache_miss" if not constructed_all else "normal",
+                )
                 if not constructed_all:
                     # Building failed somewhere: a miss, as on the normal path.
                     return empty_indices, req.last_node
@@ -694,6 +755,7 @@ class UnifiedCacheLinkerWrapper:
                 return self.load_back(req)
             prepared_from_host_prefetch = True
         else:
+            kv_trace.event(self.cache_linker, "load_back.path", req.rid, path="normal")
             component_transfers, constructed, build_error = self._build_load_transfers(
                 req, tail_hashes
             )
@@ -723,6 +785,13 @@ class UnifiedCacheLinkerWrapper:
             and revalidate is not None
             and not revalidate([transfer for _, transfer in component_transfers])
         ):
+            kv_trace.event(
+                self.cache_linker,
+                "load_back.fallback",
+                req.rid,
+                reason="normal_existence_check_failed",
+                next_path="cache_miss",
+            )
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
                 req,

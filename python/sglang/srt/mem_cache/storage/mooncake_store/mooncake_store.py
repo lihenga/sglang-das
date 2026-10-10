@@ -27,13 +27,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.unified_cache import kv_session_trace as kv_trace
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = int(
-    __import__("os").environ.get(
-        "SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE",
-        16 * 1024 * 1024
-    )
+    __import__("os").environ.get("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE", 16 * 1024 * 1024)
 )
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
@@ -1056,9 +1054,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(
-                host_indices
-            )
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             if len(ptr_list) != len(key_strs):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
@@ -1519,7 +1515,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        if not kv_trace.ENABLED:
+            return self.store.batch_is_exist(key_strs)
+        with kv_trace.scope(self, "storage.batch_is_exist", keys=len(key_strs)) as info:
+            result = self.store.batch_is_exist(key_strs)
+            info["returned"] = len(result)
+            info["present"] = sum(code == 1 for code in result)
+            return result
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
