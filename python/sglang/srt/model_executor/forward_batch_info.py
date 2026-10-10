@@ -745,7 +745,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.layers.cp.utils import cp_v2_dp_token_counts_for_strategy
 
         self.global_cp_num_tokens_cpu = cp_v2_dp_token_counts_for_strategy(
-            batch.global_cp_num_tokens
+            getattr(batch, "global_cp_num_tokens", None)
         )
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
