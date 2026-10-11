@@ -3588,6 +3588,7 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        req.time_stats.track_queue_wait_reasons = self.enable_waiting_queue_dfs_prefetch
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
