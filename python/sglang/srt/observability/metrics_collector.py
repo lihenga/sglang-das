@@ -1895,7 +1895,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of tokens backed up to L4 by source.",
             labelnames=l4_source_labels,
         )
-        # bucket 覆盖从小 page 请求到超长上下文，避免大请求全部落入 +Inf。
+        # bucket 覆盖从小 page 请求到超长上下文，避免大请求全部落入 +Inf（Prometheus Histogram 的兜底桶）。
         token_buckets = [
             1,
             16,
@@ -1912,6 +1912,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             131072,
             262144,
         ]
+        # 每次请求从 L4 成功预取了多少 token（统计器）
         self.l4_prefetched_tokens_per_request = Histogram(
             name="sglang:l4_prefetched_tokens_per_request",
             documentation="Tokens successfully prefetched from L4 per request.",
@@ -1944,6 +1945,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             10,
             20,
         ]
+        # 预取耗时（统计器）
         self.l4_prefetch_duration_seconds = Histogram(
             name="sglang:l4_prefetch_duration_seconds",
             documentation="L4 prefetch wall-clock duration in seconds.",
@@ -2035,6 +2037,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         才更新通用及 L4 token 指标，避免失败请求造成吞吐虚高。
         """
         source_labels = {**self.labels, "source": source}
+        # 为本次数据设置标签（source=mooncake, result=success），并把耗时duration_seconds写入直方图（统计器）
         self.l4_prefetch_duration_seconds.labels(
             **source_labels, result="success" if success else "failure"
         ).observe(duration_seconds)
