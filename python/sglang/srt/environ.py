@@ -663,6 +663,8 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # 最终 KV chunk 提交后允许 scheduler 等待的毫秒数；0 表示关闭补充等待，
+    # 保持原有立即进入下一轮调度的行为。
     SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS = EnvFloat(0.0)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
@@ -771,6 +773,9 @@ class Envs:
     MOONCAKE_PROTOCOL = EnvStr("rdma")
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
+    # Mooncake 客户端 HTTP 指标端口的起始值。实际端口还会叠加进程的
+    # distributed rank（普通 DP 场景还会加入 DP world 偏移），避免同机
+    # 多个 scheduler 进程监听同一端口。
     MOONCAKE_CLIENT_METRICS_PORT_BASE = EnvInt(9301)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)

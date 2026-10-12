@@ -154,9 +154,9 @@ def match_prefix_for_req(
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
 
-    # Keep cache-aware admission consistent with the canonical boundary found
-    # by PP0. This must not be implemented in the cache's generic match path:
-    # cache_unfinished_req rematches immediately after inserting newly computed KV.
+    # cache-aware 准入必须服从 PP0 找到的 canonical boundary。不能把此限制
+    # 下沉到 cache 的通用 match：cache_unfinished_req 会在插入新计算的 KV 后
+    # 立即重新匹配，届时应能命中新 KV，而不应继续受旧 external hit 截断。
     if (
         include_req
         and req.external_cache_hit_length is not None
@@ -1323,8 +1323,8 @@ class PrefillAdder:
                         prefix_len, extend_len, max_new_tokens, is_chunked
                     )
                 elif req.host_loaded_length < promised_host_hit:
-                    # A zero-token load allocates no FULL slots, so it is safe to
-                    # re-run admission for recomputation.
+                    # 零 token load 没有分配 FULL 槽位，因此可以把 host hit
+                    # 清零并重新执行准入预算，让缺失部分改走模型重算。
                     admission = self._select_prefill_admission(
                         req,
                         total_tokens=total_tokens,
@@ -1339,7 +1339,8 @@ class PrefillAdder:
                 if req.external_cache_hit_length is None:
                     req.cache_protected_len = len(req.prefix_indices)
 
-            # Successful materialization has no remaining admission gates.
+            # cache materialization 成功后不再有可能失败的准入门槛，此时才统一
+            # 扣减预算并发布请求，保证 load-back 与预算更新具有事务性。
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
         return self.budget_state()
@@ -1353,7 +1354,11 @@ class PrefillAdder:
         swa_host_hit_length: int,
         truncation_align_size: Optional[int],
     ) -> _PrefillAdmission | AddReqResult:
-        """Select a prefill shape without allocating or publishing cached KV."""
+        """只计算可准入的 prefill 形状，不分配槽位，也不发布 cached KV。
+
+        将纯预算决策与可能失败的 host/L3 load-back 分离，使调用方能够在实际
+        加载 token 数变化后安全重算，而不会留下半提交的计数或 cache 状态。
+        """
         prefix_len = len(req.prefix_indices) + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)

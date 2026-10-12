@@ -1880,6 +1880,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        # L4 指标在通用 HiCache 指标之外增加 source 维度，用来区分
+        # Mooncake、DFS、本地磁盘等实际数据来源；耗时指标再增加 result，
+        # 从而让失败操作也能被观测，而不会错误增加成功 token 计数。
         l4_source_labels = [*labels.keys(), "source"]
         l4_result_labels = [*l4_source_labels, "result"]
         self.l4_prefetched_tokens_total = Counter(
@@ -1892,6 +1895,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of tokens backed up to L4 by source.",
             labelnames=l4_source_labels,
         )
+        # bucket 覆盖从小 page 请求到超长上下文，避免大请求全部落入 +Inf。
         token_buckets = [
             1,
             16,
@@ -1920,6 +1924,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=l4_source_labels,
             buckets=token_buckets,
         )
+        # 从亚毫秒到慢存储的 20 秒，兼顾内存级命中和 DFS 长尾。
         duration_buckets = [
             0.0001,
             0.00025,
@@ -2024,6 +2029,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_l4_prefetch(
         self, source: str, tokens: int, duration_seconds: float, success: bool
     ) -> None:
+        """记录一次 L4 预取。
+
+        无论成功失败都记录 wall-clock duration；只有成功且 token 数为正时
+        才更新通用及 L4 token 指标，避免失败请求造成吞吐虚高。
+        """
         source_labels = {**self.labels, "source": source}
         self.l4_prefetch_duration_seconds.labels(
             **source_labels, result="success" if success else "failure"
@@ -2038,6 +2048,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_l4_backup(
         self, source: str, tokens: int, duration_seconds: float, success: bool
     ) -> None:
+        """记录一次 L4 备份，计数规则与预取保持一致。"""
         source_labels = {**self.labels, "source": source}
         self.l4_backup_duration_seconds.labels(
             **source_labels, result="success" if success else "failure"

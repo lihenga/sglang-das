@@ -609,7 +609,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
-    # Why the request remained in the scheduler waiting queue.
+    # 记录请求停留在 scheduler waiting queue 的原因。durations 累计各原因的
+    # wall time，checks 统计准入检查次数，二者分别回答“等了多久”和“重试几次”。
     queue_wait_reason: str = ""
     queue_wait_reason_start_time: float = 0.0
     queue_reason_durations: Dict[str, float] = field(default_factory=dict)
@@ -672,7 +673,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.scheduler_recv_time = ts
 
     def set_queue_wait_reason(self, reason: str, ts=None):
-        """Attribute queue residence time to the latest admission blocker."""
+        """切换当前准入阻塞原因，并把上一原因的驻留时间累计到账。"""
         ts = ts or time.perf_counter()
         self.queue_reason_checks[reason] = self.queue_reason_checks.get(reason, 0) + 1
         if reason == self.queue_wait_reason:
@@ -686,6 +687,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.queue_wait_reason_start_time = ts
 
     def finish_queue_wait_reason(self, ts=None):
+        """结束 waiting-queue 计时；请求进入 forward 后不再归因于准入阻塞。"""
         ts = ts or time.perf_counter()
         if self.queue_wait_reason and self.queue_wait_reason_start_time > 0.0:
             elapsed = max(0.0, ts - self.queue_wait_reason_start_time)

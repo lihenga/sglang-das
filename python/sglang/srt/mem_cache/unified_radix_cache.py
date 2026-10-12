@@ -566,7 +566,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.linker is not None and self.linker.has_pending_lookup(rid)
 
     def waiting_queue_prefetch_enabled(self) -> bool:
-        """Rank-consistent switch resolved when the linker was built."""
+        """返回 linker 构造时已在各 rank 间协商一致的 prefetch 开关。"""
         return (
             self.linker is not None
             and self.linker.cache_linker.waiting_queue_prefetch_enabled()
@@ -598,17 +598,17 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.linker.complete_host_prefetch_submission(job, submitted)
 
     def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
-        """Return one rank-wide admission state for a queued DFS prefetch."""
+        """返回 queued DFS prefetch 在全 rank 范围内一致的准入状态。"""
         return self.get_waiting_queue_prefetch_admission_states([rid])[rid]
 
     def get_waiting_queue_prefetch_admission_states(
         self, rids: Sequence[str]
     ) -> dict[str, str]:
-        """Resolve variable local request lists in one fixed-shape collective round.
+        """用一轮固定形状的 collective 汇总各 rank 长度不同的请求列表。
 
-        The request-id union and state matrix make this safe when ranks have
-        different waiting-queue lengths, including an empty queue on some
-        ranks. This method remains scheduler-thread only.
+        先取 request-id 并集，再对每个 rid 汇总固定状态矩阵；因此即使各 rank
+        waiting queue 长度不同、某些 rank 为空，也会执行相同 collective 序列。
+        本方法必须只由 scheduler 线程调用。
         """
         groups = []
         for group in (self.attn_cp_group, self.attn_tp_group):
@@ -661,8 +661,8 @@ class UnifiedRadixCache(BasePrefixCache):
             not_tracked, pending, dfs_prefetched, no_prefetch_needed, terminal = (
                 int(value) for value in row
             )
-            # PENDING wins: an in-flight native read owns its private session
-            # and must finish before any rank can fall back to normal load.
+            # PENDING 优先级最高：in-flight native read 正持有私有 session，
+            # 必须等它结束后，所有 rank 才能一致回退到普通 load。
             if pending:
                 return "pending"
             completed = dfs_prefetched + no_prefetch_needed

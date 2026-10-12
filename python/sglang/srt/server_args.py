@@ -2947,12 +2947,16 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "mooncake"
+    # page-wise 模式把同一 page 的全部 layer range 合并为一次读取；只有
+    # key 数达到阈值时才启用，避免小请求承担构造聚合 metadata 的额外开销。
     mooncake_page_wise_load_threshold: A[
         int,
         "Minimum number of Mooncake direct-linker keys that switches loading "
         "from the layer-wise flow to the complete-page flow.",
         NS("memory"),
     ] = 10
+    # 默认关闭以保持原有逐层可见、逐层流水的行为；开启后完整 page 成功
+    # 之前不会向模型发布任何 layer，换取更少的 Mooncake range API 调用。
     mooncake_enable_page_wise_load: A[
         bool,
         "Enable page-wise loading for Mooncake direct-linker. When enabled, "
@@ -2960,6 +2964,8 @@ class ServerArgs:
         "count threshold.",
         NS("memory"),
     ] = False
+    # 在请求等待 FCFS 准入期间，提前把 DFS 对象读入 Mooncake pinned session；
+    # 只有所有相关 rank 都 ready 才准入，失败则回退普通 external load 路径。
     mooncake_enable_waiting_queue_dfs_prefetch: A[
         bool,
         "Prefetch Mooncake DFS objects into its pinned session cache while "
@@ -2968,18 +2974,24 @@ class ServerArgs:
         "load path.",
         NS("memory"),
     ] = False
+    # 该上限覆盖 preparing、排队、读取中和 ready 的全部状态，既限制请求数，
+    # 也防止 ready session 长时间占用 host pinned memory。
     mooncake_waiting_queue_dfs_prefetch_max_requests: A[
         int,
         "Maximum number of preparing, queued, reading, or ready Mooncake "
         "waiting-queue DFS-prefetch requests retained per scheduler rank.",
         NS("memory"),
     ] = 8
+    # 后台 DFS 读取 worker 数；实际值还会受 max_requests 限制，避免创建
+    # 无法获得请求槽位的空闲线程。
     mooncake_waiting_queue_dfs_prefetch_workers: A[
         int,
         "Maximum number of background workers reading Mooncake DFS objects "
         "for waiting-queue prefetch. Capped by the request limit.",
         NS("memory"),
     ] = 2
+    # 每个 scheduler rank 对活跃 prefetch pinned buffer 的估算容量上限；
+    # 与请求数上限共同形成双重背压，防止大请求绕过单纯的计数限制。
     mooncake_waiting_queue_dfs_prefetch_max_bytes: A[
         int,
         "Maximum estimated active pinned-buffer capacity for waiting-queue "
@@ -9172,6 +9184,8 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        # direct external linker 依赖 radix tree 完成前缀匹配、node lock、
+        # 插入以及失败回滚；禁用 radix cache 后这些生命周期契约不存在。
         if self.enable_unified_cache_external_linker and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive "

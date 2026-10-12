@@ -410,9 +410,8 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
-    # A snapshot may arrive after another rank drained its queue. Keep it
-    # pending briefly for the matching snapshot, then retire it to the normal
-    # admission path instead of holding a request forever.
+    # 某 rank 的快照可能在 peer 已清空本地队列后才到达。最多保留若干 epoch
+    # 等待同一 rid 的其他快照；超过宽限期便回退普通准入，避免请求永久挂起。
     BG_PREFETCH_JOIN_GRACE_EPOCHS = 4
 
     def __init__(
@@ -461,9 +460,9 @@ class Scheduler(
         self.enable_overlap_mlx = (
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
-        # The worker consumes immutable linker-prefetch snapshots. Per-iteration
-        # rounds keep every CP/TP participant in the same collective sequence,
-        # including rounds with no local jobs.
+        # worker 只消费不可变的 linker-prefetch 快照。每个 scheduler iteration
+        # 都推进一轮，使所有 CP/TP participant 执行完全相同的 collective
+        # 序列；即使本 rank 没有任务也必须参加空轮次。
         self._bg_prefetch_jobs: queue.Queue = queue.Queue()
         self._bg_prefetch_acks: queue.Queue = queue.Queue()
         self._bg_pending_prefetch_jobs = {}
@@ -1830,16 +1829,16 @@ class Scheduler(
             return
         self._host_resources_done = True
         executor = getattr(self, "_forward_launch_executor", None)
-        # The background prefetch worker submits into the linker and store:
-        # stop it before they close. The 30 s bound covers this join only.
+        # 后台 prefetch worker 会访问 linker 和 store，必须先停 worker 再关闭
+        # 这些资源；30 秒只约束线程 join，不代表可以强行销毁仍在使用的对象。
         if not self._stop_bg_prefetch_worker():
             logger.error(
                 "Background DFS prefetch worker did not stop; leaving host "
                 "resources to process exit instead of closing them under it."
             )
             if executor is not None:
-                # Returns at once; a running forward is not interrupted, and
-                # interpreter exit still waits for the executor thread.
+                # 立即返回且不打断正在运行的 forward；解释器退出时仍会等待
+                # executor thread，因此这里只避免 shutdown 再次阻塞当前清理路径。
                 executor.shutdown(wait=False)
             return
         if executor is not None:
@@ -2095,7 +2094,7 @@ class Scheduler(
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
     def _bg_worker_loop(self):
-        """Execute one deterministic external-prefetch round per scheduler step."""
+        """每个 scheduler step 执行一轮顺序确定的 external prefetch。"""
         while True:
             with self._bg_condition:
                 self._bg_condition.wait_for(
@@ -2123,7 +2122,7 @@ class Scheduler(
                 self._bg_condition.notify_all()
 
     def _run_bg_prefetch_round(self) -> None:
-        """Run one CP/TP-ordered round over retained immutable job snapshots."""
+        """对保留的不可变任务快照执行一轮 CP/TP 有序协商与提交。"""
         epoch = self._bg_completed_epoch + 1
         while True:
             try:
@@ -2158,9 +2157,9 @@ class Scheduler(
                     cancelled=cancelled,
                 )
         rank_statuses = {torch.distributed.get_rank(): local_status}
-        # First propagate a fixed-width presence flag. Empty rounds can skip
-        # object serialization, while CP then TP reductions make the decision
-        # identical for every participant in the 2-D attention topology.
+        # 先传播固定宽度的 presence flag：全空轮次可跳过 Python object 序列化；
+        # 按 CP 后 TP 的 reduction 顺序传播，确保二维 attention 拓扑中的所有
+        # participant 得到同一决定且 collective 次序一致。
         has_jobs = torch.tensor([int(bool(local_status))], dtype=torch.int)
         self._all_reduce_bg_prefetch_groups(
             has_jobs, op=torch.distributed.ReduceOp.MAX
@@ -2169,8 +2168,8 @@ class Scheduler(
             self._bg_prefetch_join_age.clear()
             return
 
-        # Gathering per-rank snapshots lets every participant distinguish an
-        # ineligible request from one whose snapshot has not arrived yet.
+        # 汇总各 rank 的 snapshot 状态，使 participant 能区分“本地判定不可
+        # prefetch”和“该 rank 的 snapshot 尚未到达”，后者可在宽限期内等待。
         for group in (self._bg_attn_cp_cpu_group, self._bg_attn_tp_cpu_group):
             if group is None:
                 continue
@@ -2207,8 +2206,8 @@ class Scheduler(
                     join_age=self._bg_prefetch_join_age[rid],
                 )
 
-            # Any participant cancelling the request retires all retained
-            # snapshots immediately, including ranks that never saw a job.
+            # 任一 participant 取消请求，就在所有 rank 立即回收已保留快照；
+            # 即使某 rank 从未收到 job，也必须对该 rid 得出相同终止结论。
             if any(status is not None and status[1] for status in rid_statuses):
                 if DAS_PREFETCH_TRACE_ENABLED:
                     trace_disagg_prefill(
@@ -2250,9 +2249,9 @@ class Scheduler(
                 self._finish_bg_prefetch_job(rid, False)
                 continue
 
-            # The gathered snapshot guarantees every participant has an
-            # eligible job. Submit is local and may fail independently; every
-            # rank still enters the fixed-width result reduction.
+            # gathered snapshot 已保证每个 participant 都持有 eligible job。
+            # submit 在本地执行、可能独立失败，但所有 rank 仍要进入固定宽度
+            # result reduction，把局部结果收敛为全局 all-or-nothing verdict。
             assert job is not None
             if DAS_PREFETCH_TRACE_ENABLED:
                 trace_disagg_prefill(
@@ -2325,7 +2324,8 @@ class Scheduler(
     def _request_bg_prefetch_epoch(self) -> None:
         if not self.enable_waiting_queue_dfs_prefetch:
             return
-        # A failed round also sets the stop flag: report the failure first.
+        # 失败轮次也会设置 stop flag；必须先上报原始异常，不能被“已停止”分支
+        # 静默吞掉，否则 scheduler 会继续运行但 prefetch 永远不再推进。
         if self._bg_error is not None:
             raise RuntimeError("Background DFS prefetch is unusable") from self._bg_error
         with self._bg_condition:
@@ -2335,12 +2335,11 @@ class Scheduler(
             self._bg_condition.notify()
 
     def _stop_bg_prefetch_worker(self, timeout_s: float = 30.0) -> bool:
-        """Best-effort stop of the background prefetch worker.
+        """尽力停止后台 prefetch worker，线程已退出时返回 ``True``。
 
-        Returns True once the worker has exited. Shutting ranks do not agree
-        on a last round, so a worker blocked in a round whose peers already
-        stopped may not exit within timeout_s; the caller must then leave
-        every resource that worker may still use untouched.
+        正在关闭的各 rank 不会再协商“最后一轮”；若 peer 已停止，本 rank 的
+        worker 可能阻塞在 collective 并超过 ``timeout_s``。此时调用方必须
+        保留 worker 仍可能访问的 linker、store 和通信组，不能继续销毁资源。
         """
         thread = getattr(self, "_bg_thread", None)
         if thread is None:
@@ -3269,8 +3268,11 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _init_waiting_queue_prefetch_runtime(self) -> None:
-        """Decide the prefetch switches world-wide, then create the prefetch
-        process groups and the forward executor they need."""
+        """先在全局协商 prefetch 开关，再创建专用通信组和 forward executor。
+
+        通信组创建本身要求所有 rank 以相同顺序参加，因此开关协商必须发生在
+        创建任何子组之前，不能让单个 rank 根据本地配置独立跳过。
+        """
         (
             self.enable_waiting_queue_dfs_prefetch,
             self._forward_ingress_enabled,
@@ -3286,10 +3288,9 @@ class Scheduler(
         self._forward_deferred_reqs = []
         self._bg_prefetch_rooms = {} if DAS_PREFETCH_TRACE_ENABLED else None
         if self.enable_waiting_queue_dfs_prefetch:
-            # Every rank creates groups in the same order. The helper
-            # gathers each rank's local subgroup membership on the default
-            # group, then creates all subgroups in a deterministic order.
-            # Runtime prefetch collectives use only these duplicate Gloo PGs.
+            # 每个 rank 必须按同一顺序创建通信组。helper 先在 default group
+            # 汇总各 rank 的 subgroup membership，再以确定性顺序创建全部子组；
+            # runtime prefetch collective 只使用这些复制出的 Gloo PG。
             for attr_name, group in (
                 ("_bg_attn_cp_cpu_group", self.attn_cp_cpu_group),
                 ("_bg_attn_tp_cpu_group", self.attn_tp_cpu_group),
@@ -3302,9 +3303,9 @@ class Scheduler(
                         create_custom_parallel_group(ranks, backend="gloo"),
                     )
 
-            # A forward launched on another Python thread can use the model's
-            # original CPU groups. Receive/lookup must never enter those groups
-            # concurrently, nor share the background prefetch round's groups.
+            # 另一 Python 线程中的 forward 可能使用模型原始 CPU group；并发的
+            # receive/lookup 既不能进入这些 group，也不能与后台 prefetch 共用
+            # group，否则不同线程的 collective 次序会相互穿插而死锁。
             for attr_name, group in (
                 ("_ingress_attn_cp_cpu_group", self.attn_cp_cpu_group),
                 ("_ingress_attn_tp_cpu_group", self.attn_tp_cpu_group),
@@ -3326,8 +3327,7 @@ class Scheduler(
                 )
 
     def _waiting_queue_prefetch_configured(self) -> bool:
-        """This rank's own conditions for waiting-queue prefetch, before the
-        linker's capability."""
+        """返回本 rank 的 waiting-queue prefetch 配置条件，不含 linker 能力。"""
         return bool(
             getattr(
                 self.server_args,
@@ -3345,25 +3345,23 @@ class Scheduler(
     def _resolve_prefetch_startup_switches(
         self, group: Optional[torch.distributed.ProcessGroup]
     ) -> Tuple[bool, bool]:
-        """Agree on (prefetch, forward ingress) before any prefetch group exists.
+        """在创建 prefetch group 前协商 ``(prefetch, forward ingress)``。
 
-        create_custom_parallel_group gathers on the whole world, so every
-        scheduler rank joins this one reduction unconditionally: a rank whose
-        own flags, Mooncake capability or KV canary mode disagree turns the
-        feature off everywhere instead of skipping the group creation alone.
-        The same reduction requires SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS to be
-        on or off everywhere (positive values may differ); otherwise ranks
-        would disagree on the supplemental poll collective. That poll only runs
-        on a PD prefill with pp_size == 1 (final chunks are recorded only
-        there), so other roles do not read the variable and report it off.
+        ``create_custom_parallel_group`` 会在整个 world 上 gather，所以所有
+        scheduler rank 都无条件参加这一次 reduction。任一 rank 的开关、
+        Mooncake 能力或 KV canary 模式不兼容，便在全局关闭对应功能，而不是
+        仅让该 rank 跳过建组。相同 reduction 还要求最终 chunk 补 poll 在所有
+        相关 rank 上同时开或关（正数具体值可不同），否则 collective 次数会
+        分叉。该 poll 只适用于 ``pp_size == 1`` 的 PD prefill，其他角色按关闭
+        上报且不读取环境值。
         """
 
         prefetch_local = (
             self._waiting_queue_prefetch_configured()
             and self.tree_cache.waiting_queue_prefetch_enabled()
         )
-        # Forward ingress matches (and may split) radix nodes while the
-        # forward runs; KV canary's sweep walks them from the forward thread.
+        # forward 运行时 ingress 会匹配、甚至拆分 radix node；KV canary sweep
+        # 又会从 forward 线程遍历这些 node，两者并发会破坏 tree 访问约束。
         ingress_local = (
             str(getattr(self.server_args, "kv_canary", "none")).strip().lower()
             == "none"
@@ -3404,7 +3402,8 @@ class Scheduler(
 
         enabled = bool(prefetch)
         if prefetch_local and not enabled:
-            # Before any job exists: keep the linker consistent with the world.
+            # 此时尚无 job，可安全同步关闭本地 linker，使 backend 状态与全局
+            # verdict 一致，不会遗留已提交但无人消费的 prefetch。
             self.tree_cache.disable_waiting_queue_prefetch()
             logger.warning(
                 "Waiting-queue DFS prefetch disabled: another rank is not "
@@ -4291,8 +4290,8 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             if abandoned_prefetch:
-                # Wait for every in-flight rank first, then retire the failed
-                # speculative state and rematch via the normal external path.
+                # 先等所有 rank 的 in-flight 状态收敛，再回收失败的 speculative
+                # 状态并走普通 external path 重新匹配，禁止各 rank 独立回退。
                 self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
 
             req.init_next_round_input(self.tree_cache)
@@ -4631,8 +4630,8 @@ class Scheduler(
         if not self._forward_ingress_enabled:
             return self.model_worker.forward_batch_generation(batch, **fwd_kwargs)
 
-        # Keep the scheduler as the sole owner of its sockets, requests, and
-        # radix tree. Only the model launch moves to another Python thread.
+        # socket、request 与 radix tree 仍由 scheduler 线程独占；只把纯模型
+        # forward 移到另一 Python 线程，避免把非线程安全的调度状态暴露出去。
         def launch_forward():
             if self.device != "cpu":
                 self.device_module.set_device(self.tp_worker.gpu_id)
@@ -4662,10 +4661,9 @@ class Scheduler(
 
         sync_groups = self.request_receiver.ingress_sync_groups()
         while True:
-            # A failed launch or background round is fatal: raise it here, at
-            # the next checkpoint, instead of after every rank has finished.
-            # The other ranks then depend on this node's fatal path (SIGQUIT to
-            # the local process tree), remote timeouts or external supervision.
+            # forward launch 或后台轮次失败均不可恢复：在下一检查点立刻抛出，
+            # 不再等待所有 rank 自然结束。其他 rank 依赖本节点 fatal path
+            # （向本地进程树发 SIGQUIT）、远端超时或外部 supervisor 收敛退出。
             if future.done() and future.exception() is not None:
                 future.result()
             if self._bg_error is not None:
@@ -4673,8 +4671,8 @@ class Scheduler(
                     "Background DFS prefetch is unusable"
                 ) from self._bg_error
 
-            # Every rank that shares a receive broadcast must enter the same
-            # number of them, even when its model launch finishes earlier.
+            # 共享 receive broadcast 的 rank 必须进入完全相同的次数；即使本地
+            # forward 较早完成，也要通过 MAX reduction 等待组内全部完成。
             active = torch.tensor([int(not future.done())], dtype=torch.int)
             for group in sync_groups:
                 torch.distributed.all_reduce(
@@ -4690,7 +4688,8 @@ class Scheduler(
                 )
                 received_generate = False
                 for recv_req in recv_reqs:
-                    # Once a control request is deferred, preserve input order.
+                    # 一旦遇到必须延后的 control request，后续输入全部延后，
+                    # 保持 tokenizer 发送顺序，避免控制操作被新请求越过。
                     if deferred_reqs:
                         deferred_reqs.append(recv_req)
                         self._trace_prefill_reqs(
@@ -4701,8 +4700,8 @@ class Scheduler(
                             forward_iter=self.forward_ct,
                         )
                     elif is_health_check_generate_req(recv_req):
-                        # A forward is running, so the server is busy: answer
-                        # as process_input_requests does when not fully idle.
+                        # forward 正在运行，服务属于 busy；与常规
+                        # process_input_requests 的非 idle 分支保持相同应答语义。
                         self.return_health_check_ipcs.append(
                             getattr(recv_req, "http_worker_ipc", None)
                         )
@@ -4732,8 +4731,8 @@ class Scheduler(
                 time.sleep(0.01)
 
         result = future.result()
-        # The old non-overlap path put forward and cache updates on one stream.
-        # Keep that ordering when the forward runs on its own.
+        # 旧的 non-overlap 路径让 forward 与 cache update 位于同一 stream；
+        # forward 独立线程运行后显式建立 stream wait，保留原有先后与可见性。
         self.schedule_stream.wait_stream(self.forward_stream)
         self._trace_prefill_reqs(
             "forward_deferred_for_replay",

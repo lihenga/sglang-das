@@ -1207,6 +1207,9 @@ class SchedulerPPMixin:
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
+                # 即使 DSA prefill 开启 CP，PP proxy/output tensor 仍按
+                # attention TP 分片；发送前必须 all-gather 才能让下一 stage
+                # 的每个 rank 收到完整且一致的 pipeline 输入。
                 all_gather_group=self.attn_tp_group,
                 async_send=async_send,
             )
@@ -1252,6 +1255,8 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
+                    # 与发送端保持 attention-TP all-gather 对称，不能因 CP 下
+                    # attention weight 重复而省略 tensor 数据本身的聚合。
                     all_gather_group=self.attn_tp_group,
                 )
             )
@@ -1262,6 +1267,7 @@ class SchedulerPPMixin:
     ) -> Dict[str, torch.Tensor]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
+            # output 与 proxy 使用相同的分片契约，始终在 attention TP 组聚合。
             all_gather_group=self.attn_tp_group,
         )
 

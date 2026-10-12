@@ -38,6 +38,8 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # 普通 DP 下用于区分独立 TP/PP world 中同号 global rank 的物理进程。
+    # 该值只描述部署拓扑，不参与 KV key 或张量切分计算。
     dp_rank: Optional[int] = None
 
 

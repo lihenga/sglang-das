@@ -152,17 +152,18 @@ class SchedulerRequestReceiver:
 
     @staticmethod
     def _local_control_broadcast() -> bool:
+        """控制请求是否只需在 attention TP/CP 子组内广播。"""
         return (
             get_parallel().enable_dp_attention_local_control_broadcast
             or is_ep_scale_joiner()
         )
 
     def ingress_sync_groups(self) -> List[Any]:
-        """CPU groups spanned by this rank's recv_requests broadcasts.
+        """返回本 rank 的 ``recv_requests`` 会覆盖的 CPU 通信组。
 
-        A loop that decides on each rank whether to call recv_requests again
-        must agree on exactly these groups, or ranks would enter a different
-        number of broadcasts. Empty when this rank broadcasts to nobody.
+        如果事件循环要由各 rank 自主决定是否再次接收请求，就必须在这些组中
+        对决定达成一致；否则不同 rank 会进入不同次数的 broadcast 并死锁。
+        当前 rank 无需向任何 peer 广播时返回空列表。
         """
         if get_parallel().enable_dp_attention and self._local_control_broadcast():
             groups = []
@@ -171,8 +172,8 @@ class SchedulerRequestReceiver:
             if self.ps.attn_cp_size != 1:
                 groups.append(self.attn_cp_cpu_group)
             return groups
-        # Without DP attention everything, and with it the control requests,
-        # are broadcast over the full TP group.
+        # 未启用 DP attention 时所有请求走完整 TP 组；启用后若不采用局部
+        # control broadcast，控制请求同样必须覆盖完整 TP 组。
         return [self.tp_cpu_group] if self.ps.tp_size != 1 else []
 
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:

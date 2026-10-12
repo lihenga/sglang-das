@@ -473,7 +473,8 @@ class FullComponent(TreeComponent):
                     keys=list(keys),
                 )
             except BaseException:
-                # Not handed to the caller yet, so nobody else can free them.
+                # slots 尚未封装成功并交给调用方，此时所有权仍在本函数；
+                # 转换索引失败必须立即归还，避免后续重试逐步耗尽 device pool。
                 allocator.free(slots)
                 raise
 

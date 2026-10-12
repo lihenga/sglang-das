@@ -173,12 +173,15 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+# 该 trace 只记录调度阶段与标识符，不记录 prompt 内容；默认关闭以免在
+# tokenizer 热路径增加日志和时间戳开销。
 _DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
     "SGLANG_DAS_PREFETCH_TRACE", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _trace_disagg_prefill_dispatch(event: str, obj: Any) -> None:
+    """记录 disaggregated prefill 请求从 tokenizer 发往 scheduler 的时刻。"""
     if not _DAS_PREFETCH_TRACE_ENABLED:
         return
     requests = getattr(obj, "batch", None)
@@ -597,6 +600,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        # 同步和异步发送都在 IPC 两侧打点，便于把 tokenizer 阻塞时间与
+        # scheduler 排队时间分开分析。
         _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         sock_send(self.send_to_scheduler, obj)
         _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
@@ -604,6 +609,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        # 与同步路径保持同一组 phase 名称，确保两种入口生成的 trace 可比较。
         _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         await async_sock_send(self.send_to_scheduler, obj)
         _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)

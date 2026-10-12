@@ -1440,8 +1440,9 @@ class Req(ReqDllmMixin):
             capped = max(0, input_len - reprefill_tail)
             key_limit = capped if key_limit is None else min(key_limit, capped)
 
-        # PP0 owns the canonical external-cache boundary. Apply it only while
-        # admitting the request; cache insertion performs its own rematch.
+        # PP0 负责确定各 pipeline stage 共用的 external-cache 命中边界。
+        # 这里只在请求准入时收紧匹配上限；cache 插入阶段会重新匹配，必须允许
+        # 它看到本轮新计算出的 KV，不能继续被最初的外部缓存边界截断。
         if (
             self.external_cache_hit_length is not None
             and getattr(tree_cache, "linker", None) is not None

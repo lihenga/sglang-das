@@ -247,10 +247,23 @@ def _with_packed_draft_mapping(
     draft_layer_num: int,
     transfer_layer_num: int | None = None,
 ) -> dict[int, int | tuple[int, ...]]:
-    """Attach draft depth N to the same transfer layer as target layer N."""
+    """将第 N 个 draft buffer 附加到 target 的第 N 个逻辑传输层。
+
+    ``layer_mapping`` 可以是稀疏 target mapping，例如某些 DSA Index-K 层
+    没有自己的 target buffer；``target_device_layer_num`` 是紧凑 target
+    buffer 数量，决定 draft buffer 在合并数组中的起始下标；
+    ``transfer_layer_num`` 则是 linker 遍历的逻辑层数，两者不能混用。
+
+    返回值可能是单个 int，也可能是 ``(target, draft)`` 或仅含 draft 的
+    tuple，供 DevicePoolEntry 在同一逻辑层展开多个 packed buffer。
+    """
+    # 默认情况下 mapping 的项数就是可传输层数；稀疏 mapping 必须由调用方
+    # 显式提供 transfer_layer_num，否则会错误拒绝没有 target 的 draft 层。
     layer_count = (
         len(layer_mapping) if transfer_layer_num is None else transfer_layer_num
     )
+    # 一个 draft depth 必须能归属到现有逻辑 transfer layer，禁止静默创建
+    # 超出模型层范围的 mapping。
     if draft_layer_num > layer_count:
         raise ValueError(
             "Packed draft layers exceed the target transfer layer count: "
@@ -258,8 +271,11 @@ def _with_packed_draft_mapping(
         )
     result: dict[int, int | tuple[int, ...]] = dict(layer_mapping)
     for depth in range(draft_layer_num):
-        # Draft KV is replicated even when this rank does not own target depth N.
+        # draft KV/Index-K 通常在 rank 间复制；即使本 rank 没有该 depth 的
+        # target buffer，仍要保留仅 draft 的 tuple，不能把这一层直接跳过。
         target = (layer_mapping[depth],) if depth in layer_mapping else ()
+        # components 的布局是 [全部 target buffers, 全部 draft buffers]，
+        # 因而第 depth 个 draft 的物理下标是 target 数量加 depth。
         result[depth] = (*target, target_device_layer_num + depth)
     return result
 
@@ -446,11 +462,13 @@ def _build_dsa_device_pool_group(
     num_layers = kvcache.layer_num
     indexer_buffers = kvcache.index_k_with_scale_buffer
 
-    # Some DSA layers reuse another layer's top-k result and therefore do not
-    # own an Index-K buffer. Map the active model layers to the compact buffer
-    # list instead of assuming one Index-K buffer per model layer.
+    # DSA 的部分逻辑层会复用前一层的 top-k，不拥有自己的 Index-K buffer。
+    # 此时 indexer_buffers 是只包含 active indexer layer 的紧凑数组，不能像
+    # 主 KV 一样假定“本地逻辑层号 == buffer 下标”。这里把全局 layer id
+    # 转换为当前 PP stage 内的 local layer id，再映射到紧凑数组下标。
     indexer_layer_ids = getattr(kvcache, "indexer_layer_ids", None)
     if indexer_layer_ids is None:
+        # 兼容旧 pool：未显式声明 active layer 时按每层一个 buffer 处理。
         indexer_mapping = {layer: layer for layer in range(num_layers)}
         expected_indexer_buffers = num_layers
     else:
@@ -463,11 +481,15 @@ def _build_dsa_device_pool_group(
             layer for layer in indexer_mapping if not 0 <= layer < num_layers
         ]
         if invalid_layers:
+            # 提前拒绝跨 PP stage 的错误映射，避免稍后生成 native 地址时才
+            # 以越界或错误层数据的形式暴露问题。
             raise ValueError(
                 "DSA Index-K layers are outside the local layer range: "
                 f"{invalid_layers}, num_layers={num_layers}, start_layer={start_layer}."
             )
         expected_indexer_buffers = len(indexer_layer_ids)
+    # 映射数量与实际 buffer 数必须严格一致；数量不等说明上游 pool 的
+    # compact layout 契约已被破坏，继续运行会发生错层或下标越界。
     if len(indexer_buffers) != expected_indexer_buffers:
         raise ValueError(
             "DSA Index-K buffer count does not match its layer mapping: "
@@ -486,11 +508,16 @@ def _build_dsa_device_pool_group(
     ]
     if len(draft_kv_buffers) != len(draft_indexer_buffers):
         raise ValueError("DSA MTP KV and indexer draft layer counts must match.")
+    # 主 KV 每个 target layer 都有 buffer，因此使用稠密 identity mapping；
+    # helper 会把同 depth 的 MTP draft buffer 打包到对应逻辑层。
     kv_layer_mapping = _with_packed_draft_mapping(
         {layer: layer for layer in range(num_layers)},
         target_device_layer_num=num_layers,
         draft_layer_num=len(draft_kv_buffers),
     )
+    # Index-K target buffer 可能是稀疏紧凑布局，所以 draft buffer 的起点
+    # 必须使用 len(indexer_buffers)，而不是 num_layers。transfer_layer_num
+    # 仍取逻辑层数，使“无 target Index-K、但有 draft Index-K”的层也能传输。
     indexer_mapping = _with_packed_draft_mapping(
         indexer_mapping,
         target_device_layer_num=len(indexer_buffers),
@@ -498,6 +525,7 @@ def _build_dsa_device_pool_group(
         transfer_layer_num=num_layers,
     )
     entries = [
+        # 主 KV 的 row 是 token；一个逻辑 page 对应 page_size 个连续 row。
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
@@ -507,6 +535,7 @@ def _build_dsa_device_pool_group(
             page_size=page_size,
             rows_are_pages=False,
         ),
+        # Index-K 已按 page 存储，一个 row 就是一个完整逻辑 page。
         DevicePoolEntry(
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,

@@ -29,6 +29,8 @@ from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
+# Mooncake setup API 即使在零拷贝路径也要求传入 local_buffer_size。
+# 默认保持 16 MiB，同时允许部署按 Mooncake 版本调整而无需修改代码。
 DEFAULT_LOCAL_BUFFER_SIZE = int(
     __import__("os").environ.get(
         "SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE",
@@ -100,7 +102,15 @@ def _normalize_tenant_id(value) -> str:
 
 
 def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
-    """Return a metrics port unique to this physical scheduler process."""
+    """为当前物理 scheduler 进程计算唯一的 Mooncake HTTP 指标端口。
+
+    同一个 distributed world 内直接使用 global rank 偏移。普通 DP 的每个
+    replica 拥有独立 world，global rank 会重复，因此还需增加
+    ``dp_rank * world_size``；未初始化 distributed 时退回基础端口。
+
+    端口 = 基础端口 + global_rank + dp_rank × world_size
+
+    """
     base_port = envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.get()
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         global_rank = torch.distributed.get_rank()
@@ -113,6 +123,10 @@ def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
 def _get_mooncake_client_http_setup_kwargs(
     enable_client_http_server: bool, dp_rank: Optional[int] = None
 ) -> dict[str, Any]:
+    """仅在显式启用指标时向 Mooncake setup 传入 HTTP server 参数。
+
+    返回空字典可兼容不需要指标的部署，也避免无谓占用监听端口。
+    """
     if not enable_client_http_server:
         return {}
     return {
@@ -433,6 +447,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 else None
             )
             if enable_client_http_server is None:
+                # 直接调用 MooncakeStore 的旧路径没有显式参数时，沿用 storage
+                # metrics 开关；direct linker 会传入 SGLang 的 metrics 开关。
                 enable_client_http_server = bool(
                     getattr(storage_config, "enable_storage_metrics", False)
                 )
@@ -543,6 +559,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
 
+                # 每个物理 client 使用独立指标端口；随后 SSD/tenant 参数与其
+                # 合并，统一传给 MooncakeDistributedStore.setup()。
                 setup_kwargs = _get_mooncake_client_http_setup_kwargs(
                     enable_client_http_server,
                     getattr(storage_config, "dp_rank", None),
@@ -1028,12 +1046,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self._batch_set_v2_aggregated(transfers)
 
     def _batch_set_v2_aggregated(self, transfers: List[PoolTransfer]) -> dict:
-        """Write all v2 pool transfers with one Mooncake batch-put call.
+        """将所有 v2 physical pool 的写入聚合成一次 Mooncake batch put。
 
-        A logical page may expand to several Mooncake objects, and different
-        pools may expose either one buffer or multiple buffers per object.  The
-        object ranges recorded here allow the single, flattened put result to
-        be converted back to the existing per-pool, per-page result format.
+        一个逻辑 page 可能展开为多个 Mooncake object，每个 object 又可能由
+        单 buffer 或多 buffer 组成。这里先展平所有 pool 的 key/地址/长度，
+        同时保存各 transfer 在展平数组中的范围，I/O 完成后再还原成既有的
+        ``pool -> per-page result`` 格式，避免改变上层完成语义。
         """
         all_key_strs: List[str] = []
         all_buffer_ptrs: List[Any] = []
@@ -1051,6 +1069,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
 
+            # tagged_keys 对应逻辑 page，供 group semantics 展开 group id；
+            # key_strs 则可能按 KV component 数量进一步展开为物理 object。
             tagged_keys = self._tag_keys(keys)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
@@ -1060,6 +1080,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 host_indices
             )
             if len(ptr_list) != len(key_strs):
+                # 某些 pool 为一个 object 返回多个离散 buffer，此时把扁平
+                # 指针数组重组为 Mooncake multi-buffer API 需要的二维结构。
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )
@@ -1086,9 +1108,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if not all_key_strs:
             return {}
 
-        # batch_put_from_multi_buffers requires every object to use the same
-        # vector-of-vectors representation. Normalize scalar entries only when
-        # at least one pool already supplies multiple buffers per object.
+        # multi-buffer API 要求批次中所有 object 使用统一的二维表示。如果任一
+        # pool 是多 buffer，就把其他 scalar 指针/长度包装成单元素列表；全部
+        # 为 scalar 时保留一维形式，以继续使用更轻量的普通 batch put。
         if any(isinstance(ptr, Sequence) for ptr in all_buffer_ptrs):
             all_buffer_ptrs = [
                 list(ptr) if isinstance(ptr, Sequence) else [ptr]
@@ -1099,6 +1121,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 for size in all_buffer_sizes
             ]
 
+        # 已存在的 object 不重复写入。先为整个聚合批次做一次 exist 查询，
+        # 之后仅抽取 missing object 发起 put，并把结果填回原位置。
         exist_result = self._batch_exist(all_key_strs)
         if len(exist_result) != len(all_key_strs):
             raise RuntimeError(
@@ -1119,6 +1143,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 io_results[i] = result
 
         results = {}
+        # 按先前记录的切片拆回各 pool，再由 _batch_postprocess 按
+        # key_multiplier 合并为每个逻辑 page 的成功/失败结果。
         for pool_name, start, end, key_multiplier in transfer_ranges:
             results[pool_name] = self._batch_postprocess(
                 io_results[start:end],
@@ -1495,6 +1521,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config.group_ids = group_ids
 
         if self._uses_multi_buffer(buffer_ptrs):
+            # group semantics 需要 ReplicateConfig；旧版/未启用 group semantics
+            # 时不要传入多余的第四个参数，以兼容不同 Mooncake Python ABI。
             if config is not None:
                 return self.store.batch_put_from_multi_buffers(
                     key_strs, buffer_ptrs, buffer_sizes, config

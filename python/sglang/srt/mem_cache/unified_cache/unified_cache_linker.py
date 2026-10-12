@@ -56,7 +56,12 @@ logger = logging.getLogger(__name__)
 
 
 class ExternalLinkerLoadError(RuntimeError):
-    """A recoverable external-cache load failure for the current batch."""
+    """表示当前 batch 的 external-cache load 可恢复失败。
+
+    该类型用于区分单批 KV 恢复失败与引擎级异常：前者应终止受影响请求并
+    释放 linker/tree 资源，而不应让整个 scheduler 退出。当前完成队列路径
+    主要以 bool verdict 传播失败，保留此类型作为统一的异常语义边界。
+    """
 
 
 class UnifiedCacheLinker(ABC):
@@ -93,39 +98,39 @@ class UnifiedCacheLinker(ABC):
         """
 
     def waiting_queue_prefetch_enabled(self) -> bool:
-        """Whether waiting-queue host prefetch is enabled on every rank."""
+        """返回 waiting-queue host prefetch 是否已在所有 rank 上一致启用。"""
         return False
 
     def disable_waiting_queue_prefetch(self) -> None:
-        """Turn waiting-queue host prefetch off before any job is submitted."""
+        """在任何任务提交前关闭 waiting-queue host prefetch。"""
 
     def submit_host_prefetch(
         self, rid: str, transfers: list[PoolTransfer]
     ) -> bool:
-        """Queue a request-scoped host prefetch without allocating device pages."""
+        """提交 request-scoped host prefetch，但不分配 device page。"""
         return False
 
     def get_host_prefetch_status(self, rid: str) -> str | None:
-        """Return the backend host-prefetch state, or ``None`` if absent."""
+        """返回 backend host-prefetch 状态；请求不存在时返回 ``None``。"""
         return None
 
     def revalidate_host_prefetch(self, rid: str) -> bool:
-        """Refresh the prepared session without copying into device memory."""
+        """刷新已准备的 session，但不把数据复制到 device memory。"""
         return False
 
     def revalidate_no_prefetch_needed(self, rid: str) -> bool:
-        """Check that a prefetch finished without DFS reads is still loadable."""
+        """确认无需 DFS read 的 prefetch 在排队后仍然可以正常 load。"""
         return False
 
     def claim_ready_host_prefetch(self, rid: str) -> bool:
-        """Transfer a READY speculative session to the normal load path."""
+        """把 READY 的 speculative session 所有权移交给普通 load 路径。"""
         return False
 
     def cancel_host_prefetch(self, rid: str) -> None:
-        """Cancel or retire a request-scoped host prefetch."""
+        """取消或回收 request-scoped host prefetch。"""
 
     def abort_prepared_load(self, rid: str) -> None:
-        """Release a session claimed by the normal load path."""
+        """释放已被普通 load 路径认领、但最终未使用的 session。"""
 
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
@@ -193,7 +198,11 @@ class _PendingLookup(NamedTuple):
 
 
 class PreparedHostPrefetch(NamedTuple):
-    """Immutable request-local work for the scheduler's background prefetch round."""
+    """scheduler 后台 prefetch 轮次使用的不可变 request-local 工作快照。
+
+    worker 只读取该快照，不接触 scheduler 持有的请求、radix tree 或映射表，
+    从而把后台线程的并发边界限制在 linker/backend 内。
+    """
 
     rid: str
     locally_eligible: bool
@@ -234,12 +243,11 @@ class UnifiedCacheLinkerWrapper:
         # Cancelled/stale entries stay in FIFO until every rank retires them.
         self.lookup_queue: deque[_PendingLookup] = deque()
         self.lookup_results: dict[str, tuple[_PendingLookup, int]] = {}
-        # Waiting-queue prefetches retain the original hit until admission can
-        # rematch it. The backend owns the private session and readiness state.
+        # waiting-queue prefetch 会保留原始 hit，直到准入阶段能够重新匹配；
+        # backend 独占私有 session 及其 readiness 状态。
         self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] = {}
-        # Submission work is prepared and committed only by the scheduler
-        # thread. The background worker receives a snapshot and never touches
-        # this dict or the cache tree.
+        # submission 任务只由 scheduler 线程准备和提交；后台 worker 仅接收
+        # 不可变快照，绝不访问此字典或 cache tree。
         self.pending_host_prefetch_submissions: dict[
             str, tuple[PreparedHostPrefetch, ExternalCacheHitMarker]
         ] = {}
@@ -369,7 +377,7 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.cancel_host_prefetch(rid)
 
     def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
-        """Build a request-local snapshot without issuing any collectives."""
+        """构造 request-local 快照，不在此发起任何 collective。"""
         hit = self.hit_markers.get(req.rid)
         transfers = []
         locally_eligible = hit is not None
@@ -382,8 +390,8 @@ class UnifiedCacheLinkerWrapper:
                     if transfer is None:
                         locally_eligible = False
                         break
-                    # LOOKUP transfers are CPU metadata only. Copy their
-                    # mutable key lists so the worker owns its snapshot.
+                    # LOOKUP transfer 仅包含 CPU metadata；复制可变 keys 列表，
+                    # 使 worker 完整拥有快照，不与 scheduler 线程共享可变容器。
                     transfers.append(
                         PoolTransfer(
                             name=transfer.name,
@@ -412,7 +420,11 @@ class UnifiedCacheLinkerWrapper:
     def complete_host_prefetch_submission(
         self, job: PreparedHostPrefetch, submitted: bool
     ) -> bool:
-        """Commit a background result if this is still the live request."""
+        """仅当快照仍对应当前活跃请求时，提交后台执行结果。
+
+        请求可能在 worker 返回前已 abort 或被新一代同 rid 状态替换，因此用
+        对象身份校验，过期结果即使成功也只做 session 清理，不能重新发布。
+        """
         pending = self.pending_host_prefetch_submissions.get(job.rid)
         if pending is None or pending[0] is not job:
             if submitted:
@@ -486,8 +498,8 @@ class UnifiedCacheLinkerWrapper:
             if cache.pp_rank != 0:
                 req.external_cache_hit_length = 0
                 return result
-            # The local device hit is part of PP0's canonical restorable
-            # boundary even when the external tail lookup misses.
+            # 即使 external tail lookup miss，本地 device hit 仍属于 PP0 给出的
+            # canonical 可恢复边界，必须传给后续 pipeline stage。
             req.external_cache_hit_length = device_hit_len
 
         if device_hit_len >= len(key):
@@ -675,16 +687,13 @@ class UnifiedCacheLinkerWrapper:
     def _build_load_transfers(
         self, req: Req, tail_hashes
     ) -> tuple[list[tuple[TreeComponent, PoolTransfer]], bool, BaseException | None]:
-        """Build every component's LOAD transfer on this rank only.
+        """只在本 rank 构造所有 component 的 LOAD transfer。
 
-        Building allocates device slots and can fail on one rank alone, so the
-        caller must agree on the returned flag with the other ranks before any
-        later collective, and on failure ABORT the transfers returned here (a
-        component frees slots it could not hand over). A component returning
-        None (not enough room) is an expected miss. An unexpected error may
-        have left the tree or an allocator partly changed, so it is returned
-        rather than raised: this rank still joins that agreement, and the
-        caller re-raises it after cleanup instead of serving on.
+        构造会分配 device slot，可能只在单个 rank 失败；调用方在进入后续
+        collective 前必须汇总 ``constructed``，失败时 ABORT 已返回的 transfer
+        （component 会自行释放尚未交出的 slot）。返回 ``None`` 表示容量不足，
+        属于预期 cache miss；意外异常则作为值返回而非立即抛出，使本 rank
+        仍能参加一致性 collective，完成清理后再抛出，避免 peer rank 死锁。
         """
 
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
@@ -709,14 +718,12 @@ class UnifiedCacheLinkerWrapper:
         cancel_prefetch: bool,
         pending: BaseException | None,
     ) -> None:
-        """Clean up after the ranks agreed a load cannot proceed.
+        """各 rank 一致认定 load 无法继续后，清理本 rank 的部分状态。
 
-        Frees this rank's transfers, then, on the prefetched path, cancels the
-        prefetch (rolling a claimed session back) even if freeing raised.
-        Raises the pending build or claim error, which stays the primary one;
-        a cleanup error is logged then, and raised otherwise. Freeing stops at
-        the first component that raises, so a failed cleanup does not promise
-        that every slot was released.
+        先释放本地 transfer；若来自 prefetch，即使释放抛错也继续取消 prefetch，
+        从而回滚已认领 session。build/claim 的原始异常保持为主异常，cleanup
+        异常只记录；没有主异常时才抛 cleanup 异常。释放在首个 component
+        出错处停止，因此 cleanup 失败时不能声称所有 slot 都已释放。
         """
         cleanup_error: BaseException | None = None
         try:
@@ -768,13 +775,12 @@ class UnifiedCacheLinkerWrapper:
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
 
-            # Every rank must reach the reduction below, so any local failure,
-            # including an exception, becomes a local False.
+            # 所有 rank 都必须进入下面的 reduction，因此任何本地失败（包括
+            # 异常）先转换成 False，不能提前抛出并把 peer 留在 collective 中。
             try:
                 if status == "no_prefetch_needed":
-                    # Its session was released while queued; re-check that
-                    # the keys survived so eviction falls back to the normal
-                    # path instead of failing the later load.
+                    # 排队期间 session 已释放；重新确认 key 仍存在。若被淘汰，
+                    # 立即回退普通路径，而不是等到后续 load 才失败。
                     locally_valid = self.cache_linker.revalidate_no_prefetch_needed(
                         req.rid
                     )
@@ -797,8 +803,8 @@ class UnifiedCacheLinkerWrapper:
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
         if prefetched:
-            # Build before claiming so that the claim reduction also carries
-            # the construction verdict: one reduction instead of two.
+            # 先构造 transfer、后认领 session，使同一个 verdict reduction 同时
+            # 携带 constructed 与 claimed 两项结果，少做一次 collective。
             component_transfers, constructed, build_error = self._build_load_transfers(
                 req, tail_hashes
             )
@@ -810,17 +816,16 @@ class UnifiedCacheLinkerWrapper:
                 else:
                     claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
             except BaseException as error:
-                # Still join the reduction below, then re-raise after cleanup.
-                # Reporting "not constructed" sends every rank to the miss exit
-                # rather than to a normal-path retry this rank would not join.
+                # 即使本地 claim 抛错也要参加下面的 reduction，清理后再抛。
+                # 同时上报 not constructed，使所有 rank 走统一 miss 出口；若仅
+                # 本 rank 重试普通路径，peer 不会进入相同 collective 序列。
                 claimed, constructed, claim_error = False, False, error
             verdict = torch.tensor([int(claimed), int(constructed)], dtype=torch.int)
             cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
             claimed_all, constructed_all = (int(value) for value in verdict)
             if not (claimed_all and constructed_all):
-                # Free the device slots, then cancel (which also rolls a
-                # locally claimed session back); a build or claim error is
-                # raised on its own rank only after both were attempted.
+                # 先释放 device slot，再 cancel（同时回滚本地已认领 session）。
+                # build/claim 异常只在两项清理都尝试后由对应 rank 抛出。
                 if build_error is not None and claim_error is not None:
                     logger.error(
                         "Claiming the prefetch of rid=%s also failed",
@@ -835,10 +840,10 @@ class UnifiedCacheLinkerWrapper:
                     pending=build_error if build_error is not None else claim_error,
                 )
                 if not constructed_all:
-                    # Building failed somewhere: a miss, as on the normal path.
+                    # 任一 rank 构造失败都按普通路径的语义视为 cache miss。
                     return empty_indices, req.last_node
-                # Every rank built but a claim failed: retry the normal path,
-                # which builds again and agrees on its own construction.
+                # 所有 rank 构造成功但 claim 失败：恢复 hit marker 后递归进入
+                # 普通路径，重新构造并重新做跨 rank 一致性判断。
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
             prepared_from_host_prefetch = True
@@ -851,8 +856,8 @@ class UnifiedCacheLinkerWrapper:
                 all_constructed, torch.distributed.ReduceOp.MIN
             )
             if int(all_constructed.item()) == 0:
-                # Each rank frees what it built; a component frees its own
-                # slots when it fails after allocating.
+                # 每个 rank 只释放自己已成功交出的 transfer；component 若在
+                # alloc 后、交出前失败，会负责释放它自己仍持有的 slot。
                 self._abort_disagreed_load(
                     req,
                     component_transfers,

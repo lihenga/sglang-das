@@ -98,6 +98,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 仅在显式开启时记录 prefill 生命周期；日志不包含 prompt 内容，避免诊断
+# cache/pipeline 时泄露用户输入，同时默认不增加热路径开销。
 DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
     "SGLANG_DAS_PREFETCH_TRACE", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -106,7 +108,7 @@ DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
 def trace_disagg_prefill(
     event: str, rid, bootstrap_room, rank, **state
 ) -> None:
-    """Emit an opt-in, content-free timestamp for a disagg prefill request."""
+    """为 disaggregated prefill 请求输出可选的、无内容时间戳事件。"""
     if not DAS_PREFETCH_TRACE_ENABLED:
         return
     details = " ".join(f"{key}={value}" for key, value in state.items())
@@ -1139,7 +1141,7 @@ class SchedulerDisaggregationPrefillMixin:
                 prefetch(room)
 
     def _admit_prefill_bootstrapped_reqs(self: Scheduler) -> None:
-        """Move requests whose bootstrap is ready into the waiting queue."""
+        """把 bootstrap 已就绪的请求移入 waiting queue，并统一记录阶段事件。"""
         bootstrap_queue = self.disagg_prefill_bootstrap_queue
         bootstrapped_reqs = bootstrap_queue.pop_bootstrapped()
         if DAS_PREFETCH_TRACE_ENABLED:
@@ -1167,13 +1169,19 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
     def maybe_supplemental_poll_final_chunks(self: Scheduler) -> List[Req]:
-        """Give newly submitted final chunks one bounded chance to finish."""
+        """对刚提交的最终 chunk 做一次有界等待和补充 poll。
+
+        room 集合先被取走并清空，保证每个最终 chunk 最多触发一次额外等待；
+        超时后仍按正常 inflight 流程继续，不会无限阻塞 scheduler。
+        """
         final_rooms = getattr(self, "_disagg_final_chunk_rooms", set())
         self._disagg_final_chunk_rooms = set()
         timeout_ms = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
         if timeout_ms <= 0 or not final_rooms:
             return []
 
+        # 只等待仍在 inflight queue 中的 room；已被常规 poll 消费的请求无需
+        # 再次进入 manager，避免用陈旧 room 状态制造无意义等待。
         remaining_rooms = {
             req.bootstrap_room
             for req in self.disagg_prefill_inflight_queue
@@ -1188,6 +1196,8 @@ class SchedulerDisaggregationPrefillMixin:
             return []
 
         start = time.perf_counter()
+        # Condition 等待只帮助传输线程获得一个短暂完成窗口；其后必须调用
+        # 正式处理函数，由它执行跨 rank 状态汇总和请求迁移。
         all_done = wait_for_rooms(remaining_rooms, timeout_ms / 1000.0)
         waited = time.perf_counter()
         done_reqs = self.process_disagg_prefill_inflight_queue()
@@ -1208,11 +1218,11 @@ class SchedulerDisaggregationPrefillMixin:
         poll_s: float,
         all_done: bool,
     ) -> None:
-        """Accumulate final-chunk wait stats and log a summary every minute.
+        """累计最终 chunk 等待统计，并每分钟输出一次摘要。
 
-        wait_ms is this rank's local wait; poll_ms is the extra all-reduced poll,
-        which includes waiting for slower ranks. Their sum is the added
-        scheduler stall per round.
+        ``wait_ms`` 是本 rank 的 Condition 等待；``poll_ms`` 是额外的
+        all-reduce poll（包含等待慢 rank 的时间），两者之和才是每轮新增的
+        scheduler stall。
         """
         now = time.monotonic()
         stats = getattr(self, "_final_poll_wait_stats", None)
@@ -2348,8 +2358,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        # Also covers the external KV linker: a waiting-queue prefetch taken
-        # at arrival would otherwise keep its budget slot and pinned session.
+        # 同时覆盖 external KV linker：请求到达时占用的 waiting-queue prefetch
+        # 若不在 abort 时释放，会一直占着并发预算和 pinned session。
         self._release_aborted_request(req.rid)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
@@ -2481,8 +2491,8 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
-        # Only the non-PP event loops drain these rooms, so do not collect them
-        # otherwise (or when the supplemental poll is disabled).
+        # 只有非 PP 事件循环会消费这些 room；PP 模式或补充 poll 关闭时不收集，
+        # 否则集合只增不减，还会暗示一个实际上不存在的等待语义。
         if (
             last_chunk
             and self.ps.pp_size == 1

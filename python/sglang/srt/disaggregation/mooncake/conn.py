@@ -256,6 +256,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_outstanding = defaultdict(int)
             self._source_drain = SourceDrainTracker()
             self.session_lock = threading.Lock()
+            # 最后一个 KV chunk 提交后，scheduler 会做一次有界等待并补充 poll。
+            # Condition 由传输线程在状态或 outstanding 数量变化时唤醒，避免
+            # scheduler 用 sleep 轮询，也避免错过“状态已成功但 worker 尚未收尾”的窗口。
             self._transfer_completion_condition = threading.Condition()
             self.pd_hidden_events.init_prefill_state()
             # Determine the number of threads to use for kv sender
@@ -525,12 +528,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
 
     def _notify_transfer_waiters(self) -> None:
+        """唤醒等待最终 KV chunk 收敛的 scheduler，不在此判断完成条件。"""
         condition = getattr(self, "_transfer_completion_condition", None)
         if condition is not None:
             with condition:
                 condition.notify_all()
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        # 先发布状态再唤醒，确保 waiter 重新检查谓词时能看到最新结果。
         super().update_status(bootstrap_room, status)
         if status in (KVPoll.Success, KVPoll.Failed):
             self._notify_transfer_waiters()
@@ -538,13 +543,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def wait_for_transfer_rooms(
         self, bootstrap_rooms: Set[int], timeout_s: float
     ) -> bool:
-        """Wait briefly for final rooms so the scheduler can poll before forward."""
+        """短暂等待指定 room 终态，给 scheduler 在 forward 前补 poll 的机会。
+
+        返回值只表示本地谓词是否在超时前满足；调用方仍需执行正式 poll，
+        并通过 collective 汇总各 rank 的传输结果。
+        """
         if not bootstrap_rooms or timeout_s <= 0:
             return False
 
         def all_terminal() -> bool:
-            # Mirror MooncakeKVSender.poll(): Success is set before the worker
-            # finishes the chunk, so it only counts once nothing is outstanding.
+            # 与 MooncakeKVSender.poll() 保持一致：worker 可能先把状态置为
+            # Success，再完成 chunk 收尾；因此 Success 且 outstanding>0 仍非终态。
             for room in bootstrap_rooms:
                 status = self.request_status.get(room)
                 if status not in (None, KVPoll.Success, KVPoll.Failed):

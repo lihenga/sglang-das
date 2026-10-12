@@ -990,7 +990,8 @@ class SWAComponent(TreeComponent):
             try:
                 transfer.device_indices = slots.to(torch.int64)
             except BaseException:
-                # Not handed to the caller yet, so nobody else can free them.
+                # slots 尚未写入 transfer 并交给调用方，异常时由本函数回收；
+                # 否则构造失败路径没有持有这些索引的对象，SWA 槽位会永久泄漏。
                 allocator.free(slots)
                 raise
         return transfer

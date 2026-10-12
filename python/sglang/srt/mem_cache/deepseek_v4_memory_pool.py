@@ -825,12 +825,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
+        # 必须等主 KV、Indexer 及压缩状态全部创建后再记录容量，否则启动日志
+        # 只会统计基类的一部分 buffer，低估 DeepSeek-V4 实际占用的 HBM。
         self._finalize_allocation_log(self.swa_size)
 
     def get_kv_size_bytes(self) -> int:
+        """返回该复合 KV pool 已分配的设备张量总字节数。
+
+        DeepSeek-V4 的缓存不仅包含主 KV，还包含 Index-K、attention/indexer
+        压缩状态以及可选的在线 C128 MTP 状态；这里统一收集后按实际 dtype
+        的 element_size 计数，供启动阶段的显存分配日志使用。
+        """
         tensors: list[torch.Tensor] = []
 
-        # SWA/C4/C128 main KV data
+        # unified 布局只有一组共享主 buffer；非 unified 布局则分别统计
+        # SWA、C4 和 C128，不能同时加入两套路径，否则会重复计数。
         if self._unified_kv:
             tensors.extend(self.unified_kv_pool.kv_buffer)
         else:
@@ -838,23 +847,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             tensors.extend(self.c4_kv_pool.kv_buffer)
             tensors.extend(self.c128_kv_pool.kv_buffer)
 
-        # C4 indexer
+        # C4 Indexer 的 Index-K（以及量化 scale）是独立于主 KV 的 sidecar。
         tensors.extend(self.c4_indexer_kv_pool.index_k_with_scale_buffer)
 
-        # Attention compression states
+        # 各层 attention 压缩状态；None 表示该层没有相应压缩池。
         for pool in self.compress_state_pools:
             if pool is not None:
                 tensors.append(pool.kv_score_buffer.kv_score)
 
-        # Indexer compression states
+        # Indexer 使用另一组压缩状态，需与 attention 状态分别统计。
         for pool in self.indexer_compress_state_pools:
             if pool is not None:
                 tensors.append(pool.kv_score_buffer.kv_score)
 
-        # Online C128 MTP auxiliary states
+        # 在线 C128 MTP 才会创建的辅助序列长度状态。
         if self.online_c128_mtp_pending_seq_lens is not None:
             tensors.append(self.online_c128_mtp_pending_seq_lens)
 
+        # 使用 numel（元素总数） * element_size 可正确覆盖 bf16、fp8、int8 等混合 dtype。
         return sum(t.numel() * t.element_size() for t in tensors)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:

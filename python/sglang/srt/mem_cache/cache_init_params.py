@@ -56,7 +56,8 @@ class CacheInitParams:
 
     mtp_draft_device_pools: tuple[object, ...] = ()
 
-    # Regular DP launches one independent TP/PP world per rank. Keep this
-    # separate from the default-world rank so storage clients can identify the
-    # physical scheduler process across those worlds.
+    # 普通 DP 会为每个 DP rank 启动一套彼此独立的 TP/PP default world，
+    # 因而仅使用 distributed global rank 不能区分这些物理 scheduler 进程。
+    # 单独传递 dp_rank，供 Mooncake 等存储客户端计算全局唯一的指标端口；
+    # DP-attention 模式的 DP 维已经编码在 global rank 中，此字段应为 None。
     dp_rank: Optional[int] = None

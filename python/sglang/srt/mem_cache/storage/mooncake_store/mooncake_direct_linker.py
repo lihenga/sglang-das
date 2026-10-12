@@ -41,6 +41,11 @@ device_module = get_device_module()
 
 
 def _get_mooncake_storage_metrics_dp_rank(server_args, params) -> int:
+    """返回指标 label 应使用的 DP rank。
+
+    DP-attention 的 rank 由 attention 并行上下文维护；普通 DP 则使用构建
+    cache 时显式传入的物理 replica rank。未启用 DP 时统一记为 0。
+    """
     if getattr(server_args, "enable_dp_attention", False):
         from sglang.srt.layers.dp_attention import get_attention_dp_rank
 
@@ -59,10 +64,10 @@ def _storage_suffix(
 
 
 def _session_refresh_age_config() -> float:
-    """Refresh-skip age in seconds from the environment.
+    """从环境变量读取允许跳过 session refresh 的最大 lease 年龄（秒）。
 
-    The master's TTL is not visible to the client, so the deployment declares
-    it; an age that would not leave any of that TTL disables skipping.
+    client 无法查询 master 的真实 TTL，只能由部署显式声明；若配置年龄不小于
+    TTL，跳过 refresh 后将没有剩余保护窗口，因此自动退化为每次都刷新。
     """
     age_s = float(os.environ.get("SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S", "0") or 0)
     lease_ttl_s = float(os.environ.get("SGLANG_MOONCAKE_LEASE_TTL_S", "10") or 10)
@@ -84,14 +89,19 @@ def _session_refresh_age_config() -> float:
 
 
 class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
+    """与 KV pool 逐层等待 hook 对接的 CPU 完成计数器。
+
+    后台线程为每个 batch、每个 layer 设置 Future；模型 forward 到达某层前
+    等待对应 Future。I/O 失败只记录而不从 forward 抛出，避免单个 TP/CP
+    rank 提前退出后让其他 rank 永久阻塞在模型 collective。
+    """
 
     def __init__(self, num_layers: int):
         self.num_layers = num_layers
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
-        # Batch indices already logged: one line per failed load, not per layer.
+        # 同一失败会被每层 wait 重复观察；用 batch index 去重，避免每层打一行。
         self.reported: set[int] = set()
 
     def update_producer(self) -> int:
@@ -106,9 +116,8 @@ class LayerWiseLoadCounter:
         self.futures[index][layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
-        # A private copy, because wait_until clears the traceback of what it
-        # catches and the caller still needs its own exception for the
-        # logger.exception() that follows.
+        # 创建不带原 traceback 的私有异常副本。wait_until 会清除它捕获到的
+        # traceback，而调用方仍需保留原异常供紧随其后的 logger.exception 使用。
         failure = RuntimeError(f"{type(error).__name__}: {error}")
         for future in self.futures.get(index, ()):
             if not future.done():
@@ -122,10 +131,9 @@ class LayerWiseLoadCounter:
         try:
             futures[threshold].result()
         except BaseException as error:
-            # Never raise: this runs inside the model forward, where nothing
-            # catches before the scheduler's top-level handler and the whole
-            # engine goes down. The failure travels out through
-            # pop_completed_load(), which aborts the affected requests.
+            # 这里位于模型 forward 内，不能抛异常：否则 scheduler 顶层之前
+            # 没有恢复点，其他 rank 还可能继续进入 collective。失败会通过
+            # completed_loads 队列离开 forward，再统一 abort 受影响请求。
             if index not in self.reported:
                 self.reported.add(index)
                 logger.error(
@@ -134,11 +142,9 @@ class LayerWiseLoadCounter:
                     index,
                     error,
                 )
-            # Every layer re-raises this same exception object, and each
-            # appended traceback entry roots a frame chain that pins that
-            # layer's activations: +31.9 GiB on one faulted 61-layer forward at
-            # --chunked-prefill-size 2048, until the engine OOMed. Nothing
-            # reads the traceback.
+            # 每层等待同一个异常对象都会追加 traceback frame，并间接持有该层
+            # activation；大模型故障时会造成显存持续增长。后续逻辑不读取该
+            # traceback，因此立即清除是安全且必要的。
             error.__traceback__ = None
         finally:
             if threshold == self.num_layers - 1:
@@ -153,13 +159,17 @@ class LayerWiseLoadCounter:
 
 
 class ReadPlanLoadCounter:
-    """Publish one Mooncake ReadPlan; wait for each layer without holding the GIL."""
+    """发布一个 Mooncake ReadPlan，并在不持有 GIL 时按层等待。
+
+    Future 先连接生产者和 forward 消费者，后台线程创建好 native plan 后再
+    bind；plan.wait(layer) 与普通逐层 Future 保持相同的失败隔离语义。
+    """
 
     def __init__(self, num_layers: int):
         self.num_layers = num_layers
         self.producer_index = self.consumer_index = -1
         self.plans: dict[int, Future] = {}
-        # Batch indices already logged: one line per failed plan, not per layer.
+        # 一个 plan 的错误可能在多层 wait 中重复出现，只记录一次。
         self.reported: set[int] = set()
 
     def update_producer(self) -> int:
@@ -186,11 +196,9 @@ class ReadPlanLoadCounter:
         try:
             future.result().wait(threshold)
         except BaseException as error:
-            # Do not raise from the model forward. A rank-local failure here can
-            # strand peer TP/CP ranks in a later model collective and brings the
-            # scheduler down. load_layer_wise reports False through the linker
-            # completion queue; the cache MIN-reduces that verdict across the
-            # attention group and aborts the affected requests after forward.
+            # 不从 forward 抛出 rank-local 错误，否则 peer TP/CP rank 可能卡在
+            # 后续 collective。load_layer_wise 会把 False 写入完成队列，cache
+            # 在 attention group 上汇总 verdict，并在 forward 结束后终止请求。
             if index not in self.reported:
                 self.reported.add(index)
                 logger.error(
@@ -199,8 +207,7 @@ class ReadPlanLoadCounter:
                     index,
                     error,
                 )
-            # Repeated waits otherwise grow a traceback chain that keeps each
-            # layer's activations alive until the failed plan is retired.
+            # 避免重复 wait 形成 traceback 链并长期持有各层 activation。
             error.__traceback__ = None
         finally:
             if threshold == self.num_layers - 1:
@@ -223,6 +230,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
+        # page-wise 模式只在 key 数达到阈值时启用；小批次仍保留逐层 I/O，
+        # 避免聚合所有 layer metadata 的固定开销。
         self.page_wise_load_threshold = (
             server_args.mooncake_page_wise_load_threshold
         )
@@ -284,6 +293,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = MooncakeStore(
                 storage_config,
                 mem_pool=None,
+                # 只有 SGLang metrics 开启时才让 Mooncake client 监听 HTTP
+                # 端口，避免无监控部署占用端口或在多进程下产生冲突。
                 enable_client_http_server=params.enable_metrics,
             )
         else:
@@ -309,15 +320,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.offload_owner,
             storage_suffix,
         )
+        # ReadPlan 为 opt-in：由 Mooncake native 层一次接收全部 pool/layer
+        # layout，减少 Python 逐层构造 range metadata 的开销。
         self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
+        # range reuse 允许 native plan 复用稳定地址布局，但必须建立在
+        # ReadPlan 之上；普通 range-get 路径没有可复用的 plan 状态。
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
         )
-        # Skip the admission-time lease refresh of a prefetched request whose
-        # oldest session key was leased less than this many seconds ago. The
-        # master never evicts a leased object, so the refresh only buys lease
-        # time; 0 keeps the refresh unconditional. Must leave enough of the
-        # deployment's lease TTL to cover admission through load completion.
+        # 若 prefetch 请求最老 key 的 lease 年龄仍小于该阈值，准入时可跳过
+        # refresh。master 不会淘汰处于 lease 内的对象，所以 refresh 只是在
+        # 延长保护时间；0 保持无条件刷新。阈值必须为准入到 load 完成预留
+        # 足够的部署 TTL，不能把“当前仍有效”误当成“加载期间一直有效”。
         self.session_refresh_age_s = _session_refresh_age_config()
         self._disable_refresh_skip_for_groups()
         self.host_prefetch_enabled = bool(
@@ -372,11 +386,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "SGLANG_MOONCAKE_READ_PLAN=1"
             )
         if self.read_plan_reuse_ranges and self.enable_page_wise_load:
+            # page-wise 会把各层 range 重新组织为 key-major 完整页布局，与
+            # layer-wise reuse 所假定的稳定 range 形状不兼容。
             raise ValueError(
                 "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES is incompatible with "
                 "page-wise Mooncake loads"
             )
         if self.read_plan_enabled:
+            # 提前检查 Python binding 能力，避免服务启动成功后第一次 L3
+            # 命中才因旧 Mooncake package 缺少 API 而失败。
             if not callable(getattr(self.storage.store, "create_read_plan", None)):
                 raise RuntimeError(
                     "Mooncake ReadPlan requires a package with create_read_plan. "
@@ -416,6 +434,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
+            # 将并行拓扑写入固定 labels，确保不同 TP/DP/PP/CP 进程的数据
+            # 不会聚合到无法区分的同一条 Prometheus time series。
             labels = {
                 "storage_backend": "mooncake_direct",
                 "tp_rank": tp_rank,
@@ -433,6 +453,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage_metrics_collector = collector_cls(labels=labels)
 
         self.register_buffers()
+        # 两种 counter 向模型暴露相同的 wait_until(layer) 契约；区别在于
+        # 普通路径每层一个 Future，ReadPlan 路径由单个 native plan 按层等待。
         if self.read_plan_enabled:
             self.layer_done_counter = ReadPlanLoadCounter(self.num_layers)
         else:
@@ -442,13 +464,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        # rid -> 逻辑 token 数。一个逻辑 page 可能展开成 KV、SWA、Indexer
+        # 等多个物理 object，因此必须先按 page key 去重，不能按 transfer 求和。
         self.pending_load_tokens: dict[str, int] = {}
         self.prepared_load_sessions: dict[str, list[str]] = {}
         self.session_refcounts: dict[str, int] = {}
         self.session_sources: dict[str, str] = {}
-        # key -> time.monotonic() taken just before the RPC that last granted
-        # its master read lease (session start or refresh). Never later than
-        # Mooncake's own lease base, so ages computed from it are conservative.
+        # key -> 最近一次授予 master read lease 的 RPC（session start/refresh）
+        # 发起前记录的 monotonic 时间。该值不会晚于 Mooncake 自身 lease 起点，
+        # 因而据此计算出的 age 只会偏大，是保守估计。
         self.session_lease_base: dict[str, float] = {}
         self.session_lock = threading.Lock()
         self.host_prefetch_lock = threading.Lock()
@@ -492,7 +516,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.offload_thread.start()
 
-    # Defaults for instances built without __init__ (unit-test fixtures).
+    # 兼容绕过 __init__ 构造的轻量实例（主要是测试 fixture）；正常实例会用
+    # 已校验的环境配置覆盖该类属性。
     session_refresh_age_s = 0.0
 
     def _disable_refresh_skip_for_groups(self) -> None:
@@ -502,9 +527,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             and callable(group_semantics)
             and group_semantics()
         ):
-            # A grouped object's lease is only extended once half of it is
-            # left, yet every reply reports the full TTL: the client-side
-            # deadline can run up to TTL/2 past the master's.
+            # group semantics 只在剩余 lease 低于一半时真正延期，但每次 reply
+            # 都报告完整 TTL；据此更新 client deadline 最多会比 master 晚
+            # TTL/2，因此该模式下禁止 refresh-skip，采用保守刷新。
             logger.warning(
                 "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S is ignored with Mooncake "
                 "group semantics"
@@ -518,7 +543,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return bases
 
     def _local_host_prefetch_capability(self, requested: bool) -> tuple[bool, str]:
-        """Return whether this rank can run waiting-queue DFS prefetch."""
+        """检查本 rank 是否具备 waiting-queue DFS prefetch 的完整 native 能力。"""
         if not requested:
             return False, "disabled by --mooncake-enable-waiting-queue-dfs-prefetch"
         store = self.storage.store
@@ -549,12 +574,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def _resolve_host_prefetch_enabled(
         self, params: CacheInitParams, *, requested: bool
     ) -> bool:
-        """Agree on waiting-queue prefetch once, before any worker starts.
+        """在启动 worker 前一次性协商 waiting-queue prefetch 开关。
 
-        Every rank that builds this linker takes part unconditionally, so the
-        scheduler's per-request prefetch collectives are entered by all ranks
-        or by none. The groups and their order match
-        ``UnifiedRadixCache._all_reduce_attn_groups``.
+        所有构造该 linker 的 rank 都无条件参加，使 scheduler 的逐请求
+        prefetch collective 要么全员进入、要么全员跳过。通信组及执行顺序与
+        ``UnifiedRadixCache._all_reduce_attn_groups`` 完全一致。
         """
         local_ok, reason = self._local_host_prefetch_capability(requested)
         verdict = torch.tensor([int(local_ok)], dtype=torch.int)
@@ -593,8 +617,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.host_prefetch_enabled
 
     def disable_waiting_queue_prefetch(self) -> None:
-        # The scheduler found a rank without prefetch before any submission;
-        # the idle host-prefetch workers stay parked on an empty queue.
+        # scheduler 在任何 submission 前发现某 rank 不支持 prefetch；本 rank
+        # 的 host-prefetch worker 保持启动但停在空队列，不会接触 backend。
         self.host_prefetch_enabled = False
 
     def register_buffers(self) -> None:
@@ -702,9 +726,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        # Query establishes a boundary at which every component is restorable;
-        # insert then removes pages already resident in L1. Loading is therefore
-        # intentionally partial and may contain only a side pool such as SWA.
+        # lookup 已确定“所有 component 都可恢复”的公共边界，随后 tree insert
+        # 会去掉仍驻留在 L1 的 page。因此这里允许部分 physical pool；某次
+        # load 甚至可能只剩 SWA 等 side pool，而没有主 KV transfer。
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
@@ -727,7 +751,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def prepare_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        """Acquire key-indexed Mooncake sessions for a future range read."""
+        """为将来的 range read 按 storage key 获取并引用 Mooncake session。"""
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
@@ -760,10 +784,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if key in self.session_refcounts:
                     self.session_refcounts[key] += 1
                     self.session_sources.setdefault(key, "unknown")
-                    # Another holder may retire this Mooncake session (a
-                    # failed refresh or expired read erases it), which only a
-                    # refresh notices. Such a key stays refresh-only until it
-                    # is fully released and started afresh.
+                    # 另一 holder 可能因 refresh 失败或 read 过期而让 Mooncake
+                    # 销毁 session，而这里只能在下次 refresh 时发现。共享过的
+                    # key 清除本地 lease base，在所有引用释放并重新 start 前，
+                    # 都只能走保守 refresh，不能依赖年龄优化。
                     self._lease_bases().pop(key, None)
                     acquired.append(key)
                 else:
@@ -825,7 +849,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def _estimate_pinned_arena_capacity(
         object_sizes: list[int], alignment: int
     ) -> int:
-        """Conservatively mirror Mooncake's aligned DFS arena allocation."""
+        """保守复现 Mooncake 对齐后的 DFS arena 分配容量，用于准入背压。"""
         arena_size = 0
         for object_size in object_sizes:
             aligned_object_size = (
@@ -850,7 +874,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def _get_host_prefetch_object_sizes(
         self, transfers: list[PoolTransfer]
     ) -> dict[str, int] | None:
-        """Map tagged storage keys to one page's exact payload size."""
+        """把带 pool tag 的 storage key 映射到单页对象的精确 payload 大小。"""
         try:
             expanded = self.pool_group.resolve_transfers(
                 transfers, allow_partial=True, allow_missing_kv=True
@@ -872,9 +896,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if pool is None or key_multiplier <= 0:
                     return None
 
-                # Each metadata row describes one logical page. Group its
-                # buffer sizes the same way MooncakeStore packs buffers into
-                # the component keys returned above.
+                # 每行 metadata 描述一个逻辑 page；按 MooncakeStore 将 buffer
+                # 打包进上述 component key 的相同规则分组，容量估算才与 native
+                # arena 实际收到的对象一一对应。
                 page_buffer_sizes = [
                     size
                     for component in pool.buffer_meta
@@ -969,8 +993,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "reserved_bytes": estimated_bytes,
             }
 
-        # Session creation can contact DFS. The scheduler only publishes the
-        # work item; this worker owns both preparation and the DFS read.
+        # session 创建本身可能访问 DFS。scheduler 只发布 work item，后台
+        # worker 独占 preparation 与 DFS read，避免 scheduler 热线程被 I/O 阻塞。
         self.host_prefetch_queue.put((rid, queued_transfers))
         return True
 
@@ -993,24 +1017,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             session_rid = str(entry["session_rid"])
         with self.session_lock:
             keys = list(self.prepared_load_sessions.get(session_rid, ()))
-            # A key without a base (ever shared in this generation, or whose
-            # refresh failed) counts as infinitely old.
+            # 没有 lease base 的 key（本代曾被共享，或 refresh 曾失败）按无限
+            # 老处理，强制刷新，不能根据不可信的本地时间跳过 RPC。
             bases = [self._lease_bases().get(key) for key in keys]
             private = all(self.session_refcounts.get(key, 0) == 1 for key in keys)
         if not keys:
             return False
         oldest = None if None in bases else min(bases)
-        # Measure the age after acquiring session_lock: it may have been held
-        # across another request's session-start RPC, and that wait has used
-        # up lease too.
+        # 必须在获得 session_lock 后再计算 age：锁可能被另一请求跨越较慢的
+        # session-start RPC 持有，等待锁的时间同样已经消耗 master lease。
         age = float("inf") if oldest is None else time.monotonic() - oldest
         if (
             self.session_refresh_age_s > 0
             and private
             and age < self.session_refresh_age_s
         ):
-            # Every key still holds at least TTL - age of master read lease,
-            # during which the master neither evicts nor replaces it.
+            # 此时每个 key 至少还剩 ``TTL - age`` 的 master read lease；该窗口
+            # 内 master 既不会淘汰对象，也不会用新对象替换它。
             return True
         lease_base = time.monotonic()
         try:
@@ -1027,21 +1050,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             bases = self._lease_bases()
             for key in keys:
                 if not ok:
-                    # A failed refresh may have retired the Mooncake session.
+                    # refresh 失败可能已让 Mooncake 回收 session，本地 base
+                    # 立即失效，禁止后续请求继续走 refresh-skip。
                     bases.pop(key, None)
                 elif key in bases:
-                    # Only keys private for their whole generation keep a
-                    # base; an ended or shared key has none to renew.
+                    # 只有整代都由单一 holder 私有的 key 才保留 base；已经 end
+                    # 或曾共享的 key 没有可安全续写的本地 deadline。
                     bases[key] = lease_base
         return ok
 
     def revalidate_no_prefetch_needed(self, rid: str) -> bool:
-        """Re-check the keys of a request that needed no DFS prefetch.
+        """重新检查“无需 DFS prefetch”请求的 key 是否仍然存在。
 
-        The worker released its session on finding no DFS keys, so nothing
-        pins the objects while the request waits for admission. Returning
-        False sends every rank back to the normal path, whose revalidation
-        degrades an evicted prefix to a cache miss.
+        worker 发现没有 DFS key 后会释放 session，请求等待准入期间没有 lease
+        pin 住对象。返回 False 会让所有 rank 回到普通路径，由其 revalidation
+        把已淘汰前缀降级成 cache miss，而不是在异步 load 中失败。
         """
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
@@ -1247,10 +1270,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 and not cancelled
             ):
                 if outcome == "no_prefetch_needed":
-                    # The session is released below; keep the keys so
-                    # admission can re-check them (see
-                    # revalidate_no_prefetch_needed). Published together with
-                    # the state under the same lock.
+                    # session 会在下方释放，但保留 key 供准入时重新检查（见
+                    # revalidate_no_prefetch_needed）。key 与 state 在同一把锁下
+                    # 同时发布，读者不会看到终态却拿不到对应 key 集合。
                     current["no_prefetch_keys"] = list(keys or ())
                     current["reserved_bytes"] = 0
                 current["state"] = outcome
@@ -1349,6 +1371,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
+                    # 无论正常返回还是异常，都必须消费本批次的 token 记录并
+                    # 发布完成事件；否则指标状态和 tree-side node lock 会泄漏。
                     self._finish_prefetch_metrics(list(pending), success is True)
                     self.completed_loads.put((list(pending), success))
             finally:
@@ -1362,6 +1386,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         success = False
         maybe_fail = arm_load_failure_injection(self.tp_rank)
         try:
+            # 所有读取路径（普通逐层、page-wise、ReadPlan）统一借用 prepared
+            # session。已有 DFS 预取 session 可直接复用，没有则在此同步建立。
             for rid, transfers in request_transfers:
                 with self.session_lock:
                     prepared = rid in self.prepared_load_sessions
@@ -1370,6 +1396,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"Mooncake get session preparation failed for rid={rid}."
                     )
             if getattr(self, "read_plan_enabled", False):
+                # ReadPlan 自己负责 native range 的展开和逐层 wait；成功必须
+                # 显式返回 True，避免后台线程把 None 当作失败发布。
                 self.load_with_read_plan(counter_index, request_transfers)
                 return True
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
@@ -1394,6 +1422,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return success
 
             for layer in range(self.num_layers):
+                # 默认路径逐层完成所有 pool 的 range read；只有该 layer 的
+                # 每个 physical pool 都校验成功后，才允许模型读取这一层。
                 for name, (keys, locations) in batches.items():
                     meta = self.pools[name].get_prepared_layer_range_meta(
                         locations, layer
@@ -1425,11 +1455,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
+            # borrowed session 的所有权仍属于 linker；无论 I/O 是否成功都在
+            # 整批结束后递减引用，最后一个 holder 才真正结束 Mooncake session。
             for rid, _ in request_transfers:
                 self.abort_prepared_load(rid)
         return success
 
     def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
+        """结算一批 direct load 的成功 token 指标并清理临时计数。"""
         pending_load_tokens = getattr(self, "pending_load_tokens", {})
         tokens = sum(pending_load_tokens.pop(rid, 0) for rid in rids)
         if not success or tokens <= 0:
@@ -1448,6 +1481,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 )
 
     def _log_prefetched_tokens(self, tokens: int) -> None:
+        """隔离指标后端异常，禁止监控故障影响 KV 数据路径。"""
         collector = getattr(self, "storage_metrics_collector", None)
         if collector is None or tokens <= 0:
             return
@@ -1460,12 +1494,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
 
     def _load_page_wise(self, counter_index: int, batches, maybe_fail) -> None:
-        """Load all layer ranges for each page before exposing the data."""
+        """一次聚合读取每个 page 的全部 layer range，再整体发布。
+
+        与逐层路径相比，该模式牺牲 layer/compute overlap，换取跨 layer、跨
+        physical pool 的单次 Mooncake range 调用。任何 object short read 都
+        使整批失败，不能向模型暴露只填充了部分层的 page。
+        """
         all_keys: list[str] = []
         all_ptrs: list[list[int]] = []
         all_sizes: list[list[int]] = []
         all_offsets: list[list[int]] = []
         for name, (keys, locations) in batches.items():
+            # 临时数组保持 key-major 结构：每个 key 对应其所有 layer、所有
+            # component 的目标地址、长度和 object 内偏移。
             ptrs: list[list[int]] = [[] for _ in keys]
             sizes: list[list[int]] = [[] for _ in keys]
             offsets: list[list[int]] = [[] for _ in keys]
@@ -1483,6 +1524,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     == len(layer_offsets)
                     == len(keys)
                 ):
+                    # metadata 数量不齐时禁止进入 native API，避免 C++ 侧按
+                    # 不一致数组长度读取并写入错误地址。
                     raise ValueError(
                         f"Mooncake pool={name} layer={layer} produced "
                         f"{len(layer_ptrs)} range entries for {len(keys)} keys."
@@ -1497,6 +1540,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             all_sizes.extend(sizes)
             all_offsets.extend(offsets)
 
+        # 不同 pool 的 key 已带独立 suffix，而 range API 本身不接收 pool
+        # 参数，所以可安全展平成一个全局批次。调用前再次验证四组元数据对齐。
         lengths = {
             "keys": len(all_keys),
             "ptrs": len(all_ptrs),
@@ -1508,13 +1553,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 f"Mooncake page-wise aggregated metadata mismatch: {lengths}."
             )
 
-        # Mooncake's range API is key-major and does not take a pool argument,
-        # so differently suffixed physical-pool objects can share one call.
+        # 故障注入也以整个聚合调用为单位，模拟真实 native range get 失败。
         maybe_fail("aggregated", "complete_page")
         result = self.storage.store.batch_get_into_multi_buffer_ranges(
             all_keys, all_ptrs, all_sizes, all_offsets
         )
         expected = [sum(item) for item in all_sizes]
+        # Mooncake 可能返回 None、scalar error code 或逐 key byte count。
+        # 只有结果长度和值都与期望完全相等才算成功，short read 不可接受。
         if result is None or isinstance(result, int) or list(result) != expected:
             pool_counts = {
                 str(name): len(keys) for name, (keys, _) in batches.items()
@@ -1525,15 +1571,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 f"expected={expected}"
             )
 
+        # 所有 page 全量成功后一次性释放所有 layer，维持 all-or-nothing 可见性。
         for layer in range(self.num_layers):
             self.layer_done_counter.complete(counter_index, layer)
 
     def _prepare_read_plan_layouts(
         self, request_transfers: list[tuple[str, list[PoolTransfer]]]
     ):
-        # Consolidate index copies once per pool, preserving request/key order.
-        # Each component describes (base, row stride, byte count, source offset).
-        # Locations may be non-contiguous; Mooncake expands addresses in C++.
+        # 每个 pool 只合并一次 index，同时保持 request/key 顺序。每个 component
+        # 描述 (base address, row stride, byte count, source offset)；location
+        # 可以不连续，最终地址展开由 Mooncake C++ ReadPlan 完成。
         batches = {}
         for _rid, transfers in request_transfers:
             for transfer in transfers:
@@ -1552,6 +1599,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             layout = []
             for layer in range(self.num_layers):
                 mapped = pool.layer_mapping.get(layer)
+                # None 表示该逻辑层没有该 sidecar；int 表示单 buffer；tuple
+                # 表示 target 与 MTP draft 等多个 packed buffer 同属此层。
                 buffer_indices = (
                     ()
                     if mapped is None
@@ -1584,14 +1633,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             reuse_ranges=self.read_plan_reuse_ranges,
             page_wise=self.enable_page_wise_load,
             borrowed_sessions=True,
+            # 保留 pool/tensor owner，防止 native plan 尚持有地址时 Python
+            # 对象已被 GC；session 则由外层 finally 统一归还，plan 只借用。
             buffer_owners=self.pools,
         )
         self.layer_done_counter.bind(counter_index, plan)
-        # run() and wait() release the GIL. Each layer becomes visible only after
-        # every pool's bytes have been checked; the last wait includes cleanup.
-        # In page-wise mode a single batch_get carries all groups per key, so the
-        # first wait(0) blocks until every page is complete and later waits are
-        # no-ops, matching _load_page_wise's all-or-nothing release.
+        # run()/wait() 会释放 GIL。普通模式下，每层只有在所有 pool 的字节数
+        # 校验完成后才可见，最后一次 wait 负责 native cleanup；page-wise 下
+        # wait(0) 等待全部 page，后续 wait 为空操作，与 _load_page_wise 的
+        # all-or-nothing 发布语义一致。
         plan.run()
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
@@ -1606,6 +1656,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         tokens = len(kv.keys) * self.page_size
         ready_event = device_module.Event()
         ready_event.record()
+        # 入队时记录时间而不是 worker 开始时间，使指标包含排队、device event
+        # 等待和实际 Mooncake 写入的完整端到端 wall-clock 延迟。
         self.offload_queue.put((expanded, tokens, time.perf_counter(), ready_event))
         return True
 
@@ -1647,8 +1699,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if collector is None:
             return
         try:
-            # This branch intentionally does not guess DFS versus local disk.
-            # Its Mooncake configuration owns that routing decision.
+            # direct linker 无法可靠判断 Mooncake 最终路由到 DFS 还是本地介质，
+            # 因此统一标记为 mooncake，不根据实现细节猜测 source。
             collector.log_l4_backup("mooncake", tokens, duration, success)
         except BaseException:
             logger.warning(
