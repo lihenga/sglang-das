@@ -602,7 +602,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.get_waiting_queue_prefetch_admission_states([rid])[rid]
 
     def get_waiting_queue_prefetch_admission_states(
-        self, rids: Sequence[str]
+        self, rids: Sequence[str], *, pending_lookup_rids: Sequence[str] = ()
     ) -> dict[str, str]:
         """Resolve variable local request lists in one fixed-shape collective round.
 
@@ -642,8 +642,13 @@ class UnifiedRadixCache(BasePrefixCache):
             "no_prefetch_needed",
             "terminal",
         )
+        # A deferred snapshot is still pending even before a background job
+        # exists. Agree on this state so another rank cannot admit it early.
+        pending_lookup_rids = set(pending_lookup_rids)
         local_states = [
-            "not_tracked"
+            "pending"
+            if rid in pending_lookup_rids
+            else "not_tracked"
             if self.linker is None
             else self.linker.get_host_prefetch_admission_state(rid)
             for rid in all_rids
@@ -2806,14 +2811,43 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
+    def _publish_ready_external_lookups(self) -> None:
+        """Agree completed DFS probes by identity, never wait for a worker.
+
+        Ingress queues may arrive in different orders on CP/TP ranks. Intersect
+        immutable query identities before reducing their variable-length hit
+        masks, so a fast later request can pass an unfinished earlier request.
+        All communication stays on the scheduler's attention CPU groups.
+        """
+        ready_ids = self.linker.ready_lookup_ids()
+        has_ready = torch.tensor([int(bool(ready_ids))], dtype=torch.int)
+        self._all_reduce_attn_groups(has_ready, torch.distributed.ReduceOp.MIN)
+        if not int(has_ready.item()):
+            return
+
+        groups = [
+            group
+            for group in (self.attn_cp_group, self.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        ]
+        if not groups and self.tp_world_size > 1:
+            groups.append(self.tp_group)
+        common = set(ready_ids)
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(gathered, sorted(common), group=group)
+            common = set.intersection(*(set(ids) for ids in gathered))
+        self.linker.drain_ready_lookups(sorted(common))
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
+            ready_publication = self.linker.ready_lookup_publication
             finish_counts = torch.tensor(
                 [
                     self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
-                    self.linker.wait_pending_lookups(),
+                    0 if ready_publication else self.linker.wait_pending_lookups(),
                 ],
                 dtype=torch.int,
                 device="cpu",
@@ -2829,6 +2863,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            if ready_publication:
+                self._publish_ready_external_lookups()
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.

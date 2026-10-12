@@ -19,9 +19,12 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import threading
 from abc import ABC, abstractmethod
+from array import array
 from collections import deque
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -190,6 +193,7 @@ class _PendingLookup(NamedTuple):
     device_hit_len: int
     num_pages: int
     future: Future
+    query_id: str = ""
 
 
 class PreparedHostPrefetch(NamedTuple):
@@ -274,6 +278,54 @@ class UnifiedCacheLinkerWrapper:
     def has_pending_lookup(self, rid: str) -> bool:
         return rid in self.pending_lookups
 
+    @property
+    def ready_lookup_publication(self) -> bool:
+        # Resolved prefetch capability, not merely the requested server flag.
+        # Startup may disable prefetch after constructing the linker.
+        return self.async_lookup_enabled and getattr(
+            self.cache_linker, "waiting_queue_prefetch_enabled", lambda: False
+        )()
+
+    @staticmethod
+    def _lookup_query_id(key: RadixKey, device_hit_len: int, num_pages: int) -> str:
+        # FIFO positions need not agree across ranks at waiting-queue ingress.
+        # Match by request AND query: a rematch can change the L1 anchor or key.
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                [key.extra_key, key.cache_salt, key.is_bigram, device_hit_len, num_pages],
+                separators=(",", ":"),
+            ).encode()
+        )
+        token_ids = key.raw_token_ids()
+        # RadixKey snapshots already own an int64 array; hash its buffer
+        # directly rather than copying a long context a second time.
+        digest.update(
+            token_ids if isinstance(token_ids, array) else array("q", token_ids)
+        )
+        return digest.hexdigest()
+
+    def ready_lookup_ids(self) -> list[tuple[str, str]]:
+        """Snapshot completed, live probes without waiting on storage workers."""
+        # Obsolete probes must not block unrelated requests or publish into a
+        # reused RID. shutdown(wait=True) still joins their storage workers.
+        self.lookup_queue = deque(
+            p for p in self.lookup_queue if self.pending_lookups.get(p.rid) is p
+        )
+        return [(p.rid, p.query_id) for p in self.lookup_queue if p.future.done()]
+
+    def drain_ready_lookups(self, ready_ids: Sequence[tuple[str, str]]) -> None:
+        """Publish the same agreed requests in the same order on every rank."""
+        completed = []
+        for rid, query_id in ready_ids:
+            pending = self.pending_lookups[rid]
+            assert pending.query_id == query_id and pending.future.done()
+            completed.append(pending)
+        self._publish_lookups(completed)
+        self.lookup_queue = deque(
+            p for p in self.lookup_queue if self.pending_lookups.get(p.rid) is p
+        )
+
     def wait_pending_lookups(self) -> int:
         """Wait for a fixed cohort without serializing its submissions."""
         pending = tuple(self.lookup_queue)
@@ -289,6 +341,11 @@ class UnifiedCacheLinkerWrapper:
         if not count:
             return
         completed = [self.lookup_queue.popleft() for _ in range(count)]
+        self._publish_lookups(completed)
+
+    def _publish_lookups(self, completed: Sequence[_PendingLookup]) -> None:
+        if not completed:
+            return
         offsets = [0]
         for pending in completed:
             offsets.append(offsets[-1] + pending.num_pages + 1)
@@ -576,6 +633,12 @@ class UnifiedCacheLinkerWrapper:
             if self.async_lookup_enabled:
                 if completed_lookup is None:
                     assert self.lookup_executor is not None
+                    lookup_key = key[:]
+                    query_id = (
+                        self._lookup_query_id(lookup_key, device_hit_len, len(tail_hashes))
+                        if self.ready_lookup_publication
+                        else ""
+                    )
                     future = self.lookup_executor.submit(
                         self.cache_linker.lookup_in_worker,
                         req.rid,
@@ -583,10 +646,11 @@ class UnifiedCacheLinkerWrapper:
                     )
                     pending = _PendingLookup(
                         req.rid,
-                        key[:],
+                        lookup_key,
                         device_hit_len,
                         len(tail_hashes),
                         future,
+                        query_id,
                     )
                     self.pending_lookups[req.rid] = pending
                     self.lookup_queue.append(pending)

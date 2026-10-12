@@ -1222,6 +1222,8 @@ class Req(ReqDllmMixin):
         self.pending_bootstrap = False
         # Number of optimistic prefill forward passes started. preserved across retracts.
         self.prefill_attempt_count = 0
+        # DFS prefetch snapshot awaits asynchronous external lookup publication.
+        self.waiting_queue_dfs_lookup_pending = False
 
         # For Matryoshka embeddings
         self.dimensions = dimensions

@@ -3442,46 +3442,14 @@ class Scheduler(
                     device_hit_tokens=len(req.prefix_indices),
                     external_host_hit_tokens=req.host_hit_length,
                 )
-                trace_disagg_prefill(
-                    "radix_prefetch_prepare_start",
-                    req.rid,
-                    req.bootstrap_room,
-                    self.ps.tp_rank,
-                )
-            job = self.tree_cache.prepare_external_linker_prefetch(req)
-            if DAS_PREFETCH_TRACE_ENABLED:
-                trace_disagg_prefill(
-                    "radix_prefetch_prepare_done",
-                    req.rid,
-                    req.bootstrap_room,
-                    self.ps.tp_rank,
-                    job_created=job is not None,
-                    locally_eligible=(job.locally_eligible if job is not None else False),
-                    transfer_count=(len(job.transfers) if job is not None else 0),
-                )
-            if job is not None:
-                if self._bg_prefetch_rooms is not None:
-                    self._bg_prefetch_rooms[job.rid] = req.bootstrap_room
-                if DAS_PREFETCH_TRACE_ENABLED:
-                    trace_disagg_prefill(
-                        "bg_prefetch_job_enqueue_start",
-                        job.rid,
-                        req.bootstrap_room,
-                        self.ps.tp_rank,
-                        requested_epoch=self._bg_requested_epoch,
-                        completed_epoch=self._bg_completed_epoch,
-                    )
-                self._bg_prefetch_jobs.put(job)
-                if DAS_PREFETCH_TRACE_ENABLED:
-                    trace_disagg_prefill(
-                        "bg_prefetch_job_enqueued",
-                        job.rid,
-                        req.bootstrap_room,
-                        self.ps.tp_rank,
-                        requested_epoch=self._bg_requested_epoch,
-                        completed_epoch=self._bg_completed_epoch,
-                        queue_size=self._bg_prefetch_jobs.qsize(),
-                    )
+            if getattr(
+                getattr(self.tree_cache, "linker", None), "async_lookup_enabled", False
+            ):
+                # Defer on every rank, including local L1 hits. The query result
+                # must be published and rematched before freezing the snapshot.
+                req.waiting_queue_dfs_lookup_pending = True
+            else:
+                self._enqueue_waiting_queue_prefetch(req)
 
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -3527,6 +3495,85 @@ class Scheduler(
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                 )
+
+    def _enqueue_waiting_queue_prefetch(self, req: Req) -> None:
+        if DAS_PREFETCH_TRACE_ENABLED:
+            trace_disagg_prefill(
+                "radix_prefetch_prepare_start",
+                req.rid,
+                req.bootstrap_room,
+                self.ps.tp_rank,
+            )
+        job = self.tree_cache.prepare_external_linker_prefetch(req)
+        if DAS_PREFETCH_TRACE_ENABLED:
+            trace_disagg_prefill(
+                "radix_prefetch_prepare_done",
+                req.rid,
+                req.bootstrap_room,
+                self.ps.tp_rank,
+                job_created=job is not None,
+                locally_eligible=(job.locally_eligible if job is not None else False),
+                transfer_count=(len(job.transfers) if job is not None else 0),
+            )
+        if job is not None:
+            if self._bg_prefetch_rooms is not None:
+                self._bg_prefetch_rooms[job.rid] = req.bootstrap_room
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_job_enqueue_start",
+                    job.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    requested_epoch=self._bg_requested_epoch,
+                    completed_epoch=self._bg_completed_epoch,
+                )
+            self._bg_prefetch_jobs.put(job)
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bg_prefetch_job_enqueued",
+                    job.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    requested_epoch=self._bg_requested_epoch,
+                    completed_epoch=self._bg_completed_epoch,
+                    queue_size=self._bg_prefetch_jobs.qsize(),
+                )
+
+    def _complete_waiting_queue_prefetch_lookups(self) -> list[str]:
+        """Freeze prefetch snapshots only after main-thread lookup publication."""
+        requests = list(self.waiting_queue)
+        bootstrap = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        if bootstrap is not None:
+            requests.extend(bootstrap.queue)
+        deferred = []
+        seen = set()
+        for req in requests:
+            if req.rid in seen or not getattr(
+                req, "waiting_queue_dfs_lookup_pending", False
+            ):
+                continue
+            seen.add(req.rid)
+            if req.finished() or req.prefill_attempt_count != 0:
+                req.waiting_queue_dfs_lookup_pending = False
+                continue
+            deferred.append(req)
+        if not deferred:
+            return []
+
+        # A completed load may have changed the L1 prefix since the original
+        # probe. Rematch on the scheduler thread; a replacement lookup waits
+        # for the next event-publication pass, never becoming a false miss.
+        for req in deferred:
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        # Cross-rank eligibility remains the responsibility of the existing
+        # background coordinator, which also handles rank-local queue arrivals.
+        for req in deferred:
+            if not self.tree_cache.is_external_lookup_pending(req.rid):
+                self._enqueue_waiting_queue_prefetch(req)
+                req.waiting_queue_dfs_lookup_pending = False
+        # Include bootstrap requests: a peer may already have moved the same
+        # request into its waiting queue and be checking admission.
+        return [req.rid for req in deferred if req.waiting_queue_dfs_lookup_pending]
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -4137,9 +4184,11 @@ class Scheduler(
 
         waiting_queue_prefetch_states = {}
         if self.enable_waiting_queue_dfs_prefetch:
+            pending_lookup_rids = self._complete_waiting_queue_prefetch_lookups()
             waiting_queue_prefetch_states = (
                 self.tree_cache.get_waiting_queue_prefetch_admission_states(
-                    [req.rid for req in self.waiting_queue]
+                    [req.rid for req in self.waiting_queue],
+                    pending_lookup_rids=pending_lookup_rids,
                 )
             )
 
