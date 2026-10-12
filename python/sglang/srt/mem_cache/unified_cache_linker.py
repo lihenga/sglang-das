@@ -485,7 +485,15 @@ class UnifiedCacheLinkerWrapper:
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
-            if transfer is None:
+            if transfer is not None:
+                component_transfers.append((component, transfer))
+
+            # A lookup hit does not guarantee that every rank can allocate the
+            # destination pools. Agree before the next pool or tree publication;
+            # the next pool may itself need a collective eviction decision.
+            allocated = torch.tensor([transfer is not None], dtype=torch.int)
+            cache._all_reduce_attn_groups(allocated, torch.distributed.ReduceOp.MIN)
+            if not allocated.item():
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT,
                     req,
@@ -493,7 +501,6 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                 )
                 return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
@@ -701,10 +708,21 @@ class UnifiedCacheLinkerWrapper:
 
     def drain_offloads(self, finish_count: int) -> None:
         assert finish_count <= len(self.pending_offloads)
-        for _ in range(finish_count):
+        if finish_count == 0:
+            return
+        # check_hicache_events has already agreed on finish_count. Async writes
+        # can still succeed on only some ranks. Use the common outcome so the
+        # next write-through pass retries the same nodes and holds the same
+        # locks on every rank.
+        successes = torch.tensor(
+            [self.cache_linker.pop_completed_offload() for _ in range(finish_count)],
+            dtype=torch.int,
+        )
+        self.cache._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        for success in successes.tolist():
             node_id, lock_params = self.pending_offloads.pop(0)
             node = self.cache.resolve_node_handle(node_id)
-            node.external_cache_stored = self.cache_linker.pop_completed_offload()
+            node.external_cache_stored = bool(success)
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def num_completed_loads(self) -> int:
