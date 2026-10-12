@@ -221,9 +221,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.host_prefetch_enabled = True
         linker.host_prefetch_limit = 8
-        linker.host_prefetch_max_bytes = 1 << 20
         linker.host_prefetch_generation = 0
-        linker._get_host_prefetch_object_sizes = Mock(return_value={"page-a": 4096})
         linker.host_prefetch_lock = threading.Lock()
         linker.host_prefetch_entries = {}
         linker.host_prefetch_queue = Queue()

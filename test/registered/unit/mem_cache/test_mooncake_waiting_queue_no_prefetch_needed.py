@@ -49,7 +49,7 @@ def _linker(exist=None, error=None):
 
 
 def _finish_no_prefetch(linker, rid="rid", keys=("k0", "k1")):
-    entry = {"state": "preparing", "session_rid": "session", "reserved_bytes": 7}
+    entry = {"state": "preparing", "session_rid": "session"}
     linker.host_prefetch_entries[rid] = entry
     linker._finish_host_prefetch(
         rid, entry, "session", "no_prefetch_needed", keys=list(keys)
@@ -63,7 +63,6 @@ class TestNoPrefetchNeededRevalidation(CustomTestCase):
         entry = _finish_no_prefetch(linker)
         self.assertEqual(entry["state"], "no_prefetch_needed")
         self.assertEqual(entry["no_prefetch_keys"], ["k0", "k1"])
-        self.assertEqual(entry["reserved_bytes"], 0)
         linker._abort_prepared_load_now.assert_called_once_with("session")
 
     def test_all_keys_present_is_valid(self):

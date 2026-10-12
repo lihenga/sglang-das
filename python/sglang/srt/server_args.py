@@ -2982,12 +2982,6 @@ class ServerArgs:
         "for waiting-queue prefetch. Capped by the request limit.",
         NS("memory"),
     ] = 2
-    mooncake_waiting_queue_dfs_prefetch_max_bytes: A[
-        int,
-        "Maximum estimated active pinned-buffer capacity for waiting-queue "
-        "DFS prefetch per scheduler rank.",
-        NS("memory"),
-    ] = 1073741824
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
