@@ -1741,7 +1741,7 @@ layer_mapping = {
 则最终 layout 可能形如:
 layout = [
     [
-        (base_ptr_component_0, stride_0, size_0, offset_0),
+        (base_ptr_component_0, stride_0, size_0, offset_0),  #stride：相邻 row/page 之间的字节间隔
     ],
     [
         (base_ptr_component_1, stride_1, size_1, offset_1),
@@ -1751,11 +1751,22 @@ layout = [
 layouts = [
     (
         keys,
-        locations,    # # 这些 page 在 Mooncake 中是否按 packed object 组织
+        locations,    # “读取哪些 page”的动态索引
         pool.packed,  # 这些 page 在 Mooncake 中是否按 packed object 组织
         layout,
     )
 ]
+
+layout     = 数组的起始地址和步长
+locations  = 要访问的数组下标
+例如：
+array_base_ptr = 0x10000000
+stride = 4096
+locations = [0, 8, 9]
+实际地址是：
+0x10000000 + 0 * 4096 = 0x10000000
+0x10000000 + 8 * 4096 = 0x10008000
+0x10000000 + 9 * 4096 = 0x10009000
 
         """
         batches = {}  #按物理 pool 聚合
@@ -1798,6 +1809,7 @@ layouts = [
 
         return layouts
 
+    #它把多个请求、多个物理 pool 中需要恢复的 KV Cache page 整理成一个 ReadPlan
     def load_with_read_plan(
         self,
         counter_index: int,
@@ -1812,7 +1824,7 @@ layouts = [
             borrowed_sessions=True,
             # 保留 pool/tensor owner，防止 native plan 尚持有地址时 Python
             # 对象已被 GC；session 则由外层 finally 统一归还，plan 只借用。
-            buffer_owners=self.pools,
+            buffer_owners=self.pools,  #内存生命周期保护
         )
         self.layer_done_counter.bind(counter_index, plan)
         # run()/wait() 会释放 GIL。普通模式下，每层只有在所有 pool 的字节数

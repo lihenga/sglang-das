@@ -101,6 +101,7 @@ def _normalize_tenant_id(value) -> str:
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
+# 给每个 Mooncake client 的 HTTP 指标服务分配一个不会冲突的端口。用于暴露客户端指标，例如监控、Prometheus 采集等。
 def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
     """为当前物理 scheduler 进程计算唯一的 Mooncake HTTP 指标端口。
 
@@ -1052,10 +1053,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         单 buffer 或多 buffer 组成。这里先展平所有 pool 的 key/地址/长度，
         同时保存各 transfer 在展平数组中的范围，I/O 完成后再还原成既有的
         ``pool -> per-page result`` 格式，避免改变上层完成语义。
+
+        每个 PoolTransfer 大致包含：
+        PoolTransfer(
+    name="KV",
+    keys=["page-a", "page-b"],
+    host_indices=...,       #page 在 host pool 中对应的索引
+)
+
         """
         all_key_strs: List[str] = []
         all_buffer_ptrs: List[Any] = []
         all_buffer_sizes: List[Any] = []
+        #_can_use_group_semantics 根据 Mooncake 是否支持 group semantics 决定是否创建 group ID 数组
+        #一个逻辑 page 的多个 physical object 会拥有同一个 group ID。这可以让 Mooncake 把：
+        # page0_k + page0_v视作一个逻辑复制/一致性组，而不是两个完全独立的对象。
         all_group_ids: Optional[List[str]] = (
             [] if self._can_use_group_semantics() else None
         )
@@ -1067,21 +1079,55 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             page_size = getattr(host_pool, "page_size", 1) or 1
             host_indices = transfer.host_indices
             assert len(keys) > 0
+            # len(host_indices)对应kv数量
             assert len(keys) == len(host_indices) // page_size
 
             # tagged_keys 对应逻辑 page，供 group semantics 展开 group id；
             # key_strs 则可能按 KV component 数量进一步展开为物理 object。
+            #_tag_keys给逻辑 key 加上 pool/backend/model 等命名空间信息
             tagged_keys = self._tag_keys(keys)
+            #根据 pool 类型给每个逻辑 page 加 component suffix。
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
+            #获取 host buffer 地址和大小：源内存地址；写入字节数
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(
                 host_indices
             )
             if len(ptr_list) != len(key_strs):
                 # 某些 pool 为一个 object 返回多个离散 buffer，此时把扁平
                 # 指针数组重组为 Mooncake multi-buffer API 需要的二维结构。
+
+                """
+key_strs = ["page0", "page1"]
+
+ptr_list = [
+    1000, 5000,  # page0 的两个 buffer
+    2000, 6000,  # page1 的两个 buffer
+]
+
+element_size_list = [
+    4096, 1024,
+    4096, 1024,
+]
+计算：
+nbuf = len(ptr_list) // len(key_strs)
+     = 4 // 2
+     = 2
+
+输出：
+ptr_list = [
+    [1000, 5000],  # page0
+    [2000, 6000],  # page1
+]
+
+element_size_list = [
+    [4096, 1024],  # page0
+    [4096, 1024],  # page1
+]
+
+                """                
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )
@@ -1112,6 +1158,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # pool 是多 buffer，就把其他 scalar 指针/长度包装成单元素列表；全部
         # 为 scalar 时保留一维形式，以继续使用更轻量的普通 batch put。
         if any(isinstance(ptr, Sequence) for ptr in all_buffer_ptrs):
+            """
+            对于原始数据：
+all_buffer_ptrs = [
+    1000,
+    [2000, 2100],
+    [3000, 3100],
+]
+转换过程如下：
+1000             → [1000]
+[2000, 2100]     → [2000, 2100]
+[3000, 3100]     → [3000, 3100]
+最终得到：
+all_buffer_ptrs = [
+    [1000],
+    [2000, 2100],
+    [3000, 3100],
+]
+如果不转换，第一个元素是整数，它可能会错误地判断整个批次是普通单-buffer 批次，最终调用错误的 Mooncake API。
+            """
             all_buffer_ptrs = [
                 list(ptr) if isinstance(ptr, Sequence) else [ptr]
                 for ptr in all_buffer_ptrs
@@ -1129,8 +1194,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "Mooncake batch_is_exist returned an unexpected result count: "
                 f"expected={len(all_key_strs)}, actual={len(exist_result)}"
             )
-
+        #构造初始的 I/O 结果：已存在 object → 0表示不需要写，直接成功，不存在 object → -1
         io_results = [0 if state == 1 else -1 for state in exist_result]
+        #提取真正需要写入的 object
         missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
         if missing_idx:
             put_results = self._put_batch_zero_copy_impl(
