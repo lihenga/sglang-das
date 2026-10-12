@@ -335,13 +335,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.host_prefetch_worker_count = int(
                 getattr(server_args, "mooncake_waiting_queue_dfs_prefetch_workers", 2)
             )
-            self.host_prefetch_max_bytes = int(
-                getattr(
-                    server_args,
-                    "mooncake_waiting_queue_dfs_prefetch_max_bytes",
-                    1073741824,
-                )
-            )
             if self.host_prefetch_limit <= 0:
                 raise ValueError(
                     "--mooncake-waiting-queue-dfs-prefetch-max-requests must be "
@@ -355,11 +348,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.host_prefetch_worker_count = min(
                 self.host_prefetch_worker_count, self.host_prefetch_limit
             )
-            if self.host_prefetch_max_bytes <= 0:
-                raise ValueError(
-                    "--mooncake-waiting-queue-dfs-prefetch-max-bytes must be "
-                    f"positive, got {self.host_prefetch_max_bytes}."
-                )
         if self.read_plan_reuse_ranges and not self.read_plan_enabled:
             raise ValueError(
                 "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES requires "
@@ -773,108 +761,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.prepared_load_sessions[rid] = acquired
         return True
 
-    @staticmethod
-    def _mooncake_dfs_alignment() -> int:
-        try:
-            return max(
-                4096,
-                int(os.environ.get("MOONCAKE_DFS_ALIGNMENT", "4096") or 4096),
-            )
-        except ValueError:
-            return 4096
-
-    @staticmethod
-    def _estimate_pinned_arena_capacity(
-        object_sizes: list[int], alignment: int
-    ) -> int:
-        """Conservatively mirror Mooncake's aligned DFS arena allocation."""
-        arena_size = 0
-        for object_size in object_sizes:
-            aligned_object_size = (
-                (object_size + alignment - 1) // alignment
-            ) * alignment
-            arena_size = ((arena_size + alignment - 1) // alignment) * alignment
-            arena_size += aligned_object_size
-
-        if not arena_size:
-            return 0
-        padded_size = arena_size + alignment - 1
-        if padded_size <= 1 << 20:
-            capacity = 4 << 10
-            while capacity < padded_size:
-                capacity *= 2
-            return capacity
-        large_alignment = 2 << 20
-        return (
-            (padded_size + large_alignment - 1) // large_alignment
-        ) * large_alignment
-
-    def _get_host_prefetch_object_sizes(
-        self, transfers: list[PoolTransfer]
-    ) -> dict[str, int] | None:
-        """Map tagged storage keys to one page's exact payload size."""
-        try:
-            expanded = self.pool_group.resolve_transfers(
-                transfers, allow_partial=True, allow_missing_kv=True
-            )
-            if not expanded:
-                return None
-
-            object_sizes: dict[str, int] = {}
-            for transfer in expanded:
-                page_keys = list(transfer.keys or ())
-                if not page_keys:
-                    continue
-                component_keys, key_multiplier = (
-                    self.storage._get_hybrid_page_component_keys(
-                        page_keys, transfer
-                    )
-                )
-                pool = self.pools.get(transfer.name)
-                if pool is None or key_multiplier <= 0:
-                    return None
-
-                # Each metadata row describes one logical page. Group its
-                # buffer sizes the same way MooncakeStore packs buffers into
-                # the component keys returned above.
-                page_buffer_sizes = [
-                    size
-                    for component in pool.buffer_meta
-                    for _, _, size in component
-                ]
-                if (
-                    not page_buffer_sizes
-                    or len(page_buffer_sizes) % key_multiplier
-                    or len(component_keys) != len(page_keys) * key_multiplier
-                ):
-                    return None
-                buffers_per_object = len(page_buffer_sizes) // key_multiplier
-                if buffers_per_object <= 0:
-                    return None
-                object_payload_sizes = [
-                    sum(
-                        page_buffer_sizes[
-                            object_index
-                            * buffers_per_object : (object_index + 1)
-                            * buffers_per_object
-                        ]
-                    )
-                    for object_index in range(key_multiplier)
-                ]
-                tagged_keys = self.storage._tag_keys(component_keys)
-                for index, key in enumerate(tagged_keys):
-                    size = object_payload_sizes[index % key_multiplier]
-                    if size <= 0:
-                        return None
-                    object_sizes[key] = max(object_sizes.get(key, 0), size)
-            return object_sizes or None
-        except Exception:
-            logger.warning(
-                "Could not estimate Mooncake waiting-queue prefetch bytes.",
-                exc_info=True,
-            )
-            return None
-
     def submit_host_prefetch(
         self, rid: str, transfers: list[PoolTransfer]
     ) -> bool:
@@ -885,17 +771,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         if kv_transfer is None or not kv_transfer.keys:
             return False
-        object_sizes = self._get_host_prefetch_object_sizes(transfers)
-        if object_sizes is None:
-            return False
-
-        alignment = self._mooncake_dfs_alignment()
-        estimated_bytes = self._estimate_pinned_arena_capacity(
-            list(object_sizes.values()), alignment
-        )
-        if not estimated_bytes or estimated_bytes > self.host_prefetch_max_bytes:
-            return False
-
         with self.host_prefetch_lock:
             active = sum(
                 entry.get("state")
@@ -909,15 +784,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 }
                 for entry in self.host_prefetch_entries.values()
             )
-            reserved_bytes = sum(
-                int(entry.get("reserved_bytes", 0))
-                for entry in self.host_prefetch_entries.values()
-            )
-            if (
-                rid in self.host_prefetch_entries
-                or active >= self.host_prefetch_limit
-                or reserved_bytes + estimated_bytes > self.host_prefetch_max_bytes
-            ):
+            if rid in self.host_prefetch_entries or active >= self.host_prefetch_limit:
                 return False
             self.host_prefetch_generation += 1
             generation = self.host_prefetch_generation
@@ -927,8 +794,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "cancelled": False,
                 "transfers": queued_transfers,
                 "session_rid": self._host_prefetch_session_rid(rid, generation),
-                "object_sizes": object_sizes,
-                "reserved_bytes": estimated_bytes,
             }
 
         # Session creation can contact DFS. The scheduler only publishes the
@@ -1121,14 +986,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         key: self.session_sources.get(key, "unknown")
                         for key in keys
                     }
-                object_sizes = entry.get("object_sizes", {})
-                if not isinstance(object_sizes, dict) or any(
-                    key not in object_sizes for key in keys
-                ):
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
-                    continue
                 dfs_keys = [
                     key
                     for key in keys
@@ -1140,40 +997,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                     continue
 
-                alignment = self._mooncake_dfs_alignment()
-                dfs_estimated_bytes = self._estimate_pinned_arena_capacity(
-                    [int(object_sizes[key]) for key in dfs_keys], alignment
-                )
                 with self.host_prefetch_lock:
                     current = self.host_prefetch_entries.get(rid)
                     if current is not entry or current.get("cancelled"):
                         cancelled = True
-                        within_budget = False
                     else:
                         cancelled = False
-                        other_reserved_bytes = sum(
-                            int(other.get("reserved_bytes", 0))
-                            for other_rid, other in self.host_prefetch_entries.items()
-                            if other_rid != rid
-                        )
-                        within_budget = (
-                            other_reserved_bytes + dfs_estimated_bytes
-                            <= self.host_prefetch_max_bytes
-                        )
-                        if within_budget:
-                            current["reserved_bytes"] = dfs_estimated_bytes
-                            current["state"] = "reading"
+                        current["state"] = "reading"
                 if cancelled:
                     self._finish_host_prefetch(
                         rid, entry, session_rid, "failed"
                     )
                     continue
-                if not within_budget:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
-                    continue
-
                 try:
                     results = list(
                         self.storage.store.batch_get_session_prefetch(dfs_keys)
@@ -1223,7 +1058,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     # revalidate_no_prefetch_needed). Published together with
                     # the state under the same lock.
                     current["no_prefetch_keys"] = list(keys or ())
-                    current["reserved_bytes"] = 0
                 current["state"] = outcome
                 keep_session = outcome == "dfs_prefetched"
             if current is entry:
@@ -1231,7 +1065,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.host_prefetch_entries.pop(rid, None)
                 elif outcome not in {"dfs_prefetched", "no_prefetch_needed"}:
                     current["state"] = "failed"
-                    current["reserved_bytes"] = 0
         if not keep_session:
             self._abort_prepared_load_now(session_rid)
 

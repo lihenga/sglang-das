@@ -104,7 +104,6 @@ def _prefetch_backend(other_holder, claim="ok"):
             "state": "dfs_prefetched",
             "cancelled": False,
             "session_rid": SESSION,
-            "reserved_bytes": 8 << 10,
         }
     }
     linker.prepared_load_sessions = {SESSION: ["k0"]}
@@ -143,7 +142,6 @@ def _no_prefetch_needed_backend():
             "state": "no_prefetch_needed",
             "cancelled": False,
             "session_rid": SESSION,
-            "reserved_bytes": 0,
             "no_prefetch_keys": ["k0"],
         }
     }
