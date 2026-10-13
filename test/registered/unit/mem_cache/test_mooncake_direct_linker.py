@@ -175,6 +175,8 @@ def test_lookup_returns_sparse_mamba_boundaries():
     linker.stats = {"lookup": 0}
     linker.storage = MooncakeStore.__new__(MooncakeStore)
     linker.storage.mem_pool_host = SimpleNamespace(kv_buffer=None)
+    linker.storage.pp_rank = 0
+    linker.storage.pp_size = 1
     linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
         [f"{key}_{transfer.name}" for key in keys],
         1,
@@ -195,6 +197,43 @@ def test_lookup_returns_sparse_mamba_boundaries():
         ],
     )
     assert valid == [2, 4]
+
+
+def test_lookup_requires_each_pp_shard_for_a_page():
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    pools = [
+        SimpleNamespace(
+            name=name,
+            indices_from_pool=name,
+            translate_indices=lambda indices: indices,
+        )
+        for name in (PoolName.KV, PoolName.INDEXER)
+    ]
+    linker.pool_group = DevicePoolGroup(pools, num_layers=4, page_size=1)
+    linker.pools = linker.pool_group.entry_map
+    linker.stats = {"lookup": 0}
+    linker.storage = MooncakeStore.__new__(MooncakeStore)
+    linker.storage.mem_pool_host = SimpleNamespace(kv_buffer=None)
+    linker.storage.pp_rank = 0
+    linker.storage.pp_size = 2
+    linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+        [f"{key}_cp0_pp0_{transfer.name}" for key in keys],
+        1,
+    )
+    linker.storage._tag_keys = lambda keys: keys
+    linker.storage._batch_exist = lambda keys: [
+        int(key != "b_cp0_pp1_indexer") for key in keys
+    ]
+
+    valid = linker.lookup(
+        "rid",
+        [
+            PoolTransfer(name=PoolName.KV, keys=["a", "b"]),
+            PoolTransfer(name=PoolName.INDEXER, keys=["a", "b"]),
+        ],
+    )
+
+    assert valid == [1]
 
 
 def test_tail_hashes_honor_radix_key_limit():
