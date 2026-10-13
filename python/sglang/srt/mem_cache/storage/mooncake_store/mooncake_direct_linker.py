@@ -157,7 +157,7 @@ class LayerWiseLoadCounter:
         self.futures.clear()
         self.reported.clear()
 
-
+#后台加载线程和模型 forward 线程之间的桥梁
 class ReadPlanLoadCounter:
     """发布一个 Mooncake ReadPlan，并在不持有 GIL 时按层等待。
 
@@ -1451,7 +1451,8 @@ ReadPlanLoadCounter 会为一次加载批次创建一个 ReadPlan，并在模型
         self.freeze_gc_once()
         pending = self.pending_loads
         self.pending_loads = {}
-
+#对于readplan，counter_index自增是否有问题，forward是否能够根据counter_index拿到正确的数据信息
+# readplane为啥自己实现了一个counter？  start_layer_wise_loading怎么触发的调用？
         counter_index = self.layer_done_counter.update_producer()
         ready_event = device_module.Event()
         ready_event.record()
