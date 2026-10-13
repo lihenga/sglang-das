@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_layout import (
     CpCacheLayerSplitDeepSeekV4PoolLayout,
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_storage import allocate_dsv4_buffer
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
@@ -163,11 +164,11 @@ class DeepSeekV4SingleKVPool(KVCache):
         if self.is_bf16_attention_kv_cache:
             self.kv_cache_total_dim = self.logical_kv_dim
             self.bytes_per_page_padded = self.page_size * bytes_per_token
-            return torch.zeros(
-                num_pages,
-                self.page_size * self.logical_kv_dim,
+            return allocate_dsv4_buffer(
+                (num_pages, self.page_size * self.logical_kv_dim),
                 dtype=self.store_dtype,
                 device=self.device,
+                init="zeros",
             )
 
         self.kv_cache_total_dim = bytes_per_token
@@ -180,11 +181,11 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         assert self.store_dtype == torch.uint8
 
-        return torch.zeros(
-            num_pages,
-            self.bytes_per_page_padded,
+        return allocate_dsv4_buffer(
+            (num_pages, self.bytes_per_page_padded),
             dtype=self.store_dtype,
             device=self.device,
+            init="zeros",
         )
 
     def set_key_buffer(
@@ -422,11 +423,14 @@ class DeepSeekV4IndexerPool(KVCache):
                 else nullcontext()
             ):
                 self.index_k_with_scale_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size + 1) // self.page_size,
-                        page_bytes,
+                    allocate_dsv4_buffer(
+                        (
+                            (self.size + self.page_size + 1) // self.page_size,
+                            page_bytes,
+                        ),
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=self.device,
+                        init="zeros",
                     )
                     for _ in range(self.layer_num)
                 ]

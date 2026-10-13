@@ -7,6 +7,7 @@ from math import gcd
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.mem_cache.deepseek_v4_storage import allocate_dsv4_buffer
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -168,10 +169,11 @@ class CompressStatePool:
                 else nullcontext()
             ):
                 self.kv_score_buffer = KVAndScore(
-                    torch.empty(
+                    allocate_dsv4_buffer(
                         (self._size, self.last_dim),
                         dtype=dtype,
                         device=device,
+                        init="empty",
                     )
                 )
 
