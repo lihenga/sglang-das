@@ -334,12 +334,6 @@ class PrefillBootstrapQueue:
                 "DeepSeek-V4 PD prefill admission uses full token pool capacity: %d",
                 self.max_total_num_tokens,
             )
-        elif self.scheduler.tp_worker.is_hybrid_swa:
-            # Hybrid-SWA prefill otherwise consumes the full prompt in the SWA pool.
-            self.max_total_num_tokens = min(
-                self.max_total_num_tokens,
-                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
-            )
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
