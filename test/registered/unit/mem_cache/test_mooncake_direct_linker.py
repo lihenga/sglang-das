@@ -236,6 +236,30 @@ def test_lookup_requires_each_pp_shard_for_a_page():
     assert valid == [1]
 
 
+def test_revalidate_load_rejects_evicted_remote_object():
+    missing_updates = []
+    transfers = [PoolTransfer(name=PoolName.KV, keys=["a", "b"])]
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker._load_revalidation_groups = ()
+    linker.pool_group = SimpleNamespace(
+        resolve_transfers=lambda items, **kwargs: items
+    )
+    linker.storage = SimpleNamespace(
+        _get_hybrid_page_component_keys=lambda keys, transfer: (
+            [f"{key}_component" for key in keys],
+            1,
+        ),
+        _tag_keys=lambda keys: [f"tenant/{key}" for key in keys],
+        _batch_exist=lambda keys: [1, 0],
+        failed_get_cache=SimpleNamespace(
+            update_batch=lambda hits, missing: missing_updates.append((hits, missing))
+        ),
+    )
+
+    assert linker.revalidate_load(transfers) is False
+    assert missing_updates == [([], ["tenant/b_component"])]
+
+
 def test_tail_hashes_honor_radix_key_limit():
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = SimpleNamespace(page_size=256)

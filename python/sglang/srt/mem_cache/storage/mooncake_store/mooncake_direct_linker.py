@@ -236,6 +236,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        self._load_revalidation_groups = ()
+        if (
+            getattr(kvcache, "layer_shard_enabled", False)
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            self._load_revalidation_groups = tuple(
+                group
+                for group in (params.attn_cp_cache_group, params.attn_tp_cache_group)
+                if group is not None
+                and torch.distributed.get_world_size(group=group) > 1
+            )
 
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -585,6 +597,61 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(restorable),
             )
         return restorable
+
+    def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
+        valid = self._revalidate_load_local(transfers)
+        groups = getattr(self, "_load_revalidation_groups", ())
+        if groups:
+            # LayerSplit shards can be evicted independently after lookup.
+            # All CP ranks must either restore or recompute the same prefix.
+            verdict = torch.tensor([int(valid)], dtype=torch.int)
+            for group in groups:
+                torch.distributed.all_reduce(
+                    verdict, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+            valid = bool(verdict.item())
+        return valid
+
+    def _revalidate_load_local(self, transfers: list[PoolTransfer]) -> bool:
+        """Re-check remote objects before committing device slots to a load.
+
+        Remote objects may be evicted between lookup and load-back. A missing
+        object turns the request into a cache miss instead of letting the
+        asynchronous layer-wise load fail after scheduling has committed it.
+        Revalidation errors retain the existing load behavior.
+        """
+        try:
+            resolved = self.pool_group.resolve_transfers(
+                transfers, allow_partial=True, allow_missing_kv=True
+            )
+            if not resolved:
+                return True
+            key_strs: list[str] = []
+            for transfer in resolved:
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                key_strs.extend(self.storage._tag_keys(component_keys))
+            if not key_strs:
+                return True
+            exist = self.storage._batch_exist(key_strs)
+        except BaseException:
+            logger.exception("Mooncake direct linker load revalidation error")
+            return True
+        missing = [key for key, state in zip(key_strs, exist) if state != 1]
+        if missing:
+            logger.warning(
+                "Mooncake direct linker load revalidation failed: "
+                "missing=%d/%d keys (master eviction race), "
+                "degrading request to cache miss",
+                len(missing),
+                len(key_strs),
+            )
+            failed_get_cache = getattr(self.storage, "failed_get_cache", None)
+            if failed_get_cache is not None:
+                failed_get_cache.update_batch([], missing)
+            return False
+        return True
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
@@ -1549,12 +1616,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def pop_completed_offload(self) -> bool:
         return self.offload_results.get_nowait()
-
-    def num_completed_loads(self) -> int:
-        return self.completed_loads.qsize()
-
-    def pop_completed_load(self) -> tuple[list[str], bool]:
-        return self.completed_loads.get_nowait()
 
     def reset(self) -> None:
         with self.host_prefetch_lock:
