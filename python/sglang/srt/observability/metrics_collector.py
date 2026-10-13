@@ -2021,6 +2021,18 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
+        """记录形式：
+        sglang:prefetched_tokens_total{
+    storage_backend="mooncake_direct",
+    tp_rank="0",
+    dp_rank="0",
+    pp_rank="0",
+    pp_size="1",
+    attn_cp_rank="0",
+    attn_cp_size="1"
+} 384
+
+        """
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
 

@@ -205,7 +205,7 @@ Python 只描述静态 buffer 布局、key 和 location；具体地址展开、�
     def set_consumer(self, index: int) -> None:
         self.consumer_index = index
 
-    #后台线程在 plan.run() 前把 native ReadPlan 发布给 forward
+    #后台线程在 plan.run() 前把 native ReadPlan 发布给 forward（后台线程发布 plan）
     def bind(self, index: int, plan) -> None:
         self.plans[index].set_result(plan)
 
@@ -1580,7 +1580,7 @@ ReadPlanLoadCounter 会为一次加载批次创建一个 ReadPlan，并在模型
         )
         if recorder is not None:
             try:
-                #用于更新 Mooncake 自身的内部指标或统计信息。
+                #用于更新 Mooncake 自身的内部指标或统计信息。【Mooncake 的监控可以独立于 SGLang collector，mooncake识别不了token，多个pool会重复计算】
                 recorder(tokens)
             except BaseException:
                 logger.warning(
@@ -1734,10 +1734,10 @@ indices = [
 joined = tensor([0, 1, 8, 9])
 locations = pool.prepare_locations(joined)
 假设有两层，且：
-layer_mapping = {
+逻辑层映射layer_mapping = {
     0: 0,
     1: 1,
-}
+} 含义：逻辑层 0 -> kv_buffer[0]
 则最终 layout 可能形如:
 layout = [
     [
@@ -1751,11 +1751,11 @@ layout = [
 layouts = [
     (
         keys,
-        locations,    # “读取哪些 page”的动态索引
+        locations,    # “读取哪些 page”的动态索引，kv_buffer的row，base_ptr_component_0是buffer的起始地址
         pool.packed,  # 这些 page 在 Mooncake 中是否按 packed object 组织
         layout,
     )
-]
+]  每一个 元组 对应一个 physical pool
 
 layout     = 数组的起始地址和步长
 locations  = 要访问的数组下标
@@ -1773,17 +1773,33 @@ locations = [0, 8, 9]
         for _rid, transfers in request_transfers:
             for transfer in transfers:
                 keys, indices = batches.setdefault(transfer.name, ([], []))
+                # page key转成mooncake的object key
                 component_keys, _ = self.storage._get_hybrid_page_component_keys(
                     list(transfer.keys), transfer
                 )
                 keys.extend(self.storage._tag_keys(component_keys))
                 indices.append(transfer.host_indices)
 
+        """聚合后：
+        batches = {
+    PoolName.KV: (
+        [
+            "model-config-page-a0_0_k...",
+            "model-config-page-a1_0_k...",
+            "model-config-page-b0_0_k...",
+        ],
+        [
+            request_a_host_indices,
+            request_b_host_indices,
+        ],
+    )
+}
+        """
         layouts = []
         for name, (keys, indices) in batches.items():
             pool = self.pools[name]
             joined = indices[0] if len(indices) == 1 else torch.cat(indices)
-            locations = pool.prepare_locations(joined)
+            locations = pool.prepare_locations(joined)  #host_indices 转成 locations
             layout = []
             for layer in range(self.num_layers):
                 mapped = pool.layer_mapping.get(layer)
