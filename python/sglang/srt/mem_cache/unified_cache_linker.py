@@ -23,7 +23,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import torch
 
@@ -375,6 +375,14 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
+        # A repeated probe must not leave an older, longer load marker behind.
+        self.hit_markers.pop(req.rid, None)
+        device_hit_pages = device_hit_len // page
+        if cache.supports_mamba():
+            # Intermediate Mamba states are not necessarily checkpointed.
+            req.pp_cache_prefix_pages = 1 | (1 << device_hit_pages)
+        else:
+            req.pp_cache_prefix_pages = (1 << (device_hit_pages + 1)) - 1
         if device_hit_len >= len(key):
             return result
 
@@ -397,6 +405,8 @@ class UnifiedCacheLinkerWrapper:
             self.cache_linker.lookup(req.rid, lookup_transfers),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
+            req=req,
+            device_prefix_pages=device_hit_pages,
         )
         if hit_pages == 0:
             return result
@@ -426,7 +436,9 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
+        self, restorable: list[int], *, num_pages: int, device_hit_pages: int,
+        req: Optional[Req] = None,
+        device_prefix_pages: int = 0,
     ) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix.
@@ -441,6 +453,9 @@ class UnifiedCacheLinkerWrapper:
                 mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
+        if req is not None:
+            for pages in common.flatten().tolist():
+                req.pp_cache_prefix_pages |= 1 << (device_prefix_pages + pages)
         if common.numel() == 0:
             return 0
         return int(common[-1].item())
