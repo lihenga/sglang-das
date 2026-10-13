@@ -2911,6 +2911,14 @@ class ServerArgs:
         "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
         NS("memory"),
     ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake", "mori"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
     mooncake_page_wise_load_threshold: A[
         int,
         "Minimum number of Mooncake direct-linker keys that switches loading "
