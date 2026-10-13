@@ -192,7 +192,7 @@ Python 只描述静态 buffer 布局、key 和 location；具体地址展开、�
         self.num_layers = num_layers
         self.producer_index = self.consumer_index = -1
         self.plans: dict[int, Future] = {}
-        # 一个 plan 的错误可能在多层 wait 中重复出现，只记录一次。
+        # 一个 plan 的错误可能在多层 wait 中重复出现，只记录一次。避免重复记录日志
         self.reported: set[int] = set()
 
     #为加载批次分配 ID，并提前创建用于发布 ReadPlan 的 Future
@@ -1443,6 +1443,8 @@ ReadPlanLoadCounter 会为一次加载批次创建一个 ReadPlan，并在模型
         freeze_gc("Mooncake direct linker")
         self.gc_frozen = True
 
+#把此前通过 load() 累积起来的所有待加载请求封装成一个批次，分配一个逐层完成计数器，
+# 把批次放入后台加载线程的队列，然后立即返回批次编号。
     def start_layer_wise_loading(self) -> int:
         if not self.pending_loads:
             return -1
