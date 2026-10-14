@@ -981,7 +981,16 @@ class SWAComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             num_tokens = len(tail_keys) * page
             allocator = self.cache.token_to_kv_pool_allocator.swa_attn_allocator
-            shortfall = max(0, num_tokens - allocator.available_size())
+            # Evict the same amount on all ranks even if async pins left
+            # different free capacities. Local-only eviction would change the
+            # next request's device prefix on only a subset of ranks.
+            shortfall_tensor = torch.tensor(
+                [max(0, num_tokens - allocator.available_size())], dtype=torch.int64
+            )
+            self.cache._all_reduce_attn_groups(
+                shortfall_tensor, torch.distributed.ReduceOp.MAX
+            )
+            shortfall = int(shortfall_tensor.item())
             if shortfall:
                 self.cache.evict(EvictParams(swa_num_tokens=shortfall))
             transfer.device_indices = allocator.alloc(num_tokens)

@@ -531,6 +531,7 @@ class PrefillAdder:
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
+        self._linker_token_budgets = None
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
@@ -667,8 +668,40 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
+    def _sync_linker_budgets(self):
+        """Snapshot common budgets at shared scheduler decision boundaries.
+
+        Async direct-L3 offloads can temporarily pin different amounts of KV
+        memory on different ranks. Local budgets must not select different
+        requests or chunk lengths. Keep collectives out of the properties:
+        their reads can be short-circuited by admission branches.
+        """
+        self._linker_token_budgets = None
+        if getattr(self.tree_cache, "linker", None) is None:
+            return
+        budgets = torch.tensor(
+            [
+                self.rem_total_tokens,
+                self.cur_rem_tokens,
+                self.rem_swa_tokens if self.is_hybrid_swa else 0,
+                self.rem_mamba_slots if self.rem_mamba_slots is not None else -1,
+            ],
+            dtype=torch.float64,
+        )
+        self.tree_cache._all_reduce_attn_groups(budgets, torch.distributed.ReduceOp.MIN)
+        total, current, swa, mamba = budgets.tolist()
+        self._linker_token_budgets = (
+            total + self.rem_total_token_offset,
+            current + self.cur_rem_token_offset,
+            swa + self.rem_swa_token_offset,
+        )
+        if self.rem_mamba_slots is not None:
+            self.rem_mamba_slots = int(mamba)
+
     @property
     def rem_total_tokens(self):
+        if (budgets := getattr(self, "_linker_token_budgets", None)) is not None:
+            return budgets[0] - self.rem_total_token_offset
         if self.is_all_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.swa_available_size()
@@ -693,6 +726,8 @@ class PrefillAdder:
 
     @property
     def rem_swa_tokens(self):
+        if (budgets := getattr(self, "_linker_token_budgets", None)) is not None:
+            return budgets[2] - self.rem_swa_token_offset
         return (
             self.token_to_kv_pool_allocator.swa_available_size()
             + self.tree_cache.swa_evictable_size()
@@ -701,6 +736,8 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
+        if (budgets := getattr(self, "_linker_token_budgets", None)) is not None:
+            return budgets[1] - self.cur_rem_token_offset
         if self.is_all_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.swa_available_size()
@@ -839,6 +876,7 @@ class PrefillAdder:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
+        self._sync_linker_budgets()
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
@@ -1002,6 +1040,7 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        self._sync_linker_budgets()
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1070,6 +1109,7 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
+        self._sync_linker_budgets()
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1208,6 +1248,7 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        self._sync_linker_budgets()
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
@@ -1278,6 +1319,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
+            self._sync_linker_budgets()
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
@@ -1439,6 +1481,7 @@ class PrefillAdder:
         Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.
         """
+        self._sync_linker_budgets()
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
