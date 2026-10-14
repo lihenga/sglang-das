@@ -1006,10 +1006,6 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-        # PP prefill negotiates one reusable prefix before admission. Later
-        # cache probes must not extend it independently on another PP stage.
-        self.pp_prefill_prefix_limit: Optional[int] = None
-        self.pp_cache_prefix_pages: int = 1
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
@@ -1443,8 +1439,6 @@ class Req(ReqDllmMixin):
         # the decode-committed prefix would leave holes that abort the transfer.
         if self.pd_hidden_max_prefix_len is not None:
             max_prefix_len = min(max_prefix_len, self.pd_hidden_max_prefix_len)
-        if self.pp_prefill_prefix_limit is not None:
-            max_prefix_len = min(max_prefix_len, self.pp_prefill_prefix_limit)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313

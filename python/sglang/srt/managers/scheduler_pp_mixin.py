@@ -313,17 +313,6 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                    if pp_proxy_tensors is not None:
-                        upstream_plan = pp_proxy_tensors.tensors.pop(
-                            "pp_prefill_plan", None
-                        )
-                        local_plan = self._pp_prefill_plan(cur_batch)
-                        if upstream_plan != local_plan:
-                            raise RuntimeError(
-                                "PP prefill token ranges disagree before forward: "
-                                f"upstream={upstream_plan}, local={local_plan}"
-                            )
-
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -400,7 +389,7 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            self._pp_prepare_proxy_tensor_dict_for_send(result, cur_batch),
+                            self._pp_prepare_proxy_tensor_dict_for_send(result),
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -869,16 +858,10 @@ class SchedulerPPMixin:
         # waiting_queue before bootstrap notify is done. Here we only advance
         # bootstrap/transfer states.
         if bootstrapped_rids is not None:
-            good_consensus_bootstrapped_rids, bad_consensus_bootstrapped_rids = (
-                bootstrapped_rids[:2]
-            )
-            prefix_pages = bootstrapped_rids[2] if len(bootstrapped_rids) > 2 else None
-            if prefix_pages is not None:
-                for req in self.disagg_prefill_bootstrap_queue.queue:
-                    if req.rid in prefix_pages:
-                        req.pp_prefill_prefix_limit = (
-                            prefix_pages[req.rid].bit_length() - 1
-                        ) * self.page_size
+            (
+                good_consensus_bootstrapped_rids,
+                bad_consensus_bootstrapped_rids,
+            ) = bootstrapped_rids
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
@@ -890,10 +873,7 @@ class SchedulerPPMixin:
             # if ready_reqs:
             #     self._try_send_prefill_kv_ready_batch(ready_reqs)
             self.waiting_queue.extend(good_reqs)
-            result = [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
-            if prefix_pages is not None:
-                result.append({req.rid: prefix_pages[req.rid] for req in good_reqs})
-            return result
+            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
     def _pp_ordered_intersection(
@@ -915,7 +895,6 @@ class SchedulerPPMixin:
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
-        previous_prefix_pages = None
         if self.pp_group.is_first_rank:
             # Probe local credits without reserving resources before consensus.
             good_bootstrapped_rids, bad_bootstrapped_rids = (
@@ -925,10 +904,8 @@ class SchedulerPPMixin:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids[:2]
+                prev_bootstrapped_rids
             )
-            if len(prev_bootstrapped_rids) > 2:
-                previous_prefix_pages = prev_bootstrapped_rids[2]
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
@@ -950,22 +927,7 @@ class SchedulerPPMixin:
         good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
             good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
         )
-        result = [good_bootstrapped_rids, bad_bootstrapped_rids]
-        if getattr(self.tree_cache, "linker", None) is not None:
-            reqs = {req.rid: req for req in self.disagg_prefill_bootstrap_queue.queue}
-            prefix_pages = {}
-            for rid in good_bootstrapped_rids:
-                req = reqs[rid]
-                req.init_next_round_input(self.tree_cache, cow_mamba=False)
-                candidates = req.pp_cache_prefix_pages
-                if previous_prefix_pages is not None:
-                    candidates &= previous_prefix_pages[rid]
-                prefix_pages[rid] = candidates
-            # Piggyback on the existing asynchronous bootstrap consensus. A
-            # synchronous PP collective inside match_prefix can deadlock the
-            # pipeline while another stage is still waiting for its proxy.
-            result.append(prefix_pages)
-        return result
+        return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -1141,27 +1103,13 @@ class SchedulerPPMixin:
             tensor_dict["pd_aux_hidden_states_0"] = result.logits_output.hidden_states
         return tensor_dict
 
-    @staticmethod
-    def _pp_prefill_plan(batch: ScheduleBatch):
-        if not batch.reqs:
-            return []
-        return [
-            (req.rid, prefix, length)
-            for req, prefix, length in zip(
-                batch.reqs, batch.prefix_lens, batch.extend_lens
-            )
-        ]
-
     def _pp_prepare_proxy_tensor_dict_for_send(
-        self: Scheduler, result: GenerationBatchResult,
-        batch: Optional[ScheduleBatch] = None,
+        self: Scheduler, result: GenerationBatchResult
     ) -> Dict[str, torch.Tensor]:
         tensor_dict = result.pp_hidden_states_proxy_tensors.tensors
-        if result.can_run_cuda_graph:
-            tensor_dict = {name: tensor.clone() for name, tensor in tensor_dict.items()}
-        if batch is not None:
-            tensor_dict["pp_prefill_plan"] = self._pp_prefill_plan(batch)
-        return tensor_dict
+        if not result.can_run_cuda_graph:
+            return tensor_dict
+        return {name: tensor.clone() for name, tensor in tensor_dict.items()}
     def _pp_should_owner_direct_pd_hidden(
         self: Scheduler, batch: ScheduleBatch
     ) -> bool:
