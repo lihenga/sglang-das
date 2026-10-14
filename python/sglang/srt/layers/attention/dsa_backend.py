@@ -3326,6 +3326,7 @@ class DeepseekSparseAttnBackend(
                 indices=compact_indices.unsqueeze(1),
                 sm_scale=sm_scale,
                 d_v=v_head_dim,
+                topk_length=cache_seqlens,
             )
             o = o.unsqueeze(1)
         else:
