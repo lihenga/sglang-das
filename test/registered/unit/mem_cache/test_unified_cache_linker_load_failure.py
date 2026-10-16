@@ -145,10 +145,20 @@ def test_scheduler_marks_failed_load_request_for_abort():
         skip_radix_cache_insert=False,
         time_stats=SimpleNamespace(trace_ctx=trace),
         finished=lambda: False,
+        disagg_kv_sender=None,
+        external_kv_cleanup_done=False,
+        external_kv_abort_requested=False,
+        external_kv_pending_chunk_cleared=False,
+        external_kv_linker_released=False,
+        external_kv_sender_abort_requested=False,
     )
     released = []
-    scheduler = SimpleNamespace(
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.__dict__.update(
         _deferred_linker_rids=set(),
+        _external_kv_abort_rids=set(),
+        _external_kv_cleanup_rids=set(),
+        disagg_prefill_pending_chunk_rids=set(),
         tree_cache=SimpleNamespace(
             drain_linker_loads=lambda: ["rid-a"],
             has_outstanding_failed_linker_chains=lambda: False,

@@ -857,11 +857,7 @@ def _offload_completion_rank(rank, port, outputs):
             offload=offload,
         )
         wrapper.pending_offloads = [
-            types.SimpleNamespace(
-                lock_node_id=node_id,
-                lock_params=f"lock-{node_id}",
-                publish_node_ids=[node_id],
-            )
+            (node_id, f"lock-{node_id}")
             for node_id in (7, 8)
         ]
         cache.linker = wrapper

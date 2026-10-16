@@ -232,7 +232,6 @@ class TestResourceCleanup(unittest.TestCase):
                 "release_kv_cache",
                 "_release_aborted_kv_cache",
                 "_release_overallocated_kv_indices",
-                "_release_donated_swa_slots",
             ],
             env,
         )
