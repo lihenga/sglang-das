@@ -301,6 +301,10 @@ class UnifiedCacheLinker(ABC):
     def disable_waiting_queue_prefetch(self) -> None:
         """Turn waiting-queue host prefetch off before any job is submitted."""
 
+    def prepare_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Prepare a normal load while it can still degrade to a cache miss."""
+        return False
+
     def submit_host_prefetch(
         self, rid: str, transfers: list[PoolTransfer]
     ) -> bool:
@@ -312,7 +316,7 @@ class UnifiedCacheLinker(ABC):
         return None
 
     def revalidate_host_prefetch(self, rid: str) -> bool:
-        """Check the prepared request still owns its shared sessions."""
+        """Refresh the prepared session without copying into device memory."""
         return False
 
     def revalidate_no_prefetch_needed(self, rid: str) -> bool:
@@ -602,14 +606,18 @@ class UnifiedCacheLinkerWrapper:
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
         if known_hit_len is not None:
-            # PP0's absolute boundary also survives later local L1 rematches.
+            # The absolute boundary also survives later local L1 rematches.
             key = key[:known_hit_len]
         elif cache.pp_size > 1:
-            if cache.pp_rank != 0:
-                req.external_cache_hit_length = 0
-                return result
-            # The local device hit is part of PP0's canonical restorable
-            # boundary even when the external tail lookup misses.
+            # Every PP stage must derive the same absolute boundary before it
+            # builds its extend batch.  In particular, a downstream stage
+            # cannot stop at its local L1 hit while PP0 extends that hit from
+            # L3: the hidden states sent by PP0 would then have a different
+            # token count from the downstream batch.  Direct-linker lookups
+            # are metadata-only, and PP-aware backends (for example Mooncake)
+            # validate every PP shard, so probing from each stage's local L1
+            # frontier produces the common restorable boundary without an
+            # additional scheduler-side PP control message.
             req.external_cache_hit_length = device_hit_len
 
         if device_hit_len >= len(key):
@@ -757,9 +765,9 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def _build_load_transfers(
-        self, req: Req, tail_hashes
+        self, req: Req, tail_hashes, *, prepare_session: bool = False
     ) -> tuple[list[tuple[TreeComponent, PoolTransfer]], bool, BaseException | None]:
-        """Build every component's LOAD transfer on this rank only.
+        """Build LOAD transfers and optionally prepare their session locally.
 
         Building allocates device slots and can fail on one rank alone, so the
         caller must agree on the returned flag with the other ranks before any
@@ -782,6 +790,23 @@ class UnifiedCacheLinkerWrapper:
                 component_transfers.append((component, transfer))
         except BaseException as error:
             return component_transfers, False, error
+        if prepare_session:
+            try:
+                prepared = self.cache_linker.prepare_load(
+                    req.rid, [transfer for _, transfer in component_transfers]
+                )
+            except BaseException:
+                logger.warning(
+                    "External cache session preparation failed", exc_info=True
+                )
+                prepared = False
+            if not prepared:
+                logger.warning(
+                    "External cache session preparation failed for rid=%s, "
+                    "degrading request to cache miss",
+                    req.rid,
+                )
+                return component_transfers, False, None
         return component_transfers, True, None
 
     def _abort_disagreed_load(
@@ -792,6 +817,7 @@ class UnifiedCacheLinkerWrapper:
         *,
         cancel_prefetch: bool,
         pending: BaseException | None,
+        release_session: bool = False,
     ) -> None:
         """Clean up after the ranks agreed a load cannot proceed.
 
@@ -821,6 +847,16 @@ class UnifiedCacheLinkerWrapper:
                         req.rid,
                         exc_info=error,
                     )
+        if release_session:
+            try:
+                self.cache_linker.abort_prepared_load(req.rid)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                else:
+                    logger.error(
+                        "Releasing the failed load session also failed", exc_info=error
+                    )
         if pending is not None:
             if cleanup_error is not None:
                 logger.error(
@@ -839,7 +875,7 @@ class UnifiedCacheLinkerWrapper:
         if hit is None:
             return empty_indices, req.last_node
 
-        prepared_from_host_prefetch = False
+        prepared_for_load = False
         prefetched = (
             self.host_prefetch_hits.pop(req.rid, None) is not None
             if self._waiting_queue_prefetch_enabled
@@ -866,8 +902,6 @@ class UnifiedCacheLinkerWrapper:
                         req.rid
                     )
                 else:
-                    # Keep every rank in this ownership/existence consensus;
-                    # Mooncake repairs leases at the actual read entry point.
                     locally_valid = (
                         status == "dfs_prefetched"
                         and self.cache_linker.revalidate_host_prefetch(req.rid)
@@ -889,8 +923,9 @@ class UnifiedCacheLinkerWrapper:
             # Build before claiming so that the claim reduction also carries
             # the construction verdict: one reduction instead of two.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes
+                req, tail_hashes, prepare_session=status == "no_prefetch_needed"
             )
+            prepared_locally = status == "no_prefetch_needed" and constructed
             claim_error: BaseException | None = None
             try:
                 if status == "no_prefetch_needed":
@@ -922,6 +957,7 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=True,
                     pending=build_error if build_error is not None else claim_error,
+                    release_session=prepared_locally,
                 )
                 if not constructed_all:
                     # Building failed somewhere: a miss, as on the normal path.
@@ -930,10 +966,10 @@ class UnifiedCacheLinkerWrapper:
                 # which builds again and agrees on its own construction.
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
-            prepared_from_host_prefetch = True
+            prepared_for_load = True
         elif self._waiting_queue_prefetch_enabled:
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes
+                req, tail_hashes, prepare_session=True
             )
             all_constructed = torch.tensor(int(constructed), dtype=torch.int)
             cache._all_reduce_attn_groups(
@@ -948,8 +984,11 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=False,
                     pending=build_error,
+                    release_session=constructed,
                 )
                 return empty_indices, req.last_node
+            # Session start/refresh already checked the master on every rank.
+            prepared_for_load = True
         else:
             # With prefetch disabled, keep the original rank-local construction
             # and failure path without a construction-verdict collective.
@@ -974,7 +1013,7 @@ class UnifiedCacheLinkerWrapper:
         # here so the request degrades to a plain cache miss instead.
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
         if (
-            not prepared_from_host_prefetch
+            not prepared_for_load
             and revalidate is not None
             and not revalidate([transfer for _, transfer in component_transfers])
         ):
@@ -988,12 +1027,16 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        prepared_transfers = self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
-        )
+        try:
+            prepared_transfers = self._update_load(
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+        except BaseException:
+            self.cache_linker.abort_prepared_load(req.rid)
+            raise
 
         if cache.pp_size > 1:
             # Load into request-owned slots. The existing PP result ring delays
