@@ -817,7 +817,6 @@ def _offload_completion_rank(rank, port, outputs):
                 id=node_id,
                 external_cache_stored=True,
                 detached=False,
-                write_through_pending_id=node_id,
             )
             for node_id in (7, 8)
         }
@@ -843,11 +842,6 @@ def _offload_completion_rank(rank, port, outputs):
             to_dec_params=lambda: f"lock-{node_id}"
         )
         cache.dec_lock_ref = lambda node_id, _params: unlocked.append(node_id)
-        cache.tree_core = types.SimpleNamespace(
-            mark_write_through_pending=lambda node_id: setattr(
-                nodes[node_id], "write_through_pending_id", node_id
-            )
-        )
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
         wrapper.cache = cache
         wrapper.cache_linker = types.SimpleNamespace(
@@ -867,7 +861,6 @@ def _offload_completion_rank(rank, port, outputs):
         rank_states = [None, None]
         dist.all_gather_object(rank_states, after_failure)
         assert rank_states == [[False, True], [False, True]]
-        assert [nodes[i].write_through_pending_id for i in (7, 8)] == [None, None]
 
         # The failed shard must be the only one retried on every rank.
         wrapper.offload_nodes([7, 8])
@@ -878,7 +871,6 @@ def _offload_completion_rank(rank, port, outputs):
         rank_states = [None, None]
         dist.all_gather_object(rank_states, after_retry)
         assert rank_states == [[True, True], [True, True]]
-        assert [nodes[i].write_through_pending_id for i in (7, 8)] == [None, None]
         assert not wrapper.pending_offloads
         assert unlocked == [7, 8, 7]
         outputs[rank] = (after_failure, retries, after_retry, unlocked)

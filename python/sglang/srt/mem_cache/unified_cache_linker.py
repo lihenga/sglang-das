@@ -1264,10 +1264,18 @@ class UnifiedCacheLinkerWrapper:
 
     def drain_offloads(self, finish_count: int) -> None:
         assert finish_count <= len(self.pending_offloads)
-        for _ in range(finish_count):
+        if finish_count == 0:
+            return
+        successes = torch.tensor(
+            [self.cache_linker.pop_completed_offload() for _ in range(finish_count)],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self.cache._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        for success in successes.tolist():
             node_id, lock_params = self.pending_offloads.pop(0)
             node = self.cache.resolve_node_handle(node_id)
-            node.external_cache_stored = self.cache_linker.pop_completed_offload()
+            node.external_cache_stored = bool(success)
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def num_completed_loads(self) -> int:
