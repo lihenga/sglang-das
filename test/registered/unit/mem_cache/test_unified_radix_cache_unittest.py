@@ -7770,25 +7770,25 @@ class TestFailedLinkerChainWithASecondOwner(CustomTestCase):
         other_lock = cache.inc_lock_ref(match.last_device_node)
         other.prefix_indices = match.device_indices
         other.last_node = match.last_device_node
-        other.kv.cache_protected_len = self.CHAIN
+        other.cache_protected_len = self.CHAIN
         other.swa_uuid_for_lock = other_lock.swa_uuid_for_lock
         other.extra_key = None
 
         # Its own next chunk, computed the ordinary way.
         tokens = chain_tokens + list(range(900, 900 + self.TAIL))
         req_to_token_pool.write(
-            (other.kv.req_pool_idx, slice(0, self.CHAIN)), match.device_indices
+            (other.req_pool_idx, slice(0, self.CHAIN)), match.device_indices
         )
         tail_pages = allocator.alloc(self.TAIL)
         req_to_token_pool.write(
-            (other.kv.req_pool_idx, slice(self.CHAIN, self.CHAIN + self.TAIL)),
+            (other.req_pool_idx, slice(self.CHAIN, self.CHAIN + self.TAIL)),
             tail_pages,
         )
         other.origin_input_ids = array("q", tokens)
         other.output_ids = array("q")
         other.full_untruncated_fill_ids = array("q", tokens)
         other.set_extend_range(self.CHAIN, len(tokens))
-        other.kv.kv_committed_len = len(tokens)
+        other.kv_committed_len = len(tokens)
 
         cache.linker = _StubLinkerBackend()
         chain = cache.tree_core.detach_external_load_chain(
