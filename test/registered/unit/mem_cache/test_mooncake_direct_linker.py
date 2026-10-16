@@ -392,6 +392,8 @@ def test_load_waits_for_scheduler_stream(monkeypatch):
     linker.pending_loads = {"rid": [object()]}
     linker.layer_done_counter = SimpleNamespace(update_producer=lambda: 7)
     linker.load_queue = Queue()
+    linker.completed_loads = Queue()
+    linker.host_prefetch_enabled = False
     linker.stats = {"load": 0}
 
     def load_layer_wise(counter_index, transfers):
