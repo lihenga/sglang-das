@@ -760,9 +760,11 @@ class UnifiedCacheLinkerWrapper:
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
             prepared_for_load = True
-        elif self._waiting_queue_prefetch_enabled:
+        else:
+            # Ordinary LOAD construction must agree across ranks even when
+            # waiting-queue prefetch is disabled.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=True
+                req, tail_hashes, prepare_session=self._waiting_queue_prefetch_enabled
             )
             all_constructed = torch.tensor(int(constructed), dtype=torch.int)
             cache._all_reduce_attn_groups(
@@ -777,28 +779,12 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=False,
                     pending=build_error,
-                    release_session=constructed,
+                    release_session=constructed and self._waiting_queue_prefetch_enabled,
                 )
                 return empty_indices, req.last_node
-            # Session start/refresh already checked the master on every rank.
-            prepared_for_load = True
-        else:
-            # With prefetch disabled, keep the original rank-local construction
-            # and failure path without a construction-verdict collective.
-            component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-            for component in cache._components_tuple:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOAD, None, tail_hashes
-                )
-                if transfer is None:
-                    self._update_load(
-                        ExternalLinkerLoadPhase.ABORT,
-                        req,
-                        component_transfers,
-                        prefix_len,
-                    )
-                    return empty_indices, req.last_node
-                component_transfers.append((component, transfer))
+            # With prefetch enabled, session start/refresh already checked
+            # the master on every rank.
+            prepared_for_load = self._waiting_queue_prefetch_enabled
 
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would
