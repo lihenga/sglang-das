@@ -109,8 +109,8 @@ class _Cache:
         # One component that cannot build a transfer stops load_back right
         # after the prefetch decision, before any device-side work. On the
         # prefetched path construction joins the claim reduction as
-        # [claimed, constructed]; on the enabled normal fallback it is its own
-        # reduction. Disabled prefetch keeps rank-local construction.
+        # [claimed, constructed]; on the normal fallback it is its own
+        # reduction, including when waiting-queue prefetch is disabled.
         component = MagicMock()
         component.build_external_linker_transfer.return_value = None
         self._components_tuple = (component,)
@@ -228,8 +228,6 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
         wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
             prefix_key=None, tail_hashes=["h0"], device_hit_len=0
         )
-        wrapper._build_load_transfers = MagicMock(return_value=([], False, None))
-        wrapper._abort_disagreed_load = MagicMock()
         wrapper._update_load = MagicMock()
         req = types.SimpleNamespace(rid="rid", last_node="node")
 
@@ -240,14 +238,12 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
         first_component.build_external_linker_transfer.assert_called_once_with(
             LinkerTransferPhase.LOAD, None, ["h0"]
         )
-        wrapper._build_load_transfers.assert_not_called()
-        wrapper._abort_disagreed_load.assert_not_called()
         wrapper._update_load.assert_called_once_with(
             ExternalLinkerLoadPhase.ABORT, req, [(first_component, transfer)], 1
         )
-        self.assertEqual(cache.reductions, [])
+        self.assertEqual(cache.reductions, [0])
 
-    def test_normal_load_success_has_no_construction_reduction(self):
+    def test_normal_load_success_agrees_on_construction(self):
         cache = _Cache()
         cache.pp_size = 2
         transfer = types.SimpleNamespace(name=PoolName.KV, device_indices="loaded")
@@ -258,15 +254,14 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
             prefix_key=None, tail_hashes=["h0"], device_hit_len=0
         )
         wrapper.cache_linker.revalidate_load.return_value = True
-        wrapper._build_load_transfers = MagicMock()
         wrapper._update_load = MagicMock(return_value=[transfer])
         wrapper._queue_load = MagicMock()
         req = types.SimpleNamespace(rid="rid", last_node="node")
 
         self.assertEqual(wrapper.load_back(req), ("loaded", "node"))
 
-        wrapper._build_load_transfers.assert_not_called()
-        self.assertEqual(cache.reductions, [])
+        self.assertEqual(cache.reductions, [1])
+        wrapper.cache_linker.prepare_load.assert_not_called()
         wrapper.cache_linker.revalidate_load.assert_called_once_with([transfer])
         wrapper._update_load.assert_called_once_with(
             ExternalLinkerLoadPhase.PREPARE, req, [(component, transfer)], 1
@@ -275,10 +270,11 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
             "rid", "node", [transfer], anchor="node"
         )
 
-    def test_normal_load_build_error_propagates_without_consensus_or_abort(self):
+    def test_normal_load_build_error_propagates_after_consensus_and_abort(self):
         cache = _Cache()
         first_component = MagicMock()
-        first_component.build_external_linker_transfer.return_value = object()
+        transfer = object()
+        first_component.build_external_linker_transfer.return_value = transfer
         error = RuntimeError("construction failed")
         cache._components_tuple[0].build_external_linker_transfer.side_effect = error
         cache._components_tuple = (first_component, *cache._components_tuple)
@@ -293,8 +289,10 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
             wrapper.load_back(req)
 
         self.assertIs(raised.exception, error)
-        self.assertEqual(cache.reductions, [])
-        wrapper._update_load.assert_not_called()
+        self.assertEqual(cache.reductions, [0])
+        wrapper._update_load.assert_called_once_with(
+            ExternalLinkerLoadPhase.ABORT, req, [(first_component, transfer)], 1
+        )
         wrapper.cache_linker.revalidate_load.assert_not_called()
 
     def test_release_skips_prefetch_cancel_helper_but_keeps_normal_cleanup(self):
