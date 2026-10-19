@@ -418,14 +418,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         mem_pool: HostKVCache = None,
         enable_client_http_server: Optional[bool] = None,
         enable_dfs_prefetch: Optional[bool] = None,
+        dfs_health_config: Optional[dict[str, int]] = None,
     ):
         MooncakeBaseStore.__init__(self)
+        self._dfs_health_manager = None
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
         )
         try:
             self.store = MooncakeDistributedStore()
+            if enable_dfs_prefetch is True and not callable(
+                getattr(self.store, "disable_dfs_prefetch", None)
+            ):
+                raise RuntimeError(
+                    "Waiting-queue DFS prefetch requires Mooncake with "
+                    "disable_dfs_prefetch to release its arena if startup "
+                    "agreement disables prefetch. Rebuild/install the updated "
+                    "Mooncake package."
+                )
 
             self.config = self._load_config(storage_config)
             extra_config = (
@@ -433,6 +444,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            if dfs_health_config is None and extra_config:
+                dfs_health_config = extra_config.get("_mooncake_dfs_health_config")
             if enable_client_http_server is None:
                 enable_client_http_server = bool(
                     getattr(storage_config, "enable_storage_metrics", False)
@@ -606,6 +619,32 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             logger.info("Mooncake store setup successfully.")
 
+            distributed_dfs = (
+                os.environ.get("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR")
+                == "distributed_storage_backend"
+            )
+            if distributed_dfs:
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    MooncakeDfsHealthManager,
+                )
+
+                # Constructor installs fail-closed read/write policy before
+                # warmup. No setup parameter is used for the initial policy.
+                coordinate_health_policy = (
+                    storage_config is not None
+                    and torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                    and (
+                        getattr(storage_config, "tp_size", 1) > 1
+                        or getattr(storage_config, "attn_cp_size", 1) > 1
+                    )
+                )
+                self._dfs_health_manager = MooncakeDfsHealthManager(
+                    self.store,
+                    dfs_health_config,
+                    defer_policy_application=coordinate_health_policy,
+                )
+
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
             )
@@ -659,6 +698,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+
+            if self._dfs_health_manager is not None:
+                self._dfs_health_manager.start()
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -1483,7 +1525,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
-        pass
+        if self._dfs_health_manager is not None:
+            self._dfs_health_manager.close()
+            self._dfs_health_manager = None
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        if self._dfs_health_manager is None:
+            return None
+        return self._dfs_health_manager.local_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        if self._dfs_health_manager is not None:
+            self._dfs_health_manager.apply_effective_policy(allow_read, allow_write)
 
     def clear(self) -> None:
         self.store.remove_all()

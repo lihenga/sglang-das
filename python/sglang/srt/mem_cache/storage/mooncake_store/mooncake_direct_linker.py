@@ -224,6 +224,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 False,
             )
         )
+        if self.host_prefetch_enabled and (
+            server_args.schedule_policy != "fcfs"
+            or server_args.disaggregation_mode not in ("null", "prefill")
+            or params.pp_size != 1
+        ):
+            self.host_prefetch_enabled = False
+            logger.warning(
+                "Waiting-queue DFS prefetch disabled: requires FCFS scheduling, "
+                "a prefill or non-disaggregated role, and pp_size=1."
+            )
         self.page_size = params.page_size
         self.page_wise_load_threshold = server_args.mooncake_page_wise_load_threshold
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
@@ -279,12 +289,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeStore,
             )
+            from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                resolve_dfs_health_config,
+            )
 
             self.storage = MooncakeStore(
                 storage_config,
                 mem_pool=None,
                 enable_client_http_server=params.enable_metrics,
                 enable_dfs_prefetch=self.host_prefetch_enabled,
+                dfs_health_config=resolve_dfs_health_config(server_args=server_args),
             )
         else:
             self.storage = storage
@@ -346,9 +360,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Mooncake ReadPlan enabled; address reuse=%s",
                 self.read_plan_reuse_ranges,
             )
-        self.host_prefetch_enabled = self._resolve_host_prefetch_enabled(
+        prefetch_enabled = self._resolve_host_prefetch_enabled(
             params, requested=self.host_prefetch_enabled
         )
+        if self.host_prefetch_enabled and not prefetch_enabled:
+            self.disable_waiting_queue_prefetch()
+        self.host_prefetch_enabled = prefetch_enabled
 
         self.storage_metrics_collector = None
         if params.enable_metrics:
@@ -535,9 +552,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def waiting_queue_prefetch_enabled(self) -> bool:
         return self.host_prefetch_enabled
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        return self.storage.get_local_dfs_health_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        self.storage.apply_dfs_health_policy(allow_read, allow_write)
+
     def disable_waiting_queue_prefetch(self) -> None:
-        # The scheduler found a rank without prefetch before any submission;
-        # the idle host-prefetch workers stay parked on an empty queue.
+        # Startup only, before any request or prefetch submission. Keep the
+        # native client and its pinned arena consistent with the final switch.
+        if not self.storage.store.disable_dfs_prefetch():
+            raise RuntimeError(
+                "Mooncake cannot disable DFS prefetch after requests have started."
+            )
         self.host_prefetch_enabled = False
 
     def register_buffers(self) -> None:
@@ -1102,11 +1129,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self._abort_prepared_load_now(rid)
 
     def cancel_queued_load(self, rid: str) -> bool:
-        getattr(self, "pending_load_tokens", {}).pop(rid, None)
-        cancelled = self.pending_loads.pop(rid, None) is not None
-        if cancelled and self.host_prefetch_enabled:
-            self.abort_prepared_load(rid)
-        return cancelled
+        # Already-published loads cannot be safely canceled without tree rollback.
+        return False
 
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()

@@ -298,6 +298,13 @@ class UnifiedCacheLinker(ABC):
         """Whether waiting-queue host prefetch is enabled on every rank."""
         return False
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        """Return a rank-local DFS policy candidate, if the backend has one."""
+        return None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        """Apply a cross-rank DFS policy, if the backend supports it."""
+
     def disable_waiting_queue_prefetch(self) -> None:
         """Turn waiting-queue host prefetch off before any job is submitted."""
 
@@ -456,6 +463,17 @@ class UnifiedCacheLinkerWrapper:
     def waiting_queue_prefetch_enabled(self) -> bool:
         return self._waiting_queue_prefetch_enabled
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        linker = getattr(self, "cache_linker", None)
+        getter = getattr(linker, "get_local_dfs_health_policy", None)
+        return getter() if callable(getter) else None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        linker = getattr(self, "cache_linker", None)
+        apply_policy = getattr(linker, "apply_dfs_health_policy", None)
+        if callable(apply_policy):
+            apply_policy(allow_read, allow_write)
+
     def disable_waiting_queue_prefetch(self) -> None:
         self._waiting_queue_prefetch_enabled = False
         self.cache_linker.disable_waiting_queue_prefetch()
@@ -490,7 +508,11 @@ class UnifiedCacheLinkerWrapper:
 
     def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
         """Build a request-local snapshot without issuing any collectives."""
-        hit = self.hit_markers.get(req.rid)
+        hit = (
+            None
+            if getattr(req, "disable_external_linker", False)
+            else self.hit_markers.get(req.rid)
+        )
         transfers = []
         locally_eligible = hit is not None
         if hit is not None:
@@ -603,6 +625,10 @@ class UnifiedCacheLinkerWrapper:
             if self._waiting_queue_prefetch_enabled
             else None
         )
+
+        # A request retried after a load failure must recompute from scratch.
+        if getattr(req, "disable_external_linker", False):
+            return result
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
         if known_hit_len is not None:
@@ -967,9 +993,11 @@ class UnifiedCacheLinkerWrapper:
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
             prepared_for_load = True
-        elif self._waiting_queue_prefetch_enabled:
+        else:
+            # Ordinary LOAD construction must agree across ranks even when
+            # waiting-queue prefetch is disabled.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=True
+                req, tail_hashes, prepare_session=self._waiting_queue_prefetch_enabled
             )
             all_constructed = torch.tensor(int(constructed), dtype=torch.int)
             cache._all_reduce_attn_groups(
@@ -984,28 +1012,12 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=False,
                     pending=build_error,
-                    release_session=constructed,
+                    release_session=constructed and self._waiting_queue_prefetch_enabled,
                 )
                 return empty_indices, req.last_node
-            # Session start/refresh already checked the master on every rank.
-            prepared_for_load = True
-        else:
-            # With prefetch disabled, keep the original rank-local construction
-            # and failure path without a construction-verdict collective.
-            component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-            for component in cache._components_tuple:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOAD, None, tail_hashes
-                )
-                if transfer is None:
-                    self._update_load(
-                        ExternalLinkerLoadPhase.ABORT,
-                        req,
-                        component_transfers,
-                        prefix_len,
-                    )
-                    return empty_indices, req.last_node
-                component_transfers.append((component, transfer))
+            # With prefetch enabled, session start/refresh already checked
+            # the master on every rank.
+            prepared_for_load = self._waiting_queue_prefetch_enabled
 
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would
@@ -1278,10 +1290,18 @@ class UnifiedCacheLinkerWrapper:
 
     def drain_offloads(self, finish_count: int) -> None:
         assert finish_count <= len(self.pending_offloads)
-        for _ in range(finish_count):
+        if finish_count == 0:
+            return
+        successes = torch.tensor(
+            [self.cache_linker.pop_completed_offload() for _ in range(finish_count)],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self.cache._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        for success in successes.tolist():
             node_id, lock_params = self.pending_offloads.pop(0)
             node = self.cache.resolve_node_handle(node_id)
-            node.external_cache_stored = self.cache_linker.pop_completed_offload()
+            node.external_cache_stored = bool(success)
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def num_completed_loads(self) -> int:
