@@ -45,10 +45,18 @@ class GrammarManager:
             else False
         )
 
-        self.grammar_sync_group = scheduler.dp_tp_cpu_group
-        self.grammar_sync_size = scheduler.dp_tp_group.world_size
-        self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
-        self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
+        # Include all CP ranks for DP1 disaggregated prefill.
+        grammar_group = scheduler.dp_tp_group
+        if (
+            str(scheduler.server_args.disaggregation_mode).lower() == "prefill"
+            and scheduler.server_args.dp_size == 1
+            and scheduler.attn_cp_group.world_size > 1
+        ):
+            grammar_group = scheduler.tp_group
+        self.grammar_sync_group = grammar_group.cpu_group
+        self.grammar_sync_size = grammar_group.world_size
+        self.grammar_sync_entry = grammar_group.first_rank
+        self.is_grammar_sync_entry = grammar_group.is_first_rank
         self.pp_rank = scheduler.ps.pp_rank
         self.pp_size = scheduler.ps.pp_size
         self.pp_group = scheduler.pp_group
