@@ -172,6 +172,11 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            # Skip retracted requests — this includes requests that were
+            # retried after an external KV load failure: they have already
+            # been re-queued and must not emit output from the failed forward.
+            if req.is_retracted:
+                continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.

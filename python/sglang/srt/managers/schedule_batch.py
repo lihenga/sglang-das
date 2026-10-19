@@ -1226,6 +1226,10 @@ class Req(ReqDllmMixin):
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
+        # External linker load retry
+        self.external_load_retry_count: int = 0
+        self.disable_external_linker: bool = False
+
         # Whether to return pooled hidden states (pre-head transformer output)
         self.return_pooled_hidden_states = return_pooled_hidden_states
         self.pooled_hidden_state = None
@@ -1767,6 +1771,127 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+
+    def reset_for_external_load_retry(self):
+        """Reset request state for re-queueing after an external linker load failure.
+
+        Resets all KV/cache/scheduling state so the request can be re-prefilled
+        from scratch, while preserving the original input and sampling params.
+        Grammar is cleared (will be recompiled by grammar_manager), and the
+        external linker is disabled for the retry to avoid repeating the same
+        failure.
+        """
+        # Output state
+        self.output_ids = array("q")
+        self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+        self.finished_len = 0
+        self.finished_reason = None
+        self.to_finish = None
+        self.reasoning_tokens = array("q")
+
+        # Radix tree state
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.routed_experts = None
+        self.indexer_topk = None
+        self.last_node = None
+        self.last_host_node = None
+        self.best_match_node = None
+        self.num_matched_prefix_tokens = 0
+        self.cache_protected_len = 0
+
+        # External linker / HiCache state
+        self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
+        self.external_cache_hit_length = None
+        self.cached_tokens = 0
+        self.cached_tokens_device = 0
+        self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
+        self._cache_breakdown_computed = False
+
+        # KV resources — caller must release before calling this
+        assert self.kv is None, "expect KV already released"
+        self.req_pool_idx = None
+        self.kv_committed_len = 0
+
+        # Scheduling state
+        self.already_computed = 0
+        self.extend_range = None
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
+        self.skip_radix_cache_insert = False
+        self.dllm_initialized = False
+        # Mark as retracted so that process_batch_result_prefill and the
+        # embedding loop skip this request (its KV was already released).
+        # prepare_for_extend() clears is_retracted when the request is
+        # scheduled for the retry forward pass.
+        self.is_retracted = True
+        self.retracted_stain = False
+        self.inflight_middle_chunks = 0
+
+        # Detokenize state
+        self.surr_offset = 0
+        self.read_offset = 0
+        self.cur_decode_ids_len = 0
+        self.decoded_text = ""
+        self.surr_and_decode_ids = array("q")
+
+        # Mamba state
+        self.mamba_pool_idx = None
+        self.mamba_ping_pong_track_buffer = None
+        self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
+        self.mamba_last_track_seqlen = None
+        self.mamba_branching_seqlen = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
+
+        # SWA lock state
+        self.swa_uuid_for_lock = None
+        self.swa_prefix_lock_released = False
+        self.skip_lock_node_ids = {}
+
+        # Input logprob state — clear temp accumulators so the retry forward
+        # starts fresh (mirrors reset_for_retract).
+        self.input_token_logprobs = None
+        self.temp_input_top_logprobs_val = None
+        self.temp_input_top_logprobs_idx = None
+        self.temp_input_token_ids_logprobs_val = None
+        self.temp_input_token_ids_logprobs_idx = None
+
+        # Grammar — clear so grammar_manager recompiles on re-queue
+        self.grammar = None
+        self.grammar_key = None
+        self.grammar_wait_ct = 0
+
+        # Disaggregation prefill state — reset so the retry forward re-sends
+        # from scratch (mirrors optimistic_release_and_requeue).
+        self.start_send_idx = 0
+        self.tmp_end_idx = -1
+        self.disagg_decode_prefix_len = None
+        self.early_send_prefix_end = None
+        self.hidden_states_tensor = None
+        self.output_dsa_topk_indices = None
+        self.pending_bootstrap = False
+
+        # External KV abort tracking — keep abort_requested True so that
+        # process_batch_result_prefill skips this request (the KV was already
+        # released by the retry path). The flag is cleared when the request is
+        # re-prefilled in the next scheduling round.
+        self.external_kv_abort_requested = True
+        self.external_kv_pending_chunk_cleared = True
+        self.external_kv_linker_released = True
+        self.external_kv_sender_abort_requested = True
+        self.external_kv_abort_response_via_chunked = False
+        self.external_kv_response_sent = True
+        self.external_kv_cleanup_done = True
+
+        # Disable external linker for the retry
+        self.disable_external_linker = True
+
+        # Increment retry counter
+        self.external_load_retry_count += 1
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2557,6 +2682,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
                 req.already_computed = seq_len
             req.is_retracted = False
+            # Clear external KV abort tracking from a previous failed attempt
+            # that was retried. The request is now being re-prefilled with a
+            # fresh KV allocation, so the abort tracking no longer applies.
+            # Without this, the PD disagg path (process_batch_result_disagg_prefill)
+            # would route the retried request into abort_external_kv_request again.
+            if req.external_kv_abort_requested:
+                req.external_kv_abort_requested = False
+                req.external_kv_pending_chunk_cleared = False
+                req.external_kv_linker_released = False
+                req.external_kv_sender_abort_requested = False
+                req.external_kv_abort_response_via_chunked = False
+                req.external_kv_response_sent = False
+                req.external_kv_cleanup_done = False
 
             if mamba_extra_buffer_enabled():
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)

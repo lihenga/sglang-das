@@ -2982,6 +2982,21 @@ class ServerArgs:
         "for waiting-queue prefetch. Capped by the request limit.",
         NS("memory"),
     ] = 2
+
+    enable_external_load_retry: A[
+        bool,
+        "Retry requests whose external linker KV load failed by re-queuing "
+        "them as new requests with the external linker disabled, instead of "
+        "aborting them with an error.",
+        NS("memory"),
+    ] = False
+    external_load_retry_max: A[
+        int,
+        "Maximum number of retry attempts per request when "
+        "--enable-external-load-retry is enabled.",
+        NS("memory"),
+    ] = 1
+
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------

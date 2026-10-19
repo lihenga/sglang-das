@@ -287,7 +287,11 @@ class UnifiedCacheLinkerWrapper:
 
     def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
         """Build a request-local snapshot without issuing any collectives."""
-        hit = self.hit_markers.get(req.rid)
+        # Skip host prefetch for requests retrying after an external load failure.
+        if getattr(req, "disable_external_linker", False):
+            hit = None
+        else:
+            hit = self.hit_markers.get(req.rid)
         transfers = []
         locally_eligible = hit is not None
         if hit is not None:
@@ -400,6 +404,12 @@ class UnifiedCacheLinkerWrapper:
             if self._waiting_queue_prefetch_enabled
             else None
         )
+
+        # Skip external linker lookup for requests that are retrying after an
+        # external load failure — they must recompute from scratch without the
+        # external linker to avoid repeating the same failure.
+        if getattr(req, "disable_external_linker", False):
+            return result
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
         if known_hit_len is not None:
