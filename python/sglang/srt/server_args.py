@@ -3011,6 +3011,28 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = None
+    mooncake_dfs_health_probe_interval_s: A[
+        Optional[int],
+        "Interval in seconds between Mooncake DFS read/write health probes.",
+        NS("memory"),
+    ] = None
+    mooncake_dfs_health_failure_threshold: A[
+        Optional[int],
+        "Consecutive Mooncake DFS probe failures required to disable the "
+        "corresponding read or write capability.",
+        NS("memory"),
+    ] = None
+    mooncake_dfs_health_success_threshold: A[
+        Optional[int],
+        "Consecutive successful Mooncake DFS probes required to enable the "
+        "corresponding read or write capability.",
+        NS("memory"),
+    ] = None
+    mooncake_dfs_health_probe_timeout_s: A[
+        Optional[int],
+        "Timeout in seconds for one Mooncake DFS health probe.",
+        NS("memory"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs

@@ -426,6 +426,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 server_args.hicache_storage_backend_extra_config
             )
 
+            if storage_backend == "mooncake":
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    resolve_dfs_health_config,
+                )
+
+                # Carry the same resolved CLI/env/default values through the
+                # HiCache backend factory to MooncakeStore.
+                storage_extra_config = dict(storage_extra_config or {})
+                storage_extra_config["_mooncake_dfs_health_config"] = (
+                    resolve_dfs_health_config(server_args=server_args)
+                )
+
         attach_hybrid_pool_to_unified_cache(
             self,
             params,
@@ -2782,6 +2794,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._sync_dfs_health_policy()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -2860,6 +2873,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_metrics = StorageMetrics()
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across all attention ranks."""
+        owner = self.linker
+        if owner is None and self.cache_controller is not None:
+            owner = self.cache_controller.storage_backend
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if local_policy is None:
+            return
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+        apply_policy(*(bool(value) for value in effective.tolist()))
 
     def drain_linker_loads(self) -> list[str]:
         """Retire finished linker loads and return the rids that must abort.

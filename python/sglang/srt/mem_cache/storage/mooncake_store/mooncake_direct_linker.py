@@ -295,12 +295,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeStore,
             )
+            from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                resolve_dfs_health_config,
+            )
 
             self.storage = MooncakeStore(
                 storage_config,
                 mem_pool=None,
                 enable_client_http_server=params.enable_metrics,
                 enable_dfs_prefetch=self.host_prefetch_enabled,
+                dfs_health_config=resolve_dfs_health_config(server_args=server_args),
             )
         else:
             self.storage = storage
@@ -561,6 +565,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def waiting_queue_prefetch_enabled(self) -> bool:
         return self.host_prefetch_enabled
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        return self.storage.get_local_dfs_health_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        self.storage.apply_dfs_health_policy(allow_read, allow_write)
+
     def disable_waiting_queue_prefetch(self) -> None:
         # Startup only, before any request or prefetch submission. Keep the
         # native client and its pinned arena consistent with the final switch.
@@ -594,8 +604,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
-        # PP0 queries every PP shard; the wrapper's existing TP/CP reduction
-        # then selects a boundary that all ranks can restore.
+        # Every PP stage checks every PP shard. The wrapper's existing TP/CP
+        # reduction then selects a boundary that all ranks can restore.
         result = self.storage.batch_exists_v2(page_keys, expanded, query_all_pp=True)
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
