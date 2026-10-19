@@ -545,6 +545,24 @@ def test_check_hicache_events_drains_common_tp_offloads():
     assert drained == [1]
 
 
+def test_sync_dfs_health_policy_applies_attention_group_minimum():
+    applied = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: (True, True),
+        apply_dfs_health_policy=lambda read, write: applied.append((read, write)),
+    )
+
+    def reduce_to_common_policy(policy, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        policy.copy_(torch.tensor([0, 1], dtype=torch.int))
+
+    cache._all_reduce_attn_groups = reduce_to_common_policy
+    cache._sync_dfs_health_policy()
+
+    assert applied == [(False, True)]
+
+
 def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
         DeepSeekV4LayerItem,

@@ -51,13 +51,21 @@ class _NativeProbeCall:
     started_at: float
     thread: threading.Thread | None = None
     result: int | Exception | None = None
+    timed_out: bool = False
 
 
 class MooncakeDfsHealthManager:
-    """Owns SGLang's independent DFS read/write health state machine."""
+    """Owns rank-local DFS health and the native client's effective policy."""
 
-    def __init__(self, store: Any, config: dict[str, int] | None = None):
+    def __init__(
+        self,
+        store: Any,
+        config: dict[str, int] | None = None,
+        *,
+        defer_policy_application: bool = False,
+    ):
         self._store = store
+        self._defer_policy_application = defer_policy_application
         config = config or {}
         self._interval_s = _config_or_env(
             config,
@@ -92,6 +100,7 @@ class MooncakeDfsHealthManager:
             if value <= 0:
                 raise ValueError(f"Mooncake DFS health {name} must be positive")
         self._lock = threading.Lock()
+        self._policy_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._probe_lock = threading.Lock()
@@ -108,6 +117,7 @@ class MooncakeDfsHealthManager:
         self._write_successes = 0
         self._read_error = 0
         self._write_error = 0
+        self._effective_policy = (False, False)
 
         for method in (
             "probe_dfs_read",
@@ -152,6 +162,32 @@ class MooncakeDfsHealthManager:
                 write_error=self._write_error,
             )
 
+    def local_policy(self) -> tuple[bool, bool]:
+        """Return this rank's fail-closed policy candidate."""
+        with self._lock:
+            return (
+                self._read_state == AVAILABLE,
+                self._write_state == AVAILABLE,
+            )
+
+    def apply_effective_policy(self, allow_read: bool, allow_write: bool) -> None:
+        """Apply a scheduler-coordinated policy to this rank's native client."""
+        policy = (bool(allow_read), bool(allow_write))
+        with self._policy_lock:
+            if policy == self._effective_policy:
+                return
+            old_policy = self._effective_policy
+            self._apply_policy(*policy)
+            self._effective_policy = policy
+        logger.warning(
+            "Mooncake DFS effective policy transition: "
+            "old_read=%s old_write=%s new_read=%s new_write=%s",
+            old_policy[0],
+            old_policy[1],
+            policy[0],
+            policy[1],
+        )
+
     def probe_once(self) -> DfsHealthSnapshot:
         # Launch both operations before waiting for either one. Each operation has
         # its own deadline and in-flight slot, so a stuck read cannot delay or
@@ -191,11 +227,11 @@ class MooncakeDfsHealthManager:
             allow_write = self._write_state == AVAILABLE
             snapshot = self.snapshot_unlocked()
 
-        if read_changed or write_changed:
-            self._apply_policy(allow_read, allow_write)
+        if (read_changed or write_changed) and not self._defer_policy_application:
+            self.apply_effective_policy(allow_read, allow_write)
         if read_changed:
             logger.warning(
-                "Mooncake DFS health transition: capability=read "
+                "Mooncake DFS local health transition: capability=read "
                 "old_state=%s new_state=%s error=%s generation=%s",
                 old_read,
                 snapshot.read_state,
@@ -204,7 +240,7 @@ class MooncakeDfsHealthManager:
             )
         if write_changed:
             logger.warning(
-                "Mooncake DFS health transition: capability=write "
+                "Mooncake DFS local health transition: capability=write "
                 "old_state=%s new_state=%s error=%s generation=%s",
                 old_write,
                 snapshot.write_state,
@@ -233,6 +269,14 @@ class MooncakeDfsHealthManager:
                     call.result = exc
                 finally:
                     call.done.set()
+                    # A timed-out result is stale: release its in-flight slot,
+                    # but never let a later probe cycle count it as success.
+                    with self._probe_lock:
+                        if (
+                            call.timed_out
+                            and self._probe_calls[call.capability] is call
+                        ):
+                            self._probe_calls[call.capability] = None
 
             call.thread = threading.Thread(
                 target=invoke,
@@ -249,6 +293,13 @@ class MooncakeDfsHealthManager:
             self._probe_timeout_s - (time.monotonic() - call.started_at),
         )
         if not call.done.wait(remaining):
+            with self._probe_lock:
+                call.timed_out = True
+                # The native call may have finished between wait() timing out
+                # and acquiring the lock. Clear it here in that case; otherwise
+                # invoke() will clear it when the call eventually returns.
+                if call.done.is_set() and self._probe_calls[call.capability] is call:
+                    self._probe_calls[call.capability] = None
             logger.warning(
                 "Mooncake native DFS %s probe timed out after %ss",
                 call.capability,
@@ -258,8 +309,11 @@ class MooncakeDfsHealthManager:
 
         with self._probe_lock:
             result = call.result
+            timed_out = call.timed_out
             if self._probe_calls[call.capability] is call:
                 self._probe_calls[call.capability] = None
+        if timed_out:
+            return -1
         if isinstance(result, Exception):
             logger.error(
                 "Mooncake native DFS %s probe raised",

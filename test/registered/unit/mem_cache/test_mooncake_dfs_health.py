@@ -84,6 +84,29 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         self.assertEqual(snapshot.write_state, AVAILABLE)
         self.assertEqual(store.policies[-1], (True, True))
 
+    def test_deferred_policy_waits_for_coordinated_result(self):
+        store = _FakeStore([0], [0])
+        manager = MooncakeDfsHealthManager(
+            store,
+            {
+                "probe_interval_s": 10,
+                "failure_threshold": 1,
+                "success_threshold": 1,
+                "probe_timeout_s": 1,
+            },
+            defer_policy_application=True,
+        )
+
+        snapshot = manager.probe_once()
+        self.assertEqual(snapshot.read_state, AVAILABLE)
+        self.assertEqual(snapshot.write_state, AVAILABLE)
+        self.assertEqual(manager.local_policy(), (True, True))
+        self.assertEqual(store.policies, [(False, False)])
+
+        manager.apply_effective_policy(True, False)
+        manager.apply_effective_policy(True, False)
+        self.assertEqual(store.policies, [(False, False), (True, False)])
+
     def test_stuck_read_does_not_block_or_fail_write_probe(self):
         release_read = threading.Event()
 
@@ -155,6 +178,75 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         snapshot = manager.probe_once()
         self.assertEqual(store.write_calls, 1)
         self.assertEqual(snapshot.read_state, AVAILABLE)
+
+    def test_late_probe_success_does_not_reset_timeout_failures(self):
+        release_probes = [threading.Event(), threading.Event()]
+        first_read_finished = threading.Event()
+        first_write_finished = threading.Event()
+
+        class Store(_FakeStore):
+            def __init__(self):
+                super().__init__([], [])
+                self.read_calls = 0
+                self.write_calls = 0
+
+            def _probe(self, capability):
+                if capability == "read":
+                    call_index = self.read_calls
+                    self.read_calls += 1
+                else:
+                    call_index = self.write_calls
+                    self.write_calls += 1
+                release_probes[call_index].wait()
+                if call_index == 0:
+                    if capability == "read":
+                        first_read_finished.set()
+                    else:
+                        first_write_finished.set()
+                return 0
+
+            def probe_dfs_read(self):
+                return self._probe("read")
+
+            def probe_dfs_write(self):
+                return self._probe("write")
+
+        store = Store()
+        self.addCleanup(release_probes[0].set)
+        self.addCleanup(release_probes[1].set)
+        manager = MooncakeDfsHealthManager(
+            store,
+            {
+                "probe_interval_s": 10,
+                "failure_threshold": 2,
+                "success_threshold": 1,
+                "probe_timeout_s": 1,
+            },
+        )
+
+        first = manager.probe_once()
+        self.assertEqual(first.read_failures, 1)
+        self.assertEqual(first.write_failures, 1)
+
+        release_probes[0].set()
+        self.assertTrue(first_read_finished.wait(1))
+        self.assertTrue(first_write_finished.wait(1))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with manager._probe_lock:
+                if all(call is None for call in manager._probe_calls.values()):
+                    break
+            time.sleep(0.01)
+        else:
+            self.fail("late probe calls did not release their in-flight slots")
+
+        second = manager.probe_once()
+        self.assertEqual(store.read_calls, 2)
+        self.assertEqual(store.write_calls, 2)
+        self.assertEqual(second.read_state, UNAVAILABLE)
+        self.assertEqual(second.write_state, UNAVAILABLE)
+        self.assertEqual(second.read_failures, 2)
+        self.assertEqual(second.write_failures, 2)
 
 
 if __name__ == "__main__":
