@@ -345,6 +345,13 @@ class UnifiedCacheLinker(ABC):
         """Start queued loads and return the layer-counter consumer index."""
 
     @abstractmethod
+    def wait_for_pending_loads(self) -> None:
+        """Wait for loads already issued to the backend worker to finish.
+
+        Loads still waiting for ``start_layer_wise_loading`` are not included.
+        """
+
+    @abstractmethod
     def num_completed_loads(self) -> int:
         """Return the number of completed load batches waiting to be consumed."""
 
@@ -1330,6 +1337,9 @@ class UnifiedCacheLinkerWrapper:
 
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
+
+    def wait_for_pending_loads(self) -> None:
+        self.cache_linker.wait_for_pending_loads()
 
     # ---- lifecycle ----
 
