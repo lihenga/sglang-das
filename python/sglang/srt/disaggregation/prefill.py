@@ -552,6 +552,19 @@ class PrefillBootstrapQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return False
 
+        # Reuse an existing sender from a prior bootstrap if the request is
+        # being retried (e.g. after an external KV load failure).  Discarding
+        # it here would leak the Mooncake session and bootstrap room, and a
+        # fresh sender on the same room would collide with the old one.  The
+        # sender is re-initialized via finalize_bootstrap → sender.init()
+        # during the retry's check_bootstrap() call.
+        existing_sender = getattr(req, "disagg_kv_sender", None)
+        if existing_sender is not None and not getattr(
+            existing_sender, "conclude_state", None
+        ):
+            req.pending_bootstrap = True
+            return True
+
         backend = (
             TransferBackend.FAKE
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -1901,6 +1914,18 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            # Skip requests already re-queued by _retry_external_load_failed_request.
+            # Their KV and linker resources have been released and the request has
+            # been reset (is_retracted=True) for a fresh prefill. Falling through
+            # to any branch below would: (1) append a garbage output token, (2)
+            # call maybe_cache_unfinished_req on already-released KV, (3) enqueue
+            # into disagg_prefill_inflight_queue for KV transfer, (4) in the abort
+            # branch overwrite pending_bootstrap=True (needed for finalize_bootstrap
+            # -> sender.init() -> curr_idx reset) and wrongly set completion_time.
+            # Mirrors process_batch_result_prefill's is_retracted skip.
+            if req.is_retracted:
+                advance_logprob_pt(i, req)
+                continue
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 

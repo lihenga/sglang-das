@@ -1874,7 +1874,11 @@ class Req(ReqDllmMixin):
         self.early_send_prefix_end = None
         self.hidden_states_tensor = None
         self.output_dsa_topk_indices = None
-        self.pending_bootstrap = False
+        # Must be True so check_bootstrap() calls finalize_bootstrap() again,
+        # which calls sender.init() to set num_kv_indices. Setting False
+        # skips finalize_bootstrap and send_kv_chunk hits an uninitialized
+        # sender (AttributeError: no attribute 'num_kv_indices').
+        self.pending_bootstrap = True
 
         # External KV abort tracking — keep abort_requested True so that
         # process_batch_result_prefill skips this request (the KV was already

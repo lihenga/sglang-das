@@ -1646,6 +1646,13 @@ class CommonKVSender(BaseKVSender):
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
+        # Reset transfer progress so a re-init after retry (e.g. external KV
+        # load failure or optimistic prefill yield) re-sends from the start.
+        # init() is called once per bootstrap in normal flow, so this only
+        # affects the retry path where the sender is reused.
+        self.curr_idx = 0
+        self._transfer_num_kv_indices = 0
+        self._transfer_num_state_indices = 0
         logger.debug(
             f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
         )
