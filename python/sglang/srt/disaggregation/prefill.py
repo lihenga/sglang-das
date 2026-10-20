@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_min_attn_cp_tp_group,
     build_kv_layer_ids,
     get_dsv4_c128_state_indices,
     get_kv_class,
@@ -2114,6 +2115,11 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if req.external_kv_cleanup_done:
+                # Local cleanup is terminal; only the shared removal verdict
+                # remains pending. Do not re-enter failure or success cleanup.
+                done_reqs.append(req)
+                continue
             # Check if this request was marked for external KV abort
             external_abort_pending = req.rid in self._external_kv_abort_rids
 
@@ -2207,6 +2213,29 @@ class SchedulerDisaggregationPrefillMixin:
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                 )
 
+        # Local cleanup can finish before its TP/CP peers. Keep the request in
+        # every inflight queue until all peers agree it can be removed.
+        keep_ids = {id(req) for req in undone_reqs}
+        remove_flags = [
+            int(id(req) not in keep_ids) for req in self.disagg_prefill_inflight_queue
+        ]
+        global_remove_flags = all_reduce_min_attn_cp_tp_group(
+            remove_flags,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        ready_ids = {
+            id(req)
+            for req, remove_flag in zip(
+                self.disagg_prefill_inflight_queue, global_remove_flags
+            )
+            if remove_flag
+        }
+        done_reqs = [req for req in done_reqs if id(req) in ready_ids]
+        undone_reqs = [
+            req for req in self.disagg_prefill_inflight_queue if id(req) not in ready_ids
+        ]
+
         for req in done_reqs:
             req.time_stats.set_completion_time()
 
@@ -2277,11 +2306,15 @@ class SchedulerDisaggregationPrefillMixin:
         except Exception as e:
             exc = e
             error_message += f" with exception {e}"
-        if getattr(exc, "is_from_another_rank", False):
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        if not req.prefill_transfer_failure_reported:
+            req.prefill_transfer_failure_reported = True
+            if getattr(exc, "is_from_another_rank", False):
+                logger.debug(error_message)
+            else:
+                logger.warning(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            if self.metrics_reporter.enable_metrics:
+                self.metrics_collector.increment_transfer_failed_reqs()
 
         if req.to_finish is None and req.finished_reason is None:
             req.to_finish = FINISH_ABORT(
@@ -2297,8 +2330,6 @@ class SchedulerDisaggregationPrefillMixin:
         )
         if not cleanup_done:
             self._external_kv_abort_rids.add(req.rid)
-        if self.metrics_reporter.enable_metrics:
-            self.metrics_collector.increment_transfer_failed_reqs()
         return exc, cleanup_done
 
     def get_transferred_rids(
