@@ -473,8 +473,6 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
-        self.enable_external_load_retry = get_memory().enable_external_load_retry
-        self.external_load_retry_max = get_memory().external_load_retry_max
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -5222,21 +5220,14 @@ class Scheduler(
             if req is self.chunked_req:
                 req.external_kv_abort_response_via_chunked = True
                 self._external_kv_chunked_abort_reqs[req.rid] = req
-            if (
-                self.enable_external_load_retry
-                and req.external_load_retry_count < self.external_load_retry_max
-                and req is not self.chunked_req
-            ):
-                self._retry_external_load_failed_request(req)
-            else:
-                self.abort_external_kv_request(
-                    req,
-                    forward_drained=False,
-                    sender_terminal=False,
-                    abort_message=message,
-                    is_insert=False,
-                    emit_response=False,
-                )
+            self.abort_external_kv_request(
+                req,
+                forward_drained=False,
+                sender_terminal=False,
+                abort_message=message,
+                is_insert=False,
+                emit_response=False,
+            )
             handled_rids.add(req.rid)
 
             if req is self.chunked_req:
@@ -5251,27 +5242,6 @@ class Scheduler(
         # running_batch, so its requests are in neither list. One retry is
         # enough: a batch launched at step k is merged by step k + 1.
         self._deferred_linker_rids = failed - deferred
-
-    def _retry_external_load_failed_request(self, req: Req) -> None:
-        """Requeue a failed linker load and recompute without the linker."""
-        logger.info(
-            "Retrying request %s after external KV load failure "
-            "(attempt %d/%d)",
-            req.rid,
-            req.external_load_retry_count + 1,
-            self.external_load_retry_max,
-        )
-
-        release_kv_cache(req, self.tree_cache, is_insert=False)
-        self._release_aborted_request(req.rid)
-        req.reset_for_external_load_retry()
-
-        self.clear_pending_chunk_send(req)
-        req.time_stats.reset_prefill_retry_time()
-
-        added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
-        if not added_to_grammar_queue:
-            self._add_request_to_queue(req)
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

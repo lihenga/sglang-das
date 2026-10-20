@@ -172,10 +172,6 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
-            # A failed forward can still reach the output path after its
-            # request has already been reset and requeued for a fresh prefill.
-            if req.is_retracted:
-                continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.

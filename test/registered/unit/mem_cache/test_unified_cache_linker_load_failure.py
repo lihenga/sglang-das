@@ -1,6 +1,5 @@
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -141,7 +140,6 @@ def test_scheduler_marks_failed_load_request_for_abort():
     req = SimpleNamespace(
         rid="rid-a",
         last_node=7,
-        external_load_retry_count=0,
         to_finish=None,
         finished_reason=None,
         skip_radix_cache_insert=False,
@@ -169,8 +167,6 @@ def test_scheduler_marks_failed_load_request_for_abort():
         running_batch=SimpleNamespace(is_empty=lambda: True),
         chunked_req=None,
         _release_aborted_request=released.append,
-        enable_external_load_retry=False,
-        external_load_retry_max=1,
     )
 
     Scheduler._mark_failed_linker_loads(scheduler, SimpleNamespace(reqs=[req]))
@@ -179,67 +175,6 @@ def test_scheduler_marks_failed_load_request_for_abort():
     assert isinstance(req.to_finish, FINISH_ABORT)
     assert req.to_finish.err_type == EXTERNAL_KV_LOAD_ERR_TYPE
     assert req.skip_radix_cache_insert
-
-
-def test_scheduler_requeues_failed_load_when_retry_is_enabled():
-    trace = SimpleNamespace(abort=lambda **_kwargs: None)
-    req = SimpleNamespace(
-        rid="rid-a",
-        last_node=7,
-        external_load_retry_count=0,
-        external_kv_cleanup_done=False,
-        time_stats=SimpleNamespace(
-            trace_ctx=trace,
-            reset_prefill_retry_time=MagicMock(),
-        ),
-        reset_for_external_load_retry=MagicMock(),
-    )
-    scheduler = Scheduler.__new__(Scheduler)
-    scheduler.__dict__.update(
-        _deferred_linker_rids=set(),
-        _external_kv_cleanup_rids=set(),
-        tree_cache=SimpleNamespace(
-            drain_linker_loads=lambda: ["rid-a"],
-            has_outstanding_failed_linker_chains=lambda: False,
-            is_on_failed_linker_chain=lambda _node_id: False,
-        ),
-        running_batch=SimpleNamespace(is_empty=lambda: True),
-        chunked_req=None,
-        enable_external_load_retry=True,
-        external_load_retry_max=1,
-        _release_aborted_request=MagicMock(),
-        clear_pending_chunk_send=MagicMock(),
-        grammar_manager=SimpleNamespace(
-            process_req_with_grammar=MagicMock(return_value=False)
-        ),
-        _add_request_to_queue=MagicMock(),
-    )
-
-    with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
-        Scheduler._mark_failed_linker_loads(
-            scheduler, SimpleNamespace(reqs=[req])
-        )
-
-    release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
-    scheduler._release_aborted_request.assert_called_once_with("rid-a")
-    req.reset_for_external_load_retry.assert_called_once_with()
-    scheduler.clear_pending_chunk_send.assert_called_once_with(req)
-    req.time_stats.reset_prefill_retry_time.assert_called_once_with()
-    scheduler.grammar_manager.process_req_with_grammar.assert_called_once_with(req)
-    scheduler._add_request_to_queue.assert_called_once_with(req)
-
-
-def test_linker_wrapper_skips_lookup_for_retried_request():
-    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
-    wrapper.cache = SimpleNamespace(page_size=1, pp_size=1)
-    wrapper.hit_markers = {"rid-a": object()}
-    wrapper.host_prefetch_hits = {}
-    wrapper._waiting_queue_prefetch_enabled = False
-    result = SimpleNamespace(device_indices=torch.tensor([1, 2]))
-    req = SimpleNamespace(rid="rid-a", disable_external_linker=True)
-
-    assert wrapper.match(object(), req, result) is result
-    assert "rid-a" not in wrapper.hit_markers
 
 
 def test_tree_core_reclaims_detached_external_load_leaf():
