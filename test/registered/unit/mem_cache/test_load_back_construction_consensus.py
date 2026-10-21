@@ -197,8 +197,6 @@ def _session_released(linker, ended, other_holder, claim="ok"):
 # "mixed" is the prefetched path with ranks 2 and 3 in no_prefetch_needed.
 SCENARIOS = {
     "normal_second_component_none": ("normal", {3: (1, "none")}, False, {}),
-    "normal_session_fails_one_rank": ("normal_session_fail", {}, False, {}),
-    "normal_session_raises_one_rank": ("normal_session_raise", {}, False, {}),
     "normal_first_component_raises": ("normal", {1: (0, "raise")}, False, {}),
     "prefetch_one_rank_fails": ("prefetch", {2: (0, "none")}, False, {}),
     "prefetch_second_component_raises": ("prefetch", {0: (1, "raise")}, False, {}),
@@ -321,11 +319,6 @@ def _rank(rank, world_size, port, results):
                     backend, ended = _prefetch_backend(other_holder, claim)
                 else:
                     backend, ended = MagicMock(), None
-                if path.startswith("normal_session") and rank == 2:
-                    if path.endswith("raise"):
-                        backend.prepare_load.side_effect = RuntimeError("refresh failed")
-                    else:
-                        backend.prepare_load.return_value = False
                 backend.revalidate_load = revalidate_load
                 wrapper = _wrapper(
                     cache,
@@ -425,8 +418,6 @@ class TestConstructionConsensus(CustomTestCase):
         miss_prefetch = ("miss", [0, 0], 0, True, 3, 2)
         expected = {
             "normal_second_component_none": ("miss", [0, 0], 0, None, 1, None),
-            "normal_session_fails_one_rank": ("miss", [0, 0], 0, None, 1, None),
-            "normal_session_raises_one_rank": ("miss", [0, 0], 0, None, 1, None),
             # The raising rank re-raises (see overrides); the others miss.
             "normal_first_component_raises": ("miss", [0, 0], 0, None, 1, None),
             "normal_component_assert": ("miss", [0, 0], 0, None, 1, None),
@@ -436,7 +427,7 @@ class TestConstructionConsensus(CustomTestCase):
             "prefetch_fails_with_other_holder": miss_prefetch,
             # Everyone built, a claim failed: free, then the normal path builds
             # again, agrees once more and reaches revalidate_load.
-            "prefetch_claim_fails_one_rank": ("miss", [0, 0], 0, True, 4, 2),
+            "prefetch_claim_fails_one_rank": ("miss", [0, 0], 1, True, 4, 2),
             # A build failure wins: a miss without retrying the normal path.
             "prefetch_build_and_claim_fail": miss_prefetch,
             "prefetch_claim_raises_one_rank": miss_prefetch,
@@ -444,13 +435,14 @@ class TestConstructionConsensus(CustomTestCase):
             # Ranks 2 and 3 needed no DFS read; the agreement is the same.
             "mixed_all_built": ("prepare", [1, 1], 0, None, 3, 2),
             "mixed_one_rank_none": miss_prefetch,
-            "mixed_claim_fails_one_rank": ("miss", [0, 0], 0, True, 4, 2),
+            "mixed_claim_fails_one_rank": ("miss", [0, 0], 1, True, 4, 2),
             "mixed_claim_raises_one_rank": miss_prefetch,
             "mixed_build_raises_on_no_prefetch_rank": miss_prefetch,
             # Three reductions, built once, straight on to PREPARE.
             "prefetch_all_built": ("prepare", [1, 1], 0, None, 3, 2),
-            # Preparation already established a lease; skip the existence RPC.
-            "all_built": ("prepare", [1, 1], 0, None, 1, None),
+            # Session preparation is deferred to the worker; admission still
+            # checks for an already stale hit (this fake returns a cache miss).
+            "all_built": ("miss", [0, 0], 1, None, 1, None),
             # Prefetch disabled still agrees on construction before either
             # LayerSplit revalidation or the later prefix-mask reduction.
             "disabled_layer_split_none": ("miss", [0, 0], 0, None, 2, None),

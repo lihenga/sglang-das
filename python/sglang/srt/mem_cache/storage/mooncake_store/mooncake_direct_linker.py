@@ -715,9 +715,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return self._prepare_expanded_load(rid, expanded)
 
-    def _prepare_expanded_load(
-        self, rid: str, expanded: list[PoolTransfer]
-    ) -> bool:
+    def _prepare_expanded_load(self, rid: str, expanded: list[PoolTransfer]) -> bool:
         keys = []
         seen = set()
         for transfer in expanded:
@@ -731,83 +729,101 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not keys:
             return False
 
-        with self.session_lock:
-            if rid in self.prepared_load_sessions:
-                if self.prepared_load_sessions[rid] != keys:
-                    return False
-                reused_keys = keys
-            else:
-                acquired = []
-                new_keys = []
-                reused_keys = []
-                for key in keys:
-                    if key in self.session_refcounts:
-                        self.session_refcounts[key] += 1
-                        if self.host_prefetch_enabled:
-                            self.session_sources.setdefault(key, "unknown")
-                            # Shared keys have no reliable lease-age shortcut.
-                            self._lease_bases().pop(key, None)
-                        acquired.append(key)
-                        reused_keys.append(key)
+        # Reserve only dictionary state under the global lock. A request that
+        # overlaps an in-flight start/end waits for those keys, never while
+        # holding session_lock; disjoint workers can contact the master together.
+        while True:
+            with self.session_lock:
+                operations = self._session_operations_locked()
+                waiting = {operations[key] for key in keys if key in operations}
+                if not waiting:
+                    existing = rid in self.prepared_load_sessions
+                    if existing and self.prepared_load_sessions[rid] != keys:
+                        return False
+                    acquired, new_keys, reused_keys = [], [], []
+                    owned = {}
+                    if existing:
+                        reused_keys = keys
                     else:
-                        new_keys.append(key)
+                        for key in keys:
+                            if key in self.session_refcounts:
+                                self.session_refcounts[key] += 1
+                                self.session_sources.setdefault(key, "unknown")
+                                self._lease_bases().pop(key, None)
+                                acquired.append(key)
+                                reused_keys.append(key)
+                            else:
+                                new_keys.append(key)
+                                owned[key] = operations[key] = threading.Event()
+                    break
+            for operation in waiting:
+                operation.wait()
 
-                lease_base = (
-                    time.monotonic() if self.host_prefetch_enabled else 0.0
-                )
-                try:
-                    if new_keys and self.host_prefetch_enabled:
-                        results, sources = (
-                            self.storage.store.batch_get_session_start_with_sources(
-                                new_keys
-                            )
+        failed = False
+        try:
+            lease_base = time.monotonic()
+            try:
+                if new_keys:
+                    results, sources = (
+                        self.storage.store.batch_get_session_start_with_sources(
+                            new_keys
                         )
-                        results = list(results)
-                        sources = list(sources)
-                    elif new_keys:
-                        results = list(
-                            self.storage.store.batch_get_session_start(new_keys)
-                        )
-                        sources = []
-                    else:
-                        results = []
-                        sources = []
-                except BaseException:
-                    logger.warning(
-                        "Mooncake get session start raised for rid=%s",
-                        rid,
-                        exc_info=True,
                     )
-                    self._rollback_session_refs_locked(acquired)
-                    return False
-
-                failed = len(results) != len(new_keys) or any(
-                    result != 0 for result in results
+                    results, sources = list(results), list(sources)
+                else:
+                    results, sources = [], []
+            except BaseException:
+                logger.warning(
+                    "Mooncake get session start raised for rid=%s", rid, exc_info=True
                 )
-                for index, key in enumerate(new_keys):
-                    if index < len(results) and results[index] == 0:
-                        self.session_refcounts[key] = 1
-                        if self.host_prefetch_enabled:
+                results, sources = [], []
+            to_end = []
+            with self.session_lock:
+                if not existing:
+                    failed = len(results) != len(new_keys) or any(
+                        result != 0 for result in results
+                    )
+                    for index, key in enumerate(new_keys):
+                        if index < len(results) and results[index] == 0:
+                            self.session_refcounts[key] = 1
                             source = (
                                 sources[index] if index < len(sources) else "unknown"
                             )
                             self.session_sources[key] = str(source).lower()
                             self._lease_bases()[key] = lease_base
-                        acquired.append(key)
-                if failed:
-                    self._rollback_session_refs_locked(acquired)
-                    return False
-
-                self.prepared_load_sessions[rid] = acquired
-
-        # New keys already queried the master; only reused sessions need checking.
+                            acquired.append(key)
+                    if failed:
+                        to_end = self._rollback_session_refs_locked(acquired)
+                    else:
+                        self.prepared_load_sessions[rid] = acquired
+            self._end_session_keys(to_end)
+        finally:
+            with self.session_lock:
+                self._complete_session_operations_locked(owned)
+        if failed:
+            return False
+        # Reused sessions are refreshed on a worker before any device read.
         if reused_keys and not self._refresh_session_keys(reused_keys):
             self._abort_prepared_load_now(rid)
             return False
         return True
 
+    def _session_operations_locked(self) -> dict[str, threading.Event]:
+        # Also supports linkers constructed without __init__ in CPU fixtures.
+        operations = getattr(self, "session_operations", None)
+        if operations is None:
+            operations = self.session_operations = {}
+        return operations
+
+    def _complete_session_operations_locked(self, owned) -> None:
+        operations = self._session_operations_locked()
+        for key, operation in owned.items():
+            if operations.get(key) is operation:
+                operations.pop(key)
+                operation.set()
+
     def _refresh_session_keys(self, keys: list[str]) -> bool:
-        """Apply the admission lease-age check before explicitly refreshing."""
+        """Apply the worker lease-age check before explicitly refreshing."""
         with self.session_lock:
             bases = [self._lease_bases().get(key) for key in keys]
             private = all(self.session_refcounts.get(key, 0) == 1 for key in keys)
@@ -902,7 +918,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             session_rid = str(entry["session_rid"])
         with self.session_lock:
             keys = list(self.prepared_load_sessions.get(session_rid, ()))
-        return self._refresh_session_keys(keys)
+        # Admission checks local ownership only. The load worker refreshes the
+        # lease before reading, so a slow master cannot stall the scheduler.
+        return bool(keys)
 
     def revalidate_no_prefetch_needed(self, rid: str) -> bool:
         """Re-check the keys of a request that needed no DFS prefetch.
@@ -949,8 +967,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         if not self.host_prefetch_enabled:
             return False
-        # Session RPCs may hold session_lock; wait before locking worker state.
         # Keep session ownership and the claimed state atomic under both locks.
+        # Neither lock is held across a session RPC.
         with self.session_lock, self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is None or entry.get("state") != "dfs_prefetched":
@@ -1107,7 +1125,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not keep_session:
             self._abort_prepared_load_now(session_rid)
 
-    def _rollback_session_refs_locked(self, keys: list[str]) -> None:
+    def _rollback_session_refs_locked(self, keys: list[str]) -> list[str]:
         to_end = []
         for key in keys:
             count = self.session_refcounts.get(key, 0)
@@ -1119,20 +1137,39 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 to_end.append(key)
             else:
                 self.session_refcounts[key] = count - 1
-        if to_end:
-            try:
-                self.storage.store.batch_get_session_end(to_end)
-            except BaseException:
-                logger.warning(
-                    "Mooncake get session cleanup failed for %d keys.",
-                    len(to_end),
-                    exc_info=True,
-                )
+        operations = self._session_operations_locked()
+        for key in to_end:
+            # Transfer ownership to end: an earlier start's finally block must
+            # not unblock a replacement start before this cleanup finishes.
+            previous = operations.get(key)
+            operations[key] = threading.Event()
+            if previous is not None:
+                previous.set()  # Existing waiters retry against the end event.
+        return to_end
+
+    def _end_session_keys(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        with self.session_lock:
+            operations = self._session_operations_locked()
+            owned = {key: operations[key] for key in keys}
+        try:
+            self.storage.store.batch_get_session_end(keys)
+        except BaseException:
+            logger.warning(
+                "Mooncake get session cleanup failed for %d keys.",
+                len(keys),
+                exc_info=True,
+            )
+        finally:
+            with self.session_lock:
+                self._complete_session_operations_locked(owned)
 
     def _abort_prepared_load_now(self, rid: str) -> None:
         with self.session_lock:
             keys = self.prepared_load_sessions.pop(rid, [])
-            self._rollback_session_refs_locked(keys)
+            to_end = self._rollback_session_refs_locked(keys)
+        self._end_session_keys(to_end)
 
     def abort_prepared_load(self, rid: str) -> None:
         if not self.host_prefetch_enabled:
@@ -1225,12 +1262,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if self.host_prefetch_enabled:
                 if request_ids is None:
                     raise ValueError("Prefetched loads require request IDs")
-                for rid in request_ids:
-                    with self.session_lock:
-                        prepared = rid in self.prepared_load_sessions
-                    if not prepared:
+                for rid, transfers in zip(request_ids, request_transfers):
+                    if not self._prepare_expanded_load(rid, transfers):
                         raise RuntimeError(
-                            f"Load admitted without prepared session: rid={rid}"
+                            f"Mooncake get session preparation failed for rid={rid}"
                         )
             if read_plan_enabled:
                 self.load_with_read_plan(counter_index, request_transfers)
