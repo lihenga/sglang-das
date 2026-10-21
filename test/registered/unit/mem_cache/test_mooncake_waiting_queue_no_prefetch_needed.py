@@ -160,13 +160,13 @@ class TestCancelWaitingQueuePrefetch(CustomTestCase):
         wrapper.pending_host_prefetch_submissions = {}
         return wrapper
 
-    def test_untracked_request_does_not_cancel_backend_prefetch(self):
+    def test_untracked_prefetch_still_cancels_ordinary_admission(self):
         wrapper = self._wrapper()
 
         wrapper.cancel_waiting_queue_prefetch("rid")
 
         self.assertNotIn("rid", wrapper.hit_markers)
-        wrapper.cache_linker.cancel_host_prefetch.assert_not_called()
+        wrapper.cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
 
     def test_tracked_host_prefetch_is_cancelled(self):
         wrapper = self._wrapper()
@@ -260,7 +260,7 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
 
         self.assertEqual(wrapper.load_back(req), ("loaded", "node"))
 
-        self.assertEqual(cache.reductions, [1])
+        self.assertEqual(cache.reductions, [1, 1])
         wrapper.cache_linker.prepare_load.assert_not_called()
         wrapper.cache_linker.revalidate_load.assert_called_once_with([transfer])
         wrapper._update_load.assert_called_once_with(

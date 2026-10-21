@@ -86,6 +86,15 @@ def _prefetched(linker, clock, rid="rid", keys=("k0", "k1"), session="s"):
     transfer = types.SimpleNamespace(keys=list(keys))
     with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
         assert linker._prepare_expanded_load(session, [transfer])
+    if not hasattr(linker, "load_admissions"):
+        linker.load_admissions = {}
+    linker.load_admissions[rid] = dict(
+        done=True,
+        valid=True,
+        cancelled=False,
+        deadline=float("inf"),
+        session_rid=session,
+    )
     linker.host_prefetch_entries[rid] = {
         "state": "dfs_prefetched",
         "session_rid": session,

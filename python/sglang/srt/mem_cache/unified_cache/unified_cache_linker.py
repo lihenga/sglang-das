@@ -300,15 +300,15 @@ class UnifiedCacheLinkerWrapper:
         return "terminal"
 
     def cancel_waiting_queue_prefetch(self, rid: str) -> None:
+        getattr(self, "load_admission_verdicts", {}).pop(rid, None)
         self.hit_markers.pop(rid, None)
         if not self._waiting_queue_prefetch_enabled:
             return
-        tracked = self.host_prefetch_hits.pop(rid, None) is not None
+        self.host_prefetch_hits.pop(rid, None)
         pending = self.pending_host_prefetch_submissions.pop(rid, None)
         if pending is not None:
             pending[0].cancelled.set()
-        if tracked or pending is not None:
-            self.cache_linker.cancel_host_prefetch(rid)
+        self.cache_linker.cancel_host_prefetch(rid)
 
     def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
         """Build a request-local snapshot without issuing any collectives."""
@@ -662,6 +662,48 @@ class UnifiedCacheLinkerWrapper:
         if cleanup_error is not None:
             raise cleanup_error
 
+    def prepare_load_admission(self, req: Req) -> bool:
+        """Wait in the queue for session RPCs, then agree before allocating KV."""
+        prepare = getattr(self.cache_linker, "prepare_load_admission", None)
+        if not self._waiting_queue_prefetch_enabled or not callable(prepare):
+            return True
+        hit = self.hit_markers.get(req.rid)
+        if hit is None:
+            self.cache_linker.abort_prepared_load(req.rid)
+        transfers = []
+        state = "ready"
+        try:
+            if hit is None:
+                components = ()
+            else:
+                components = self.cache._components_tuple
+            for component in components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+                )
+                if transfer is None:
+                    raise ValueError("No metadata for load admission")
+                transfers.append(transfer)
+            if hit is not None:
+                state = prepare(req.rid, transfers)
+        except BaseException:
+            logger.warning(
+                "External load admission failed for rid=%s", req.rid, exc_info=True
+            )
+            state = "failed"
+        verdict = torch.tensor(
+            [int(state == "pending"), int(state == "ready")], dtype=torch.int
+        )
+        self.cache._all_reduce_attn_groups(verdict[:1], torch.distributed.ReduceOp.MAX)
+        self.cache._all_reduce_attn_groups(verdict[1:], torch.distributed.ReduceOp.MIN)
+        if int(verdict[0]):
+            return False
+        if not hasattr(self, "load_admission_verdicts"):
+            self.load_admission_verdicts = {}
+        if hit is not None:
+            self.load_admission_verdicts[req.rid] = bool(verdict[1])
+        return True
+
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
@@ -669,7 +711,12 @@ class UnifiedCacheLinkerWrapper:
         if hit is None:
             return empty_indices, req.last_node
 
-        prepared_for_load = False
+        admission = getattr(self, "load_admission_verdicts", {}).pop(req.rid, None)
+        if admission is False:
+            self.cancel_waiting_queue_prefetch(req.rid)
+            self.cache_linker.abort_prepared_load(req.rid)
+            return empty_indices, req.last_node
+        prepared_for_load = admission is True
         prefetched = (
             self.host_prefetch_hits.pop(req.rid, None) is not None
             if self._waiting_queue_prefetch_enabled
@@ -682,13 +729,17 @@ class UnifiedCacheLinkerWrapper:
             cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
             if int(ready.item()) == 0:
                 self.cache_linker.cancel_host_prefetch(req.rid)
+                if admission is True:
+                    return empty_indices, req.last_node
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
 
             # Every rank must reach the reduction below, so any local failure,
             # including an exception, becomes a local False.
             try:
-                if status == "no_prefetch_needed":
+                if prepared_for_load:
+                    locally_valid = True
+                elif status == "no_prefetch_needed":
                     # Its session was released while queued; re-check that
                     # the keys survived so eviction falls back to the normal
                     # path instead of failing the later load.
@@ -706,6 +757,8 @@ class UnifiedCacheLinkerWrapper:
             cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
             if int(valid.item()) == 0:
                 self.cache_linker.cancel_host_prefetch(req.rid)
+                if admission is True:
+                    return empty_indices, req.last_node
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
 
@@ -721,7 +774,7 @@ class UnifiedCacheLinkerWrapper:
             )
             claim_error: BaseException | None = None
             try:
-                if status == "no_prefetch_needed":
+                if status == "no_prefetch_needed" and admission is not True:
                     self.cache_linker.cancel_host_prefetch(req.rid)
                     claimed = True
                 else:
@@ -751,7 +804,9 @@ class UnifiedCacheLinkerWrapper:
                     cancel_prefetch=True,
                     pending=build_error if build_error is not None else claim_error,
                 )
-                if not constructed_all:
+                if not constructed_all or admission is True:
+                    # A prepared session cannot be retried after its admission
+                    # failed on a peer; recompute consistently instead.
                     # Building failed somewhere: a miss, as on the normal path.
                     return empty_indices, req.last_node
                 # Every rank built but a claim failed: retry the normal path,
@@ -788,11 +843,16 @@ class UnifiedCacheLinkerWrapper:
         # then fail the async layer-wise session fatally. Re-check existence
         # here so the request degrades to a plain cache miss instead.
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
-        if (
-            not prepared_for_load
-            and revalidate is not None
-            and not revalidate([transfer for _, transfer in component_transfers])
-        ):
+        valid = True
+        if not prepared_for_load and revalidate is not None:
+            try:
+                valid = revalidate([transfer for _, transfer in component_transfers])
+            except BaseException:
+                valid = False
+            verdict = torch.tensor(int(valid), dtype=torch.int)
+            cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+            valid = bool(verdict.item())
+        if not valid:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
                 req,

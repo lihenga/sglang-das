@@ -4324,6 +4324,18 @@ class Scheduler(
                     req.swa_host_hit_length = (
                         self.tree_cache.staged_prefetch_swa_tokens(req.rid)
                     )
+            if (
+                self.enable_waiting_queue_dfs_prefetch
+                and not self.tree_cache.prepare_external_load_admission(req)
+            ):
+                req.mamba_cow_src_index = None
+                req.mamba_needs_clear = False
+                if req.mamba_pool_idx is not None and not getattr(req, "session", None):
+                    self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
+                    req.mamba_pool_idx = None
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
