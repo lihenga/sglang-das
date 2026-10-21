@@ -845,6 +845,9 @@ def _get_deepgemm_shuffle_unique() -> tuple[int, str]:
 
     try:
         mode = get_global_server_args().disaggregation_mode
+        # Match the decode W6 kernel and weight layout used by the existing fast path.
+        if mode == "decode" and os.getenv("SGLANG_DEEPGEMM_DECODE_W6", "0") == "1":
+            return 1, mode
         if mode in ("prefill", "decode"):
             return 0, mode
     except Exception:
