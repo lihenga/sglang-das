@@ -120,16 +120,28 @@ def _prefetch_backend(other_holder, claim="ok"):
             raise RuntimeError("claim failed")
 
         linker.claim_ready_host_prefetch = raising_claim
+    linker.load_admissions = {
+        "r": dict(
+            done=True,
+            valid=True,
+            cancelled=False,
+            deadline=float("inf"),
+            session_rid=SESSION,
+        )
+    }
     ended = []
     linker.pool_group = types.SimpleNamespace(resolve_transfers=lambda transfers, **_: transfers)
     linker.storage = types.SimpleNamespace(
         _get_hybrid_page_component_keys=lambda keys, transfer: (["k0"], None),
         _tag_keys=lambda keys: keys,
         store=types.SimpleNamespace(
-            batch_get_session_start_with_sources=lambda keys: ([0] * len(keys), ["dfs"] * len(keys)),
+            batch_get_session_start_with_sources=lambda keys: (
+                [0] * len(keys),
+                ["dfs"] * len(keys),
+            ),
             batch_get_session_refresh=lambda keys: [0] * len(keys),
             batch_get_session_end=lambda keys: ended.append(list(keys)),
-        )
+        ),
     )
     return linker, ended
 
@@ -152,6 +164,15 @@ def _no_prefetch_needed_backend():
     linker.prepared_load_sessions = {}
     linker.session_refcounts = {}
     linker.session_sources = {}
+    linker.load_admissions = {
+        "r": dict(
+            done=True,
+            valid=True,
+            cancelled=False,
+            deadline=float("inf"),
+            session_rid=SESSION,
+        )
+    }
     ended = []
     linker.pool_group = types.SimpleNamespace(resolve_transfers=lambda transfers, **_: transfers)
     linker.storage = types.SimpleNamespace(
@@ -159,7 +180,10 @@ def _no_prefetch_needed_backend():
         _tag_keys=lambda keys: keys,
         _batch_exist=lambda keys: [1] * len(keys),
         store=types.SimpleNamespace(
-            batch_get_session_start_with_sources=lambda keys: ([0] * len(keys), ["memory"] * len(keys)),
+            batch_get_session_start_with_sources=lambda keys: (
+                [0] * len(keys),
+                ["memory"] * len(keys),
+            ),
             batch_get_session_refresh=lambda keys: [0] * len(keys),
             batch_get_session_end=lambda keys: ended.append(list(keys)),
         ),
@@ -449,6 +473,10 @@ class TestConstructionConsensus(CustomTestCase):
             "disabled_no_layer_split_none": ("miss", [0, 0], 0, None, 2, None),
             "disabled_all_built": ("prepare", [1, 1], 1, None, 2, None),
         }
+        expected = {
+            name: (*value[:4], value[4] + int(value[2] > 0), value[5])
+            for name, value in expected.items()
+        }
         # The rank whose build or claim raised re-raises after the same
         # agreement and cleanup; nobody retries the normal path.
         raised_prefetch = lambda message: (f"raised:{message}", [0, 0], 0, True, 3, 2)
@@ -490,7 +518,7 @@ class TestConstructionConsensus(CustomTestCase):
             self.assertEqual(rank_masks, [rank_masks[0]] * 4)
             for common_pages, reduction_shapes in rank_masks[0]:
                 self.assertEqual(common_pages, 2)
-                self.assertEqual(reduction_shapes, (1, 3))
+                self.assertEqual(reduction_shapes, (1, 1, 3) if name == "disabled_all_built" else (1, 3))
 
 
 class TestInterruptDuringConstruction(CustomTestCase):
