@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
@@ -41,6 +42,55 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def test_runtime_mooncake_attach_injects_cli_health_config(monkeypatch):
+    controller = SimpleNamespace(
+        storage_backend_type=None,
+        mem_pool_host=SimpleNamespace(entries=[]),
+    )
+    attached = []
+    controller.attach_storage_backend = lambda **kwargs: attached.append(kwargs)
+    cache = SimpleNamespace(
+        cache_controller=controller,
+        enable_storage=False,
+        _enable_metrics_flag=False,
+        extra_metric_labels=None,
+    )
+    attachment = StorageAttachment(cache)
+    monkeypatch.setattr(attachment, "apply_runtime_config", lambda **kwargs: None)
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_cache.storage_attachment."
+        "HybridCacheController.parse_storage_backend_extra_config",
+        lambda raw: (
+            {"master_server_address": "127.0.0.1:50051"},
+            256,
+            1.0,
+            0.25,
+            False,
+        ),
+    )
+    server_args = SimpleNamespace(
+        mooncake_dfs_health_probe_interval_s=13,
+        mooncake_dfs_health_failure_threshold=3,
+        mooncake_dfs_health_success_threshold=4,
+        mooncake_dfs_health_probe_timeout_s=7,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_server_args", lambda: server_args
+    )
+
+    ok, _ = attachment.attach("mooncake")
+
+    assert ok
+    assert attached[0]["storage_backend_extra_config"][
+        "_mooncake_dfs_health_config"
+    ] == {
+        "probe_interval_s": 13,
+        "failure_threshold": 3,
+        "success_threshold": 4,
+        "probe_timeout_s": 7,
+    }
 
 
 class _Allocator:
@@ -561,6 +611,29 @@ def test_sync_dfs_health_policy_applies_attention_group_minimum():
     cache._sync_dfs_health_policy()
 
     assert applied == [(False, True)]
+
+
+def test_sync_dfs_health_policy_applies_pp_group_minimum(monkeypatch):
+    applied = []
+    pp_group = object()
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: (True, True),
+        apply_dfs_health_policy=lambda read, write: applied.append((read, write)),
+    )
+    cache._all_reduce_attn_groups = lambda policy, op: None
+    cache.pp_size = 2
+    cache.pp_group = pp_group
+
+    def reduce_pp_policy(policy, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        assert group is pp_group
+        policy.copy_(torch.tensor([1, 0], dtype=torch.int))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_pp_policy)
+    cache._sync_dfs_health_policy()
+
+    assert applied == [(True, False)]
 
 
 def test_sync_dfs_health_policy_failure_is_nonfatal_and_throttled(monkeypatch):

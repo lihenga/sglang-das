@@ -639,6 +639,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     and (
                         getattr(storage_config, "tp_size", 1) > 1
                         or getattr(storage_config, "attn_cp_size", 1) > 1
+                        or getattr(storage_config, "pp_size", 1) > 1
                     )
                 )
                 self._dfs_health_manager = MooncakeDfsHealthManager(
