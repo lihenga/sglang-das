@@ -6,7 +6,8 @@ import os
 import threading
 import time
 from concurrent.futures import Future
-from queue import Empty, Full, Queue
+from itertools import count
+from queue import Empty, Full, PriorityQueue, Queue
 
 import torch
 
@@ -456,11 +457,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             self.session_end_thread.start()
             self.host_prefetch_generation = 0
-            self.host_prefetch_queue: Queue[
-                tuple[str, list[PoolTransfer]] | tuple[str, list[PoolTransfer], dict] | None
-            ] = (
-                Queue(maxsize=2 * self.host_prefetch_limit)
-            )
+            self.host_prefetch_task_ids = count()
+            self.host_prefetch_queue = PriorityQueue(maxsize=2 * self.host_prefetch_limit)
             for worker_id in range(self.host_prefetch_worker_count):
                 thread = threading.Thread(
                     target=self.host_prefetch_thread_func,
@@ -702,12 +700,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
         if self.host_prefetch_enabled:
-            with self.host_prefetch_lock:
+            with self.session_lock, self.host_prefetch_lock:
                 entry = self.host_prefetch_entries.get(rid)
                 if entry is not None and entry.get("state") == "claimed":
                     entry["state"] = "loading"
                 admission = getattr(self, "load_admissions", {}).get(rid)
                 if admission is not None:
+                    session_rid = admission["session_rid"]
+                    if session_rid != rid and session_rid in self.prepared_load_sessions:
+                        self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
+                            session_rid
+                        )
+                    admission["session_rid"] = rid
                     admission["loading"] = True
         logical_pages = {
             page_key for transfer in expanded for page_key in transfer.keys
@@ -731,9 +735,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return self._prepare_expanded_load(rid, expanded, force_refresh=force_refresh)
 
-    def _prepare_expanded_load(
-        self, rid: str, expanded: list[PoolTransfer], *, force_refresh: bool = False
-    ) -> bool:
+    def _load_session_keys(self, expanded: list[PoolTransfer]) -> list[str]:
         keys = []
         seen = set()
         for transfer in expanded:
@@ -744,6 +746,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if key not in seen:
                     seen.add(key)
                     keys.append(key)
+        return keys
+
+    def _prepare_expanded_load(
+        self, rid: str, expanded: list[PoolTransfer], *, force_refresh: bool = False
+    ) -> bool:
+        keys = self._load_session_keys(expanded)
         if not keys:
             return False
 
@@ -920,7 +928,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Session creation can contact DFS. The scheduler only publishes the
         # work item; this worker owns both preparation and the DFS read.
         try:
-            self.host_prefetch_queue.put_nowait((rid, queued_transfers))
+            self.host_prefetch_queue.put_nowait(
+                (1, next(self.host_prefetch_task_ids), (rid, queued_transfers))
+            )
         except Full:
             with self.host_prefetch_lock:
                 self.host_prefetch_entries.pop(rid, None)
@@ -941,40 +951,51 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if current["signature"] != signature:
                     return "failed"
                 if not current["done"]:
-                    return "pending"
-                if not current["valid"]:
+                    if current["queued"]:
+                        return "pending"
+                elif not current["valid"]:
                     return "failed"
-                if time.monotonic() < current["deadline"]:
+                elif time.monotonic() < current["deadline"]:
                     return "ready"
-                # A request can wait behind device-capacity admission for a
-                # whole lease. Refresh again rather than using stale readiness.
-                current["done"] = False
-                current["valid"] = False
+                else:
+                    # Refresh stale readiness after waiting for device capacity.
+                    current["done"] = False
+                    current["valid"] = False
+                    current["queued"] = False
             else:
                 if (
                     len(admissions) >= self.host_prefetch_limit
                     or getattr(self, "pending_session_ends", 0)
                     >= self.host_prefetch_limit
                 ):
-                    return "failed"
+                    return "pending"
                 prefetch = self.host_prefetch_entries.get(rid, {})
+                generation = next(self.host_prefetch_task_ids)
                 session_rid = (
                     str(prefetch["session_rid"])
                     if prefetch.get("state") == "dfs_prefetched"
-                    else rid
+                    else f"__sglang_load_admission__:{rid}:{generation}"
                 )
                 current = admissions[rid] = dict(
                     session_rid=session_rid,
                     done=False,
                     valid=False,
                     cancelled=False,
+                    queued=False,
                     signature=signature,
                 )
             try:
-                self.host_prefetch_queue.put_nowait((rid, list(transfers), current))
+                if not current["queued"]:
+                    self.host_prefetch_queue.put_nowait(
+                        (
+                            0,
+                            next(self.host_prefetch_task_ids),
+                            (rid, list(transfers), current),
+                        )
+                    )
+                    current["queued"] = True
             except Full:
-                current["done"] = True
-                return "failed"
+                return "pending"
             return "pending"
 
     def load_admission_valid(self, rid: str) -> bool:
@@ -991,8 +1012,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def _run_load_admission(self, rid, transfers, admission) -> None:
         session_rid = admission["session_rid"]
         before = time.monotonic()
+        ttl = float(os.environ.get("SGLANG_MOONCAKE_LEASE_TTL_S", "10") or 10)
+        deadline = before + ttl / 2
         try:
-            valid = self.prepare_load(session_rid, transfers, force_refresh=True)
+            expanded = self.pool_group.resolve_transfers(
+                transfers, allow_partial=True, allow_missing_kv=True
+            )
+            keys = self._load_session_keys(expanded)
+            with self.session_lock:
+                prepared = self.prepared_load_sessions.get(session_rid, ())
+                bases = [self._lease_bases().get(key) for key in keys]
+                fresh_deadline = (
+                    min(bases) + ttl / 2
+                    if keys and None not in bases and set(keys).issubset(prepared)
+                    else 0
+                )
+            if before < fresh_deadline:
+                # Keep the original RPC's lease origin, not the poll time.
+                valid, deadline = True, fresh_deadline
+            else:
+                valid = bool(expanded) and self._prepare_expanded_load(
+                    session_rid, expanded, force_refresh=True
+                )
         except BaseException:
             logger.warning(
                 "Mooncake load admission failed for rid=%s", rid, exc_info=True
@@ -1000,8 +1041,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             valid = False
         # Use the deployment's declared TTL, conservatively leaving half for
         # admission and device loading. Slow RPCs cannot publish fresh readiness.
-        ttl = float(os.environ.get("SGLANG_MOONCAKE_LEASE_TTL_S", "10") or 10)
-        deadline = before + ttl / 2
         with self.host_prefetch_lock:
             cancelled = admission["cancelled"]
             admission.update(
@@ -1013,6 +1052,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._abort_prepared_load_now(session_rid)
 
     def _cancel_load_admission(self, rid: str, *, drained: bool = False) -> None:
+        if not self.host_prefetch_enabled:
+            return
         with self.host_prefetch_lock:
             admissions = getattr(self, "load_admissions", {})
             admission = admissions.get(rid)
@@ -1023,7 +1064,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 # The load worker owns the native read until its finally block.
                 return
             admissions.pop(rid)
-            done = admission["done"]
+            done = admission["done"] or not admission.get("queued", True)
         if done:
             self._abort_prepared_load_async(admission["session_rid"])
 
@@ -1105,6 +1146,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if entry is None:
                 return False
             if entry.get("state") == "no_prefetch_needed":
+                admission = getattr(self, "load_admissions", {}).get(rid)
+                if admission is not None:
+                    session_rid = admission["session_rid"]
+                    if session_rid in self.prepared_load_sessions and session_rid != rid:
+                        self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
+                            session_rid
+                        )
+                        admission["session_rid"] = rid
                 if rid not in self.prepared_load_sessions:
                     return False
                 entry["state"] = "claimed"
@@ -1145,7 +1194,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def host_prefetch_thread_func(self) -> None:
         while True:
-            task = self.host_prefetch_queue.get()
+            _, _, task = self.host_prefetch_queue.get()
             try:
                 if task is None:
                     return
@@ -1815,7 +1864,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_queue.put(None)
         self.offload_queue.put(None)
         for _ in self.host_prefetch_threads:
-            self.host_prefetch_queue.put(None)
+            self.host_prefetch_queue.put((2, next(self.host_prefetch_task_ids), None))
         self.load_thread.join()
         self.offload_thread.join()
         for thread in self.host_prefetch_threads:

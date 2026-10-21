@@ -2,12 +2,13 @@
 
 import datetime
 import pathlib
-from queue import Queue
+from queue import PriorityQueue, Queue
 import tempfile
 import threading
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -34,8 +35,10 @@ class MetadataComponent(FakeComponent):
 def backend():
     linker = _linker(age_s=0)
     linker.host_prefetch_limit = 8
-    linker.host_prefetch_queue = Queue(maxsize=16)
+    linker.host_prefetch_queue = PriorityQueue(maxsize=16)
     linker.load_admissions = {}
+    linker.pending_loads = {}
+    linker.page_size = 1
     linker.pool_group = types.SimpleNamespace(
         resolve_transfers=lambda transfers, **_: transfers
     )
@@ -43,7 +46,7 @@ def backend():
 
 
 def run_job(linker):
-    rid, transfers, admission = linker.host_prefetch_queue.get_nowait()
+    _, _, (rid, transfers, admission) = linker.host_prefetch_queue.get_nowait()
     linker._run_load_admission(rid, transfers, admission)
     linker.host_prefetch_queue.task_done()
 
@@ -97,6 +100,9 @@ def _admission_rank(rank, init_file):
                     state="dfs_prefetched", session_rid="session"
                 )
                 wrapper.host_prefetch_hits["r"] = hit
+                if scenario.startswith("refresh"):
+                    for key in keys:
+                        linker.session_lease_base[key] = time.monotonic() - 6
             if scenario == "same_prefix":
                 assert linker._prepare_expanded_load(
                     "other", [types.SimpleNamespace(keys=["h1"])]
@@ -136,6 +142,7 @@ def _admission_rank(rank, init_file):
                 actual = ["h1"] if scenario == "swa_subset" else keys
                 if scenario == "shared_order":
                     actual = list(reversed(keys))
+                assert linker.load("r", [PoolTransfer(name=PoolName.KV, keys=actual)])
                 linker.storage.store.batch_get_session_refresh.reset_mock()
                 assert linker._prepare_expanded_load(
                     "r", [types.SimpleNamespace(keys=actual)]
@@ -146,6 +153,32 @@ def _admission_rank(rank, init_file):
                     assert linker.session_refcounts == {"h1": 1}
                     linker._abort_prepared_load_now("other")
                 assert not linker.session_refcounts
+        # A one-rank allocation failure must release ordinary admissions on
+        # every rank, repeatedly beyond the admission limit.
+        linker = backend()
+        linker.host_prefetch_limit = 2
+        for _ in range(6):
+            component = MetadataComponent(PoolName.KV)
+            cache._components_tuple = (component,)
+            wrapper = _wrapper(cache, linker, False)
+            req = types.SimpleNamespace(rid="r", last_node="node")
+            assert not wrapper.prepare_load_admission(req)
+            run_job(linker)
+            assert wrapper.prepare_load_admission(req)
+            if rank == 1:
+                component.failure = "none"
+            indices, _ = wrapper.load_back(req)
+            assert indices.numel() == 0 and component.allocated == 0
+            assert not linker.load_admissions and not linker.prepared_load_sessions
+            assert not linker.session_refcounts
+        component.failure = None
+        wrapper = _wrapper(cache, linker, False)
+        assert not wrapper.prepare_load_admission(req)
+        run_job(linker)
+        assert wrapper.prepare_load_admission(req)
+        assert wrapper.load_admission_verdicts["r"]
+        linker.abort_prepared_load("r")
+
         # Ordinary revalidation without a LayerSplit group also agrees.
         linker = backend()
         linker.revalidate_load = lambda transfers: rank == 0
@@ -159,6 +192,122 @@ def _admission_rank(rank, init_file):
 
 
 class TestLoadAdmission(unittest.TestCase):
+    def test_over_capacity_requests_wait_and_all_retain_hits(self):
+        linker = backend()
+        requests = [str(index) for index in range(24)]
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["k"])]
+        for rid in requests:
+            self.assertEqual(linker.prepare_load_admission(rid, transfers), "pending")
+        self.assertEqual(len(linker.load_admissions), 8)
+        completed = set()
+        for _ in range(4):
+            while not linker.host_prefetch_queue.empty():
+                run_job(linker)
+            for rid in requests:
+                if rid in completed:
+                    continue
+                state = linker.prepare_load_admission(rid, transfers)
+                self.assertNotEqual(state, "failed")
+                if state == "ready":
+                    completed.add(rid)
+                    linker.abort_prepared_load(rid)
+        self.assertEqual(len(completed), 24)
+        self.assertFalse(linker.load_admissions)
+        self.assertFalse(linker.session_refcounts)
+
+    def test_queue_and_cleanup_pressure_retry_without_losing_admission(self):
+        linker = backend()
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["k"])]
+        linker.pending_session_ends = 8
+        self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
+        self.assertFalse(linker.load_admissions)
+        linker.pending_session_ends = 0
+        for index in range(16):
+            linker.host_prefetch_queue.put((1, index, ("prefetch", [])))
+        self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
+        linker.host_prefetch_queue.get_nowait()
+        linker.host_prefetch_queue.task_done()
+        self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
+        run_job(linker)  # Admission overtakes the remaining prefetch tasks.
+        self.assertEqual(linker.prepare_load_admission("r", transfers), "ready")
+        self.assertEqual(linker.host_prefetch_queue.qsize(), 15)
+
+    def test_capacity_wait_has_total_timeout_in_wrapper(self):
+        linker = backend()
+        linker.host_prefetch_limit = 0
+        component = MetadataComponent(PoolName.KV)
+        cache = types.SimpleNamespace(
+            _components_tuple=(component,),
+            _all_reduce_attn_groups=lambda *args: None,
+        )
+        wrapper = _wrapper(cache, linker, False)
+        req = types.SimpleNamespace(rid="r")
+        self.assertFalse(wrapper.prepare_load_admission(req))
+        started = req.external_load_admission_started
+        with patch("time.monotonic", return_value=started + 20):
+            self.assertFalse(wrapper.prepare_load_admission(req))
+        self.assertEqual(req.external_load_admission_started, started)
+        with patch("time.monotonic", return_value=started + 31):
+            self.assertTrue(wrapper.prepare_load_admission(req))
+        self.assertFalse(wrapper.load_admission_verdicts["r"])
+
+    def test_cancelled_generation_cannot_end_replacement_session(self):
+        linker = backend()
+        entered, release = threading.Event(), threading.Event()
+
+        def start(keys):
+            if keys == ["old"]:
+                entered.set()
+                assert release.wait(5)
+            return [0] * len(keys), ["dfs"] * len(keys)
+
+        linker.storage.store.batch_get_session_start_with_sources.side_effect = start
+        old = [PoolTransfer(name=PoolName.KV, keys=["old"])]
+        new = [PoolTransfer(name=PoolName.KV, keys=["new"])]
+        linker.prepare_load_admission("r", old)
+        old_session = linker.load_admissions["r"]["session_rid"]
+        worker = threading.Thread(target=run_job, args=(linker,))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            linker.cancel_host_prefetch("r")
+            linker.prepare_load_admission("r", new)
+            self.assertNotEqual(old_session, linker.load_admissions["r"]["session_rid"])
+            run_job(linker)
+            self.assertEqual(linker.prepare_load_admission("r", new), "ready")
+            self.assertTrue(linker.load("r", new))
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(linker.prepared_load_sessions, {"r": ["new"]})
+        self.assertTrue(linker.load_admission_valid("r"))
+        linker.abort_prepared_load("r")
+        self.assertFalse(linker.session_refcounts)
+
+    def test_fresh_prefetch_reuses_original_lease_deadline(self):
+        linker = backend()
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["k"])]
+        self.assertTrue(linker.prepare_load("session", transfers))
+        base = linker.session_lease_base["k"]
+        linker.host_prefetch_entries["r"] = dict(
+            state="dfs_prefetched", session_rid="session"
+        )
+        linker.prepare_load_admission("r", transfers)
+        run_job(linker)
+        self.assertEqual(linker.prepare_load_admission("r", transfers), "ready")
+        linker.storage.store.batch_get_session_refresh.assert_not_called()
+        self.assertEqual(linker.load_admissions["r"]["deadline"], base + 5)
+
+    def test_disabled_prefetch_empty_commit_and_cleanup_are_safe(self):
+        linker = backend()
+        linker.host_prefetch_enabled = False
+        del linker.host_prefetch_lock
+        wrapper = _wrapper(None, linker, False)
+        wrapper._queue_load("r", "node", [], anchor="node")
+        linker.cancel_host_prefetch("r")
+        linker.abort_prepared_load("r")
+
     def test_two_rank_failures_and_valid_subsets(self):
         import torch.multiprocessing as mp
 
@@ -220,6 +369,7 @@ class TestLoadAdmission(unittest.TestCase):
         run_job(linker)
         self.assertEqual(linker.prepare_load_admission("r", transfers), "ready")
         linker.load_admissions["r"]["deadline"] = 0
+        linker.session_lease_base["k"] = time.monotonic() - 6
         linker.storage.store.batch_get_session_refresh.side_effect = lambda keys: [
             7
         ] * len(keys)
@@ -228,7 +378,9 @@ class TestLoadAdmission(unittest.TestCase):
         self.assertEqual(linker.prepare_load_admission("r", transfers), "failed")
         self.assertFalse(linker.prepared_load_sessions)
         for i in range(100):
-            linker.prepare_load_admission(str(i), transfers)
+            self.assertEqual(
+                linker.prepare_load_admission(str(i), transfers), "pending"
+            )
         self.assertLessEqual(linker.host_prefetch_queue.qsize(), 16)
         self.assertLessEqual(len(linker.load_admissions), 8)
 
