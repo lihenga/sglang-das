@@ -7,7 +7,6 @@ RPC that granted the lease, so it never understates the lease Mooncake sees.
 """
 
 import os
-from itertools import count
 import threading
 import types
 import unittest
@@ -55,7 +54,7 @@ def _linker(age_s=5.0, refresh_results=None, refresh_error=None):
     linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
     linker.host_prefetch_entries = {}
-    linker.host_prefetch_task_ids = count()
+    linker.host_prefetch_generation = 0
     linker.session_lock = threading.Lock()
     linker.prepared_load_sessions = {}
     linker.session_refcounts = {}
