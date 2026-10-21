@@ -479,6 +479,19 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
+        # Bundled Spark metadata describes the target depth. TokenFlow builds
+        # num_draft_layers; price its cache using that same draft depth.
+        if (
+            self.is_draft_model
+            and self.speculative_algorithm == "DSPARK"
+            and self.hf_config.architectures[0] == "SparkV1DSparkDraftModel"
+        ):
+            draft_layers = int(self.hf_config.num_draft_layers)
+            if draft_layers <= 0:
+                raise ValueError("Spark DSpark requires positive num_draft_layers")
+            self.hf_config.num_hidden_layers = draft_layers
+            self.hf_text_config.num_hidden_layers = draft_layers
+
         # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
         # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
         # FP8 expert tensor layout.

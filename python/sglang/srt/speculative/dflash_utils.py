@@ -181,9 +181,18 @@ def dflash_draft_cell_size_per_token(
     """Exact bytes/token of the DFLASH draft KV pool."""
     if draft_num_layers <= 0:
         return 0
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    from sglang.srt.configs.model_config import AttentionArch
+
+    if draft_model_config.attention_arch == AttentionArch.MLA:
+        # MLA stores a replicated latent vector plus RoPE, rather than
+        # separate K/V tensors for every query head or TP shard.
+        kv_width = (
+            draft_model_config.kv_lora_rank + draft_model_config.qk_rope_head_dim
+        )
+        return int(kv_width * int(draft_num_layers) * dtype_size)
     num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
     kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
-    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
     return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
