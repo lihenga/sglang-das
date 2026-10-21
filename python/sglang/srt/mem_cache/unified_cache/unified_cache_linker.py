@@ -21,14 +21,12 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -693,14 +691,6 @@ class UnifiedCacheLinkerWrapper:
                 "External load admission failed for rid=%s", req.rid, exc_info=True
             )
             state = "failed"
-        started = getattr(req, "external_load_admission_started", None)
-        if started is None:
-            started = req.external_load_admission_started = time.monotonic()
-        wait_s = envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.get()
-        # Zero disables waiting for capacity, not ordinary background RPCs.
-        timeout_s = wait_s if wait_s > 0 else 30
-        if state == "pending" and time.monotonic() - started >= timeout_s:
-            state = "failed"
         verdict = torch.tensor(
             [int(state == "pending"), int(state == "ready")], dtype=torch.int
         )
@@ -708,7 +698,6 @@ class UnifiedCacheLinkerWrapper:
         self.cache._all_reduce_attn_groups(verdict[1:], torch.distributed.ReduceOp.MIN)
         if int(verdict[0]):
             return False
-        req.external_load_admission_started = None
         if not hasattr(self, "load_admission_verdicts"):
             self.load_admission_verdicts = {}
         if hit is not None:

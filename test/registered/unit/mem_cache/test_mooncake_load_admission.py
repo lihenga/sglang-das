@@ -1,9 +1,8 @@
 """Worker session admission must agree before any rank commits device KV."""
 
 import datetime
-import os
 import pathlib
-from queue import PriorityQueue, Queue
+from queue import Queue
 import tempfile
 import threading
 import time
@@ -14,7 +13,6 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LinkerTransferPhase
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,7 +35,7 @@ class MetadataComponent(FakeComponent):
 def backend():
     linker = _linker(age_s=0)
     linker.host_prefetch_limit = 8
-    linker.host_prefetch_queue = PriorityQueue(maxsize=16)
+    linker.host_prefetch_queue = Queue()
     linker.load_admissions = {}
     linker.pending_loads = {}
     linker.page_size = 1
@@ -48,7 +46,7 @@ def backend():
 
 
 def run_job(linker):
-    _, _, (rid, transfers, admission) = linker.host_prefetch_queue.get_nowait()
+    rid, transfers, admission = linker.host_prefetch_queue.get_nowait()
     linker._run_load_admission(rid, transfers, admission)
     linker.host_prefetch_queue.task_done()
 
@@ -156,7 +154,7 @@ def _admission_rank(rank, init_file):
                     linker._abort_prepared_load_now("other")
                 assert not linker.session_refcounts
         # A one-rank allocation failure must release ordinary admissions on
-        # every rank, repeatedly beyond the admission limit.
+        # every rank before this rid is reused by later requests.
         linker = backend()
         linker.host_prefetch_limit = 2
         for _ in range(6):
@@ -181,24 +179,6 @@ def _admission_rank(rank, init_file):
         assert wrapper.load_admission_verdicts["r"]
         linker.abort_prepared_load("r")
 
-        # At the zero default, one rank can be full while its peer has already
-        # submitted ordinary preparation. Both must eventually degrade together.
-        linker = backend()
-        if rank == 1:
-            linker.host_prefetch_limit = 0
-        component = MetadataComponent(PoolName.KV)
-        cache._components_tuple = (component,)
-        wrapper = _wrapper(cache, linker, False)
-        req = types.SimpleNamespace(rid="r", last_node="node")
-        with envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.override(0):
-            assert not wrapper.prepare_load_admission(req)
-            if rank == 0:
-                run_job(linker)
-            assert wrapper.prepare_load_admission(req)
-            indices, _ = wrapper.load_back(req)
-            assert indices.numel() == 0 and component.allocated == 0
-            assert not linker.load_admissions and not linker.prepared_load_sessions
-
         # Ordinary revalidation without a LayerSplit group also agrees.
         linker = backend()
         linker.revalidate_load = lambda transfers: rank == 0
@@ -212,108 +192,27 @@ def _admission_rank(rank, init_file):
 
 
 class TestLoadAdmission(unittest.TestCase):
-    def test_default_zero_rejects_pressure_but_waits_for_submitted_work(self):
-        component = MetadataComponent(PoolName.KV)
-        cache = types.SimpleNamespace(
-            _components_tuple=(component,),
-            _all_reduce_attn_groups=lambda *args: None,
-            tree_core=types.SimpleNamespace(
-                empty_match_result=types.SimpleNamespace(
-                    device_indices=torch.empty(0, dtype=torch.int64)
-                )
-            ),
-        )
-        with patch.dict(os.environ):
-            os.environ.pop("SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S", None)
-            self.assertEqual(envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.get(), 0)
-            for pressure in ("capacity", "queue", "cleanup"):
-                with self.subTest(pressure=pressure):
-                    linker = backend()
-                    if pressure == "capacity":
-                        linker.host_prefetch_limit = 0
-                    elif pressure == "cleanup":
-                        linker.pending_session_ends = linker.host_prefetch_limit
-                    else:
-                        for index in range(16):
-                            linker.host_prefetch_queue.put((1, index, ("unused", [])))
-                    wrapper = _wrapper(cache, linker, False)
-                    req = types.SimpleNamespace(rid="r", last_node="node")
-                    self.assertTrue(wrapper.prepare_load_admission(req))
-                    self.assertFalse(wrapper.load_admission_verdicts["r"])
-                    indices, _ = wrapper.load_back(req)
-                    self.assertEqual(indices.numel(), 0)
-                    self.assertFalse(linker.load_admissions)
-                    self.assertFalse(linker.prepared_load_sessions)
-            linker = backend()
-            wrapper = _wrapper(cache, linker, False)
-            req = types.SimpleNamespace(rid="r")
-            self.assertFalse(wrapper.prepare_load_admission(req))
-            run_job(linker)
-            self.assertTrue(wrapper.prepare_load_admission(req))
-            self.assertTrue(wrapper.load_admission_verdicts["r"])
-            linker.abort_prepared_load("r")
 
-    @envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.override(30)
-    def test_over_capacity_requests_wait_and_all_retain_hits(self):
+    def test_prefetch_limit_does_not_limit_ordinary_l4_loads(self):
         linker = backend()
-        requests = [str(index) for index in range(24)]
-        transfers = [PoolTransfer(name=PoolName.KV, keys=["k"])]
-        for rid in requests:
+        linker.host_prefetch_entries = {
+            f"prefetch-{i}": dict(state="reading", session_rid=f"p-{i}")
+            for i in range(linker.host_prefetch_limit)
+        }
+        requests = {
+            str(i): [PoolTransfer(name=PoolName.KV, keys=[str(i)])] for i in range(24)
+        }
+        self.assertFalse(linker.submit_host_prefetch("overflow", requests["0"]))
+        for rid, transfers in requests.items():
             self.assertEqual(linker.prepare_load_admission(rid, transfers), "pending")
-        self.assertEqual(len(linker.load_admissions), 8)
-        completed = set()
-        for _ in range(4):
-            while not linker.host_prefetch_queue.empty():
-                run_job(linker)
-            for rid in requests:
-                if rid in completed:
-                    continue
-                state = linker.prepare_load_admission(rid, transfers)
-                self.assertNotEqual(state, "failed")
-                if state == "ready":
-                    completed.add(rid)
-                    linker.abort_prepared_load(rid)
-        self.assertEqual(len(completed), 24)
+        self.assertEqual(len(linker.load_admissions), 24)
+        while not linker.host_prefetch_queue.empty():
+            run_job(linker)
+        for rid, transfers in requests.items():
+            self.assertEqual(linker.prepare_load_admission(rid, transfers), "ready")
+            linker.abort_prepared_load(rid)
         self.assertFalse(linker.load_admissions)
         self.assertFalse(linker.session_refcounts)
-
-    @envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.override(30)
-    def test_queue_and_cleanup_pressure_retry_without_losing_admission(self):
-        linker = backend()
-        transfers = [PoolTransfer(name=PoolName.KV, keys=["k"])]
-        linker.pending_session_ends = 8
-        self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
-        self.assertFalse(linker.load_admissions)
-        linker.pending_session_ends = 0
-        for index in range(16):
-            linker.host_prefetch_queue.put((1, index, ("prefetch", [])))
-        self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
-        linker.host_prefetch_queue.get_nowait()
-        linker.host_prefetch_queue.task_done()
-        self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
-        run_job(linker)  # Admission overtakes the remaining prefetch tasks.
-        self.assertEqual(linker.prepare_load_admission("r", transfers), "ready")
-        self.assertEqual(linker.host_prefetch_queue.qsize(), 15)
-
-    @envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.override(2.5)
-    def test_capacity_wait_has_total_timeout_in_wrapper(self):
-        linker = backend()
-        linker.host_prefetch_limit = 0
-        component = MetadataComponent(PoolName.KV)
-        cache = types.SimpleNamespace(
-            _components_tuple=(component,),
-            _all_reduce_attn_groups=lambda *args: None,
-        )
-        wrapper = _wrapper(cache, linker, False)
-        req = types.SimpleNamespace(rid="r")
-        self.assertFalse(wrapper.prepare_load_admission(req))
-        started = req.external_load_admission_started
-        with patch("time.monotonic", return_value=started + 2):
-            self.assertFalse(wrapper.prepare_load_admission(req))
-        self.assertEqual(req.external_load_admission_started, started)
-        with patch("time.monotonic", return_value=started + 3):
-            self.assertTrue(wrapper.prepare_load_admission(req))
-        self.assertFalse(wrapper.load_admission_verdicts["r"])
 
     def test_cancelled_generation_cannot_end_replacement_session(self):
         linker = backend()
@@ -355,11 +254,11 @@ class TestLoadAdmission(unittest.TestCase):
         self.assertTrue(linker.prepare_load("session", transfers))
         base = linker.session_lease_base["k"]
         linker.host_prefetch_entries["r"] = dict(
-            state="dfs_prefetched", session_rid="session"
+            state="dfs_prefetched", session_rid="session", transfers=transfers
         )
-        linker.prepare_load_admission("r", transfers)
-        run_job(linker)
+        linker.host_prefetch_queue.put(("other-prefetch", []))
         self.assertEqual(linker.prepare_load_admission("r", transfers), "ready")
+        self.assertEqual(linker.host_prefetch_queue.qsize(), 1)
         linker.storage.store.batch_get_session_refresh.assert_not_called()
         self.assertEqual(linker.load_admissions["r"]["deadline"], base + 5)
 
@@ -393,7 +292,7 @@ class TestLoadAdmission(unittest.TestCase):
             return [0] * len(keys), ["dfs"] * len(keys)
 
         linker.storage.store.batch_get_session_start_with_sources.side_effect = start
-        transfers = [PoolTransfer(name=PoolName.KV, keys=["k"])]
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["h0", "h1"])]
         self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
         worker = threading.Thread(target=run_job, args=(linker,))
         worker.start()
@@ -401,7 +300,18 @@ class TestLoadAdmission(unittest.TestCase):
             self.assertTrue(entered.wait(1))
             before = time.monotonic()
             self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
-            wrapper = _wrapper(None, linker, False)
+            cache = types.SimpleNamespace(
+                _components_tuple=(MetadataComponent(PoolName.KV),),
+                _all_reduce_attn_groups=lambda *args: None,
+            )
+            wrapper = _wrapper(cache, linker, False)
+            with patch("time.monotonic", return_value=before + 60):
+                self.assertFalse(
+                    wrapper.prepare_load_admission(types.SimpleNamespace(rid="r"))
+                )
+            self.assertTrue(
+                wrapper.prepare_load_admission(types.SimpleNamespace(rid="cold"))
+            )
             wrapper.cancel_waiting_queue_prefetch("r")
             self.assertLess(time.monotonic() - before, 0.5)
         finally:
@@ -426,8 +336,7 @@ class TestLoadAdmission(unittest.TestCase):
         self.assertFalse(linker.session_refcounts)
         linker.storage.store.batch_get_session_end.assert_called_once_with(["k"])
 
-    @envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.override(30)
-    def test_expired_readiness_refreshes_and_queue_is_bounded(self):
+    def test_expired_readiness_refreshes_before_load(self):
         linker = backend()
         transfers = [PoolTransfer(name=PoolName.KV, keys=["k"])]
         self.assertEqual(linker.prepare_load_admission("r", transfers), "pending")
@@ -442,12 +351,6 @@ class TestLoadAdmission(unittest.TestCase):
         run_job(linker)
         self.assertEqual(linker.prepare_load_admission("r", transfers), "failed")
         self.assertFalse(linker.prepared_load_sessions)
-        for i in range(100):
-            self.assertEqual(
-                linker.prepare_load_admission(str(i), transfers), "pending"
-            )
-        self.assertLessEqual(linker.host_prefetch_queue.qsize(), 16)
-        self.assertLessEqual(len(linker.load_admissions), 8)
 
     def test_admission_refreshes_even_with_large_refresh_skip_age(self):
         linker = backend()
@@ -484,11 +387,9 @@ class TestLoadAdmission(unittest.TestCase):
     def test_async_end_reserves_key_until_rpc_finishes(self):
         linker = backend()
         linker.session_end_queue = Queue()
-        linker.pending_session_ends = 0
         transfers = [types.SimpleNamespace(keys=["k"])]
         self.assertTrue(linker._prepare_expanded_load("r", transfers))
         linker.abort_prepared_load("r")
-        self.assertEqual(linker.pending_session_ends, 1)
         linker.storage.store.batch_get_session_end.assert_not_called()
         self.assertIn("k", linker.session_operations)
         worker = threading.Thread(target=linker.session_end_thread_func)
@@ -498,7 +399,6 @@ class TestLoadAdmission(unittest.TestCase):
         worker.join(5)
         self.assertFalse(worker.is_alive())
         self.assertFalse(linker.session_operations)
-        self.assertEqual(linker.pending_session_ends, 0)
         linker.storage.store.batch_get_session_end.assert_called_once_with(["k"])
 
 
