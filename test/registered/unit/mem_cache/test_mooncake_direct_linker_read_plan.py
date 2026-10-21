@@ -86,26 +86,29 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         )
         linker.storage.store.create_read_plan.return_value.run.assert_called_once()
 
-    def test_prefetch_on_read_plan_prepares_on_worker_and_borrows_sessions(self):
+    def test_prefetch_on_read_plan_borrows_prepared_sessions(self):
         linker = self._read_plan_linker(prefetch=True)
-        linker._prepare_expanded_load = Mock(return_value=True)
+        linker.session_lock = threading.Lock()
+        linker.prepared_load_sessions = {"rid": ["tagged-page"]}
         transfers = [[PoolTransfer(name=PoolName.KV, keys=["page"])]]
 
         self.assertTrue(linker.load_layer_wise(0, transfers, request_ids=["rid"]))
 
-        linker._prepare_expanded_load.assert_called_once_with("rid", transfers[0])
+        linker._prepare_expanded_load.assert_not_called()
         self.assertTrue(
             linker.storage.store.create_read_plan.call_args.kwargs["borrowed_sessions"]
         )
         linker.abort_prepared_load.assert_called_once_with("rid")
 
-    def test_worker_session_preparation_failure_does_not_read(self):
+    def test_prefetch_load_without_prepared_session_fails_closed(self):
         for read_plan_enabled in (True, False):
             with self.subTest(read_plan_enabled=read_plan_enabled):
                 linker = self._read_plan_linker(prefetch=True)
                 linker.read_plan_enabled = read_plan_enabled
-                linker._prepare_expanded_load = Mock(return_value=False)
+                linker.session_lock = threading.Lock()
+                linker.prepared_load_sessions = {}
                 transfers = [[PoolTransfer(name=PoolName.KV, keys=["page"])]]
+
                 with self.assertLogs(
                     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
                     level="ERROR",
@@ -115,12 +118,18 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
                             0, transfers, request_ids=["missing-rid"]
                         )
                     )
-                self.assertIn("session preparation failed", logs.output[0])
-                linker._prepare_expanded_load.assert_called_once_with(
-                    "missing-rid", transfers[0]
+
+                self.assertIn(
+                    "Load admitted without prepared session: rid=missing-rid",
+                    logs.output[0],
                 )
+                linker._prepare_expanded_load.assert_not_called()
                 store = linker.storage.store
                 store.create_read_plan.assert_not_called()
+                store.batch_get_session_start.assert_not_called()
+                store.batch_get_session_start_with_sources.assert_not_called()
+                store.batch_get_session_refresh.assert_not_called()
+                store.batch_get_session_prefetch.assert_not_called()
                 store.batch_get_into_multi_buffer_ranges.assert_not_called()
                 linker.abort_prepared_load.assert_called_once_with("missing-rid")
 
@@ -395,7 +404,6 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertEqual(queued_rid, "rid")
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -2725,9 +2725,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
-    def prepare_external_load_admission(self, req: Req) -> bool:
-        return self.linker is None or self.linker.prepare_load_admission(req)
-
     def init_load_back(
         self,
         params: InitLoadBackParams,
