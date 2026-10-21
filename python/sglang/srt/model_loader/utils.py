@@ -240,6 +240,11 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
             install_spark_v1_layer_split_prefetch,
         )
 
+        from sglang.srt.models.sparkv1_dspark_cp import (
+            install_spark_v1_dspark_cp_adapter,
+        )
+
+        install_spark_v1_dspark_cp_adapter()
         install_spark_v1_0512_adapters(model_config.hf_text_config)
         install_spark_v1_layer_split_prefetch()
         install_spark_v1_int8_deepgemm_adapter()
