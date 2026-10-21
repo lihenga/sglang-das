@@ -5277,8 +5277,8 @@ class Scheduler(
 
         # Clear any pending chunk send state from the failed attempt so the
         # retry forward re-sends from scratch (mirrors optimistic_release_and_requeue).
-        if hasattr(self, "clear_pending_chunk_send"):
-            self.clear_pending_chunk_send(req)
+        # clear_pending_chunk_send internally guards on the PD-only attribute.
+        self.clear_pending_chunk_send(req)
         req.time_stats.reset_prefill_retry_time()
 
         # Recompile grammar if needed. process_req_with_grammar checks

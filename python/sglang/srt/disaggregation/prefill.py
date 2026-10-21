@@ -1809,15 +1809,21 @@ class SchedulerDisaggregationPrefillMixin:
                 req.external_kv_finish_state_applied = True
 
             if not req.external_kv_metadata_released:
-                maybe_release_metadata_buffer(
-                    req,
-                    self.req_to_metadata_buffer_idx_allocator,
-                    getattr(
-                        getattr(self, "disagg_metadata_buffers", None),
-                        "pd_hidden_pool",
-                        None,
-                    ),
+                # req_to_metadata_buffer_idx_allocator is initialized only in
+                # PD modes; skip metadata release for non-PD aborts.
+                metadata_allocator = getattr(
+                    self, "req_to_metadata_buffer_idx_allocator", None
                 )
+                if metadata_allocator is not None:
+                    maybe_release_metadata_buffer(
+                        req,
+                        metadata_allocator,
+                        getattr(
+                            getattr(self, "disagg_metadata_buffers", None),
+                            "pd_hidden_pool",
+                            None,
+                        ),
+                    )
                 req.external_kv_metadata_released = True
 
             if not req.external_kv_cache_released:
@@ -2360,7 +2366,11 @@ class SchedulerDisaggregationPrefillMixin:
         call this: a stale entry holds the unified-memory compaction gate closed
         for the process lifetime.
         """
-        self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        # disagg_prefill_pending_chunk_rids is initialized only in PD prefill
+        # mode; abort_external_kv_request can be reached via non-PD paths.
+        pending = getattr(self, "disagg_prefill_pending_chunk_rids", None)
+        if pending is not None:
+            pending.discard(req.rid)
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         error_message = (

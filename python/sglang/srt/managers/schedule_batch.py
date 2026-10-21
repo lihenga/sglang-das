@@ -3360,6 +3360,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
+                and not self.reqs[i].is_retracted
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 
