@@ -245,6 +245,7 @@ class TestAbortDrain(unittest.TestCase):
         self.req.disagg_kv_sender.poll.return_value = KVPoll.Failed
         self.req.disagg_kv_sender.is_transfer_drained.return_value = True
         s = self.s
+        s.server_args = SimpleNamespace(enable_unified_cache_external_linker=False)
         s._external_kv_abort_rids = {"r"}
         s._external_kv_chunked_abort_reqs = {}
         s._deferred_linker_rids = set()
@@ -286,6 +287,7 @@ class TestAbortDrain(unittest.TestCase):
 
     def setup_client_abort(self, queue):
         s = self.s
+        s.server_args = SimpleNamespace(enable_unified_cache_external_linker=False)
         s._external_kv_abort_rids.clear()
         s._pending_chunked_abort_req = None
         s.chunked_req = None

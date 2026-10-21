@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LinkerTransferPhase
+from sglang.srt.mem_cache.unified_cache_linker import LinkerTransferPhase
 from sglang.test.ci.ci_register import register_cpu_ci
 from test_load_back_construction_consensus import (
     FakeComponent,
