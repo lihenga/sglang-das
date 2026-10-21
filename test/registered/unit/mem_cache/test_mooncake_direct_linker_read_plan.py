@@ -1,7 +1,8 @@
 import threading
 import types
 import unittest
-from queue import Queue
+from itertools import count
+from queue import PriorityQueue
 from unittest.mock import Mock, call
 
 import torch
@@ -380,7 +381,8 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker.host_prefetch_generation = 0
         linker.host_prefetch_lock = threading.Lock()
         linker.host_prefetch_entries = {}
-        linker.host_prefetch_queue = Queue()
+        linker.host_prefetch_queue = PriorityQueue()
+        linker.host_prefetch_task_ids = count()
         linker.prepare_load = Mock(
             side_effect=AssertionError(
                 "session preparation must run on the prefetch worker"
@@ -391,7 +393,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertTrue(linker.submit_host_prefetch("rid", [transfer]))
         linker.prepare_load.assert_not_called()
         self.assertEqual(linker.get_host_prefetch_status("rid"), "queued")
-        queued_rid, queued_transfers = linker.host_prefetch_queue.get_nowait()
+        _, _, (queued_rid, queued_transfers) = linker.host_prefetch_queue.get_nowait()
         self.assertEqual(queued_rid, "rid")
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
