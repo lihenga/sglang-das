@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -695,7 +696,10 @@ class UnifiedCacheLinkerWrapper:
         started = getattr(req, "external_load_admission_started", None)
         if started is None:
             started = req.external_load_admission_started = time.monotonic()
-        if state == "pending" and time.monotonic() - started >= 30:
+        wait_s = envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.get()
+        # Zero disables waiting for capacity, not ordinary background RPCs.
+        timeout_s = wait_s if wait_s > 0 else 30
+        if state == "pending" and time.monotonic() - started >= timeout_s:
             state = "failed"
         verdict = torch.tensor(
             [int(state == "pending"), int(state == "ready")], dtype=torch.int

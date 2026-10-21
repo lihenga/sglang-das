@@ -760,6 +760,9 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    # Extra load-admission wait under resource pressure (seconds).
+    # Zero falls back immediately; already submitted session RPCs still run.
+    SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S = EnvFloat(0.0)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")

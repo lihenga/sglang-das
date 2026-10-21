@@ -11,6 +11,7 @@ from queue import Empty, Full, PriorityQueue, Queue
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -939,6 +940,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def prepare_load_admission(self, rid: str, transfers: list[PoolTransfer]) -> str:
         """Poll bounded worker preparation; the scheduler never waits for RPCs."""
+        pressure_state = (
+            "pending"
+            if envs.SGLANG_MOONCAKE_LOAD_ADMISSION_WAIT_S.get() > 0
+            else "failed"
+        )
         signature = [
             (transfer.name, tuple(transfer.keys or ())) for transfer in transfers
         ]
@@ -968,7 +974,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     or getattr(self, "pending_session_ends", 0)
                     >= self.host_prefetch_limit
                 ):
-                    return "pending"
+                    return pressure_state
                 prefetch = self.host_prefetch_entries.get(rid, {})
                 generation = next(self.host_prefetch_task_ids)
                 session_rid = (
@@ -995,7 +1001,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                     current["queued"] = True
             except Full:
-                return "pending"
+                return pressure_state
             return "pending"
 
     def load_admission_valid(self, rid: str) -> bool:
