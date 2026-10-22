@@ -1388,6 +1388,19 @@ class Scheduler(
                 backend="gloo",
                 timeout=timedelta(seconds=timeout_s),
             )
+            from sglang.srt.managers.scheduler_components.pd_decode_sync import (
+                init_pd_decode_sync_hierarchy,
+            )
+
+            hierarchical_sync = init_pd_decode_sync_hierarchy(
+                self.dp_scheduler_cpu_group, tp_ranks,
+                self.server_args.node_rank, self.server_args.nnodes,
+            )
+            if self.ps.tp_rank == 0 and hierarchical_sync:
+                logger.info(
+                    "PD Decode scheduler hierarchy enabled: nodes=%s ranks_per_node=%s",
+                    self.server_args.nnodes, len(tp_ranks) // self.server_args.nnodes,
+                )
             if self.ps.tp_rank == 0:
                 logger.info(
                     "PD Decode single-clock enabled: dedicated Gloo scheduler "

@@ -163,10 +163,6 @@ class MLPSyncBatchInfo:
         # at world size 1 the expanded view is already contiguous, contiguous()
         # is a no-op, and the masked fallback writes below would then read and
         # write the same storage.
-        global_info_tensor = fallback_tensor.repeat(
-            self.dp_size, self.tp_size * self.cp_size, 1
-        )
-
         expected_world = self.dp_size * self.tp_size * self.cp_size
         actual_world = torch.distributed.get_world_size(group)
         if self.scheduler_step_info is not None and actual_world != expected_world:
@@ -175,7 +171,25 @@ class MLPSyncBatchInfo:
                 f"actual={actual_world} expected={expected_world}"
             )
 
-        if use_all_reduce:
+        hierarchical_info = None
+        if self.scheduler_step_info is not None and device == "cpu" and not use_all_reduce:
+            from sglang.srt.managers.scheduler_components.pd_decode_sync import (
+                gather_pd_decode_step_info,
+            )
+
+            hierarchical_info = gather_pd_decode_step_info(local_info_tensor, group)
+        if hierarchical_info is not None:
+            global_info_tensor = hierarchical_info.view(
+                self.dp_size, self.tp_size * self.cp_size, info_width
+            )
+        else:
+            global_info_tensor = fallback_tensor.repeat(
+                self.dp_size, self.tp_size * self.cp_size, 1
+            )
+
+        if hierarchical_info is not None:
+            pass  # All ranks' state was exchanged on the dedicated CPU hierarchy.
+        elif use_all_reduce:
             if self.scheduler_step_info is not None:
                 raise RuntimeError(
                     "PD Decode StepInfo cannot use the elastic WORLD all-reduce"
