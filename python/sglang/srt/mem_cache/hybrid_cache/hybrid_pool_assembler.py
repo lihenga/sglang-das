@@ -225,6 +225,16 @@ def _build_deepseek_v4_device_pool_group(
 def _build_dsa_device_pool_group(
     kvcache: Any, page_size: int, mtp_draft_device_pools: tuple[Any, ...] = ()
 ) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
+
+    for pool in mtp_draft_device_pools:
+        if not isinstance(pool, DSATokenToKVPool) and type(pool) is not MLATokenToKVPool:
+            raise ValueError(
+                "DSA direct linker requires DSA or plain MLA draft pools, "
+                f"got {type(pool).__name__}."
+            )
+        if pool.size != kvcache.size:
+            raise ValueError("Direct-linker draft pools must share target token slots.")
     pools = (kvcache, *mtp_draft_device_pools)
     for pool in pools:
         if pool.page_size != page_size:
@@ -242,6 +252,11 @@ def _build_dsa_device_pool_group(
             mapping = {start + layer: layer for layer in range(pool.layer_num)}
             source = pool.kv_buffer
             if name == PoolName.INDEXER:
+                if type(pool) is MLATokenToKVPool:
+                    # Spark DSpark has multiple MLA KV layers, no DSA indexer.
+                    # Preserve their logical layer range for the load counter.
+                    layer_offset += pool.layer_num
+                    continue
                 source = pool.index_k_with_scale_buffer
                 mapping = getattr(pool, "indexer_layer_id_to_index", mapping)
             for layer_id, buffer_index in mapping.items():

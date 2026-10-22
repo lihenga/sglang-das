@@ -54,6 +54,33 @@ def _can_pack_hicache_mtp(
     return is_nextn_mtp or is_dspark_dsv4
 
 
+def _can_pack_direct_linker_spark_dspark(target_runner, draft_runners) -> bool:
+    """Spark injects every draft layer at the target's full token locations.
+
+    The direct linker can append these plain MLA layers without an indexer.
+    Keep this separate from host HiCache, whose MTP layout assumes one layer
+    per runner, and reject compressed or remapped draft pool variants.
+    """
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
+
+    if not target_runner.spec_algorithm.is_dspark() or len(draft_runners) != 1:
+        return False
+    runner = draft_runners[0]
+    config = runner.model_config.hf_config
+    if config.architectures != ["SparkV1DSparkDraftModel"]:
+        return False
+    target_pool = target_runner.token_to_kv_pool
+    draft_pool = runner.token_to_kv_pool
+    return (
+        isinstance(target_pool, DSATokenToKVPool)
+        and type(draft_pool) is MLATokenToKVPool
+        and draft_pool.layer_num == getattr(config, "num_draft_layers", 0) > 0
+        and draft_pool.start_layer == 0
+        and draft_pool.size == target_pool.size
+        and draft_pool.page_size == target_pool.page_size
+    )
+
+
 class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
@@ -259,12 +286,17 @@ class BaseSpecWorker(ABC):
         if direct_linker:
             from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-            if not can_pack or any(
-                not isinstance(pool, DSATokenToKVPool) or pool.layer_num != 1
+            single_layer_dsa = can_pack and all(
+                isinstance(pool, DSATokenToKVPool) and pool.layer_num == 1
                 for pool in draft_pools
-            ):
+            )
+            can_pack = single_layer_dsa or _can_pack_direct_linker_spark_dspark(
+                target_model_runner, draft_runners
+            )
+            if not can_pack:
                 raise NotImplementedError(
-                    "Direct external linker requires single-layer DSA MTP draft pools."
+                    "Direct external linker requires single-layer DSA MTP pools "
+                    "or full-token-aligned Spark DSpark MLA draft pools."
                 )
         if can_pack:
             target_model_runner.mtp_draft_device_pools = draft_pools
