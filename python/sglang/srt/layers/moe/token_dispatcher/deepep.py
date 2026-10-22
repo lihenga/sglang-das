@@ -1013,6 +1013,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         overlap_args = self.overlap_args
         meta_overlap_args = self.meta_overlap_args
 
+        if os.getenv("SGLANG_SPARK_W4A8_CT") == "1":
+            ready = getattr(self, "_spark_w4a8_combine_ready", None)
+            if ready is None:
+                ready = self.device_module.Event()
+                self._spark_w4a8_combine_ready = ready
+            ready.record(self.device_module.current_stream())
+            combine_stream = (overlap_args.stream if overlap_args is not None
+                              else self.device_module.current_stream())
+            combine_stream.wait_event(ready)
+
         ctx = nullcontext()
         if overlap_args is not None:
             overlap_args.stream.wait_event(overlap_args.wait_event)

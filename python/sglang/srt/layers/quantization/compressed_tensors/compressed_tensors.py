@@ -279,6 +279,12 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
+        if cls is CompressedTensorsConfig and os.getenv("SGLANG_SPARK_W4A8_CT") == "1":
+            from sglang.srt.layers.quantization.spark_w4a8 import SparkW4A8Config
+            hf = config.get("hf_config")
+            if getattr(hf, "model_type", None) != "sparkv1":
+                raise ValueError("SGLANG_SPARK_W4A8_CT is restricted to SparkV1")
+            return SparkW4A8Config.from_config(config)
         ignore: List[str] = cast(List[str], config.get("ignore", []))
         quant_format = cast(str, config.get("format"))
         target_scheme_map = cls._quantization_scheme_map_from_config(config=config)

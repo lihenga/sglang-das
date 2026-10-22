@@ -659,6 +659,10 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
+        if os.getenv("SGLANG_SPARK_W4A8_CT") == "1":
+            from sglang.srt.layers.quantization.spark_w4a8 import convert_spark_experts
+            weights_iterator = convert_spark_experts(weights_iterator)
+
         if self.load_config.draft_model_idx is not None:
             return self._filter_mtp_weights(
                 weights_iterator, source.prefix, self.load_config.draft_model_idx
