@@ -17,24 +17,26 @@ _HEALTH_CONFIG_SOURCES = {
     "probe_interval_s": (
         "mooncake_dfs_health_probe_interval_s",
         "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S",
-        10,
+        5,
     ),
     "failure_threshold": (
         "mooncake_dfs_health_failure_threshold",
         "SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD",
-        3,
+        2,
     ),
     "success_threshold": (
         "mooncake_dfs_health_success_threshold",
         "SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD",
-        3,
+        2,
     ),
     "probe_timeout_s": (
         "mooncake_dfs_health_probe_timeout_s",
         "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S",
-        2,
+        5,
     ),
 }
+
+DFS_HEALTH_CONFIG_KEY = "_mooncake_dfs_health_config"
 
 
 def resolve_dfs_health_config(
@@ -59,6 +61,23 @@ def resolve_dfs_health_config(
             raise ValueError(f"Mooncake DFS health {key} must be positive, got {value}")
         resolved[key] = value
     return resolved
+
+
+def inject_dfs_health_config(
+    extra_config: dict[str, Any] | None = None, server_args: Any = None
+) -> dict[str, Any]:
+    """Copy an extra config and attach the resolved Mooncake DFS settings.
+
+    An explicitly supplied nested health config keeps the highest precedence;
+    missing values are filled from ServerArgs, the environment, and defaults.
+    Keeping this in one place prevents startup, runtime attach, and decode-side
+    offload from resolving the same command-line settings differently.
+    """
+    resolved_extra_config = dict(extra_config or {})
+    resolved_extra_config[DFS_HEALTH_CONFIG_KEY] = resolve_dfs_health_config(
+        resolved_extra_config.get(DFS_HEALTH_CONFIG_KEY), server_args=server_args
+    )
+    return resolved_extra_config
 
 
 @dataclass(frozen=True)
@@ -165,16 +184,22 @@ class MooncakeDfsHealthManager:
             )
 
     def local_policy(self) -> tuple[bool, bool]:
-        """Return this rank's fail-closed policy candidate."""
+        """Return this rank's fail-closed policy candidate.
+
+        DFS reads require both capabilities: a read probe alone must never
+        reopen reads while the filesystem is still not writable.
+        """
         with self._lock:
+            allow_write = self._write_state == AVAILABLE
             return (
-                self._read_state == AVAILABLE,
-                self._write_state == AVAILABLE,
+                self._read_state == AVAILABLE and allow_write,
+                allow_write,
             )
 
     def apply_effective_policy(self, allow_read: bool, allow_write: bool) -> None:
         """Apply a scheduler-coordinated policy to this rank's native client."""
-        policy = (bool(allow_read), bool(allow_write))
+        allow_write = bool(allow_write)
+        policy = (bool(allow_read) and allow_write, allow_write)
         with self._policy_lock:
             if policy == self._effective_policy:
                 return
@@ -188,6 +213,60 @@ class MooncakeDfsHealthManager:
             old_policy[1],
             policy[0],
             policy[1],
+        )
+
+    def report_operation_timeout(self, capability: str, error: int) -> None:
+        """Trip one DFS capability immediately after a real data-I/O timeout."""
+        if capability not in ("read", "write"):
+            raise ValueError(f"Unknown DFS capability: {capability}")
+        with self._lock:
+            if capability == "read":
+                changed = self._read_state != UNAVAILABLE
+                self._read_state = UNAVAILABLE
+                self._read_successes = 0
+                self._read_failures = max(
+                    self._read_failures, self._failure_threshold
+                )
+                self._read_error = int(error)
+            else:
+                changed = self._write_state != UNAVAILABLE
+                self._write_state = UNAVAILABLE
+                self._write_successes = 0
+                self._write_failures = max(
+                    self._write_failures, self._failure_threshold
+                )
+                self._write_error = int(error)
+            if changed:
+                self._generation += 1
+            allow_write = self._write_state == AVAILABLE
+            allow_read = self._read_state == AVAILABLE and allow_write
+        # A real business I/O timeout is stronger evidence than a probe
+        # failure. Only restrict the currently effective policy here: the
+        # unaffected capability may already be disabled by scheduler consensus
+        # because another rank is unhealthy, and must never be reopened by a
+        # local timeout report. A write failure also closes reads because read
+        # eligibility depends on both capabilities.
+        with self._policy_lock:
+            policy = (
+                self._effective_policy[0] and allow_read,
+                self._effective_policy[1] and allow_write,
+            )
+            if policy != self._effective_policy:
+                old_policy = self._effective_policy
+                self._apply_policy(*policy)
+                self._effective_policy = policy
+                logger.warning(
+                    "Mooncake DFS effective policy transition: "
+                    "old_read=%s old_write=%s new_read=%s new_write=%s",
+                    old_policy[0],
+                    old_policy[1],
+                    policy[0],
+                    policy[1],
+                )
+        logger.error(
+            "Mooncake DFS data operation timed out; capability=%s error=%s",
+            capability,
+            error,
         )
 
     def probe_once(self) -> DfsHealthSnapshot:
@@ -225,8 +304,8 @@ class MooncakeDfsHealthManager:
             read_changed = old_read != self._read_state
             write_changed = old_write != self._write_state
             self._generation += int(read_changed) + int(write_changed)
-            allow_read = self._read_state == AVAILABLE
             allow_write = self._write_state == AVAILABLE
+            allow_read = self._read_state == AVAILABLE and allow_write
             snapshot = self.snapshot_unlocked()
 
         if (read_changed or write_changed) and not self._defer_policy_application:
@@ -234,18 +313,23 @@ class MooncakeDfsHealthManager:
         if read_changed:
             logger.warning(
                 "Mooncake DFS local health transition: capability=read "
-                "old_state=%s new_state=%s error=%s generation=%s",
+                "old_state=%s new_state=%s write_state=%s "
+                "effective_read=%s error=%s generation=%s",
                 old_read,
                 snapshot.read_state,
+                snapshot.write_state,
+                allow_read,
                 read_error,
                 snapshot.generation,
             )
         if write_changed:
             logger.warning(
                 "Mooncake DFS local health transition: capability=write "
-                "old_state=%s new_state=%s error=%s generation=%s",
+                "old_state=%s new_state=%s effective_read=%s "
+                "error=%s generation=%s",
                 old_write,
                 snapshot.write_state,
+                allow_read,
                 write_error,
                 snapshot.generation,
             )
