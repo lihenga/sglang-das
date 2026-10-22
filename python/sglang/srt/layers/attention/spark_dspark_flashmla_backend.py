@@ -88,12 +88,16 @@ class SparkDSparkFlashMLAAttnBackend(TritonAttnBackend):
     ):
         # All scratch addresses exist before graph capture. Replays only refill
         # these buffers and the parent's existing physical-index metadata.
+        # DSpark proposes a TARGET_VERIFY block, so it needs no Triton
+        # single-token decode logits/LSE scratch. A later decode capture can
+        # still allocate that scratch through the parent's capture path.
         self._allocate_draft_windows(max_bs)
         return super().init_cuda_graph_state(
             max_bs,
             max_num_tokens,
             kv_indices_buf,
             cuda_graph_num_kv_splits_buf,
+            allocate_decode_scratch=False,
         )
 
     @staticmethod

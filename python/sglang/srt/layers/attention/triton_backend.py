@@ -681,6 +681,8 @@ class TritonAttnBackend(AttentionBackend):
 
         if in_capture:
             assert forward_batch.encoder_lens is None, "Not supported"
+            if forward_mode.is_decode_or_idle():
+                self._ensure_cuda_graph_decode_scratch()
             # Multi-step spec decode: kv buffers come from spec_info, not the
             # cuda-graph pool, so replay is not involved.
             if forward_mode.is_decode_or_idle() and spec_info is not None:
@@ -1064,30 +1066,18 @@ class TritonAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
+        *,
+        allocate_decode_scratch: bool = True,
     ):
-        self.cuda_graph_attn_logits = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        if self.swa_v_head_dim is not None:
-            self.cuda_graph_swa_attn_logits = torch.zeros(
-                (
-                    max_num_tokens,
-                    self.num_head,
-                    self.max_kv_splits,
-                    self.swa_v_head_dim,
-                ),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        else:
-            self.cuda_graph_swa_attn_logits = None
-        self.cuda_graph_attn_lse = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        # Verify/extend graphs do not use the single-token decode reduction.
+        # Keep their metadata buffers, but allow verify-only backends to defer
+        # the large logits/LSE allocation until a decode graph is captured.
+        self._cuda_graph_decode_max_tokens = max_num_tokens
+        self.cuda_graph_attn_logits = None
+        self.cuda_graph_swa_attn_logits = None
+        self.cuda_graph_attn_lse = None
+        if allocate_decode_scratch:
+            self._ensure_cuda_graph_decode_scratch()
 
         if cuda_graph_num_kv_splits_buf is None:
             self.cuda_graph_num_kv_splits = torch.full(
@@ -1160,6 +1150,35 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+
+    def _ensure_cuda_graph_decode_scratch(self):
+        """Allocate decode scratch once, before capturing a decode/idle graph."""
+        if self.cuda_graph_attn_logits is not None:
+            return
+        max_num_tokens = self._cuda_graph_decode_max_tokens
+        self.cuda_graph_attn_logits = torch.zeros(
+            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if self.swa_v_head_dim is not None:
+            self.cuda_graph_swa_attn_logits = torch.zeros(
+                (
+                    max_num_tokens,
+                    self.num_head,
+                    self.max_kv_splits,
+                    self.swa_v_head_dim,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            self.cuda_graph_swa_attn_logits = None
+        self.cuda_graph_attn_lse = torch.zeros(
+            (max_num_tokens, self.num_head, self.max_kv_splits),
+            dtype=torch.float32,
+            device=self.device,
+        )
 
     def _build_cuda_graph_forward_metadata(
         self,
