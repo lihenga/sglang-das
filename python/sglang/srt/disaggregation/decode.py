@@ -559,6 +559,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_len: int,
         preallocated_reqs: List[DecodeRequest],
     ) -> bool:
+        if not self._uses_dsv4_decode_radix_cache():
+            return False
         min_prefix_len = self._dsv4_singleflight_min_prefix_len()
         for inflight_req in self._dsv4_inflight_prompt_reqs(preallocated_reqs):
             if inflight_req is req:
