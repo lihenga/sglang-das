@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 import warnings
 from typing import TYPE_CHECKING
 
@@ -195,6 +196,20 @@ def create_triton_backend(runner):
         "Cross attention is not supported in the triton attention backend. "
         "Please use `--attention-backend flashinfer`."
     )
+    # TokenFlow's Spark DP/EP initialization requires the Triton metadata/KV
+    # interface. This subclass retains that interface and replaces only the
+    # eight-token Spark draft extend kernel, behind an explicit opt-in.
+    if (
+        os.getenv("SGLANG_SPARK_DSPARK_FLASHMLA", "0") == "1"
+        and getattr(runner, "is_draft_worker", False)
+        and runner.model_config.hf_config.architectures == ["SparkV1DSparkDraftModel"]
+    ):
+        from sglang.srt.layers.attention.spark_dspark_flashmla_backend import (
+            SparkDSparkFlashMLAAttnBackend,
+        )
+
+        return SparkDSparkFlashMLAAttnBackend(runner)
+
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
     return TritonAttnBackend(runner)
