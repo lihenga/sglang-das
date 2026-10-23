@@ -761,6 +761,36 @@ class ModelConfig:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Spark2_5ForCausalLM"
+        ):
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                checkpoint_bundles_dspark_draft,
+            )
+
+            if checkpoint_bundles_dspark_draft(self.hf_config) and (
+                self.speculative_algorithm in (None, "DSPARK")
+            ):
+                draft_num_layers = getattr(self.hf_config, "num_draft_layers", None)
+                if draft_num_layers is None:
+                    raise ValueError(
+                        "Bundled Spark2.5 DSpark checkpoint is missing "
+                        "num_draft_layers."
+                    )
+
+                self.hf_config.num_hidden_layers = int(draft_num_layers)
+                self.hf_config.layer_types = [
+                    "sliding_attention"
+                ] * int(draft_num_layers)
+                self.hf_config.hybrid_layer_pattern = [1] * int(draft_num_layers)
+                self.hf_config.is_hybrid_swa = True
+                self.hf_config.architectures[0] = "SparkX25DesparkDraftModel"
+                logger.info(
+                    "Draft checkpoint bundles Spark2.5 DSpark weights; loading "
+                    "SparkX25DesparkDraftModel."
+                )
+
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
         if (
