@@ -1090,8 +1090,9 @@ class UnifiedCacheLinkerWrapper:
                     else None
                 ),
                 prev_prefix_len=device_hit_len,
-                swa_evicted_seqlen=(
-                    req.kv.swa_evicted_seqlen if req.kv is not None else 0
+                swa_evicted_seqlen=max(
+                    req.kv.swa_evicted_seqlen,
+                    req.pending_swa_evicted_seqlen,
                 ),
                 chunked=True,
                 priority=getattr(req, "priority", 0) or 0,

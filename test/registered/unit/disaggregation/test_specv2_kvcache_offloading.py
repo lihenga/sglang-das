@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -35,7 +36,7 @@ def _make_mock_req(
     req.rid = rid
     req.req_pool_idx = req_pool_idx
     req.kv_committed_len = kv_committed_len
-    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len)
+    req.kv = ReqKvInfo(kv_allocated_len=kv_allocated_len)
     req.prefix_indices = list(range(prefix_indices_len))
     req.effective_kv_committed_len = lambda: req.kv_committed_len
     return req

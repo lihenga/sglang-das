@@ -980,7 +980,10 @@ def test_swa_linker_load_prepare_commit_and_abort():
         token_to_kv_pool_allocator=allocator,
     )
     component.sliding_window_size = 2
-    req = SimpleNamespace(kv=SimpleNamespace(swa_evicted_seqlen=0))
+    req = SimpleNamespace(
+        kv=SimpleNamespace(swa_evicted_seqlen=0),
+        pending_swa_evicted_seqlen=0,
+    )
     full = PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([1, 2, 3, 4]))
     swa = PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([20, 21]))
 
@@ -990,7 +993,8 @@ def test_swa_linker_load_prepare_commit_and_abort():
     mapped_full, mapped_swa = swa_allocator.mapping[0]
     assert mapped_full.tolist() == [3, 4]
     assert mapped_swa.tolist() == [20, 21]
-    assert req.kv.swa_evicted_seqlen == 2
+    assert req.kv.swa_evicted_seqlen == 0
+    assert req.pending_swa_evicted_seqlen == 2
 
     insert_result = InsertResult(
         prefix_len=2,

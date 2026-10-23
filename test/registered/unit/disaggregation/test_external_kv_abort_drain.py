@@ -218,6 +218,8 @@ class TestAbortDrain(unittest.TestCase):
             return_logprob=False,
             req_pool_idx=1,
             kv=object(),
+            is_holding_kv=True,
+            pending_swa_evicted_seqlen=0,
             mamba_pool_idx=None,
             inflight_middle_chunks=0,
             time_stats=Mock(),
@@ -741,7 +743,9 @@ class TestAbortDrain(unittest.TestCase):
         self.req.external_kv_cleanup_steps = {}
 
         def unknown(*args, **kwargs):
-            self.req.req_pool_idx = self.req.kv = None
+            self.req.req_pool_idx = None
+            self.req.is_holding_kv = False
+            self.req.kv = SimpleNamespace(kv_allocated_len=0, swa_evicted_seqlen=0)
             self.req.external_kv_cleanup_steps["kv.cache_finished"] = ("unknown", None)
             raise RuntimeError("cache cleared owner fields then failed")
 

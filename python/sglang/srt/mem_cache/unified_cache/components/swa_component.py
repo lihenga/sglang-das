@@ -1021,15 +1021,9 @@ class SWAComponent(TreeComponent):
             page = self.cache.page_size
             window = ((self.sliding_window_size + page - 1) // page) * page
             boundary = max(0, prefix_len - window)
-            if req.kv is None:
-                from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-                req.kv = ReqKvInfo(
-                    kv_allocated_len=prefix_len,
-                    swa_evicted_seqlen=boundary,
-                )
-            else:
-                req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
+            req.pending_swa_evicted_seqlen = max(
+                req.pending_swa_evicted_seqlen, boundary
+            )
             return transfer
 
         assert phase == ExternalLinkerLoadPhase.COMMIT

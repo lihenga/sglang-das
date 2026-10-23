@@ -58,6 +58,8 @@ def _make_scheduler(rank, tp_group, cp_group, mode, state):
         return_logprob=False,
         req_pool_idx=1,
         kv=object(),
+        is_holding_kv=True,
+        pending_swa_evicted_seqlen=0,
         mamba_pool_idx=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,

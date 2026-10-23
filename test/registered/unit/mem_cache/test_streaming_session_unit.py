@@ -2,12 +2,26 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+def test_kv_metadata_release_and_session_ownership():
+    kv = ReqKvInfo(kv_allocated_len=48, swa_evicted_seqlen=16)
+    assert not kv.is_released
+    kv.mark_released()
+    assert kv.is_released
+    assert kv.kv_allocated_len == 0
+    assert kv.swa_evicted_seqlen == 0
+
+    slot = SessionSlot(kv=ReqKvInfo(kv_allocated_len=48))
+    assert not slot.is_holding_kv
+    slot.req_pool_idx = 0
+    assert slot.is_holding_kv
 
 
 class _FakeAllocator:

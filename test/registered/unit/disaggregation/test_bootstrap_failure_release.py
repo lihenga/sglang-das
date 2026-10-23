@@ -35,7 +35,9 @@ def _req(rid="r"):
     req = MagicMock()
     req.rid = rid
     req.req_pool_idx = None
-    req.kv = None
+    req.kv = types.SimpleNamespace(kv_allocated_len=0, swa_evicted_seqlen=0)
+    req.is_holding_kv = False
+    req.pending_swa_evicted_seqlen = 0
     req.mamba_pool_idx = None
     req.disagg_kv_sender.failure_exception.side_effect = RuntimeError("boom")
     return req
@@ -43,6 +45,7 @@ def _req(rid="r"):
 
 def _scheduler(*, hicache, external_linker, tree_cache):
     s = types.SimpleNamespace(
+        enable_hierarchical_cache=False,
         enable_hicache_storage=hicache,
         server_args=types.SimpleNamespace(
             enable_unified_cache_external_linker=external_linker
@@ -52,10 +55,16 @@ def _scheduler(*, hicache, external_linker, tree_cache):
         clear_pending_chunk_send=MagicMock(),
         req_to_metadata_buffer_idx_allocator=MagicMock(),
         disagg_metadata_buffers=None,
+        disagg_prefill_inflight_queue=[],
         output_streamer=MagicMock(),
         metrics_reporter=types.SimpleNamespace(enable_metrics=False),
     )
     s._release_aborted_request = lambda rid: Scheduler._release_aborted_request(s, rid)
+    s.prefill_abort_forward_drained = lambda req: True
+    s.prefill_abort_sender_terminal = lambda req: True
+    s.abort_external_kv_request = MagicMock(
+        side_effect=lambda req, **_kwargs: s._release_aborted_request(req.rid)
+    )
     return s
 
 

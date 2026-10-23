@@ -75,7 +75,7 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
     retain_floor: int | None = None,
 ) -> None:
-    if req.kv is None:
+    if not req.is_holding_kv:
         return
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
@@ -216,10 +216,9 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     if getattr(req, "external_kv_abort_requested", False):
         return _release_aborted_kv_cache(req, tree_cache, is_insert)
-    # the two resources currently have the same lifecycle, thus simplify logic below
-    assert (req.req_pool_idx is None) == (req.kv is None)
+    assert (not req.is_holding_kv) == req.kv.is_released
     # MambaRadixCache may alloc mamba state before alloc KV cache
-    if req.req_pool_idx is None:
+    if not req.is_holding_kv:
         assert (
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
@@ -229,6 +228,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
+        req.pending_swa_evicted_seqlen = 0
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
@@ -240,8 +240,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
-    assert (req.req_pool_idx is None) == (req.kv is None)
-    if req.req_pool_idx is None and req.kv is None:
+    assert (not req.is_holding_kv) == req.kv.is_released
+    if not req.is_holding_kv:
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
@@ -258,15 +258,16 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
-    req.kv = None
+    req.kv.mark_released()
+    req.pending_swa_evicted_seqlen = 0
 
 
 def _release_aborted_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool):
     """Resume successful substeps without re-entering completed allocator calls."""
 
     def snapshot():
-        assert (req.req_pool_idx is None) == (req.kv is None)
-        if req.req_pool_idx is None:
+        assert (not req.is_holding_kv) == req.kv.is_released
+        if not req.is_holding_kv:
             return None
         return req.effective_kv_committed_len(), req.kv.kv_allocated_len
 
@@ -282,6 +283,7 @@ def _release_aborted_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: 
                 ),
             )
             req.mamba_pool_idx = None
+        req.pending_swa_evicted_seqlen = 0
         return
 
     committed, allocated = layout
@@ -295,7 +297,7 @@ def _release_aborted_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: 
         ),
     )
     # Streaming sessions can take responsibility for all resources here.
-    if req.req_pool_idx is None and req.kv is None:
+    if not req.is_holding_kv and req.kv.is_released:
         return
     run_cleanup_step(
         req,
@@ -313,7 +315,8 @@ def _release_aborted_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: 
     run_cleanup_step(
         req, "kv.request_slot", lambda: tree_cache.req_to_token_pool.free(req)
     )
-    req.kv = None
+    req.kv.mark_released()
+    req.pending_swa_evicted_seqlen = 0
 
 
 def _release_overallocated_kv_indices(

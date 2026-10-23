@@ -37,10 +37,29 @@ cleanup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cleanup)
 
 
+class _Req(SimpleNamespace):
+    @property
+    def is_holding_kv(self):
+        return self.req_pool_idx is not None
+
+
+class _ReqKvInfo(SimpleNamespace):
+    @property
+    def is_released(self):
+        return self.kv_allocated_len == 0 and self.swa_evicted_seqlen == 0
+
+    def mark_released(self):
+        self.kv_allocated_len = 0
+        self.swa_evicted_seqlen = 0
+
+
 class TestResourceCleanup(unittest.TestCase):
     def setUp(self):
-        self.req = SimpleNamespace(
+        self.req = _Req(
             rid="partial",
+            req_pool_idx=None,
+            kv=_ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0),
+            pending_swa_evicted_seqlen=0,
             external_kv_abort_requested=True,
             external_kv_cleanup_steps={},
             metadata_buffer_index=0,
@@ -143,7 +162,7 @@ class TestResourceCleanup(unittest.TestCase):
 
     def setup_kv(self):
         self.req.req_pool_idx = 1
-        self.req.kv = SimpleNamespace(kv_allocated_len=4)
+        self.req.kv = _ReqKvInfo(kv_allocated_len=4, swa_evicted_seqlen=0)
         self.req.mamba_pool_idx = None
         self.req.cache_protected_len = 0
         self.req.skip_radix_cache_insert = True
@@ -251,7 +270,7 @@ class TestResourceCleanup(unittest.TestCase):
         self.token_allocator.free.assert_called_once()
         self.assertEqual(self.token_allocator.free_segment.call_count, 2)
         self.assertEqual(self.cache.req_to_token_pool.free_slots, [1])
-        self.assertIsNone(self.req.kv)
+        self.assertTrue(self.req.kv.is_released)
 
     def test_partial_cache_free_unknown_outcome_is_not_repeated(self):
         release = self.setup_kv()
@@ -287,7 +306,7 @@ class TestResourceCleanup(unittest.TestCase):
         self.assertEqual(self.cache.req_to_token_pool.free_slots, [1])
         self.token_allocator.free.assert_called_once()
         self.token_allocator.free_segment.assert_called_once()
-        self.assertIsNotNone(self.req.kv)
+        self.assertFalse(self.req.kv.is_released)
 
 
 if __name__ == "__main__":

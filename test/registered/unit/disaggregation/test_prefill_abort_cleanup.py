@@ -13,7 +13,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation import prefill  # noqa: E402
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.utils import EXTERNAL_KV_LOAD_ERR_TYPE  # noqa: E402
-from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -31,7 +31,9 @@ class TestPrefillAbortCleanup(unittest.TestCase):
             pending_bootstrap=False,
             inflight_middle_chunks=0,
             req_pool_idx=1,
-            kv=object(),
+            kv=ReqKvInfo(kv_allocated_len=8),
+            is_holding_kv=True,
+            pending_swa_evicted_seqlen=0,
             mamba_pool_idx=None,
             bootstrap_room=7,
             bootstrap_host="peer",
@@ -251,7 +253,9 @@ class TestPrefillAbortCleanup(unittest.TestCase):
         self.scheduler.output_streamer.stream_output.assert_called_once()
 
     def test_bootstrap_before_kv_allocation_does_not_free_unallocated_cache(self):
-        self.req.req_pool_idx = self.req.kv = None
+        self.req.req_pool_idx = None
+        self.req.is_holding_kv = False
+        self.req.kv.mark_released()
         self.scheduler.handle_bootstrap_failure(self.req)
         self.assertTrue(self.req.external_kv_cleanup_done)
         self.cache.assert_not_called()

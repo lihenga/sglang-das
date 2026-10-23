@@ -1745,8 +1745,7 @@ class SchedulerDisaggregationPrefillMixin:
             if not req.external_kv_cache_released:
                 # Bootstrap may fail before any KV or Mamba allocation exists.
                 if (
-                    req.req_pool_idx is not None
-                    or req.kv is not None
+                    req.is_holding_kv
                     or req.mamba_pool_idx is not None
                     or any(
                         name.startswith("kv.")

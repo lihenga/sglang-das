@@ -806,13 +806,21 @@ class ReqLogprob:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
-    kv_allocated_len: int
+    kv_allocated_len: int = 0
     # The length of KV that have been removed in swa cache.
     # SWA KV cache eviction behavior differs by cache type:
     # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
     #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
     # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
-    swa_evicted_seqlen: int
+    swa_evicted_seqlen: int = 0
+
+    @property
+    def is_released(self) -> bool:
+        return self.kv_allocated_len == 0 and self.swa_evicted_seqlen == 0
+
+    def mark_released(self) -> None:
+        self.kv_allocated_len = 0
+        self.swa_evicted_seqlen = 0
 
 
 class Req(ReqDllmMixin):
@@ -895,7 +903,7 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv: Optional[ReqKvInfo] = None
+        self.kv = ReqKvInfo()
         self.retraction_backup: Optional[RetractionBackup] = None
 
         # for cross-encoder model
@@ -904,6 +912,7 @@ class Req(ReqDllmMixin):
         # Tokens in [0, swa_evict_floor) are protected from SWA window eviction.
         # This is used by prefill-aware SWA models such as Unlimited-OCR to keep prompt/image KV visible during decode.
         self.swa_evict_floor: int = 0
+        self.pending_swa_evicted_seqlen = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -1267,6 +1276,10 @@ class Req(ReqDllmMixin):
             or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
         )
+
+    @property
+    def is_holding_kv(self) -> bool:
+        return self.req_pool_idx is not None
 
     def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
@@ -1751,8 +1764,9 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
-        assert self.kv is None, "expect it is already released"
+        assert not self.is_holding_kv, "expect it is already released"
         self.kv_committed_len = 0
+        self.pending_swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -3444,7 +3458,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # seqlen progress is monotonic per KV handle.
                     if (
                         req.decode_batch_idx >= 1
-                        and req.kv is not None
+                        and req.is_holding_kv
                         and req.seqlen - 1 - sliding_window_size
                         >= req.kv.swa_evicted_seqlen + eviction_interval
                     ):
