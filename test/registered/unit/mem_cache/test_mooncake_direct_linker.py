@@ -384,6 +384,7 @@ def test_async_offload_pins_node_until_completion():
         inc_lock_ref=inc_lock_ref,
         dec_lock_ref=lambda node, params: unlocks.append((node, params)),
         resolve_node_handle=lambda value: node if value == node_id else None,
+        _all_reduce_attn_groups=lambda tensor, op: None,
     )
 
     wrapper.offload_nodes([node_id])
