@@ -94,6 +94,7 @@ if _is_hcu:
             hadamard_transform as hcu_fast_hadamard_transform,
         )
 _tokenflow_legacy_compat = os.getenv("SGLANG_TOKENFLOW_LEGACY_COMPAT") == "1"
+_lightop_preprocess = os.getenv("SGLANG_SPARK_LIGHTOP_PREPROCESS", "0") == "1"
 _legacy_hcu_hadamard_cache: Dict[
     Tuple[int, torch.device, torch.dtype], torch.Tensor
 ] = {}
@@ -693,6 +694,58 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         return False
 
+    def _get_q_k_hcu_int8_fused(self, x, x_for_gate, q_lora, positions, batch, mode):
+        """Fuse the Spark Q epilogue; K preprocessing and cache writes stay native."""
+        if not _lightop_preprocess or not _tokenflow_legacy_compat:
+            return None
+        norm, rope, parallel = self.k_norm, self.rotary_emb, get_parallel()
+        tokens = q_lora.shape[0]
+        if (
+            type(self).__module__ != "tokenflow.models.sparkv1.layers.attention"
+            or type(self).__name__ != "SparkV1Indexer"
+            or self.use_dsa_indexer_fusion
+            or envs.SGLANG_DSA_HCU_FUSE_LN_ROPE.get()
+            or (self.n_heads, self.head_dim, self.rope_head_dim) != (32, 128, 64)
+            or tokens > 36
+            or q_lora.dtype != torch.bfloat16 or not q_lora.is_cuda
+            or not (mode.is_decode_or_idle() or mode.is_target_verify()
+                    or mode.is_draft_extend_v2())
+            or batch.attn_cp_metadata is not None or self.dsa_enable_prefill_cp
+            or parallel.attn_tp_size != 1 or getattr(parallel, "dcp_enabled", False)
+            or getattr(batch, "attn_dcp_metadata", None) is not None
+            or not self.paged_mqa_logits_backend.is_lightop()
+            or not isinstance(norm, LayerNorm) or norm.dtype != torch.float32
+            or not norm.elementwise_affine
+            or any(getattr(layer, "set_lora", False)
+                   for layer in (self.weights_proj, self.wq_b, self.wk))
+            or (rope.rotary_dim, rope.head_size) != (64, 64)
+            or rope.cos_sin_cache.dtype != torch.bfloat16
+            or positions.dtype not in (torch.int32, torch.int64)
+            or not positions.is_contiguous()
+        ):
+            return None
+        from lightop import op
+
+        query, _ = self.wq_b(q_lora)
+        key, _ = self.wk(x)
+        # TokenFlow owns the gate-input context and the quantized projections.
+        query, gates = op.indexer_q_rope_hadamard_quant(
+            query.view(tokens, 32, 128), positions, rope.cos_sin_cache,
+            self._weights_proj_bf16_in_fp32_out(x_for_gate), rope.is_neox_style,
+            128 ** -0.5, 32 ** -0.5, self.softmax_scale,
+        )
+        # Keep K's original FP32 LayerNorm and BF16 Hadamard accumulation.
+        key = norm.forward_native(key.view(tokens, 1, 128))
+        key_rope = key[..., :self.rope_head_dim]
+        _, rotated_key = self._apply_indexer_rope(positions, key_rope, key_rope)
+        self._update_rope_guarded(key_rope, rotated_key)
+        key = rotate_activation(key)
+        if not getattr(self, "_lightop_preprocess_logged", False):
+            logger.info("Spark LightOp Indexer Q preprocessing active: M<=36, "
+                        "native projection, K preprocessing and INT8 store retained")
+            self._lightop_preprocess_logged = True
+        return query, key, gates.unsqueeze(-1)
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -1179,6 +1232,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        *,
+        q_int8_prepared: bool = False,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1303,9 +1358,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 block_tables[:paged_row_count].to(torch.int32).contiguous()
             )
             if use_int8_index_cache:
-                paged_q, active_weights = self._prepare_hcu_int8_query(
-                    q_fp8[:paged_row_count], weights[:paged_row_count]
-                )
+                if q_int8_prepared:
+                    # The fused epilogue already folded Q's per-head INT8
+                    # scale into the FP32 gates. Quantizing/scaling again
+                    # would change logits. Keep the real-row metadata slice.
+                    assert q_fp8.dtype == torch.int8
+                    assert weights.dtype == torch.float32
+                    paged_q = q_fp8[:paged_row_count]
+                    active_weights = weights[:paged_row_count]
+                else:
+                    paged_q, active_weights = self._prepare_hcu_int8_query(
+                        q_fp8[:paged_row_count], weights[:paged_row_count]
+                    )
                 paged_schedule_metadata = None
             elif use_bf16_index_cache:
                 paged_q = q_fp8[:paged_row_count]
@@ -2346,10 +2410,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.weights_proj, "set_lora", False
         )
 
+        q_int8_prepared = False
         if _is_hcu:
             pool = get_token_to_kv_pool()
             x_for_gate = self._get_gate_input_tensor(x)
-            if self._use_hcu_bf16_indexer_compute(pool):
+            prepared = None
+            if self._use_hcu_int8_index_cache(pool):
+                prepared = self._get_q_k_hcu_int8_fused(
+                    x, x_for_gate, q_lora, positions, forward_batch, forward_mode
+                )
+            if prepared is not None:
+                q_fp8, key, weights = prepared
+                self._store_index_k_cache(
+                    forward_batch=forward_batch, layer_id=layer_id, key=key
+                )
+                q_int8_prepared = True
+            elif self._use_hcu_bf16_indexer_compute(pool):
                 q_fp8, key, _ = self._get_q_k_bf16(
                     q_lora,
                     x,
@@ -2590,7 +2666,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 or forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                    forward_batch, layer_id, q_fp8, weights, metadata,
+                    q_int8_prepared=q_int8_prepared,
                 )
             else:
                 if (
