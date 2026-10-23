@@ -90,6 +90,19 @@ class VanillaMarkov(nn.Module):
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self._lightop_markov = None
+        if envs.SGLANG_DSPARK_LIGHTOP_MARKOV.get() and type(self) is VanillaMarkov:
+            from sglang.srt.utils import is_hcu
+
+            if not is_hcu():
+                raise ValueError("SGLANG_DSPARK_LIGHTOP_MARKOV requires HCU")
+            from lightop.sampling import markov_gemv_add_argmax
+
+            self._lightop_markov = markov_gemv_add_argmax
+            logger.info(
+                "DSpark LightOp Markov projection/add enabled for BF16 rank-256 "
+                "and BS1..4; the configured draft sampler is unchanged"
+            )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -112,6 +125,28 @@ class VanillaMarkov(nn.Module):
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        weight = self.markov_w2.weight
+        if (
+            self._lightop_markov is not None
+            and type(self) is VanillaMarkov
+            and self.markov_rank == 256
+            and logits.ndim == 2
+            and 1 <= logits.shape[0] <= 4
+            and logits.shape[1] == self.vocab_size
+            and logits.dtype in (torch.bfloat16, torch.float32)
+            and logits.is_cuda
+            and logits.stride(-1) == 1
+            and weight.dtype == torch.bfloat16
+            and weight.is_contiguous()
+            and weight.device == logits.device
+            and self.markov_w1.weight.dtype == torch.bfloat16
+            and self.markov_w1.weight.device == logits.device
+        ):
+            latent = self.get_prev_embeddings(token_ids)
+            corrected_logits, _ = self._lightop_markov(latent, weight, logits)
+            # Keep stochastic sampling, RNG consumption and greedy/temperature
+            # masks in the existing sampler. The fused argmax is not substituted.
+            return corrected_logits
         return logits + self.compute_step_bias(token_ids, hidden_states)
 
     def apply_block_logits(

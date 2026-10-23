@@ -1508,6 +1508,8 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Opt-in BF16 VanillaMarkov projection/add; sampling behavior is unchanged.
+    SGLANG_DSPARK_LIGHTOP_MARKOV = EnvBool(False)
     # Paired gfx938 LightOp sparse Page-MQA and mask-aware paged TopK.
     SGLANG_DSA_HCU_LIGHTOP_MASK_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_LIGHTOP_MASK_TOPK"
