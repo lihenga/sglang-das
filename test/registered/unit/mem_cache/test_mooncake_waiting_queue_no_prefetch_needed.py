@@ -8,7 +8,7 @@ re-checks them and, if any is gone, sends every rank back to the normal path.
 import threading
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -160,13 +160,13 @@ class TestCancelWaitingQueuePrefetch(CustomTestCase):
         wrapper.pending_host_prefetch_submissions = {}
         return wrapper
 
-    def test_untracked_request_does_not_cancel_backend_prefetch(self):
+    def test_untracked_prefetch_still_cancels_ordinary_admission(self):
         wrapper = self._wrapper()
 
         wrapper.cancel_waiting_queue_prefetch("rid")
 
         self.assertNotIn("rid", wrapper.hit_markers)
-        wrapper.cache_linker.cancel_host_prefetch.assert_not_called()
+        wrapper.cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
 
     def test_tracked_host_prefetch_is_cancelled(self):
         wrapper = self._wrapper()
@@ -260,7 +260,7 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
 
         self.assertEqual(wrapper.load_back(req), ("loaded", "node"))
 
-        self.assertEqual(cache.reductions, [1])
+        self.assertEqual(cache.reductions, [1, 1])
         wrapper.cache_linker.prepare_load.assert_not_called()
         wrapper.cache_linker.revalidate_load.assert_called_once_with([transfer])
         wrapper._update_load.assert_called_once_with(
@@ -319,14 +319,7 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
         )
         cache_linker = MagicMock()
         cache_linker.waiting_queue_prefetch_enabled.return_value = False
-        with patch(
-            "sglang.srt.mem_cache.storage.mooncake_store."
-            "mooncake_direct_linker.MooncakeDirectLinker",
-            return_value=cache_linker,
-        ):
-            wrapper = UnifiedCacheLinkerWrapper(
-                cache, types.SimpleNamespace(), types.SimpleNamespace()
-            )
+        wrapper = UnifiedCacheLinkerWrapper(cache, cache_linker)
 
         self.assertIsNone(wrapper.host_prefetch_hits)
         self.assertIsNone(wrapper.pending_host_prefetch_submissions)
