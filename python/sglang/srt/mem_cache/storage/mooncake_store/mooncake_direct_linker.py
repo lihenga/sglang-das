@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import threading
 import time
 from concurrent.futures import Future
@@ -31,11 +32,14 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
-from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+DFS_BATCH_GET_TIMEOUT = -1607
+DFS_BATCH_GET_ADMISSION_TIMEOUT = -1608
+_READ_PLAN_RC_PATTERN = re.compile(r"(?:^|\s)rc=(-?\d+)(?=\s|$)")
 
 
 def _get_mooncake_storage_metrics_dp_rank(server_args, params) -> int:
@@ -286,11 +290,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             dp_rank=getattr(params, "dp_rank", None),
         )
         if storage is None:
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
-            )
             from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
                 resolve_dfs_health_config,
+            )
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
             )
 
             self.storage = MooncakeStore(
@@ -448,7 +452,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_thread.start()
         logger.info(
             "Mooncake direct linker ready: rank=%s layers=%d draft_layers=%d pools=%s",
-            rank_suffix, self.num_layers, sum(p.layer_num for p in params.mtp_draft_device_pools),
+            rank_suffix,
+            self.num_layers,
+            sum(p.layer_num for p in params.mtp_draft_device_pools),
             {name.value: len(pool.kv_buffer) for name, pool in self.pools.items()},
         )
 
@@ -557,6 +563,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
         self.storage.apply_dfs_health_policy(allow_read, allow_write)
+
+    def _report_dfs_operation_timeout(self, capability: str, error: int) -> None:
+        self.storage._report_dfs_operation_timeout(capability, error)
+
+    def _dfs_read_policy_allows_read(self) -> bool:
+        getter = getattr(self.storage, "get_local_dfs_health_policy", None)
+        if not callable(getter):
+            return True
+        policy = getter()
+        return policy is None or (bool(policy[0]) and bool(policy[1]))
 
     def disable_waiting_queue_prefetch(self) -> None:
         # Startup only, before any request or prefetch submission. Keep the
@@ -701,9 +717,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return self._prepare_expanded_load(rid, expanded)
 
-    def _prepare_expanded_load(
-        self, rid: str, expanded: list[PoolTransfer]
-    ) -> bool:
+    def _prepare_expanded_load(self, rid: str, expanded: list[PoolTransfer]) -> bool:
         keys = []
         seen = set()
         for transfer in expanded:
@@ -738,9 +752,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     else:
                         new_keys.append(key)
 
-                lease_base = (
-                    time.monotonic() if self.host_prefetch_enabled else 0.0
-                )
+                lease_base = time.monotonic() if self.host_prefetch_enabled else 0.0
                 try:
                     if new_keys and self.host_prefetch_enabled:
                         results, sources = (
@@ -803,7 +815,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Include time spent waiting for another request's session-start RPC.
         age = float("inf") if oldest is None else time.monotonic() - oldest
         if (
-            self.session_refresh_age_s > 0
+            self._dfs_read_policy_allows_read()
+            and self.session_refresh_age_s > 0
             and private
             and age < self.session_refresh_age_s
         ):
@@ -825,9 +838,58 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     bases[key] = lease_base
         return ok
 
-    def submit_host_prefetch(
-        self, rid: str, transfers: list[PoolTransfer]
-    ) -> bool:
+    def _reselect_read_plan_sessions_if_needed(self, layouts) -> None:
+        """Move borrowed ReadPlan sessions off DFS after read policy closes."""
+        if not self.host_prefetch_enabled or self._dfs_read_policy_allows_read():
+            return
+
+        keys = list(dict.fromkeys(key for layout in layouts for key in layout[0]))
+        if not keys:
+            return
+
+        try:
+            results, sources = self.storage.store.batch_get_session_start_with_sources(
+                keys
+            )
+            results = list(results)
+            sources = list(sources)
+        except Exception as error:
+            raise RuntimeError(
+                "Mooncake ReadPlan failed to reselect sessions after DFS "
+                "read policy was disabled"
+            ) from error
+
+        all_memory = len(sources) == len(keys) and all(
+            str(source).lower() == "memory" for source in sources
+        )
+        if (
+            len(results) != len(keys)
+            or any(result != 0 for result in results)
+            or not all_memory
+        ):
+            raise RuntimeError(
+                "Mooncake ReadPlan has no usable memory replica after DFS "
+                "read policy was disabled: "
+                f"results={results}, sources={sources}"
+            )
+
+        lease_base = time.monotonic()
+        with self.session_lock:
+            bases = self._lease_bases()
+            for index, key in enumerate(keys):
+                if key not in self.session_refcounts:
+                    continue
+                source = sources[index] if index < len(sources) else "memory"
+                self.session_sources[key] = str(source).lower()
+                bases[key] = lease_base
+
+        logger.warning(
+            "Mooncake ReadPlan reselected %d borrowed session key(s) to "
+            "memory because DFS reads are disabled",
+            len(keys),
+        )
+
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         if not self.host_prefetch_enabled:
             return False
         kv_transfer = next(
@@ -935,20 +997,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         if not self.host_prefetch_enabled:
             return False
-        with self.host_prefetch_lock:
+        # Session RPCs may hold session_lock; wait before locking worker state.
+        # Keep session ownership and the claimed state atomic under both locks.
+        with self.session_lock, self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is None or entry.get("state") != "dfs_prefetched":
                 return False
             session_rid = str(entry["session_rid"])
-            with self.session_lock:
-                if (
-                    rid in self.prepared_load_sessions
-                    or session_rid not in self.prepared_load_sessions
-                ):
-                    return False
-                self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
-                    session_rid
-                )
+            if (
+                rid in self.prepared_load_sessions
+                or session_rid not in self.prepared_load_sessions
+            ):
+                return False
+            self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
+                session_rid
+            )
             entry["state"] = "claimed"
         return True
 
@@ -1000,21 +1063,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 with self.session_lock:
                     keys = list(self.prepared_load_sessions.get(session_rid, ()))
                 if not prepared or not keys:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
                     continue
 
                 with self.session_lock:
                     sources = {
-                        key: self.session_sources.get(key, "unknown")
-                        for key in keys
+                        key: self.session_sources.get(key, "unknown") for key in keys
                     }
-                dfs_keys = [
-                    key
-                    for key in keys
-                    if sources[key] in {"dfs", "unknown"}
-                ]
+                dfs_keys = [key for key in keys if sources[key] in {"dfs", "unknown"}]
                 if not dfs_keys:
                     self._finish_host_prefetch(
                         rid, entry, session_rid, "no_prefetch_needed", keys=keys
@@ -1029,9 +1085,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         cancelled = False
                         current["state"] = "reading"
                 if cancelled:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
                     continue
                 try:
                     results = list(
@@ -1135,6 +1189,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()
 
+    def wait_for_pending_loads(self) -> None:
+        self.load_queue.join()
+
     def pop_completed_load(self) -> tuple[list[str], bool]:
         return self.completed_loads.get_nowait()
 
@@ -1232,6 +1289,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 # with no request-indexed session maps or duplicate key build.
                 for keys, _ in batches.values():
                     result = self.storage.store.batch_get_session_start(keys)
+                    # A partial result can still leave some sessions active.
+                    started.append(keys)
                     failed = [key for key, code in zip(keys, result) if code != 0]
                     if failed:
                         logger.warning(
@@ -1253,7 +1312,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             f"Mooncake get session start failed: keys={len(keys)}, "
                             f"failed={len(failed)}, results={result}"
                         )
-                    started.append(keys)
             if self.enable_page_wise_load and any(
                 len(keys) >= self.page_wise_load_threshold
                 for keys, _ in batches.values()
@@ -1361,9 +1419,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
@@ -1406,9 +1462,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         expected = [sum(item) for item in all_sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
-            pool_counts = {
-                str(name): len(keys) for name, (keys, _) in batches.items()
-            }
+            pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
             raise RuntimeError(
                 "Mooncake aggregated range get failed for "
                 f"pools={pool_counts}, complete_page: transferred={result}, "
@@ -1447,9 +1501,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 buffer_indices = (
                     ()
                     if mapped is None
-                    else (mapped,)
-                    if isinstance(mapped, int)
-                    else tuple(mapped)
+                    else (mapped,) if isinstance(mapped, int) else tuple(mapped)
                 )
                 layout.append(
                     [
@@ -1470,6 +1522,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         request_transfers: list[list[PoolTransfer]],
     ) -> None:
         layouts = self._prepare_read_plan_layouts(request_transfers)
+        self._reselect_read_plan_sessions_if_needed(layouts)
         plan = self.storage.store.create_read_plan(
             layouts,
             self.num_layers,
@@ -1484,7 +1537,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # In page-wise mode a single batch_get carries all groups per key, so the
         # first wait(0) blocks until every page is complete and later waits are
         # no-ops, matching _load_page_wise's all-or-nothing release.
-        plan.run()
+        try:
+            plan.run()
+        except RuntimeError as error:
+            match = _READ_PLAN_RC_PATTERN.search(str(error))
+            # Admission pressure (-1608) is local backpressure, not evidence
+            # that DFS itself is unhealthy. Only an admitted BatchGet that
+            # exceeded its I/O deadline may trip the DFS read policy.
+            if match and int(match.group(1)) == DFS_BATCH_GET_TIMEOUT:
+                self._report_dfs_operation_timeout("read", DFS_BATCH_GET_TIMEOUT)
+            raise
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)

@@ -2,7 +2,7 @@ import threading
 import types
 import unittest
 from queue import Queue
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import torch
 
@@ -58,7 +58,11 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker.tp_rank = 0
         linker.num_layers = 1
         linker.pools = {}
-        linker.storage = types.SimpleNamespace(store=Mock())
+        linker.storage = types.SimpleNamespace(
+            store=Mock(),
+            get_local_dfs_health_policy=Mock(return_value=(True, True)),
+            _report_dfs_operation_timeout=Mock(),
+        )
         linker._prepare_read_plan_layouts = Mock(return_value=[])
         linker._prepare_expanded_load = Mock(
             side_effect=AssertionError("unexpected Python session preparation")
@@ -149,6 +153,98 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker._prepare_expanded_load.assert_not_called()
         linker.abort_prepared_load.assert_not_called()
 
+    def test_read_plan_timeout_marks_dfs_read_unavailable(self):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.storage.store.create_read_plan.return_value.run.side_effect = (
+            RuntimeError(
+                "Mooncake read plan range get failed at group=-1 "
+                "key_index=0 rc=-1607 expected=4096"
+            )
+        )
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, []))
+
+        linker.storage._report_dfs_operation_timeout.assert_called_once_with(
+            "read", -1607
+        )
+
+    def test_read_plan_non_timeout_error_does_not_change_dfs_policy(self):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.storage.store.create_read_plan.return_value.run.side_effect = (
+            RuntimeError(
+                "Mooncake read plan range get failed at group=-1 "
+                "key_index=0 rc=-1601 expected=4096"
+            )
+        )
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, []))
+
+        linker.storage._report_dfs_operation_timeout.assert_not_called()
+
+    def test_read_plan_admission_timeout_does_not_change_dfs_policy(self):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.storage.store.create_read_plan.return_value.run.side_effect = (
+            RuntimeError(
+                "Mooncake read plan range get failed at group=-1 "
+                "key_index=0 rc=-1608 expected=4096"
+            )
+        )
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, []))
+
+        linker.storage._report_dfs_operation_timeout.assert_not_called()
+
+    def test_borrowed_read_plan_reselects_memory_when_dfs_is_disabled(self):
+        linker = self._read_plan_linker(prefetch=True)
+        linker.storage.get_local_dfs_health_policy.return_value = (False, True)
+        linker.session_lock = threading.Lock()
+        linker.prepared_load_sessions = {"rid": ["tagged-page"]}
+        linker.session_refcounts = {"tagged-page": 1}
+        linker.session_sources = {"tagged-page": "dfs"}
+        linker.session_lease_base = {"tagged-page": 1.0}
+        linker._prepare_read_plan_layouts.return_value = [
+            (["tagged-page"], [0], True, [[]])
+        ]
+        store = linker.storage.store
+        store.batch_get_session_start_with_sources.return_value = (
+            [0],
+            ["memory"],
+        )
+
+        self.assertTrue(linker.load_layer_wise(0, [], request_ids=["rid"]))
+
+        store.batch_get_session_start_with_sources.assert_called_once_with(
+            ["tagged-page"]
+        )
+        self.assertEqual(linker.session_sources["tagged-page"], "memory")
+        store.create_read_plan.return_value.run.assert_called_once()
+
+    def test_borrowed_read_plan_rejects_dfs_source_when_dfs_is_disabled(self):
+        linker = self._read_plan_linker(prefetch=True)
+        linker.storage.get_local_dfs_health_policy.return_value = (False, True)
+        linker.storage.store.batch_get_session_start_with_sources.return_value = (
+            [0],
+            ["dfs"],
+        )
+        layouts = [(["tagged-page"], [0], True, [[]])]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "no usable memory replica.*sources=\\['dfs'\\]"
+        ):
+            linker._reselect_read_plan_sessions_if_needed(layouts)
+
     def test_prefetch_off_legacy_load_batches_sessions_by_pool(self):
         for page_wise in (False, True):
             with self.subTest(page_wise=page_wise):
@@ -203,6 +299,138 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
                 )
                 linker._prepare_expanded_load.assert_not_called()
                 linker.abort_prepared_load.assert_not_called()
+
+    def _legacy_load_linker(self, store):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.read_plan_enabled = False
+        linker.storage.store = store
+        linker.pools = {
+            name: types.SimpleNamespace(prepare_locations=lambda indices: list(indices))
+            for name in (PoolName.KV, PoolName.SWA)
+        }
+        linker.storage._get_hybrid_page_component_keys = lambda keys, _: (keys, 1)
+        linker.storage._tag_keys = lambda keys: list(keys)
+        linker.storage.failed_get_cache = Mock()
+        linker.layer_done_counter = Mock()
+        return linker
+
+    def test_partial_session_start_failures_release_every_started_batch(self):
+        scenarios = (
+            ("first_batch_partial", False),
+            ("earlier_then_partial", True),
+        )
+        for scenario, include_earlier in scenarios:
+            with self.subTest(scenario=scenario):
+                store = Mock()
+                sessions = set()
+
+                def start(keys):
+                    if keys == ["earlier"]:
+                        sessions.add("earlier")
+                        return [0]
+                    sessions.add("present")
+                    return [0, -702]
+
+                def end(keys):
+                    sessions.difference_update(keys)
+
+                store.batch_get_session_start.side_effect = start
+                store.batch_get_session_end.side_effect = end
+                linker = self._legacy_load_linker(store)
+                transfers = []
+                if include_earlier:
+                    transfers.append(
+                        [
+                            PoolTransfer(
+                                name=PoolName.KV,
+                                keys=["earlier"],
+                                host_indices=[0],
+                            )
+                        ]
+                    )
+                transfers.append(
+                    [
+                        PoolTransfer(
+                            name=(PoolName.SWA if include_earlier else PoolName.KV),
+                            keys=["present", "missing"],
+                            host_indices=[0, 1],
+                        )
+                    ]
+                )
+
+                with self.assertLogs(
+                    "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+                    level="ERROR",
+                ):
+                    self.assertFalse(linker.load_layer_wise(0, transfers))
+
+                self.assertEqual(sessions, set())
+                expected_start_batches = (
+                    [["earlier"], ["present", "missing"], ["present", "missing"]]
+                    if include_earlier
+                    else [["present", "missing"], ["present", "missing"]]
+                )
+                self.assertEqual(
+                    store.batch_get_session_start.call_args_list,
+                    [call(keys) for keys in expected_start_batches],
+                )
+                self.assertEqual(
+                    [
+                        call.args[0]
+                        for call in store.batch_get_session_end.call_args_list
+                    ],
+                    (
+                        [["earlier"], ["present", "missing"]]
+                        if include_earlier
+                        else [["present", "missing"]]
+                    ),
+                )
+                linker.storage.failed_get_cache.update_batch.assert_called_once_with(
+                    [], ["missing"]
+                )
+                linker.layer_done_counter.fail.assert_called_once()
+                linker.layer_done_counter.complete.assert_not_called()
+
+    def test_partial_session_start_retry_exception_releases_current_batch(self):
+        store = Mock()
+        sessions = set()
+        retry_error = RuntimeError("retry failed")
+
+        def start(keys):
+            if store.batch_get_session_start.call_count == 1:
+                sessions.add("present")
+                return [0, -702]
+            raise retry_error
+
+        store.batch_get_session_start.side_effect = start
+        store.batch_get_session_end.side_effect = (
+            lambda keys: sessions.difference_update(keys)
+        )
+        linker = self._legacy_load_linker(store)
+        transfers = [
+            [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=["present", "missing"],
+                    host_indices=[0, 1],
+                )
+            ]
+        ]
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, transfers))
+
+        self.assertEqual(sessions, set())
+        store.batch_get_session_start.assert_has_calls(
+            [call(["present", "missing"])] * 2
+        )
+        store.batch_get_session_end.assert_called_once_with(["present", "missing"])
+        linker.storage.failed_get_cache.update_batch.assert_not_called()
+        linker.layer_done_counter.fail.assert_called_once_with(0, retry_error)
+        linker.layer_done_counter.complete.assert_not_called()
 
     def test_layout_expands_packed_layer_mapping(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -272,6 +500,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertEqual(queued_rid, "rid")
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
+
 
 if __name__ == "__main__":
     unittest.main()

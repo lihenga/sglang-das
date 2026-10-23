@@ -345,6 +345,13 @@ class UnifiedCacheLinker(ABC):
         """Start queued loads and return the layer-counter consumer index."""
 
     @abstractmethod
+    def wait_for_pending_loads(self) -> None:
+        """Wait for loads already issued to the backend worker to finish.
+
+        Loads still waiting for ``start_layer_wise_loading`` are not included.
+        """
+
+    @abstractmethod
     def num_completed_loads(self) -> int:
         """Return the number of completed load batches waiting to be consumed."""
 
@@ -508,11 +515,7 @@ class UnifiedCacheLinkerWrapper:
 
     def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
         """Build a request-local snapshot without issuing any collectives."""
-        hit = (
-            None
-            if getattr(req, "disable_external_linker", False)
-            else self.hit_markers.get(req.rid)
-        )
+        hit = self.hit_markers.get(req.rid)
         transfers = []
         locally_eligible = hit is not None
         if hit is not None:
@@ -625,10 +628,6 @@ class UnifiedCacheLinkerWrapper:
             if self._waiting_queue_prefetch_enabled
             else None
         )
-
-        # A request retried after a load failure must recompute from scratch.
-        if getattr(req, "disable_external_linker", False):
-            return result
 
         known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
         if known_hit_len is not None:
@@ -1338,6 +1337,9 @@ class UnifiedCacheLinkerWrapper:
 
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
+
+    def wait_for_pending_loads(self) -> None:
+        self.cache_linker.wait_for_pending_loads()
 
     # ---- lifecycle ----
 
