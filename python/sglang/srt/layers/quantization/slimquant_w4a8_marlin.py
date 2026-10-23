@@ -675,7 +675,10 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                     pack_w4a8_moe_hipc_weight(layer.w2_weight.data),
                     requires_grad=False,
                 )
-                scale_mul = 16.0
+                # N32 HIPC packing retains [E, N, K/2]. These kernels unpack
+                # INT4 into the high nibble of INT8, so they consume scale/16.
+                # The older seven-dimensional layout consumes the true scale.
+                scale_mul = 1.0 if layer.w13_weight.ndim == 3 else 16.0
                 layer.w13_weight_scale = Parameter(
                     layer.w13_weight_scale.data * scale_mul,
                     requires_grad=False,

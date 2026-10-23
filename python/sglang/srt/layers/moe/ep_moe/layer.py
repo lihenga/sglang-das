@@ -400,13 +400,16 @@ def m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
     masked_m: torch.Tensor,
     expected_m_per_group: int,
 ) -> torch.Tensor:
-    return m_grouped_w4a8_gemm_nt_masked_hipc(
+    m_grouped_w4a8_gemm_nt_masked_hipc(
         (a0, a1),
         (b0, b1),
         d,
         masked_m,
         expected_m_per_group,
     )
+    # New DeepGEMM versions return overlap tile metadata; the custom op's
+    # Tensor return contract remains the output buffer supplied by SGLang.
+    return d
 
 
 def m_grouped_w4a8_gemm_nt_masked_hipc_fake(

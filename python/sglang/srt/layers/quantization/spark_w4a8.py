@@ -9,8 +9,6 @@ import os
 import re
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
 from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
@@ -68,6 +66,10 @@ class SparkW4A8Config(CompressedTensorsConfig, SlimQuantW4A8Int8MarlinConfig):
     """CT linear methods plus the existing HCU W4A8 DeepEP expert runner."""
     spark_w4a8 = True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _install_tokenflow_expert_selection()
+
     def get_quant_method(self, layer, prefix):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         if isinstance(layer, FusedMoE):
@@ -85,6 +87,25 @@ class SparkW4A8Config(CompressedTensorsConfig, SlimQuantW4A8Int8MarlinConfig):
             install_runners()
             return SlimQuantW4A8Int8MarlinMoEMethod(self)
         return CompressedTensorsConfig.get_quant_method(self, layer, prefix)
+
+
+def _install_tokenflow_expert_selection():
+    """Keep the HIPC adapter when TokenFlow specializes a CT expert config."""
+    import tokenflow.models.sparkv1.backends.gpu_w4a8 as backend
+
+    original = backend.select_experts_quant_config
+    if getattr(original, "_spark_w4a8_hipc", False):
+        return
+
+    def select_experts_quant_config(quant_config, *, is_cuda, is_w8a8):
+        # TokenFlow's generic HCU W4A8 wrapper uses its Triton MoE runner.
+        # This explicit adapter already owns packing and the DeepEP HIPC path.
+        if isinstance(quant_config, SparkW4A8Config):
+            return quant_config
+        return original(quant_config, is_cuda=is_cuda, is_w8a8=is_w8a8)
+
+    select_experts_quant_config._spark_w4a8_hipc = True
+    backend.select_experts_quant_config = select_experts_quant_config
 
 
 def _gelu_quant(layer, x, masked_m=None, expected_m=None):
@@ -108,50 +129,8 @@ def _gelu_quant(layer, x, masked_m=None, expected_m=None):
     )
 
 
-@triton.jit
-def _layout_copy(src, dst, starts, counts, H: tl.constexpr, CAP: tl.constexpr,
-                 TO_MASKED: tl.constexpr, BLOCK: tl.constexpr):
-    e = tl.program_id(1)
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    row, col = offsets // H, offsets % H
-    start, count = tl.load(starts + e), tl.load(counts + e)
-    flat = (start + row) * H + col
-    masked = e * CAP * H + offsets
-    valid = (row < CAP) & (row < count)
-    if TO_MASKED:
-        value = tl.load(src + flat, valid, 0)
-        tl.store(dst + masked, value, row < CAP)
-    else:
-        value = tl.load(src + masked, valid, 0)
-        tl.store(dst + flat, value, valid)
-
-
-def to_masked(x, scale, counts):
-    capacity = triton.cdiv(max(counts), 256) * 256
-    starts = [0]
-    for count in counts[:-1]:starts.append(starts[-1] + count)
-    starts_gpu = torch.tensor(starts, dtype=torch.int32, device=x.device)
-    counts_gpu = torch.tensor(counts, dtype=torch.int32, device=x.device)
-    masked = torch.empty((len(counts), capacity, x.shape[1]), dtype=x.dtype, device=x.device)
-    masked_scale = torch.empty((len(counts), capacity, 1), dtype=scale.dtype, device=x.device)
-    grid = (triton.cdiv(capacity * x.shape[1], 1024), len(counts))
-    _layout_copy[grid](x, masked, starts_gpu, counts_gpu, x.shape[1], capacity, True, 1024)
-    _layout_copy[(triton.cdiv(capacity, 256), len(counts))](
-        scale, masked_scale, starts_gpu, counts_gpu, 1, capacity, True, 256,
-    )
-    return masked, masked_scale, starts_gpu, counts_gpu
-
-
-def from_masked(x, starts_gpu, counts_gpu, total):
-    groups, capacity, hidden = x.shape
-    out = torch.empty((total, hidden), dtype=x.dtype, device=x.device)
-    _layout_copy[(triton.cdiv(capacity * hidden, 1024), groups)](
-        x, out, starts_gpu, counts_gpu, hidden, capacity, False, 1024,
-    )
-    return out
-
-
 def forward_normal(self, dispatch_output):
+    from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc
     import sglang.srt.layers.moe.ep_moe.layer as ep
     x, scale, ids, weights, counts = dispatch_output
     if counts is None or sum(counts) == 0:
@@ -159,20 +138,31 @@ def forward_normal(self, dispatch_output):
     if x.dtype != torch.int8 or scale is None:
         raise RuntimeError("Spark W4A8 normal dispatch requires INT8 payload")
     total, hidden = sum(counts), x.shape[1]
+    if any(c % 256 for c in counts):
+        raise RuntimeError("Spark contiguous HIPC requires 256-aligned expert counts")
+    gate_up_size = self.w13_weight_scale.shape[1]
+    # The current HIPC kernel writes four 128-column tiles without an N mask.
+    if gate_up_size % 512 or hidden % 512:
+        raise RuntimeError("Spark contiguous HIPC requires GEMM N divisible by 512")
     a = torch.zeros((total, hidden), dtype=x.dtype, device=x.device)
     a_scale = torch.ones((total, 1), dtype=torch.float32, device=x.device)
     counts_gpu = torch.tensor(counts, device=x.device, dtype=torch.int32)
     indices, output_indices = ep._ep_scatter_with_optional_lightop(
         x, scale, ids, counts_gpu, a, a_scale, total,
-        counts_are_aligned=all(c % 256 == 0 for c in counts),
+        counts_are_aligned=True,
     )
-    masked, masked_scale, starts_gpu, counts_gpu = to_masked(a, a_scale, counts)
+    gate_up = torch.zeros((total, gate_up_size), dtype=torch.bfloat16, device=x.device)
+    m_grouped_w4a8_gemm_nt_contiguous_hipc(
+        (a, a_scale), (self.w13_weight, self.w13_weight_scale), gate_up, indices,
+    )
     del a, a_scale
-    masked_down = forward_masked(self, (
-        masked, masked_scale, None, None, counts_gpu, max(counts),
-    ))
-    del masked, masked_scale
-    down = from_masked(masked_down, starts_gpu, counts_gpu, total)
+    q, q_scale = _gelu_quant(self, gate_up)
+    del gate_up
+    down = torch.zeros((total, hidden), dtype=torch.bfloat16, device=x.device)
+    m_grouped_w4a8_gemm_nt_contiguous_hipc(
+        (q, q_scale), (self.w2_weight, self.w2_weight_scale), down, indices,
+    )
+    del q, q_scale
     result = torch.zeros(x.shape, dtype=torch.bfloat16, device=x.device)
     ep._ep_gather_with_optional_lightop(down, ids, weights, output_indices, result)
     return result
@@ -194,11 +184,14 @@ def forward_masked(self, dispatch_output):
 
 
 def install_runners():
+    import deepgemm
     from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
     if getattr(DeepEPMoE.forward_deepgemm_w4a8_marlin_contiguous, "_spark_w4a8", False):
         return
     if os.environ.get("SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE", "true").lower() not in ("0", "false"):
         raise RuntimeError("Spark W4A8 HIPC requires SGLANG_USE_LIGHTOP_W4A8_MARLIN_MOE=0")
+    if not hasattr(deepgemm, "m_grouped_w4a8_gemm_nt_contiguous_hipc"):
+        raise RuntimeError("Spark W4A8 requires DeepGEMM contiguous HIPC support")
     forward_normal._spark_w4a8 = True
     DeepEPMoE.forward_deepgemm_w4a8_marlin_contiguous = forward_normal
     DeepEPMoE.forward_groupgemm_w4a8_marlin_masked = forward_masked

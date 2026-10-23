@@ -279,7 +279,18 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
-        if cls is CompressedTensorsConfig and os.getenv("SGLANG_SPARK_W4A8_CT") == "1":
+        # Mixed checkpoints may carry a separate W8A8 DSpark draft. Keep
+        # ordinary CT dispatch unless the expert group is actually INT4.
+        has_w4_experts = any(
+            "FusedMoE" in group.get("targets", ())
+            and (group.get("weights") or {}).get("num_bits") == 4
+            for group in config.get("config_groups", {}).values()
+        )
+        if (
+            cls is CompressedTensorsConfig
+            and os.getenv("SGLANG_SPARK_W4A8_CT") == "1"
+            and has_w4_experts
+        ):
             from sglang.srt.layers.quantization.spark_w4a8 import SparkW4A8Config
             hf = config.get("hf_config")
             if getattr(hf, "model_type", None) != "sparkv1":
