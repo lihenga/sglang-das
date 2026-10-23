@@ -499,6 +499,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
     # Spark DSpark's captured integer prologue reads these per-forward sources.
     spark_dspark_graph_inputs: Optional[SparkDSparkGraphInputs] = None
+    spark_mla_preprocess: Optional[object] = None
 
 
     # Draft LM-head-only routing. These must be dataclass fields: the eager

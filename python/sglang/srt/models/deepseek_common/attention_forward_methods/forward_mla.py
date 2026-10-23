@@ -573,7 +573,14 @@ class DeepseekMLAForwardMixin:
             # Already applied at the q-prep/indexer overlap fork.
             and not self._q8kv8_qprep_overlap_pending
         ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            from sglang.srt.models.sparkv1_mla_preprocess import maybe_defer_spark_mla
+
+            deferred = maybe_defer_spark_mla(
+                self, forward_batch, positions, q_nope_out, q_pe, k_nope, k_pe,
+                fusion_plan=fusion_plan, llama_4_scaling=llama_4_scaling,
+            )
+            if not deferred:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         if born_q_backend is not None:
             # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
@@ -684,6 +691,14 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
     ):
         save_kv_cache = True
+        if forward_batch.spark_mla_preprocess is not None:
+            from sglang.srt.models.sparkv1_mla_preprocess import consume_spark_mla
+
+            q_nope_out, k_pe = consume_spark_mla(
+                self, forward_batch, q_nope_out, q_pe, k_nope, k_pe, positions
+            )
+            q_pe = None
+            save_kv_cache = False
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -738,6 +753,7 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     k_nope,
                     forward_batch,
+                    save_kv_cache=save_kv_cache,
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,
