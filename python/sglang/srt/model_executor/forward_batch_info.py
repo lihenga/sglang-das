@@ -72,6 +72,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.spark_dspark_graph_inputs import SparkDSparkGraphInputs
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
@@ -496,6 +497,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Spark DSpark's captured integer prologue reads these per-forward sources.
+    spark_dspark_graph_inputs: Optional[SparkDSparkGraphInputs] = None
+
 
     # Draft LM-head-only routing. These must be dataclass fields: the eager
     # buffer registry reconstructs ForwardBatch with dataclasses.replace.

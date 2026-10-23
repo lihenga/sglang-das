@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 import torch
 
@@ -22,7 +23,9 @@ from sglang.srt.layers.attention.spark_dspark_flashmla_ops import (
     attention_from_window,
     gather_draft_window,
 )
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.utils import is_hcu
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,23 @@ class SparkDSparkFlashMLAAttnBackend(TritonAttnBackend):
         if self.token_to_kv_pool.dtype != torch.float8_e4m3fn:
             raise ValueError("Spark draft FlashMLA requires FP8 E4M3 prefix storage")
 
+        self._graph_metadata_enabled = (
+            is_hcu()
+            and os.getenv("SGLANG_HCU_DSPARK_FAST_PREP", "0") == "1"
+        )
+        if self._graph_metadata_enabled:
+            if (
+                type(self.token_to_kv_pool).__name__ != "MLATokenToKVPool"
+                or self._translate_kv_loc is not None
+                or self.use_sliding_window_kv_pool
+            ):
+                raise ValueError("Graph metadata requires the native Spark draft MLA pool")
+            logger.info(
+                "Spark DSpark draft metadata captured in CUDA Graph; "
+                "shared request-table reads fenced after replay"
+            )
+
+        self._input_stager = None
         self._native_extend_attention_fwd = self.extend_attention_fwd
         self._draft_windows = {}
         self._allocate_draft_windows(self.req_to_token_pool.size)
@@ -99,6 +119,71 @@ class SparkDSparkFlashMLAAttnBackend(TritonAttnBackend):
             cuda_graph_num_kv_splits_buf,
             allocate_decode_scratch=False,
         )
+
+    def bind_draft_sampler(self, sampler):
+        self._graph_sampler = sampler
+
+    def skip_replay_metadata_init(self, forward_batch):
+        return (
+            self._graph_metadata_enabled
+            and forward_batch.forward_mode.is_target_verify()
+        )
+
+    def configure_cuda_graph_inputs(self, buffers, registry, **config):
+        if not self._graph_metadata_enabled:
+            return
+        from sglang.srt.layers.attention.spark_dspark_graph_inputs import (
+            SparkDraftGraphInputStager,
+        )
+
+        self._input_stager = SparkDraftGraphInputStager(
+            buffers, registry, sampler=getattr(self, "_graph_sampler", None), **config
+        )
+        logger.info("Spark DSpark input copies/padding captured in CUDA Graph")
+        logger.info("Spark DSpark draft/verify inputs generated in CUDA Graph")
+
+    def try_fill_cuda_graph_inputs(self, forward_batch, *unused, **context):
+        if self._input_stager is None:
+            return False
+        return self._input_stager.stage(forward_batch, **context)
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        if in_capture and self._input_stager is not None:
+            self._input_stager.prepare_capture()
+        if (
+            self._graph_metadata_enabled
+            and forward_batch.forward_mode.is_target_verify()
+            and not in_capture
+        ):
+            # Replay uses the capture-stable input buffers. The graph refreshes
+            # all length-dependent indices before the first attention layer.
+            return
+        return super().init_forward_metadata_out_graph(forward_batch, in_capture)
+
+    def init_forward_metadata_in_graph(self, forward_batch):
+        if (
+            self._graph_metadata_enabled
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            if self._input_stager is not None:
+                self._input_stager.capture_refresh()
+            self._apply_cuda_graph_metadata(
+                bs=forward_batch.batch_size,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+            )
+            return
+        return super().init_forward_metadata_in_graph(forward_batch)
+
+    def shared_read_ends(self, forward_mode):
+        if self._graph_metadata_enabled and forward_mode.is_target_verify():
+            # POST_REPLAY is safe even when HCU lacks an external event node.
+            # Never declare these newly captured request-table reads complete
+            # before the graph that performs them has actually run.
+            return SharedReadEnds.POST_REPLAY
+        return super().shared_read_ends(forward_mode)
 
     @staticmethod
     def _supports_flashmla(

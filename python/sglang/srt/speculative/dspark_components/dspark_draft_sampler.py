@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -9,7 +10,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
-from sglang.srt.utils import get_available_gpu_memory
+from sglang.srt.utils import get_available_gpu_memory, is_hcu
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,15 @@ class DsparkDraftSampler:
             else None
         )
         self.folded_sampling = folded_sampling
+        self._graph_params_enabled = (
+            folded_sampling
+            and is_hcu()
+            and type(model).__name__ == "SparkV1DSparkDraftModel"
+            and os.getenv("SGLANG_HCU_DSPARK_FAST_PREP", "0") == "1"
+        )
+        self._raw_temperatures = None
+        self._raw_top_ks = None
+
         self.temperatures = None
         self.greedy_mask = None
         self.exp_noise = None
@@ -74,6 +84,13 @@ class DsparkDraftSampler:
                 (max_bs,), dtype=torch.float32, device=device
             )
             self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
+            if self._graph_params_enabled:
+                self._raw_temperatures = torch.ones_like(self.temperatures)
+                self._raw_top_ks = torch.ones(
+                    (max_bs,), dtype=torch.int32, device=device
+                )
+                logger.info("Spark DSpark sampling parameter refresh captured in CUDA Graph")
+
             self.exp_noise = torch.empty(
                 (max_bs, vocab), dtype=torch.float32, device=device
             )
@@ -83,11 +100,40 @@ class DsparkDraftSampler:
                 device=device,
             )
 
+    def graph_sampling_sources(self, sampling_info, bs):
+        if getattr(self, "_graph_input_stager", None) is None:
+            return None
+        from sglang.srt.layers.attention.spark_dspark_graph_inputs import SparkGraphSamplingSources
+
+        if sampling_info is None:
+            return SparkGraphSamplingSources(None, None)
+        temperatures, top_ks = sampling_info.temperatures, sampling_info.top_ks
+        if (temperatures.is_cuda and top_ks.is_cuda
+                and temperatures.is_contiguous() and top_ks.is_contiguous()
+                and temperatures.dtype == torch.float32 and top_ks.dtype == torch.int32
+                and temperatures.device == self.temperatures.device == top_ks.device
+                and temperatures.numel() >= bs and top_ks.numel() >= bs):
+            return SparkGraphSamplingSources(temperatures, top_ks)
+        return None
+
     @torch.inference_mode()
-    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
+    def stage_sampling_params(self, *, bs: int, sampling_info, deferred=False) -> None:
         """Host-side refresh of the static sampling params; must run before
         the draft graph replay that consumes them."""
         if not self.folded_sampling:
+            return
+        if deferred:
+            assert getattr(self, "_graph_input_stager", None) is not None
+            return
+        if self._graph_params_enabled:
+            if sampling_info is None:
+                self._raw_temperatures[:bs].fill_(1.0)
+                self._raw_top_ks[:bs].fill_(1)
+            else:
+                self._raw_temperatures[:bs].copy_(
+                    sampling_info.temperatures.view(-1)[:bs]
+                )
+                self._raw_top_ks[:bs].copy_(sampling_info.top_ks.view(-1)[:bs])
             return
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
@@ -100,8 +146,16 @@ class DsparkDraftSampler:
         )
         self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
+    def _refresh_sampling_params_in_graph(self, bs):
+        if getattr(self, "_graph_input_stager", None) is not None:
+            return
+        torch.clamp(self._raw_temperatures[:bs], min=1e-5, out=self.temperatures[:bs])
+        torch.le(self._raw_top_ks[:bs], 1, out=self.greedy_mask[:bs])
+
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
+        if self._graph_params_enabled:
+            self._refresh_sampling_params_in_graph(bs)
         base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]

@@ -467,6 +467,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
+        configure_inputs = getattr(self.attn_backend, "configure_cuda_graph_inputs", None)
+        if configure_inputs is not None:
+            configure_inputs(
+                self.buffers,
+                self.buffer_registry,
+                seq_len_fill_value=self.seq_len_fill_value,
+                require_gathered_buffer=self.require_gathered_buffer,
+                attn_tp_size=self.attn_tp_size,
+                enable_prefill_cp=self.enable_prefill_cp,
+                max_bs=self.max_bs,
+                captured_req_width=self.captured_req_width,
+                enable_pdmux=self.enable_pdmux,
+                enable_two_batch_overlap=self.enable_two_batch_overlap,
+                is_encoder_decoder=self.is_encoder_decoder,
+                has_lora=self.model_runner.lora_manager is not None,
+                pp_size=self.pp_size,
+            )
+
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
 
@@ -1348,14 +1366,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs=bs, num_tokens=padded_num_tokens
             )
 
-        self.buffer_registry.fill_from(
+        fast_fill = getattr(self._replay_attn_backend(), "try_fill_cuda_graph_inputs", None)
+        inputs_filled = fast_fill is not None and fast_fill(
             forward_batch,
+            self.buffers,
+            self.buffer_registry,
             raw_bs=raw_bs,
             padded_bs=bs,
             raw_num_tokens=raw_num_token,
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if not inputs_filled:
+            self.buffer_registry.fill_from(
+                forward_batch,
+                raw_bs=raw_bs,
+                padded_bs=bs,
+                raw_num_tokens=raw_num_token,
+                padded_num_tokens=padded_num_tokens,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         if (
             not is_ragged
@@ -1381,17 +1411,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
 
         attn_backend = self._replay_attn_backend()
-        fb_view = build_replay_fb_view(
-            forward_batch=forward_batch,
-            buffers=buffers,
-            bs=bs,
-            raw_bs=raw_bs,
-            num_tokens=padded_num_tokens,
-            seq_len_fill_value=self.seq_len_fill_value,
-            capture_forward_mode=self.capture_forward_mode,
-            is_encoder_decoder=self.is_encoder_decoder,
-        )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
+        skip_metadata_init = getattr(attn_backend, "skip_replay_metadata_init", None)
+        if skip_metadata_init is None or not skip_metadata_init(forward_batch):
+            fb_view = build_replay_fb_view(
+                forward_batch=forward_batch,
+                buffers=buffers,
+                bs=bs,
+                raw_bs=raw_bs,
+                num_tokens=padded_num_tokens,
+                seq_len_fill_value=self.seq_len_fill_value,
+                capture_forward_mode=self.capture_forward_mode,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
+            attn_backend.init_forward_metadata_out_graph(fb_view)
 
         if get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (

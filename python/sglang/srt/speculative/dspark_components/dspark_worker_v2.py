@@ -640,14 +640,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
-        verify_window = alloc_verify_window(
-            batch=batch,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
-            model_runner=self.model_runner,
-        )
+        if (
+            self.verify_num_draft_tokens == self.gamma + 1
+            and self._proposer.can_generate_window(
+                batch, draft_input, self.model_runner.req_to_token_pool.req_to_token
+            )
+        ):
+            verify_window = None
+        else:
+            verify_window = alloc_verify_window(
+                batch=batch,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
+            )
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
@@ -659,7 +667,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
+                block_pos_offsets=self._block_pos_offsets,
+                target_model_runner=self.model_runner,
             )
+        verify_window = proposal.verify_window
+        assert verify_window is not None
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens

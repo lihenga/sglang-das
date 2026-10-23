@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Optional
 
@@ -22,12 +24,16 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
-from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    VerifyWindow,
+    alloc_verify_window,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils import is_hcu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
@@ -70,6 +76,7 @@ class DraftForwardResult(msgspec.Struct, frozen=True):
     raw_hidden: torch.Tensor
     draft_hidden_3d: torch.Tensor
     can_run_graph: bool
+    verify_window: Optional[VerifyWindow] = None
 
 
 class DraftProposal(msgspec.Struct, frozen=True):
@@ -79,6 +86,7 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_tap: Optional[torch.Tensor] = None
     folded: bool = False
+    verify_window: Optional[VerifyWindow] = None
 
 
 def make_next_draft_input(
@@ -193,25 +201,91 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._prep_cache_enabled = (
+            is_hcu()
+            and type(draft_model).__name__ == "SparkV1DSparkDraftModel"
+            and os.getenv("SGLANG_HCU_DSPARK_FAST_PREP", "0") == "1"
+        )
+        self._prep_tensor_cache = OrderedDict()
+        if self._prep_cache_enabled:
+            logger.info(
+                "Spark DSpark immutable count metadata cache enabled; "
+                "bounded to 16 entries"
+            )
+
+    def _cached_count_tensor(self, values, dtype):
+        # Constants are never mutated; new request mixes get separate storage.
+        # The LRU bounds retained memory when serving batch compositions change.
+        key = (dtype, values)
+        tensor = self._prep_tensor_cache.get(key)
+        if tensor is None:
+            tensor = torch.tensor(
+                values, dtype=dtype, device=self.draft_model_runner.device
+            )
+            self._prep_tensor_cache[key] = tensor
+            if len(self._prep_tensor_cache) > 16:
+                self._prep_tensor_cache.popitem(last=False)
+        else:
+            self._prep_tensor_cache.move_to_end(key)
+        tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
+        return tensor
+
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
+        backend = getattr(self.draft_model_runner, "attn_backend", None)
+        bind = getattr(backend, "bind_draft_sampler", None)
+        if bind is not None:
+            bind(draft_sampler)
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
+    def _generated_input_stager(self):
+        runner = self.draft_model_runner.decode_cuda_graph_runner
+        backend = getattr(runner, "attn_backend", None)
+        stager = getattr(backend, "_input_stager", None)
+        if (
+            self.gamma != 8 or stager is None
+            or not envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get()
+            or not hasattr(self.draft_model, "forward_embed")
+        ):
+            return None
+        return stager
+
+    def can_generate_window(self, batch, draft_input, req_to_token):
+        stager = self._generated_input_stager()
+        return (
+            stager is not None and batch.can_run_dp_cuda_graph
+            and stager.supports_generation(
+                batch.req_pool_indices, batch.seq_lens,
+                draft_input.bonus_tokens, req_to_token,
+            )
+        )
+
+    def _native_draft_inputs(self, verify_window, draft_input, bs, device):
+        ids = torch.full(
+            (bs, self.gamma), int(self._mask_token_id), dtype=torch.long, device=device
+        )
+        ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        positions = verify_window.positions_2d[:, :self.gamma].reshape(-1)
+        locations = verify_window.verify_cache_loc_2d[:, :self.gamma].reshape(-1)
+        return ids, positions, locations
+
     def propose(
         self,
         *,
         batch: ScheduleBatch,
         draft_input: DFlashDraftInputV2,
-        verify_window: VerifyWindow,
+        verify_window: Optional[VerifyWindow],
         bs: int,
         device: str,
         target_model,
         sampling_info,
+        block_pos_offsets=None,
+        target_model_runner=None,
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
         draft_sampler = self._draft_sampler
@@ -225,6 +299,8 @@ class DraftBlockProposer:
             embed_module=embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
+            block_pos_offsets=block_pos_offsets,
+            target_model_runner=target_model_runner,
         )
         draft_block_ids = fwd.draft_block_ids
 
@@ -294,6 +370,7 @@ class DraftBlockProposer:
             confidence=folded_confidence,
             confidence_tap=confidence_tap,
             folded=folded,
+            verify_window=fwd.verify_window,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
@@ -317,6 +394,9 @@ class DraftBlockProposer:
         )
         self._fill_num_token_non_padded(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
+        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+        if graph_runner is None or not graph_runner.can_run_graph(idle_batch):
+            self._detach_eager_count_metadata(idle_batch)
         with torch.inference_mode():
             result = self.draft_model_runner.forward(idle_batch)
             head = self.draft_model.lm_head
@@ -335,24 +415,46 @@ class DraftBlockProposer:
         *,
         batch: ScheduleBatch,
         draft_input: DFlashDraftInputV2,
-        verify_window: VerifyWindow,
+        verify_window: Optional[VerifyWindow],
         bs: int,
         device: str,
         embed_module,
         draft_sampler=None,
         sampling_info=None,
+        block_pos_offsets=None,
+        target_model_runner=None,
     ) -> DraftForwardResult:
         gamma = self.gamma
         prefix_lens = batch.seq_lens
-        positions_2d = verify_window.positions_2d
-        verify_cache_loc_2d = verify_window.verify_cache_loc_2d
+        generated_inputs = None
+        generated_views = None
+        if verify_window is None:
+            from sglang.srt.layers.attention.spark_dspark_graph_inputs import (
+                SparkDSparkGraphInputs,
+            )
 
-        draft_block_ids = torch.full(
-            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
-        )
-        draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :gamma].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
+            stager = self._generated_input_stager()
+            assert stager is not None and target_model_runner is not None
+            generated_views = stager.generated_views[bs]
+            draft_block_ids = generated_views.block_ids
+            draft_positions = generated_views.positions
+            draft_cache_loc = generated_views.locations
+            generated_inputs = SparkDSparkGraphInputs(
+                bonus_tokens=draft_input.bonus_tokens,
+                mask_token_id=int(self._mask_token_id),
+                req_to_token=target_model_runner.req_to_token_pool.req_to_token,
+                sampling=(draft_sampler.graph_sampling_sources(sampling_info, bs)
+                          if draft_sampler is not None else None),
+            )
+            verify_window = VerifyWindow(
+                positions_2d=generated_views.full_positions,
+                verify_cache_loc=generated_views.flat_locations,
+                verify_cache_loc_2d=generated_views.full_locations,
+            )
+        else:
+            draft_block_ids, draft_positions, draft_cache_loc = self._native_draft_inputs(
+                verify_window, draft_input, bs, device
+            )
 
         draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
             self.draft_model, "forward_embed"
@@ -375,7 +477,8 @@ class DraftBlockProposer:
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
-            input_ids=draft_block_ids.flatten(),
+            input_ids=(generated_views.input_ids if generated_views is not None
+                       else draft_block_ids.flatten()),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=prefix_lens,
             out_cache_loc=draft_cache_loc,
@@ -385,19 +488,43 @@ class DraftBlockProposer:
             input_embeds=draft_input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
+            spark_dspark_graph_inputs=generated_inputs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
+            num_token_non_padded=(
+                None if self._prep_cache_enabled
+                else _make_num_token_non_padded(draft_num_tokens, device)
+            ),
             num_token_non_padded_cpu=draft_num_tokens,
         )
         self._fill_num_token_non_padded(draft_forward_batch)
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
-        if (
-            draft_sampler is not None
-            and graph_runner is not None
-            and graph_runner.can_run_graph(draft_forward_batch)
-        ):
-            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        can_run_graph = graph_runner is not None and graph_runner.can_run_graph(
+            draft_forward_batch
+        )
+        if draft_sampler is not None and can_run_graph:
+            draft_sampler.stage_sampling_params(
+                bs=bs, sampling_info=sampling_info,
+                deferred=(generated_inputs is not None and generated_inputs.sampling is not None),
+            )
+        if not can_run_graph:
+            if generated_inputs is not None:
+                # Eligibility can change with the shared DP graph tier. Materialize
+                # the original private tensors before taking the eager path.
+                verify_window = alloc_verify_window(
+                    batch=batch, bs=bs, device=device,
+                    verify_num_draft_tokens=gamma + 1,
+                    block_pos_offsets=block_pos_offsets,
+                    model_runner=target_model_runner,
+                )
+                draft_block_ids, draft_positions, draft_cache_loc = self._native_draft_inputs(
+                    verify_window, draft_input, bs, device
+                )
+                draft_forward_batch.input_ids = draft_block_ids.flatten()
+                draft_forward_batch.positions = draft_positions
+                draft_forward_batch.out_cache_loc = draft_cache_loc
+                draft_forward_batch.spark_dspark_graph_inputs = None
+            self._detach_eager_count_metadata(draft_forward_batch)
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output
@@ -410,7 +537,23 @@ class DraftBlockProposer:
             raw_hidden=raw_hidden,
             draft_hidden_3d=draft_hidden_3d,
             can_run_graph=draft_out.can_run_graph,
+            verify_window=verify_window,
         )
+
+    def _detach_eager_count_metadata(self, forward_batch: ForwardBatch) -> None:
+        # The graph registry copies count constants into its own storage. Eager
+        # MLP-sync padding instead writes the live batch tensors in place, so it
+        # needs private storage rather than an alias of an immutable cache entry.
+        if not self._prep_cache_enabled:
+            return
+        for name in (
+            "num_token_non_padded",
+            "global_num_tokens_gpu",
+            "global_num_tokens_for_logprob_gpu",
+        ):
+            tensor = getattr(forward_batch, name, None)
+            if tensor is not None:
+                setattr(forward_batch, name, tensor.clone())
 
     def _fill_num_token_non_padded(self, forward_batch: ForwardBatch) -> None:
         """Populate num_token_non_padded, mirroring ForwardBatch.init_new.
@@ -428,11 +571,16 @@ class DraftBlockProposer:
             len(forward_batch.input_ids) if forward_batch.input_ids is not None else 0
         )
         if enable_num_token_non_padded():
-            forward_batch.num_token_non_padded = (
-                torch.tensor(num_tokens, dtype=torch.int32)
-                .pin_memory()
-                .to(self.draft_model_runner.device, non_blocking=True)
-            )
+            if self._prep_cache_enabled:
+                forward_batch.num_token_non_padded = self._cached_count_tensor(
+                    num_tokens, torch.int32
+                )
+            else:
+                forward_batch.num_token_non_padded = (
+                    torch.tensor(num_tokens, dtype=torch.int32)
+                    .pin_memory()
+                    .to(self.draft_model_runner.device, non_blocking=True)
+                )
         forward_batch.num_token_non_padded_cpu = num_tokens
 
     def _fill_dp_moe_sync_metadata(
@@ -459,15 +607,30 @@ class DraftBlockProposer:
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
         if enable_num_token_non_padded():
-            forward_batch.num_token_non_padded = torch.tensor(
-                num_tokens, dtype=torch.int32, device=device
-            )
+            if self._prep_cache_enabled:
+                # _fill_num_token_non_padded has already installed this value.
+                if forward_batch.num_token_non_padded is None:
+                    forward_batch.num_token_non_padded = self._cached_count_tensor(
+                        num_tokens, torch.int32
+                    )
+            else:
+                forward_batch.num_token_non_padded = torch.tensor(
+                    num_tokens, dtype=torch.int32, device=device
+                )
         forward_batch.num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
-        forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
-            device, non_blocking=True
-        )
-        forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-            gnt_logprob, dtype=torch.int64
-        ).to(device, non_blocking=True)
+        if self._prep_cache_enabled:
+            forward_batch.global_num_tokens_gpu = self._cached_count_tensor(
+                tuple(gnt), torch.int64
+            )
+            forward_batch.global_num_tokens_for_logprob_gpu = self._cached_count_tensor(
+                tuple(gnt_logprob), torch.int64
+            )
+        else:
+            forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
+                device, non_blocking=True
+            )
+            forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+                gnt_logprob, dtype=torch.int64
+            ).to(device, non_blocking=True)
