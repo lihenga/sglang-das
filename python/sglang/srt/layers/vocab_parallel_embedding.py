@@ -241,6 +241,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        tp_rank_override: Optional[int] = None,
+        tp_size_override: Optional[int] = None,
     ):
         super().__init__()
         self.quant_config = quant_config
@@ -258,6 +260,12 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert use_attn_tp_group is False
             tp_rank = 0
             self.tp_size = 1
+
+        if tp_size_override is not None:
+            if not enable_tp or use_attn_tp_group or tp_rank_override is None:
+                raise ValueError("LM-head TP override requires explicit global TP loading")
+            self.tp_size = tp_size_override
+            tp_rank = tp_rank_override
 
         self.num_embeddings = num_embeddings
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -619,6 +627,20 @@ class ParallelLMHead(VocabParallelEmbedding):
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
+        from sglang.srt.layers.node_local_lm_head import (
+            requested_lm_head_tp_size,
+            validate_lm_head_tp_layout,
+        )
+
+        node_tp_size = requested_lm_head_tp_size()
+        node_tp_rank = None
+        if node_tp_size:
+            node_tp_rank = validate_lm_head_tp_layout(get_parallel(), node_tp_size)
+            if use_presharded_weights or bias:
+                raise ValueError("Node-local LM head requires unsharded weights without bias")
+            # Keep the model's DP embedding/sampling policy; override this head only.
+            enable_tp = True
+            use_attn_tp_group = False
         super().__init__(
             num_embeddings,
             embedding_dim,
@@ -630,7 +652,18 @@ class ParallelLMHead(VocabParallelEmbedding):
             enable_tp=enable_tp,
             use_attn_tp_group=use_attn_tp_group,
             use_presharded_weights=use_presharded_weights,
+            tp_rank_override=node_tp_rank,
+            tp_size_override=node_tp_size or None,
         )
+        if node_tp_size:
+            logger.info(
+                "Node-local TP%d LM-head weight: shard=[%d,%d) shape=(%d,%d)",
+                node_tp_size,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.num_embeddings_per_partition,
+                embedding_dim,
+            )
         self.quant_config = quant_config
 
         # We only support pack LMHead if it's not quantized.

@@ -232,6 +232,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.server_args
         ) and not self._forward_is_dp_local(model_runner)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        # DeepEP permits different local graph buckets, but a sharded LM head
+        # adds equal-count all-gather/all-to-all inside the graph. Use the shared
+        # DP maximum for its bucket without changing the MoE buffer layout.
+        from sglang.srt.layers.node_local_lm_head import requested_lm_head_tp_size
+
+        self.node_local_lm_head_enabled = requested_lm_head_tp_size() > 0
+        self.require_uniform_dp_graph_batch = (
+            self.require_mlp_tp_gather or self.node_local_lm_head_enabled
+        )
         # Composite predicates derive from the instance values so the dp-local
         # draft exemption above stays consistent (require_gathered_buffer ==
         # mlp_tp_gather or attn_tp_gather; require_mlp_sync adds dp attention).
@@ -651,6 +660,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         return max(request_counts)
 
+    def _uniform_graph_batch_size(self, forward_batch: ForwardBatch) -> int:
+        if self.node_local_lm_head_enabled:
+            counts = forward_batch.lm_head_global_num_tokens_cpu
+            if counts is None:
+                raise RuntimeError("TP LM-head graph replay requires full DP counts")
+            return max(counts)
+        if self.require_uniform_dp_graph_batch:
+            return self._max_dp_batch_size(forward_batch)
+        return forward_batch.batch_size
+
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -677,10 +696,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        if self.require_mlp_tp_gather:
-            cuda_graph_bs = self._max_dp_batch_size(forward_batch)
-        else:
-            cuda_graph_bs = forward_batch.batch_size
+        cuda_graph_bs = self._uniform_graph_batch_size(forward_batch)
 
         graph_key = self._make_graph_key(
             cuda_graph_bs,
@@ -1324,11 +1340,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
-            if self.require_mlp_tp_gather:
-                max_batch_size = self._max_dp_batch_size(forward_batch)
-                bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
-            else:
-                bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+            bs = self._pad_to_bucket(
+                self._uniform_graph_batch_size(forward_batch), self.capture_bs
+            )
             padded_num_tokens = bs * self.captured_req_width
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens

@@ -318,7 +318,17 @@ class DraftBlockProposer:
         self._fill_num_token_non_padded(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
-            self.draft_model_runner.forward(idle_batch)
+            result = self.draft_model_runner.forward(idle_batch)
+            head = self.draft_model.lm_head
+            if (
+                getattr(head, "_node_local_lm_head_group", None) is not None
+                and not result.can_run_graph
+            ):
+                # Captured draft graphs already include the projection tail.
+                # Eager idle ranks must join the active peers' head collective.
+                empty_hidden = head.weight.new_empty((0, head.weight.shape[1]))
+                with self._base_logits_context():
+                    self.draft_model.compute_base_logits(empty_hidden)
 
     def _run_forward(
         self,
@@ -437,6 +447,9 @@ class DraftBlockProposer:
         # them separate from global_num_tokens_cpu below, which is scaled into
         # draft-token units for DP/MoE synchronization.
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
+        from sglang.srt.layers.node_local_lm_head import populate_lm_head_dp_metadata
+
+        populate_lm_head_dp_metadata(forward_batch, batch)
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
             batch.global_num_tokens,

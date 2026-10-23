@@ -29,6 +29,8 @@ StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
 def gather_and_crop_vocab(
     local_logits: torch.Tensor, lm_head: nn.Module
 ) -> torch.Tensor:
+    if getattr(lm_head, "_node_local_lm_head_group", None) is not None:
+        return local_logits[..., : int(lm_head.org_vocab_size)]
     full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
     return full_logits[..., : int(lm_head.org_vocab_size)]
 
@@ -36,6 +38,13 @@ def gather_and_crop_vocab(
 def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
     """Project draft hidden states through the target head; a quantized head
     stores `weight` packed, so it needs its own kernel instead of a matmul."""
+    group = getattr(lm_head, "_node_local_lm_head_group", None)
+    if group is not None:
+        metadata = lm_head._node_local_lm_head_metadata
+        return group.project(
+            hidden, lm_head, metadata,
+            lambda rows, head, bias: torch.matmul(rows.to(head.weight.dtype), head.weight.T),
+        )
     quant_method = lm_head.quant_method
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)

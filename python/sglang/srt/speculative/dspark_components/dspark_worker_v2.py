@@ -190,6 +190,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         self._attach_shared_modules()
+        from sglang.srt.layers.node_local_lm_head import configure_dspark_lm_head
+
+        configure_dspark_lm_head(self.draft_model)
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,

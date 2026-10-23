@@ -184,6 +184,7 @@ class LogitsMetadata:
     # Number of tokens to sample per DP rank
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    lm_head_global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
 
@@ -251,6 +252,7 @@ class LogitsMetadata:
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            lm_head_global_num_tokens_for_logprob_cpu=forward_batch.lm_head_global_num_tokens_for_logprob_cpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
@@ -303,6 +305,19 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
+        from sglang.srt.layers.node_local_lm_head import (
+            get_node_local_lm_head_group,
+            requested_lm_head_tp_size,
+            validate_lm_head_tp_layout,
+        )
+
+        self.node_local_lm_head = None
+        node_tp_size = requested_lm_head_tp_size()
+        if node_tp_size:
+            validate_lm_head_tp_layout(get_parallel(), node_tp_size)
+            if skip_all_gather or getattr(config, "tie_word_embeddings", False):
+                raise ValueError("Node-local target LM head requires untied weights")
+            self.node_local_lm_head = get_node_local_lm_head_group(node_tp_size)
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
@@ -336,7 +351,9 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            enabled=(self.do_tensor_parallel_all_gather
+                     and not self.use_attn_tp_group
+                     and self.node_local_lm_head is None),
             skip_entry_sync=True,
         )
 
@@ -447,7 +464,10 @@ class LogitsProcessor(nn.Module):
             lm_head=lm_head,
             get_logits_fn=self._get_logits,
             logits_metadata=logits_metadata,
-            skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
+            skip_chunking_for_dp_attn=(
+                self.do_tensor_parallel_all_gather_dp_attn
+                or self.node_local_lm_head is not None
+            ),
         )
 
         logits_output = LogitsProcessorOutput(
@@ -691,31 +711,39 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
-            hidden_states, logits_metadata
-        )
-
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
-
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)
-
-        used_tp_lm_head_all_to_all = False
-        if self.do_tensor_parallel_all_gather:
-            if self.use_attn_tp_group:
-                logits = self._gather_attn_tp_logits(logits)
-            elif self._can_use_tp_lm_head_all_to_all(
-                logits, local_hidden_states, lm_head, logits_metadata
-            ):
-                logits = self._tp_lm_head_all_to_all(logits)
-                used_tp_lm_head_all_to_all = True
-            else:
-                logits = self._logits_gatherer(logits)
-
-        if not used_tp_lm_head_all_to_all:
-            logits = self._scatter_dp_attn_logits(
-                logits, local_hidden_states, logits_metadata
+        if self.node_local_lm_head is not None:
+            logits = self.node_local_lm_head.project(
+                hidden_states, lm_head, logits_metadata,
+                self._compute_lm_head, embedding_bias,
             )
+            if self.logit_scale is not None:
+                logits.mul_(self.logit_scale)
+        else:
+            hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
+                hidden_states, logits_metadata
+            )
+
+            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+
+            if self.logit_scale is not None:
+                logits.mul_(self.logit_scale)
+
+            used_tp_lm_head_all_to_all = False
+            if self.do_tensor_parallel_all_gather:
+                if self.use_attn_tp_group:
+                    logits = self._gather_attn_tp_logits(logits)
+                elif self._can_use_tp_lm_head_all_to_all(
+                    logits, local_hidden_states, lm_head, logits_metadata
+                ):
+                    logits = self._tp_lm_head_all_to_all(logits)
+                    used_tp_lm_head_all_to_all = True
+                else:
+                    logits = self._logits_gatherer(logits)
+
+            if not used_tp_lm_head_all_to_all:
+                logits = self._scatter_dp_attn_logits(
+                    logits, local_hidden_states, logits_metadata
+                )
 
         logits = self._copy_logits_to_buffer(
             logits, logits_metadata, use_buffer=use_logits_buffer

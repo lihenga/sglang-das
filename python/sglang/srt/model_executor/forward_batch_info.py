@@ -543,6 +543,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
+    # The scheduler retains full DP counts even when DeepEP's MLP metadata
+    # contains only this rank. TP LM-head collectives need the full vector.
+    lm_head_global_num_tokens_cpu: Optional[List[int]] = None
+    lm_head_global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
     _original_num_tokens: Optional[int] = None
@@ -712,6 +716,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         server_args: ServerArgs,
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
+        from sglang.srt.layers.node_local_lm_head import populate_lm_head_dp_metadata
+
+        populate_lm_head_dp_metadata(self, batch)
         global_num_tokens = batch.global_num_tokens
         global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
         if (
