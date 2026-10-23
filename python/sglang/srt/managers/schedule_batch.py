@@ -77,7 +77,6 @@ from typing import (
 import msgspec
 import numpy as np
 import torch
-
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -977,6 +976,22 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+
+        # External KV abort cleanup state. Each action is independently
+        # retryable so a request can move between scheduler queues without
+        # losing progress when an asynchronous cleanup step fails.
+        self.external_kv_abort_requested = False
+        self.external_kv_pending_chunk_cleared = False
+        self.external_kv_linker_released = False
+        self.external_kv_sender_abort_requested = False
+        self.external_kv_metadata_released = False
+        self.external_kv_cache_released = False
+        self.external_kv_finish_state_applied = False
+        self.external_kv_response_sent = False
+        self.external_kv_abort_response_via_chunked = False
+        self.external_kv_cleanup_done = False
+        self.prefill_transfer_failure_reported = False
+        self.external_kv_cleanup_steps = {}
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -1021,6 +1036,9 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Absolute external-cache hit boundary agreed by every PP stage;
+        # None outside PP.
+        self.external_cache_hit_length: Optional[int] = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -1353,6 +1371,18 @@ class Req(ReqDllmMixin):
             if reprefill_tail:
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
+
+        # Keep the external-cache boundary stable while admitting the request
+        # on every PP stage. Cache insertion performs its own rematch and must
+        # be allowed to see KV computed after that original boundary.
+        if (
+            tree_cache is not None
+            and self.external_cache_hit_length is not None
+            and getattr(tree_cache, "linker", None) is not None
+            and getattr(tree_cache, "pp_size", 1) > 1
+        ):
+            capped = min(input_len, self.external_cache_hit_length)
+            key_limit = capped if key_limit is None else min(key_limit, capped)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.

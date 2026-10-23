@@ -2911,6 +2911,71 @@ class ServerArgs:
         "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
         NS("memory"),
     ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake", "mori"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
+    mooncake_page_wise_load_threshold: A[
+        int,
+        "Minimum number of Mooncake direct-linker keys that switches loading "
+        "from the layer-wise flow to the complete-page flow.",
+        NS("memory"),
+    ] = 10
+    mooncake_enable_page_wise_load: A[
+        bool,
+        "Enable page-wise loading for Mooncake direct-linker. When enabled, "
+        "switches from layer-wise flow to complete-page flow based on key "
+        "count threshold.",
+        NS("memory"),
+    ] = False
+    mooncake_enable_waiting_queue_dfs_prefetch: A[
+        bool,
+        "Prefetch Mooncake DFS objects into its pinned session cache while "
+        "requests wait in the FCFS scheduler queue. Hold admission until "
+        "the prefetch is ready on all ranks; failures use the normal external "
+        "load path. When disabled, ignore the waiting-queue prefetch limits "
+        "and disable this client's DFS prefetch arena even if its size is "
+        "configured in the environment.",
+        NS("memory"),
+    ] = False
+    mooncake_waiting_queue_dfs_prefetch_max_requests: A[
+        int,
+        "Maximum number of preparing, queued, reading, or ready Mooncake "
+        "waiting-queue DFS-prefetch requests retained per scheduler rank.",
+        NS("memory"),
+    ] = 8
+    mooncake_waiting_queue_dfs_prefetch_workers: A[
+        int,
+        "Maximum number of background workers reading Mooncake DFS objects "
+        "for waiting-queue prefetch. Capped by the request limit.",
+        NS("memory"),
+    ] = 2
+    mooncake_dfs_health_probe_interval_s: A[
+        Optional[int],
+        "Interval in seconds between Mooncake DFS read/write health probes.",
+        NS("memory"),
+    ] = None
+    mooncake_dfs_health_failure_threshold: A[
+        Optional[int],
+        "Consecutive Mooncake DFS probe failures required to disable the "
+        "corresponding read or write capability.",
+        NS("memory"),
+    ] = None
+    mooncake_dfs_health_success_threshold: A[
+        Optional[int],
+        "Consecutive successful Mooncake DFS probes required to enable the "
+        "corresponding read or write capability.",
+        NS("memory"),
+    ] = None
+    mooncake_dfs_health_probe_timeout_s: A[
+        Optional[int],
+        "Timeout in seconds for one Mooncake DFS health probe.",
+        NS("memory"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
@@ -8926,6 +8991,12 @@ class ServerArgs:
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
+        if self.enable_unified_cache_external_linker and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-unified-cache-external-linker and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
 

@@ -81,14 +81,15 @@ def test_linker_wrapper_commits_failure_and_detaches_chain():
     assert wrapper.take_failed_chain("rid-a") == [7, 3]
 
 
-def test_linker_wrapper_cancels_queued_load_and_detaches_chain():
+def test_release_request_keeps_published_load_and_lock_until_completion():
     detached = []
     unlocked = []
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.hit_markers = {}
+    wrapper._waiting_queue_prefetch_enabled = False
     wrapper.failed_chains = {}
     wrapper.pending_loads = {"rid-a": (7, "lock", 3)}
-    wrapper.cache_linker = SimpleNamespace(cancel_queued_load=lambda _rid: True)
+    wrapper.cache_linker = SimpleNamespace(cancel_queued_load=lambda _rid: False)
     wrapper.cache = SimpleNamespace(
         tree_core=SimpleNamespace(
             detach_external_load_chain=lambda endpoint, anchor: detached.append(
@@ -103,9 +104,10 @@ def test_linker_wrapper_cancels_queued_load_and_detaches_chain():
 
     wrapper.release_request("rid-a")
 
-    assert detached == [(7, 3)]
-    assert unlocked == [(7, "lock")]
-    assert wrapper.take_failed_chain("rid-a") == [7]
+    assert detached == []
+    assert unlocked == []
+    assert wrapper.pending_loads == {"rid-a": (7, "lock", 3)}
+    assert wrapper.failed_chains == {}
 
 
 def test_unified_radix_event_path_records_failed_load_rids():
@@ -143,10 +145,20 @@ def test_scheduler_marks_failed_load_request_for_abort():
         skip_radix_cache_insert=False,
         time_stats=SimpleNamespace(trace_ctx=trace),
         finished=lambda: False,
+        disagg_kv_sender=None,
+        external_kv_cleanup_done=False,
+        external_kv_abort_requested=False,
+        external_kv_pending_chunk_cleared=False,
+        external_kv_linker_released=False,
+        external_kv_sender_abort_requested=False,
     )
     released = []
-    scheduler = SimpleNamespace(
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.__dict__.update(
         _deferred_linker_rids=set(),
+        _external_kv_abort_rids=set(),
+        _external_kv_cleanup_rids=set(),
+        disagg_prefill_pending_chunk_rids=set(),
         tree_cache=SimpleNamespace(
             drain_linker_loads=lambda: ["rid-a"],
             has_outstanding_failed_linker_chains=lambda: False,

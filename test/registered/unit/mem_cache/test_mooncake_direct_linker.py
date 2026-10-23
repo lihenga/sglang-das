@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult, MatchResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
@@ -41,6 +42,55 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def test_runtime_mooncake_attach_injects_cli_health_config(monkeypatch):
+    controller = SimpleNamespace(
+        storage_backend_type=None,
+        mem_pool_host=SimpleNamespace(entries=[]),
+    )
+    attached = []
+    controller.attach_storage_backend = lambda **kwargs: attached.append(kwargs)
+    cache = SimpleNamespace(
+        cache_controller=controller,
+        enable_storage=False,
+        _enable_metrics_flag=False,
+        extra_metric_labels=None,
+    )
+    attachment = StorageAttachment(cache)
+    monkeypatch.setattr(attachment, "apply_runtime_config", lambda **kwargs: None)
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_cache.storage_attachment."
+        "HybridCacheController.parse_storage_backend_extra_config",
+        lambda raw: (
+            {"master_server_address": "127.0.0.1:50051"},
+            256,
+            1.0,
+            0.25,
+            False,
+        ),
+    )
+    server_args = SimpleNamespace(
+        mooncake_dfs_health_probe_interval_s=13,
+        mooncake_dfs_health_failure_threshold=3,
+        mooncake_dfs_health_success_threshold=4,
+        mooncake_dfs_health_probe_timeout_s=7,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_server_args", lambda: server_args
+    )
+
+    ok, _ = attachment.attach("mooncake")
+
+    assert ok
+    assert attached[0]["storage_backend_extra_config"][
+        "_mooncake_dfs_health_config"
+    ] == {
+        "probe_interval_s": 13,
+        "failure_threshold": 3,
+        "success_threshold": 4,
+        "probe_timeout_s": 7,
+    }
 
 
 class _Allocator:
@@ -175,6 +225,8 @@ def test_lookup_returns_sparse_mamba_boundaries():
     linker.stats = {"lookup": 0}
     linker.storage = MooncakeStore.__new__(MooncakeStore)
     linker.storage.mem_pool_host = SimpleNamespace(kv_buffer=None)
+    linker.storage.pp_rank = 0
+    linker.storage.pp_size = 1
     linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
         [f"{key}_{transfer.name}" for key in keys],
         1,
@@ -197,6 +249,67 @@ def test_lookup_returns_sparse_mamba_boundaries():
     assert valid == [2, 4]
 
 
+def test_lookup_requires_each_pp_shard_for_a_page():
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    pools = [
+        SimpleNamespace(
+            name=name,
+            indices_from_pool=name,
+            translate_indices=lambda indices: indices,
+        )
+        for name in (PoolName.KV, PoolName.INDEXER)
+    ]
+    linker.pool_group = DevicePoolGroup(pools, num_layers=4, page_size=1)
+    linker.pools = linker.pool_group.entry_map
+    linker.stats = {"lookup": 0}
+    linker.storage = MooncakeStore.__new__(MooncakeStore)
+    linker.storage.mem_pool_host = SimpleNamespace(kv_buffer=None)
+    linker.storage.pp_rank = 0
+    linker.storage.pp_size = 2
+    linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+        [f"{key}_cp0_pp0_{transfer.name}" for key in keys],
+        1,
+    )
+    linker.storage._tag_keys = lambda keys: keys
+    linker.storage._batch_exist = lambda keys: [
+        int(key != "b_cp0_pp1_indexer") for key in keys
+    ]
+
+    valid = linker.lookup(
+        "rid",
+        [
+            PoolTransfer(name=PoolName.KV, keys=["a", "b"]),
+            PoolTransfer(name=PoolName.INDEXER, keys=["a", "b"]),
+        ],
+    )
+
+    assert valid == [1]
+
+
+def test_revalidate_load_rejects_evicted_remote_object():
+    missing_updates = []
+    transfers = [PoolTransfer(name=PoolName.KV, keys=["a", "b"])]
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker._load_revalidation_groups = ()
+    linker.pool_group = SimpleNamespace(
+        resolve_transfers=lambda items, **kwargs: items
+    )
+    linker.storage = SimpleNamespace(
+        _get_hybrid_page_component_keys=lambda keys, transfer: (
+            [f"{key}_component" for key in keys],
+            1,
+        ),
+        _tag_keys=lambda keys: [f"tenant/{key}" for key in keys],
+        _batch_exist=lambda keys: [1, 0],
+        failed_get_cache=SimpleNamespace(
+            update_batch=lambda hits, missing: missing_updates.append((hits, missing))
+        ),
+    )
+
+    assert linker.revalidate_load(transfers) is False
+    assert missing_updates == [([], ["tenant/b_component"])]
+
+
 def test_tail_hashes_honor_radix_key_limit():
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = SimpleNamespace(page_size=256)
@@ -204,6 +317,70 @@ def test_tail_hashes_honor_radix_key_limit():
     result = SimpleNamespace(last_device_node=None)
 
     assert wrapper._tail_hashes(key, result, device_hit_len=0) == []
+
+
+def test_every_pp_stage_probes_l3_and_agrees_on_extend_boundary():
+    """A downstream PP stage must not stop at its shorter local-only hit."""
+
+    canonical_hit_len = 5
+    prompt_len = 7
+    lookups = []
+
+    class _Component:
+        @staticmethod
+        def build_external_linker_transfer(_phase, _node, keys):
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+    def run_match(pp_rank, device_hit_len):
+        cache = SimpleNamespace(
+            page_size=1,
+            pp_size=2,
+            pp_rank=pp_rank,
+            _components_tuple=(_Component(),),
+            _all_reduce_attn_groups=lambda _tensor, _op: None,
+        )
+        backend = SimpleNamespace(
+            lookup=lambda rid, transfers: lookups.append(
+                (pp_rank, rid, len(transfers[0].keys))
+            )
+            or [len(transfers[0].keys)]
+        )
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache = cache
+        wrapper.cache_linker = backend
+        wrapper.hit_markers = {}
+        wrapper.host_prefetch_hits = {}
+        wrapper._waiting_queue_prefetch_enabled = False
+        wrapper._tail_hashes = lambda _key, _result, local_hit: [
+            f"page-{index}" for index in range(local_hit, canonical_hit_len)
+        ]
+
+        req = SimpleNamespace(rid=f"req-{pp_rank}", external_cache_hit_length=None)
+        root = object()
+        result = MatchResult(
+            device_indices=torch.arange(device_hit_len, dtype=torch.int64),
+            last_device_node=root,
+            last_host_node=root,
+            best_match_node=root,
+        )
+        matched = wrapper.match(RadixKey(array("q", range(prompt_len))), req, result)
+        return req, matched
+
+    pp0_req, pp0_match = run_match(pp_rank=0, device_hit_len=2)
+    pp1_req, pp1_match = run_match(pp_rank=1, device_hit_len=3)
+
+    assert [rank for rank, _rid, _pages in lookups] == [0, 1]
+    assert pp0_req.external_cache_hit_length == canonical_hit_len
+    assert pp1_req.external_cache_hit_length == canonical_hit_len
+    assert (
+        len(pp0_match.device_indices) + pp0_match.host_hit_length
+        == canonical_hit_len
+    )
+    assert (
+        len(pp1_match.device_indices) + pp1_match.host_hit_length
+        == canonical_hit_len
+    )
+    assert prompt_len - canonical_hit_len == 2  # identical extend length on both stages
 
 
 def test_load_and_offload_share_gc_freeze(monkeypatch):
@@ -265,6 +442,8 @@ def test_load_waits_for_scheduler_stream(monkeypatch):
     linker.pending_loads = {"rid": [object()]}
     linker.layer_done_counter = SimpleNamespace(update_producer=lambda: 7)
     linker.load_queue = Queue()
+    linker.completed_loads = Queue()
+    linker.host_prefetch_enabled = False
     linker.stats = {"load": 0}
 
     def load_layer_wise(counter_index, transfers):
@@ -415,6 +594,118 @@ def test_check_hicache_events_drains_common_tp_offloads():
     cache.check_hicache_events()
 
     assert drained == [1]
+
+
+def test_sync_dfs_health_policy_applies_attention_group_minimum():
+    applied = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: (True, True),
+        apply_dfs_health_policy=lambda read, write: applied.append((read, write)),
+    )
+
+    def reduce_to_common_policy(policy, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        policy.copy_(torch.tensor([0, 1], dtype=torch.int))
+
+    cache._all_reduce_attn_groups = reduce_to_common_policy
+    cache._sync_dfs_health_policy()
+
+    assert applied == [(False, True)]
+
+
+def test_sync_dfs_health_policy_applies_pp_group_minimum(monkeypatch):
+    applied = []
+    pp_group = object()
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: (True, True),
+        apply_dfs_health_policy=lambda read, write: applied.append((read, write)),
+    )
+    cache._all_reduce_attn_groups = lambda policy, op: None
+    cache.pp_size = 2
+    cache.pp_group = pp_group
+
+    def reduce_pp_policy(policy, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        assert group is pp_group
+        policy.copy_(torch.tensor([1, 0], dtype=torch.int))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_pp_policy)
+    cache._sync_dfs_health_policy()
+
+    assert applied == [(False, False)]
+
+
+def test_sync_dfs_health_policy_failure_is_nonfatal_and_throttled(monkeypatch):
+    now = [100.0]
+    calls = []
+    reductions = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+
+    def fail_policy(read, write):
+        calls.append((read, write))
+        raise RuntimeError("standalone RPC unavailable")
+
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: (True, True),
+        apply_dfs_health_policy=fail_policy,
+    )
+    cache._all_reduce_attn_groups = lambda policy, op: reductions.append(op)
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_radix_cache.time.monotonic", lambda: now[0]
+    )
+
+    cache._sync_dfs_health_policy()
+    now[0] += 0.5
+    cache._sync_dfs_health_policy()
+
+    assert calls == [(True, True)]
+    assert reductions == [
+        torch.distributed.ReduceOp.MIN,
+        torch.distributed.ReduceOp.MIN,
+    ]
+    assert cache._dfs_policy_failed_target == (True, True)
+    assert cache._dfs_policy_consecutive_failures == 1
+
+    now[0] += 0.5
+    cache._sync_dfs_health_policy()
+    assert calls == [(True, True), (True, True)]
+    assert cache._dfs_policy_consecutive_failures == 2
+
+
+def test_sync_dfs_health_policy_recovers_and_applies_latest_target(monkeypatch):
+    now = [200.0]
+    target = [(True, True)]
+    calls = []
+    fail = [True]
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+
+    def apply_policy(read, write):
+        calls.append((read, write))
+        if fail[0]:
+            raise RuntimeError("standalone RPC unavailable")
+
+    cache.linker = SimpleNamespace(
+        get_local_dfs_health_policy=lambda: target[0],
+        apply_dfs_health_policy=apply_policy,
+    )
+    cache._all_reduce_attn_groups = lambda policy, op: None
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_radix_cache.time.monotonic", lambda: now[0]
+    )
+
+    cache._sync_dfs_health_policy()
+    target[0] = (False, True)
+    fail[0] = False
+    # A changed (and more restrictive) target bypasses the stale target's
+    # retry delay, so failure recovery does not postpone DFS disablement.
+    cache._sync_dfs_health_policy()
+
+    assert calls == [(True, True), (False, True)]
+    assert cache._dfs_policy_failed_target is None
+    assert cache._dfs_policy_consecutive_failures == 0
+    assert cache._dfs_policy_next_retry_at == 0.0
 
 
 def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
