@@ -25,6 +25,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import math
 import time
 from collections import deque
@@ -298,6 +299,7 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    pending_metadata_send: Any = None
     is_rebootstrap: bool = False
     pd_hidden_dst_indices: Optional[List[int]] = None
     pd_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
@@ -354,6 +356,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
+        self._async_page_metadata = (
+            _is_hcu
+            and type(self.token_to_kv_pool).__name__
+            in ("MLATokenToKVPool", "DSATokenToKVPool", "LayerSplitDSATokenToKVPool")
+            and not scheduler.enable_hisparse
+            and os.getenv("SGLANG_HCU_DSPARK_FAST_PREP", "0") == "1"
+        )
+        if self._async_page_metadata:
+            logger.info(
+                "Async PD page metadata readback enabled for %s",
+                type(self.token_to_kv_pool).__name__,
+            )
+        self._page_metadata_copy_stream = None
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
@@ -1786,6 +1801,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             seq_len = origin_input_len
+            metadata_readback = None
+            if self._async_page_metadata:
+                from sglang.srt.disaggregation.async_metadata import MetadataReadback
+
+                if self._page_metadata_copy_stream is None:
+                    self._page_metadata_copy_stream = torch.cuda.Stream()
+                metadata_readback = MetadataReadback(self._page_metadata_copy_stream)
+
+            def _page_indices(indices, transfer_page_size):
+                if metadata_readback is None:
+                    return kv_to_page_indices(indices, transfer_page_size)
+                return metadata_readback.page_indices(indices, transfer_page_size)
 
             def _mamba_payload():
                 return [
@@ -1810,7 +1837,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return _page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1818,7 +1845,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(kv_indices_full, device_page_size)
+                return _page_indices(kv_indices_full, device_page_size)
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -1952,7 +1979,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
+            page_indices = _page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
             device_page_indices = None
@@ -2006,18 +2033,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            decode_req.kv_receiver.send_metadata(
+            send_args = (
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
+            )
+            send_kwargs = dict(
                 **metadata_kwargs,
                 decode_prefix_len=total_prefix_len,
                 spec_metadata=spec_metadata,
             )
-            if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
+            if metadata_readback is None:
+                decode_req.kv_receiver.send_metadata(*send_args, **send_kwargs)
+                if decode_req.is_rebootstrap:
+                    self.kv_manager.submit_prefill_recompute(
+                        decode_req.kv_receiver,
+                        decode_req.req.build_rebootstrap_payload(),
+                    )
+            else:
+                from sglang.srt.disaggregation.async_metadata import PendingMetadataSend
+
+                after_send = None
+                if decode_req.is_rebootstrap:
+                    from functools import partial
+
+                    after_send = partial(
+                        self.kv_manager.submit_prefill_recompute,
+                        decode_req.kv_receiver,
+                        decode_req.req.build_rebootstrap_payload(),
+                    )
+                metadata_readback.issue()
+                decode_req.pending_metadata_send = PendingMetadataSend(
+                    metadata_readback, send_args, send_kwargs, after_send
                 )
             self._num_published_destinations += 1
             preallocated_reqs.append(decode_req)
@@ -2863,6 +2910,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if self.scheduler.enable_decode_hicache
             else [dr.kv_receiver for dr in self.queue]
         )
+        if any(dr.pending_metadata_send is not None for dr in self.queue):
+            from sglang.srt.disaggregation.async_metadata import MetadataReadyGatedReceiver
+
+            pollers = [
+                MetadataReadyGatedReceiver(dr, receiver)
+                for dr, receiver in zip(self.queue, pollers)
+            ]
         return poll_and_all_reduce(
             pollers,
             self.gloo_group,
@@ -3056,6 +3110,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
             ):
+                if decode_req.pending_metadata_send is not None:
+                    from sglang.srt.disaggregation.async_metadata import cancel_pending_metadata
+
+                    cancel_pending_metadata(decode_req)
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -3178,6 +3236,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
 
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
+        if decode_req.pending_metadata_send is not None:
+            from sglang.srt.disaggregation.async_metadata import cancel_pending_metadata
+
+            cancel_pending_metadata(decode_req)
         room = decode_req.req.bootstrap_room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
