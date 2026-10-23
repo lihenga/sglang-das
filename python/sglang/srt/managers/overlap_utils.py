@@ -14,6 +14,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -328,7 +331,21 @@ class FutureMap:
         # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
         # recovers occupancy lost to the WAR barrier (also CUDA-only); other
         # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # HCU DSpark can issue its required CPU mirror when verify publishes,
+        # while draft-extend and the next scheduling epoch are still in flight.
+        # Preserve the CPU mirror; only move the copy off the launch path.
+        self._hcu_early_seq_lens = (
+            _is_hcu
+            and needs_cpu_seq_lens
+            and spec_algo.is_dspark()
+            and os.getenv("SGLANG_HCU_DSPARK_FAST_PREP", "0") == "1"
+        )
+        if self._hcu_early_seq_lens:
+            logging.getLogger(__name__).info(
+                "Early DSpark sequence-length D2H readback enabled"
+            )
+        self._seq_lens_cpu_ready = None
+        if _is_cuda or self._hcu_early_seq_lens:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -512,7 +529,7 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if _is_hip and not self._hcu_early_seq_lens:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
             else:
@@ -528,6 +545,20 @@ class FutureMap:
                 # Poison consumed rows: each row must be re-published/seeded
                 # before the next resolve gathers it (safe here: the forward's
                 # re-publish is fenced behind this stream via wait_stream).
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return
+
+        if self._hcu_early_seq_lens and self._seq_lens_cpu_ready is not None:
+            # Do not enter HIP's blocking synchronize path for an already-ready
+            # copy. The event protects pinned-buffer reads and the GPU gather
+            # above remains ordered after the matching publish event.
+            if not self._seq_lens_cpu_ready.query():
+                self._seq_lens_cpu_ready.synchronize()
+            batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[
+                batch.req_pool_indices_cpu
+            ]
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
@@ -572,6 +603,19 @@ class FutureMap:
                 self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
             self._publish_fresh = True
+            if self._hcu_early_seq_lens:
+                self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
+                with torch.get_device_module(self.device).stream(
+                    self.fwd_prepare_d2h_stream
+                ):
+                    self.new_seq_lens_cpu_pinned.copy_(
+                        self.new_seq_lens_buf, non_blocking=True
+                    )
+                    if self._seq_lens_cpu_ready is None:
+                        self._seq_lens_cpu_ready = torch.get_device_module(
+                            self.device
+                        ).Event()
+                    self._seq_lens_cpu_ready.record()
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,
