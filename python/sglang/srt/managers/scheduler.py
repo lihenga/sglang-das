@@ -5117,6 +5117,17 @@ class Scheduler(
             self.server_args.enable_unified_cache_external_linker
             and batch.forward_mode.is_extend()
         ):
+            if (
+                linker_failed_rids is None
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+                and getattr(self.server_args, "kvserve_compression", None) is not None
+            ):
+                # Layer waits can finish before the backend publishes its load
+                # verdict. Drain issued loads and reach TP consensus before any
+                # compression worker can read restored prefix pages.
+                linker_failed_rids = set(
+                    self.tree_cache.drain_linker_loads(wait_for_completion=True)
+                )
             self._mark_failed_linker_loads(batch, failed_rids=linker_failed_rids)
 
         # Flush async trace ops here: in overlap mode this CPU work runs while

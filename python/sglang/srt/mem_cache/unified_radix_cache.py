@@ -2747,7 +2747,12 @@ class UnifiedRadixCache(BasePrefixCache):
         req = params.req
         assert req is not None
         if self.linker is not None and self.linker.has_hit(req.rid):
-            return self.linker.load_back(req)
+            indices, node_id = self.linker.load_back(req)
+            # Direct linker reuses host-hit admission accounting, but its KV
+            # comes from external storage, not the host tier. Stamp the source
+            # before ScheduleBatch computes the per-tier cache breakdown.
+            req.storage_hit_length = max(req.storage_hit_length, len(indices))
+            return indices, node_id
         last_best_match_device_node_id = req.last_node
 
         if (

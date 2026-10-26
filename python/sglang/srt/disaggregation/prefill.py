@@ -470,6 +470,11 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
         )
         kv_manager.pd_hidden_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        if getattr(self.scheduler.server_args, "kvserve_compression", None) is not None:
+            kv_manager.attach_kvserve(
+                self.token_to_kv_pool,
+                self.scheduler.model_config.num_hidden_layers,
+            )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -2405,6 +2410,15 @@ class SchedulerDisaggregationPrefillMixin:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
+        if getattr(self.server_args, "kvserve_compression", None) is not None and (
+            self.server_args.enable_unified_cache_external_linker
+            or getattr(self.server_args, "enable_hierarchical_cache", False)
+        ):
+            # External loads may publish radix entries before bytes/verdicts
+            # arrive, including entries shared by another request. Keep cache
+            # reuse, but publish KV only through the normal post-forward path.
+            return
+
         # Staging sends into positional grid slots, so the early-send boundary
         # must stay stable across the request's batches: snapshot the at-rest
         # prefix on the first batch. Non-staging reads the live prefix.
@@ -2682,6 +2696,12 @@ class SchedulerDisaggregationPrefillMixin:
                     if streaming_pd_hidden
                     else pd_hidden_state(req).src_indices,
                 )
+            if getattr(get_disagg(), "kvserve_compression", None) is not None:
+                # Model writes are on forward_stream, not necessarily the
+                # scheduler's current stream under overlap scheduling.
+                source_event = self.device_module.Event()
+                source_event.record(self.forward_stream)
+                req.disagg_kv_sender.set_source_event(source_event)
             req.disagg_kv_sender.send(
                 page_indices,
                 state_indices if segment_is_last or send_hidden_chunk else None,

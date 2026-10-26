@@ -3332,6 +3332,25 @@ class ServerArgs:
         ),
         NS("disagg"),
     ] = "mooncake"
+    kvserve_compression: A[
+        Optional[str],
+        "Experimental Mooncake PD KV compression: default, raw (lossless staging "
+        "test), a JSON object, or @JSON_FILE. Requires BF16 NHD, homogeneous TP, "
+        "PP/DP=1 and --max-running-requests 1. Disabled when omitted.",
+        NS("disagg"),
+    ] = None
+    kvserve_reserved_mb: A[
+        int,
+        "Per-rank GPU memory budget reserved before KV sizing for KVServe "
+        "runtime, packed chunks and gather scratch (MiB).",
+        NS("disagg"),
+    ] = 1024
+    kvserve_rpc_timeout: A[
+        float,
+        "Timeout in seconds for experimental KVServe chunk handshakes. "
+        "An ambiguous transfer quarantines staging until worker restart.",
+        NS("disagg"),
+    ] = 120.0
     disaggregation_bootstrap_port: A[
         int,
         "Bootstrap server port on the prefill server. Default is 8998.",
@@ -4345,8 +4364,10 @@ class ServerArgs:
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
             handle_pd_disaggregation,
         )
+        from sglang.srt.disaggregation.kvserve_config import validate_kvserve_launch
 
         handle_pd_disaggregation(self)
+        validate_kvserve_launch(self)
 
     def _handle_dcp_validation(self):
         if self.dcp_size < 1:

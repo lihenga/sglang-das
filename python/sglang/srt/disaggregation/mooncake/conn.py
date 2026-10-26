@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_string_list,
 )
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
+from sglang.srt.disaggregation.mooncake.kvserve_transport import PROTOCOL_VERSION
 from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -161,6 +162,7 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    kvserve: Optional[dict] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -208,6 +210,7 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
+            kvserve=json.loads(msg[19]) if len(msg) > 19 and msg[19] else None,
         )
 
 
@@ -223,6 +226,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        self.kvserve = None
+        self.kvserve_sender = None
+        self.kvserve_receiver = None
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -661,6 +667,62 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def attach_kvserve(self, pool, num_layers):
+        from sglang.srt.disaggregation.kvserve_config import resolve_kvserve_config
+        from sglang.srt.disaggregation.mooncake.kvserve_adapter import KVServeAdapter
+        from sglang.srt.disaggregation.mooncake.kvserve_transport import (
+            CompressionReceiver,
+            CompressionSender,
+        )
+
+        if (
+            self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or self.enable_staging
+            or self.pp_size != 1
+            or self.dcp_size != 1
+            or self.attn_cp_size != 1
+        ):
+            raise ValueError(
+                "KVServe v1 requires dense BF16 NHD with homogeneous TP, PP/CP=1"
+            )
+        self.kvserve = KVServeAdapter(
+            pool,
+            resolve_kvserve_config(self.server_args.kvserve_compression),
+            num_layers,
+            self.attn_tp_size,
+            self.attn_tp_rank,
+            self.server_args.kvserve_reserved_mb * 2**20,
+        )
+        addresses, lengths = self.kvserve.registered_memory()
+        if self.engine.batch_register(addresses, lengths) != 0:
+            raise RuntimeError("Mooncake could not register KVServe staging buffers")
+        timeout = self.server_args.kvserve_rpc_timeout
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.kvserve_sender = CompressionSender(
+                self.kvserve,
+                self.engine,
+                timeout,
+                lambda room: self.request_status.get(room)
+                not in (None, KVPoll.Failed, KVPoll.Success),
+            )
+        else:
+            self.kvserve_receiver = CompressionReceiver(
+                self.kvserve,
+                lambda room: self.request_status.get(room) in (
+                    KVPoll.WaitingForInput,
+                    KVPoll.Transferring,
+                ),
+                self._fail_kvserve_room,
+                timeout,
+            )
+            self.kvserve_receiver.start(self.local_ip)
+
+    def _fail_kvserve_room(self, room, reason):
+        self.record_failure(room, reason)
+        if room in self.request_status:
+            self.update_status(room, KVPoll.Failed)
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
@@ -2102,6 +2164,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         if bootstrap_room not in self.request_status:
             return
+        compression = getattr(self, "kvserve_receiver", None)
+        if status == KVPoll.Success and compression is not None:
+            if not compression.is_complete(bootstrap_room):
+                self._fail_kvserve_room(
+                    bootstrap_room,
+                    "Prefill reported success without all compressed KV parts",
+                )
+                return
         current_status = self.request_status[bootstrap_room]
         if current_status == KVPoll.Failed:
             return
@@ -2556,6 +2626,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             if len(chunked_dst_kv_indice) < len(
                                 kv_chunk.prefill_kv_indices
                             ):
+                                if getattr(self, "kvserve", None) is not None:
+                                    raise RuntimeError(
+                                        "KVServe source/destination page counts differ"
+                                    )
                                 logger.warning(
                                     f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                                 )
@@ -2603,6 +2677,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
                             )
+                        elif getattr(self, "kvserve_sender", None) is not None:
+                            try:
+                                self.kvserve_sender.send(
+                                    target_rank_registration_info.kvserve,
+                                    req.mooncake_session_id,
+                                    req.room,
+                                    kv_chunk.prefill_kv_indices.tolist(),
+                                    chunked_dst_kv_indice.tolist(),
+                                    kv_chunk.num_kv_tokens
+                                    if kv_chunk.num_kv_tokens is not None
+                                    else (
+                                        len(kv_chunk.prefill_kv_indices)
+                                        * self.kv_args.page_size
+                                    ),
+                                )
+                                ret = 0
+                            except Exception as error:
+                                # Compression owns its separate wire buffers.
+                                # A cancelled/failed session does not retain the
+                                # original KV pages once gather has fenced.
+                                if getattr(error, "source_read_unfenced", False):
+                                    self._source_drain.poison(kv_chunk.room)
+                                logger.exception(
+                                    "KVServe send failed for room %s", kv_chunk.room
+                                )
+                                ret = -1
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -2654,6 +2754,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     executor,
                                 )
                         if ret != 0:
+                            if getattr(self, "kvserve_sender", None) is not None:
+                                # A per-request cancellation/protocol rejection
+                                # is not evidence that the Mooncake peer died.
+                                self._fail_kvserve_room(
+                                    kv_chunk.room, "KVServe compressed transfer failed"
+                                )
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    prefill_unique_rank,
+                                )
+                                break
                             self._mark_session_failed_and_sync(
                                 kv_chunk=kv_chunk,
                                 req=req,
@@ -2931,6 +3045,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    local_compression = getattr(self, "kvserve", None)
+                    peer = decode_kv_args.kvserve
+                    if bool(local_compression) != bool(peer):
+                        decode_kv_args.registration_error = (
+                            "KVServe must be enabled on both prefill and decode"
+                        )
+                    elif local_compression is not None and (
+                        peer.get("version") != PROTOCOL_VERSION
+                        or peer.get("profile") != local_compression.profile
+                        or decode_kv_args.dst_attn_tp_size != self.attn_tp_size
+                        or decode_kv_args.dst_tp_rank != self.attn_tp_rank
+                    ):
+                        decode_kv_args.registration_error = (
+                            "KVServe peer profile/TP/cache geometry mismatch"
+                        )
                     try:
                         self.validate_remote_state_transfer_abis(
                             decode_kv_args.dst_state_data_formats,
@@ -3116,7 +3245,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # queue, which enables early abort with failed sessions.
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        if getattr(self, "kvserve_sender", None) is not None:
+            # Preserve FIFO within one request, but let requests targeting the
+            # same D instance use different workers and transfer slot credits.
+            shard_idx = bootstrap_room % len(self.transfer_queues)
+        else:
+            shard_idx = session_port_sum % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -3282,6 +3416,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
+        if self._source_event is None and getattr(self.kv_mgr, "kvserve", None) is not None:
+            raise RuntimeError("KVServe send requires a producer forward-stream event")
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
@@ -3511,6 +3647,15 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_rank,
                             packed_state_data_formats,
                         ]
+                        + (
+                            [
+                                json.dumps(
+                                    self.kv_mgr.kvserve_receiver.advertisement()
+                                ).encode()
+                            ]
+                            if getattr(self.kv_mgr, "kvserve_receiver", None) is not None
+                            else []
+                        )
                     )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
@@ -3540,6 +3685,9 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             return
 
         self.chunk_staging_infos = []
+        compression = getattr(self.kv_mgr, "kvserve_receiver", None)
+        if compression is not None:
+            compression.expect_pages(self.bootstrap_room, kv_indices.tolist())
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
@@ -3633,7 +3781,16 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             return False
         return len(self.kv_mgr.prefill_response_tracker.get(room, ())) >= expected
 
+    def clear(self):
+        compression = getattr(self.kv_mgr, "kvserve_receiver", None)
+        if compression is not None:
+            compression.forget(self.bootstrap_room)
+        super().clear()
+
     def poll(self) -> KVPoll:
+        service = getattr(self.kv_mgr, "kvserve_receiver", None)
+        if service is not None:
+            service.advance(self.bootstrap_room)
         if self.conclude_state is not None:
             return self.conclude_state
 

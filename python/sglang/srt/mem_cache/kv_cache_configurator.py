@@ -1888,6 +1888,10 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        if getattr(get_disagg(), "kvserve_compression", None) is not None:
+            reserved_mb = get_disagg().kvserve_reserved_mb
+            rest_memory -= reserved_mb / 1024
+            logger.info("Reserving %d MiB per rank for KVServe PD staging", reserved_mb)
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

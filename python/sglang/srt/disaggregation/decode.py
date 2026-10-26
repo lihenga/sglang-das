@@ -677,6 +677,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.is_mla_backend,
         )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
+        if getattr(self.scheduler.server_args, "kvserve_compression", None) is not None:
+            kv_manager.attach_kvserve(
+                self.token_to_kv_pool,
+                self.scheduler.model_config.num_hidden_layers,
+            )
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
             if hasattr(kv_pool_for_heads, "full_kv_pool"):
