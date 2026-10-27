@@ -873,8 +873,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys)
-            if key_multiplier > 0:
+            if key_multiplier > 0 and transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                page_exists = self._prefix_component_exists(
+                    component_keys, key_multiplier, kv_pages
+                )
+            elif key_multiplier > 0:
+                ex = self._batch_exist(component_keys)
                 page_exists = [
                     all(
                         r == 1
@@ -1367,7 +1371,46 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        # A 1M LayerSplit prompt expands to many layer/component keys. Keep
+        # each metadata RPC bounded instead of submitting one oversized batch.
+        result = []
+        for start in range(0, len(key_strs), 4096):
+            keys = key_strs[start : start + 4096]
+            values = self.store.batch_is_exist(keys)
+            if len(values) != len(keys):
+                raise RuntimeError(
+                    "Mooncake batch_is_exist result size mismatch: "
+                    f"requested={len(keys)} returned={len(values)}"
+                )
+            result.extend(values)
+        return result
+
+    def _prefix_component_exists(
+        self, component_keys: List[str], key_multiplier: int, page_count: int
+    ) -> List[bool]:
+        # ALL_PAGES restore boundaries cannot cross the first missing page.
+        # Probe page zero first: a cold namespace needs only one page's keys,
+        # not every layer of every page in a million-token prompt. TRAILING_PAGES
+        # still uses the complete lookup above, since later windows can be valid.
+        page_exists = [False] * page_count
+        if key_multiplier <= 0 or len(component_keys) < page_count * key_multiplier:
+            raise ValueError("Mooncake prefix component keys do not cover all pages")
+        start = 0
+        pages_per_batch = max(1, 4096 // key_multiplier)
+        while start < page_count:
+            end = min(page_count, 1 if start == 0 else start + pages_per_batch)
+            values = self._batch_exist(
+                component_keys[start * key_multiplier : end * key_multiplier]
+            )
+            pages = [
+                all(value == 1 for value in values[i : i + key_multiplier])
+                for i in range(0, len(values), key_multiplier)
+            ]
+            page_exists[start:end] = pages
+            if not all(pages):
+                break
+            start = end
+        return page_exists
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
