@@ -303,7 +303,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 storage_config,
                 mem_pool=None,
                 enable_client_http_server=params.enable_metrics,
-                enable_dfs_prefetch=self.host_prefetch_enabled,
+                # Queue prefetch publishes MEMORY replicas; allocate no legacy arena.
+                enable_dfs_prefetch=False,
                 dfs_health_config=resolve_dfs_health_config(server_args=server_args),
             )
         else:
@@ -333,11 +334,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
         )
-        # Skip the admission-time lease refresh of a prefetched request whose
-        # oldest session key was leased less than this many seconds ago. The
-        # master never evicts a leased object, so the refresh only buys lease
-        # time; 0 keeps the refresh unconditional. Must leave enough of the
-        # deployment's lease TTL to cover admission through load completion.
+        # Queue-time promotion creates no sessions. This age bound applies
+        # only to sessions reused by admitted loads; sharing a key still
+        # forces a lease check before another reader consumes it.
         if self.host_prefetch_enabled:
             self.session_refresh_age_s = _session_refresh_age_config()
             self._disable_refresh_skip_for_groups()
@@ -446,7 +445,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.session_lock = threading.Lock()
             self.host_prefetch_lock = threading.Lock()
             self.host_prefetch_entries: dict[str, dict[str, object]] = {}
-            self.host_prefetch_generation = 0
             self.host_prefetch_queue: Queue[tuple[str, list[PoolTransfer]] | None] = (
                 Queue()
             )
@@ -499,25 +497,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             name
             for name in (
                 "batch_get_session_start_with_sources",
-                "batch_get_session_prefetch",
+                "batch_prefetch_to_memory",
                 "batch_get_session_refresh",
-                "dfs_prefetch_arena_available",
+                "dfs_prefetch_to_memory_available",
+                "disable_dfs_prefetch",
             )
             if not callable(getattr(store, name, None))
         ]
         if missing:
             return False, "Mooncake package lacks " + ", ".join(missing)
         try:
-            if store.dfs_prefetch_arena_available():
+            # An injected Store may have allocated the old arena. Release it
+            # before enabling promotion, inside the all-rank capability check.
+            if not store.disable_dfs_prefetch():
+                return False, "legacy DFS prefetch arena is still in use"
+            if store.dfs_prefetch_to_memory_available():
                 return True, "ready"
-            status = getattr(store, "dfs_prefetch_arena_status", None)
-            reason = status() if callable(status) else "unavailable"
+            reason = "DFS backend or registered client staging unavailable"
         except Exception as exc:
-            reason = f"arena query failed: {exc!r}"
-        return False, (
-            f"DFS prefetch arena unavailable ({reason}); set "
-            "MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES on prefill"
-        )
+            reason = f"promotion capability query failed: {exc!r}"
+        return False, f"DFS promotion unavailable ({reason})"
 
     def _resolve_host_prefetch_enabled(
         self, params: CacheInitParams, *, requested: bool
@@ -693,7 +692,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if self.host_prefetch_enabled:
             with self.host_prefetch_lock:
                 entry = self.host_prefetch_entries.get(rid)
-                if entry is not None and entry.get("state") == "claimed":
+                if entry is not None and entry.get("state") == "dfs_prefetched":
                     entry["state"] = "loading"
         logical_pages = {
             page_key for transfer in expanded for page_key in transfer.keys
@@ -715,9 +714,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return self._prepare_expanded_load(rid, expanded)
 
-    def _prepare_expanded_load(
-        self, rid: str, expanded: list[PoolTransfer]
-    ) -> bool:
+    def _expanded_load_keys(self, expanded: list[PoolTransfer]) -> list[str]:
         keys = []
         seen = set()
         for transfer in expanded:
@@ -728,6 +725,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if key not in seen:
                     seen.add(key)
                     keys.append(key)
+        return keys
+
+    def _prepare_expanded_load(self, rid: str, expanded: list[PoolTransfer]) -> bool:
+        keys = self._expanded_load_keys(expanded)
         if not keys:
             return False
 
@@ -752,9 +753,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     else:
                         new_keys.append(key)
 
-                lease_base = (
-                    time.monotonic() if self.host_prefetch_enabled else 0.0
-                )
+                lease_base = time.monotonic() if self.host_prefetch_enabled else 0.0
                 try:
                     if new_keys and self.host_prefetch_enabled:
                         results, sources = (
@@ -839,9 +838,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     bases[key] = lease_base
         return ok
 
-    def submit_host_prefetch(
-        self, rid: str, transfers: list[PoolTransfer]
-    ) -> bool:
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         if not self.host_prefetch_enabled:
             return False
         kv_transfer = next(
@@ -864,18 +861,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             if rid in self.host_prefetch_entries or active >= self.host_prefetch_limit:
                 return False
-            self.host_prefetch_generation += 1
-            generation = self.host_prefetch_generation
             queued_transfers = list(transfers)
             self.host_prefetch_entries[rid] = {
                 "state": "queued",
                 "cancelled": False,
                 "transfers": queued_transfers,
-                "session_rid": self._host_prefetch_session_rid(rid, generation),
             }
 
-        # Session creation can contact DFS. The scheduler only publishes the
-        # work item; this worker owns both preparation and the DFS read.
+        # The scheduler publishes only metadata; the worker drives promotion.
         self.host_prefetch_queue.put((rid, queued_transfers))
         return True
 
@@ -888,85 +881,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return None
             return str(entry.get("state"))
 
-    def revalidate_host_prefetch(self, rid: str) -> bool:
-        if not self.host_prefetch_enabled:
-            return False
-        with self.host_prefetch_lock:
-            entry = self.host_prefetch_entries.get(rid)
-            if (
-                entry is None
-                or entry.get("state") != "dfs_prefetched"
-                or entry.get("cancelled")
-            ):
-                return False
-            session_rid = str(entry["session_rid"])
-        with self.session_lock:
-            keys = list(self.prepared_load_sessions.get(session_rid, ()))
-        return self._refresh_session_keys(keys)
-
-    def revalidate_no_prefetch_needed(self, rid: str) -> bool:
-        """Re-check the keys of a request that needed no DFS prefetch.
-
-        The worker released its session on finding no DFS keys, so nothing
-        pins the objects while the request waits for admission. Returning
-        False sends every rank back to the normal path, whose revalidation
-        degrades an evicted prefix to a cache miss.
-        """
-        if not self.host_prefetch_enabled:
-            return False
-        with self.host_prefetch_lock:
-            entry = self.host_prefetch_entries.get(rid)
-            if (
-                entry is None
-                or entry.get("state") != "no_prefetch_needed"
-                or entry.get("cancelled")
-            ):
-                return False
-            keys = list(entry.get("no_prefetch_keys", ()))
-        if not keys:
-            return False
-        try:
-            exist = list(self.storage._batch_exist(keys))
-        except BaseException:
-            logger.warning(
-                "Mooncake waiting-queue existence check failed for rid=%s",
-                rid,
-                exc_info=True,
-            )
-            return False
-        missing = len(keys) - sum(1 for state in exist if state == 1)
-        if len(exist) != len(keys) or missing:
-            logger.warning(
-                "Mooncake waiting-queue keys changed while queued for rid=%s: "
-                "missing=%d/%d, falling back to the normal load path",
-                rid,
-                missing,
-                len(keys),
-            )
-            return False
-        return True
-
-    def claim_ready_host_prefetch(self, rid: str) -> bool:
-        if not self.host_prefetch_enabled:
-            return False
-        # Session RPCs may hold session_lock; wait before locking worker state.
-        # Keep session ownership and the claimed state atomic under both locks.
-        with self.session_lock, self.host_prefetch_lock:
-            entry = self.host_prefetch_entries.get(rid)
-            if entry is None or entry.get("state") != "dfs_prefetched":
-                return False
-            session_rid = str(entry["session_rid"])
-            if (
-                rid in self.prepared_load_sessions
-                or session_rid not in self.prepared_load_sessions
-            ):
-                return False
-            self.prepared_load_sessions[rid] = self.prepared_load_sessions.pop(
-                session_rid
-            )
-            entry["state"] = "claimed"
-        return True
-
     def cancel_host_prefetch(self, rid: str) -> None:
         if not self.host_prefetch_enabled:
             return
@@ -974,17 +888,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             entry = self.host_prefetch_entries.get(rid)
             if entry is None:
                 return
-            state = str(entry.get("state"))
-            session_rid = str(entry["session_rid"])
-            if state in {"preparing", "reading", "loading"}:
+            if entry.get("state") in {"preparing", "reading", "loading"}:
                 entry["cancelled"] = True
-                return
-            self.host_prefetch_entries.pop(rid, None)
-        self._abort_prepared_load_now(rid if state == "claimed" else session_rid)
-
-    @staticmethod
-    def _host_prefetch_session_rid(rid: str, generation: int) -> str:
-        return f"__sglang_waiting_queue_prefetch__:{rid}:{generation}"
+            else:
+                self.host_prefetch_entries.pop(rid, None)
 
     def host_prefetch_thread_func(self) -> None:
         while True:
@@ -997,115 +904,38 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     entry = self.host_prefetch_entries.get(rid)
                     if entry is None or entry.get("transfers") is not transfers:
                         continue
-                    session_rid = str(entry["session_rid"])
                     if entry.get("cancelled"):
                         self.host_prefetch_entries.pop(rid, None)
                         continue
-                    entry["state"] = "preparing"
-
+                    entry["state"] = "reading"
                 try:
-                    prepared = self.prepare_load(session_rid, transfers)
-                except BaseException:
-                    logger.warning(
-                        "Mooncake waiting-queue session preparation failed for rid=%s",
-                        rid,
-                        exc_info=True,
+                    expanded = self.pool_group.resolve_transfers(
+                        transfers, allow_partial=True, allow_missing_kv=True
                     )
-                    prepared = False
-                with self.session_lock:
-                    keys = list(self.prepared_load_sessions.get(session_rid, ()))
-                if not prepared or not keys:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
-                    continue
-
-                with self.session_lock:
-                    sources = {
-                        key: self.session_sources.get(key, "unknown")
-                        for key in keys
-                    }
-                dfs_keys = [
-                    key
-                    for key in keys
-                    if sources[key] in {"dfs", "unknown"}
-                ]
-                if not dfs_keys:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "no_prefetch_needed", keys=keys
-                    )
-                    continue
-
-                with self.host_prefetch_lock:
-                    current = self.host_prefetch_entries.get(rid)
-                    if current is not entry or current.get("cancelled"):
-                        cancelled = True
-                    else:
-                        cancelled = False
-                        current["state"] = "reading"
-                if cancelled:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
-                    continue
-                try:
-                    results = list(
-                        self.storage.store.batch_get_session_prefetch(dfs_keys)
-                    )
-                    success = len(results) == len(dfs_keys) and all(
-                        result == 0 for result in results
+                    keys = self._expanded_load_keys(expanded)
+                    # Promotion owns its temporary staging and master task.
+                    # No get session or buffered object survives this call.
+                    results = list(self.storage.store.batch_prefetch_to_memory(keys))
+                    success = (
+                        bool(keys)
+                        and len(results) == len(keys)
+                        and all(result == 0 for result in results)
                     )
                 except BaseException:
                     logger.warning(
-                        "Mooncake waiting-queue DFS prefetch failed for rid=%s",
+                        "Mooncake waiting-queue DFS promotion failed for rid=%s",
                         rid,
                         exc_info=True,
                     )
                     success = False
-                self._finish_host_prefetch(
-                    rid,
-                    entry,
-                    session_rid,
-                    "dfs_prefetched" if success else "failed",
-                )
+                with self.host_prefetch_lock:
+                    if self.host_prefetch_entries.get(rid) is entry:
+                        if entry.get("cancelled"):
+                            self.host_prefetch_entries.pop(rid, None)
+                        else:
+                            entry["state"] = "dfs_prefetched" if success else "failed"
             finally:
                 self.host_prefetch_queue.task_done()
-
-    def _finish_host_prefetch(
-        self,
-        rid: str,
-        entry: dict[str, object],
-        session_rid: str,
-        outcome: str,
-        *,
-        keys: list[str] | None = None,
-    ) -> None:
-        keep_session = False
-        with self.host_prefetch_lock:
-            current = self.host_prefetch_entries.get(rid)
-            cancelled = bool(
-                current is not entry or current is None or current.get("cancelled")
-            )
-            if (
-                current is entry
-                and outcome in {"dfs_prefetched", "no_prefetch_needed"}
-                and not cancelled
-            ):
-                if outcome == "no_prefetch_needed":
-                    # The session is released below; keep the keys so
-                    # admission can re-check them (see
-                    # revalidate_no_prefetch_needed). Published together with
-                    # the state under the same lock.
-                    current["no_prefetch_keys"] = list(keys or ())
-                current["state"] = outcome
-                keep_session = outcome == "dfs_prefetched"
-            if current is entry:
-                if cancelled:
-                    self.host_prefetch_entries.pop(rid, None)
-                elif outcome not in {"dfs_prefetched", "no_prefetch_needed"}:
-                    current["state"] = "failed"
-        if not keep_session:
-            self._abort_prepared_load_now(session_rid)
 
     def _rollback_session_refs_locked(self, keys: list[str]) -> None:
         to_end = []
@@ -1377,9 +1207,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
@@ -1422,9 +1250,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         expected = [sum(item) for item in all_sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
-            pool_counts = {
-                str(name): len(keys) for name, (keys, _) in batches.items()
-            }
+            pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
             raise RuntimeError(
                 "Mooncake aggregated range get failed for "
                 f"pools={pool_counts}, complete_page: transferred={result}, "

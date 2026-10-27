@@ -1,6 +1,6 @@
-"""Admission may skip the lease refresh of a freshly leased prefetch session.
+"""Admitted loads may reuse a young private session without a refresh.
 
-``SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S`` lets ``revalidate_host_prefetch``
+``SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S`` lets ``_refresh_session_keys``
 trust a private session whose oldest key was leased less than that many
 seconds ago. The age is measured from a monotonic timestamp taken before the
 RPC that granted the lease, so it never understates the lease Mooncake sees.
@@ -82,7 +82,7 @@ def _linker(age_s=5.0, refresh_results=None, refresh_error=None):
     return linker
 
 
-def _prefetched(linker, clock, rid="rid", keys=("k0", "k1"), session="s"):
+def _admitted(linker, clock, rid="rid", keys=("k0", "k1"), session="s"):
     transfer = types.SimpleNamespace(keys=list(keys))
     with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
         assert linker._prepare_expanded_load(session, [transfer])
@@ -94,14 +94,18 @@ def _prefetched(linker, clock, rid="rid", keys=("k0", "k1"), session="s"):
 
 def _revalidate(linker, clock, rid="rid"):
     with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
-        return linker.revalidate_host_prefetch(rid)
+        return linker._refresh_session_keys(
+            linker.prepared_load_sessions[
+                linker.host_prefetch_entries[rid]["session_rid"]
+            ]
+        )
 
 
 class TestSessionRefreshAge(CustomTestCase):
     def test_young_private_session_skips_refresh(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         clock.now += 4.9
         self.assertTrue(_revalidate(linker, clock))
         linker.storage.store.batch_get_session_refresh.assert_not_called()
@@ -109,7 +113,7 @@ class TestSessionRefreshAge(CustomTestCase):
     def test_old_session_refreshes_and_resets_its_base(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         clock.now += 5.0
         self.assertTrue(_revalidate(linker, clock))
         linker.storage.store.batch_get_session_refresh.assert_called_once_with(
@@ -124,14 +128,14 @@ class TestSessionRefreshAge(CustomTestCase):
     def test_disabled_always_refreshes(self):
         clock = _Clock()
         linker = _linker(age_s=0.0)
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         self.assertTrue(_revalidate(linker, clock))
         linker.storage.store.batch_get_session_refresh.assert_called_once()
 
     def test_oldest_key_decides(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         linker.session_lease_base["k1"] = clock.now - 10.0
         self.assertTrue(_revalidate(linker, clock))
         linker.storage.store.batch_get_session_refresh.assert_called_once()
@@ -139,7 +143,7 @@ class TestSessionRefreshAge(CustomTestCase):
     def test_key_without_base_counts_as_old(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         del linker.session_lease_base["k0"]
         self.assertTrue(_revalidate(linker, clock))
         linker.storage.store.batch_get_session_refresh.assert_called_once()
@@ -147,9 +151,9 @@ class TestSessionRefreshAge(CustomTestCase):
     def test_shared_session_always_refreshes(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         # A second session reuses k1: its Mooncake session is no longer private.
-        _prefetched(linker, clock, rid="other", keys=("k1",), session="s2")
+        _admitted(linker, clock, rid="other", keys=("k1",), session="s2")
         self.assertEqual(linker.session_refcounts["k1"], 2)
         self.assertTrue(_revalidate(linker, clock))
         self.assertEqual(linker.storage.store.batch_get_session_refresh.call_count, 2)
@@ -157,9 +161,9 @@ class TestSessionRefreshAge(CustomTestCase):
     def test_reused_key_loses_its_base(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         clock.now += 3.0
-        _prefetched(linker, clock, rid="other", keys=("k1", "k2"), session="s2")
+        _admitted(linker, clock, rid="other", keys=("k1", "k2"), session="s2")
         self.assertEqual(linker.session_lease_base, {"k0": 100.0, "k2": 103.0})
 
     def test_formerly_shared_key_stays_refresh_only(self):
@@ -167,8 +171,8 @@ class TestSessionRefreshAge(CustomTestCase):
         session and A is released, leaving B the sole holder of a young base."""
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock, rid="b", keys=("k",), session="sb")
-        _prefetched(linker, clock, rid="a", keys=("k",), session="sa")
+        _admitted(linker, clock, rid="b", keys=("k",), session="sb")
+        _admitted(linker, clock, rid="a", keys=("k",), session="sa")
         linker.storage.store.batch_get_session_refresh.reset_mock()
         clock.now += 1.0
         linker.storage.store.batch_get_session_refresh.side_effect = lambda keys: [
@@ -192,13 +196,13 @@ class TestSessionRefreshAge(CustomTestCase):
     def test_released_key_restarts_with_a_fresh_base(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock, rid="b", keys=("k",), session="sb")
-        _prefetched(linker, clock, rid="a", keys=("k",), session="sa")
+        _admitted(linker, clock, rid="b", keys=("k",), session="sb")
+        _admitted(linker, clock, rid="a", keys=("k",), session="sa")
         linker._abort_prepared_load_now("sa")
         linker._abort_prepared_load_now("sb")
         linker.storage.store.batch_get_session_refresh.reset_mock()
         clock.now += 2.0
-        _prefetched(linker, clock, rid="c", keys=("k",), session="sc")
+        _admitted(linker, clock, rid="c", keys=("k",), session="sc")
         self.assertEqual(linker.session_lease_base, {"k": 102.0})
         self.assertTrue(_revalidate(linker, clock, rid="c"))
         linker.storage.store.batch_get_session_refresh.assert_not_called()
@@ -206,7 +210,7 @@ class TestSessionRefreshAge(CustomTestCase):
     def test_failed_refresh_is_invalid_and_drops_bases(self):
         clock = _Clock()
         linker = _linker(refresh_results=[0, 7])
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         clock.now += 6.0
         self.assertFalse(_revalidate(linker, clock))
         self.assertEqual(linker.session_lease_base, {})
@@ -214,25 +218,17 @@ class TestSessionRefreshAge(CustomTestCase):
     def test_refresh_exception_is_invalid(self):
         clock = _Clock()
         linker = _linker(refresh_error=RuntimeError("master unreachable"))
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         clock.now += 6.0
         with self.assertLogs(level="WARNING"):
             self.assertFalse(_revalidate(linker, clock))
         self.assertEqual(linker.session_lease_base, {})
 
-    def test_not_prefetched_is_invalid_without_age(self):
-        clock = _Clock()
-        linker = _linker()
-        _prefetched(linker, clock)
-        linker.host_prefetch_entries["rid"]["cancelled"] = True
-        self.assertFalse(_revalidate(linker, clock))
-        linker.storage.store.batch_get_session_refresh.assert_not_called()
-
     def test_release_drops_base(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
-        _prefetched(linker, clock, rid="other", keys=("k1",), session="s2")
+        _admitted(linker, clock)
+        _admitted(linker, clock, rid="other", keys=("k1",), session="s2")
         linker._abort_prepared_load_now("s")
         # k1 was shared, so it lost its base already.
         self.assertEqual(linker.session_lease_base, {})
@@ -246,7 +242,7 @@ class TestSessionRefreshAge(CustomTestCase):
         clock = _Clock()
         linker = _linker()
         linker.session_lock = _ContendedLock()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         clock.now += 1.0
         in_rpc = threading.Event()
         release = threading.Event()
@@ -269,7 +265,9 @@ class TestSessionRefreshAge(CustomTestCase):
             self.assertTrue(in_rpc.wait(5))
             result = {}
             admission = threading.Thread(
-                target=lambda: result.update(ok=linker.revalidate_host_prefetch("rid"))
+                target=lambda: result.update(
+                    ok=linker._refresh_session_keys(["k0", "k1"])
+                )
             )
             admission.start()
             # Admission blocks on the lock while the unrelated start RPC runs
@@ -288,62 +286,10 @@ class TestSessionRefreshAge(CustomTestCase):
             linker.session_lease_base, {"k0": 111.0, "k1": 111.0, "unrelated": 101.0}
         )
 
-    def test_claim_wait_does_not_hold_host_prefetch_lock(self):
-        linker = _linker()
-        session_lock = _ContendedLock()
-        linker.session_lock = session_lock
-        linker.prepared_load_sessions = {"session": ["k0"]}
-        linker.host_prefetch_entries["rid"] = {
-            "state": "dfs_prefetched",
-            "session_rid": "session",
-        }
-        linker.host_prefetch_entries["worker"] = {"state": "reading"}
-
-        claim = {}
-        claim_done = threading.Event()
-        update_done = threading.Event()
-
-        def claim_ready():
-            try:
-                claim["result"] = linker.claim_ready_host_prefetch("rid")
-            except BaseException as exc:
-                claim["error"] = exc
-            finally:
-                claim_done.set()
-
-        def publish_ready():
-            with linker.host_prefetch_lock:
-                linker.host_prefetch_entries["worker"]["state"] = "dfs_prefetched"
-            update_done.set()
-
-        with session_lock:
-            claimant = threading.Thread(target=claim_ready)
-            claimant.start()
-            claim_waiting_for_session = session_lock.contended.wait(5)
-            worker = threading.Thread(target=publish_ready)
-            worker.start()
-            updated_while_session_locked = update_done.wait(5)
-
-        claimant.join(5)
-        worker.join(5)
-        self.assertFalse(claimant.is_alive())
-        self.assertFalse(worker.is_alive())
-        self.assertTrue(claim_done.is_set())
-        self.assertTrue(update_done.is_set())
-        self.assertTrue(claim_waiting_for_session)
-        self.assertTrue(
-            updated_while_session_locked,
-            "claim blocked host-prefetch state updates while waiting for session_lock",
-        )
-        self.assertNotIn("error", claim)
-        self.assertTrue(claim["result"])
-        self.assertEqual(linker.host_prefetch_entries["rid"]["state"], "claimed")
-        self.assertEqual(linker.prepared_load_sessions, {"rid": ["k0"]})
-
     def test_refresh_skips_base_of_key_ended_meanwhile(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         clock.now += 6.0
 
         def refresh(keys):
@@ -369,7 +315,7 @@ class TestSharedSessionPreparation(CustomTestCase):
     def test_expired_shared_session_is_renewed_before_read_and_keeps_other_holder(self):
         clock = _Clock()
         linker = _linker()
-        _prefetched(linker, clock)
+        _admitted(linker, clock)
         lease_deadline = clock.now + 8.0
         clock.now += 10.0
 
@@ -394,13 +340,11 @@ class TestSharedSessionPreparation(CustomTestCase):
         linker.storage.store.batch_get_session_end.assert_not_called()
         self.assertTrue(_revalidate(linker, clock))
         linker._abort_prepared_load_now("s")
-        linker.storage.store.batch_get_session_end.assert_called_once_with(
-            ["k0", "k1"]
-        )
+        linker.storage.store.batch_get_session_end.assert_called_once_with(["k0", "k1"])
 
     def test_mixed_batch_refreshes_all_reused_keys_only(self):
         linker = _linker()
-        _prefetched(linker, _Clock())
+        _admitted(linker, _Clock())
         store = linker.storage.store
         store.batch_get_session_start_with_sources.reset_mock()
         transfer = types.SimpleNamespace(keys=["k0", "k1", "k2"])
@@ -412,7 +356,7 @@ class TestSharedSessionPreparation(CustomTestCase):
         for result in ([0, 7], [], RuntimeError("session missing")):
             with self.subTest(result=result):
                 linker = _linker()
-                _prefetched(linker, _Clock())
+                _admitted(linker, _Clock())
                 store = linker.storage.store
                 if isinstance(result, BaseException):
                     store.batch_get_session_refresh.side_effect = result
@@ -427,7 +371,9 @@ class TestSharedSessionPreparation(CustomTestCase):
                 self.assertEqual(linker.session_refcounts, {"k0": 1, "k1": 1})
                 self.assertEqual(linker.session_lease_base, {})
                 store.batch_get_session_end.assert_not_called()
-                self.assertEqual(store.batch_get_session_start_with_sources.call_count, 1)
+                self.assertEqual(
+                    store.batch_get_session_start_with_sources.call_count, 1
+                )
                 self.assertFalse(_revalidate(linker, _Clock()))
 
     def test_ordinary_revalidation_exception_fails_closed(self):
@@ -436,7 +382,9 @@ class TestSharedSessionPreparation(CustomTestCase):
         linker.pool_group = types.SimpleNamespace(
             resolve_transfers=lambda *a, **k: [transfer]
         )
-        linker.storage._batch_exist = MagicMock(side_effect=RuntimeError("master failed"))
+        linker.storage._batch_exist = MagicMock(
+            side_effect=RuntimeError("master failed")
+        )
         self.assertFalse(linker.revalidate_load([transfer]))
 
 
