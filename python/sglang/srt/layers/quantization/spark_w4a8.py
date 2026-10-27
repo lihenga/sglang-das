@@ -84,6 +84,12 @@ class SparkW4A8Config(CompressedTensorsConfig, SlimQuantW4A8Int8MarlinConfig):
                 raise ValueError("Unsupported Spark expert quantization scheme")
             if layer.moe_tp_size != 1 or layer.num_fused_shared_experts:
                 raise ValueError("Spark W4A8 requires TP=EP and independent shared experts")
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+            if get_moe_a2a_backend().is_megamoe():
+                from sglang.srt.layers.quantization.spark_w4a8_megamoe import (
+                    SparkW4A8MegaMoEMethod,
+                )
+                return SparkW4A8MegaMoEMethod(self)
             install_runners()
             return SlimQuantW4A8Int8MarlinMoEMethod(self)
         return CompressedTensorsConfig.get_quant_method(self, layer, prefix)
