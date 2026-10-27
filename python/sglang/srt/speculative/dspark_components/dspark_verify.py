@@ -140,12 +140,13 @@ class TargetVerifyExecutor:
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
 
-        from sglang.srt.speculative.dspark_components.spark_attention_tp import (
-            broadcast_attention_tp,
-        )
+        if self._attention_tp_group is not None:
+            from sglang.srt.speculative.dspark_components.spark_attention_tp import (
+                broadcast_attention_tp,
+            )
 
-        for tensor in (correct_len, bonus, cap_trim_lens):
-            broadcast_attention_tp(tensor, self._attention_tp_group)
+            for tensor in (correct_len, bonus, cap_trim_lens):
+                broadcast_attention_tp(tensor, self._attention_tp_group)
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,

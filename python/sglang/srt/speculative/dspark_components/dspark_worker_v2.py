@@ -119,7 +119,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             supports_spark_attention_tp,
         )
 
-        self._spark_attention_tp = supports_spark_attention_tp(
+        self._spark_attention_tp = ps.attn_tp_size > 1 and supports_spark_attention_tp(
             parallel=ps,
             target_model=self.model_runner.model,
             server_args=server_args,

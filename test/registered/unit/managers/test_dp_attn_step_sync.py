@@ -56,6 +56,66 @@ def _mlp_sync_info(step_info):
 
 class TestPDDecodeStepInfo(CustomTestCase):
 
+    def test_dp16_tp1_retains_view_without_replica_reductions(self):
+        tensor_min, tensor_max = torch.Tensor.min, torch.Tensor.max
+
+        def no_replica_min(tensor, *args, **kwargs):
+            self.assertNotEqual(kwargs.get("dim", args[0] if args else None), 1)
+            return tensor_min(tensor, *args, **kwargs)
+
+        def no_replica_max(tensor, *args, **kwargs):
+            self.assertNotEqual(kwargs.get("dim", args[0] if args else None), 1)
+            return tensor_max(tensor, *args, **kwargs)
+
+        for has_step_info in (False, True):
+            with self.subTest(has_step_info=has_step_info):
+                info = _mlp_sync_info(_step_info() if has_step_info else None)
+                info.dp_size = 16
+                shared = info._get_local_tensor("cpu").repeat(16, 1)
+                shared[:, 0] = torch.arange(1, 17)
+                storage = {}
+
+                def gather_into(output, local, group=None):
+                    output.copy_(shared.flatten())
+                    storage["ptr"] = output.untyped_storage().data_ptr()
+
+                if has_step_info:
+                    storage["ptr"] = shared.untyped_storage().data_ptr()
+                with (
+                    patch.object(torch.distributed, "get_world_size", return_value=16),
+                    patch.object(torch.distributed, "get_rank", return_value=1),
+                    patch.object(
+                        torch.distributed,
+                        "all_gather_into_tensor",
+                        side_effect=gather_into,
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.pd_decode_sync.gather_pd_decode_step_info",
+                        return_value=shared if has_step_info else None,
+                    ),
+                    patch.object(
+                        dp_attn,
+                        "get_tp_group",
+                        return_value=SimpleNamespace(
+                            active_ranks_cpu=torch.ones(16, dtype=torch.int64)
+                        ),
+                    ),
+                    patch.object(
+                        torch.Tensor,
+                        "clone",
+                        side_effect=AssertionError(
+                            "TP1 must not clone replica metadata"
+                        ),
+                    ),
+                    patch.object(torch.Tensor, "min", new=no_replica_min),
+                    patch.object(torch.Tensor, "max", new=no_replica_max),
+                ):
+                    info.all_gather(device="cpu", group=object())
+                self.assertEqual(info.global_num_tokens, list(range(1, 17)))
+                self.assertEqual(
+                    info.tp0_info_cpu.untyped_storage().data_ptr(), storage["ptr"]
+                )
+
     def _gather_tp8dp4(self, mutate=None):
         info = _mlp_sync_info(_step_info())
         info.dp_size, info.tp_size = 4, 8

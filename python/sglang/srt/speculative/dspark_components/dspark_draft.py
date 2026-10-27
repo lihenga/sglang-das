@@ -129,10 +129,6 @@ def sample_draft_block(
     device: torch.device,
     attention_tp_group=None,
 ) -> DraftBlockResult:
-    from sglang.srt.speculative.dspark_components.spark_attention_tp import (
-        broadcast_attention_tp,
-    )
-
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
@@ -149,9 +145,7 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
-            return broadcast_attention_tp(
-                torch.argmax(step_logits, dim=-1), attention_tp_group
-            )
+            return torch.argmax(step_logits, dim=-1)
 
     else:
 
@@ -161,14 +155,11 @@ def sample_draft_block(
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
                 ).exponential_(1)
-                return broadcast_attention_tp(
-                    SampleStepTokens.execute(
-                        step_logits=step_logits,
-                        temperatures=temperatures,
-                        greedy_mask=greedy_mask,
-                        exp_noise=exp_noise,
-                    ),
-                    attention_tp_group,
+                return SampleStepTokens.execute(
+                    step_logits=step_logits,
+                    temperatures=temperatures,
+                    greedy_mask=greedy_mask,
+                    exp_noise=exp_noise,
                 )
             else:
                 probs = torch.softmax(
@@ -177,10 +168,19 @@ def sample_draft_block(
                 probs = expect(_DRAFT_PROBS, probs)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                return broadcast_attention_tp(
-                    torch.where(greedy_mask, argmax_tokens, sampled_tokens),
-                    attention_tp_group,
-                )
+                return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
+
+    if attention_tp_group is not None:
+        from sglang.srt.speculative.dspark_components.spark_attention_tp import (
+            broadcast_attention_tp,
+        )
+
+        local_sampler = sampler
+
+        def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            return broadcast_attention_tp(
+                local_sampler(step_logits, step_idx), attention_tp_group
+            )
 
     draft_tokens, corrected_logits = markov_head.sample_block(
         base_logits,

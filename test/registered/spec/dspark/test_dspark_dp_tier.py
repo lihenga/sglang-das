@@ -262,5 +262,151 @@ def test_spark_tp_logits_reuses_outer_attention_context():
             pass
 
 
+@pytest.mark.parametrize("sampling,fast", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("has_tp_group", [False, True])
+def test_draft_sampling_wraps_only_attention_tp_replicas(sampling, fast, has_tp_group):
+    from unittest.mock import Mock
+
+    from sglang.srt.speculative.dspark_components import dspark_draft as draft
+    from sglang.srt.speculative.dspark_components import spark_attention_tp
+
+    logits = torch.tensor(
+        [[[1.0, 3.0, 2.0], [4.0, 1.0, 2.0]], [[3.0, 2.0, 1.0], [1.0, 2.0, 4.0]]]
+    )
+
+    def sample_block(base, *, first_prev_tokens, hidden_states, sampler):
+        return torch.stack([sampler(base[:, i], i) for i in range(2)], dim=1), base
+
+    def broadcast(tokens, src):
+        assert src == 0
+        tokens.fill_(2)
+
+    group = (
+        SimpleNamespace(broadcast=Mock(side_effect=broadcast)) if has_tp_group else None
+    )
+    info = (
+        SimpleNamespace(
+            is_all_greedy=False, top_ks=torch.full((2,), 3), temperatures=torch.ones(2)
+        )
+        if sampling
+        else None
+    )
+    kwargs = (
+        {"wraps": spark_attention_tp.broadcast_attention_tp}
+        if has_tp_group
+        else {"side_effect": AssertionError("TP1 must not call the broadcast helper")}
+    )
+    with (
+        patch.object(draft.envs.SGLANG_DSPARK_FAST_SAMPLING, "get", return_value=fast),
+        patch.object(spark_attention_tp, "broadcast_attention_tp", **kwargs) as sync,
+        patch.object(
+            draft.SampleStepTokens,
+            "execute",
+            side_effect=lambda **kw: torch.tensor([1, 0]),
+        ) as kernel,
+    ):
+        result = draft.sample_draft_block(
+            base_logits=logits,
+            anchor_tokens=torch.zeros(2, dtype=torch.long),
+            draft_hidden=torch.zeros(2, 2, 4),
+            sampling_info=info,
+            markov_head=SimpleNamespace(sample_block=sample_block),
+            device=torch.device("cpu"),
+            attention_tp_group=group,
+        )
+    assert sync.call_count == (2 if has_tp_group else 0)
+    if has_tp_group:
+        assert torch.equal(result.draft_tokens, torch.full((2, 2), 2))
+    elif not sampling:
+        assert torch.equal(result.draft_tokens, logits.argmax(dim=-1))
+    elif fast:
+        assert torch.equal(result.draft_tokens, torch.tensor([[1, 1], [0, 0]]))
+    assert kernel.call_count == (2 if sampling and fast else 0)
+
+
+@pytest.mark.parametrize("has_tp_group", [False, True])
+def test_verify_sync_runs_only_with_attention_tp_group(has_tp_group):
+    from unittest.mock import Mock
+
+    from sglang.srt.speculative.dspark_components import dspark_verify as verify
+    from sglang.srt.speculative.dspark_components import spark_attention_tp
+
+    correct, bonus, trim = torch.tensor([2]), torch.tensor([7]), torch.tensor([2])
+    final = SimpleNamespace(
+        cap_trim_lens=trim, commit_lens=correct, new_seq_lens=correct
+    )
+    executor = verify.TargetVerifyExecutor.__new__(verify.TargetVerifyExecutor)
+    executor._simulate_acc_len = 0
+    executor._attention_tp_group = (
+        SimpleNamespace(broadcast=Mock()) if has_tp_group else None
+    )
+    executor.gamma, executor.verify_num_draft_tokens = 8, 9
+    kwargs = (
+        {"wraps": spark_attention_tp.broadcast_attention_tp}
+        if has_tp_group
+        else {"side_effect": AssertionError("TP1 must not call the broadcast helper")}
+    )
+    with (
+        patch.object(
+            verify, "accept_draft_tokens", return_value=(correct, bonus, trim)
+        ),
+        patch.object(
+            verify.FinalizeAcceptLens, "execute", return_value=final
+        ) as finalize,
+        patch.object(verify.BuildOutTokens, "execute", return_value=bonus),
+        patch.object(spark_attention_tp, "broadcast_attention_tp", **kwargs) as sync,
+    ):
+        result = executor.accept_and_finalize(
+            folded_accept=False,
+            bs=1,
+            verify_ids_2d=torch.empty(1, 9, dtype=torch.long),
+            target_logits=None,
+            draft_block=None,
+            sampling_info=None,
+            draft_input=None,
+            layout=None,
+            prefix_lens=correct,
+            draft_tokens=bonus,
+        )
+    assert sync.call_count == (3 if has_tp_group else 0)
+    assert finalize.call_args.kwargs["correct_len"] is correct
+    assert result.correct_len is correct
+
+
+def test_spark_tp1_cp1_aux_adapter_preserves_original_fast_return():
+    import sys
+    from types import ModuleType
+
+    from sglang.srt.models import sparkv1_dspark_cp as adapter
+
+    original_result = object()
+
+    class Model:
+        @property
+        def pp_group(self):
+            raise AssertionError("TP1/CP1 must return before inspecting the output")
+
+        def forward(self, *args, **kwargs):
+            return original_result
+
+    module = ModuleType("tokenflow.models.sparkv1.model")
+    module.SparkV1Model = Model
+    with (
+        patch.dict(sys.modules, {module.__name__: module}),
+        patch.object(
+            adapter,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_tp_size=1, attn_cp_size=1),
+        ),
+        patch.object(
+            adapter.os,
+            "getenv",
+            side_effect=AssertionError("TP1 must not inspect TP opt-in"),
+        ),
+    ):
+        adapter.install_spark_v1_dspark_cp_adapter()
+        assert Model().forward(None, None, object()) is original_result
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

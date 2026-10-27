@@ -289,8 +289,9 @@ class MLPSyncBatchInfo:
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         all_info_cpu = global_info_tensor.cpu()
-        tp0_info_cpu = all_info_cpu[:, 0, :].clone()
-        if self.scheduler_step_info is not None:
+        tp0_info_cpu = all_info_cpu[:, 0, :]
+        if self.scheduler_step_info is not None and self.tp_size > 1:
+            tp0_info_cpu = tp0_info_cpu.clone()
             # Attention TP ranks replicate one DP scheduler. Count tokens once
             # per replica, but require every participating rank to agree before
             # issuing an EP-wide forward. Graph/TBO capability is a vote: a

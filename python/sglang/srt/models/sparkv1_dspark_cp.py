@@ -96,6 +96,9 @@ def install_spark_v1_dspark_cp_adapter() -> bool:
     @functools.wraps(original)
     def forward(self, input_ids, positions, forward_batch, *args, **kwargs):
         result = original(self, input_ids, positions, forward_batch, *args, **kwargs)
+        parallel = get_parallel()
+        if parallel.attn_cp_size <= 1 and parallel.attn_tp_size <= 1:
+            return result
         if (
             not self.pp_group.is_last_rank
             or not isinstance(result, tuple)
@@ -103,7 +106,6 @@ def install_spark_v1_dspark_cp_adapter() -> bool:
         ):
             return result
         hidden_states, aux_hidden_states = result
-        parallel = get_parallel()
         if (
             parallel.attn_tp_size > 1
             and os.getenv("SGLANG_SPARK_DSPARK_ATTENTION_TP8", "0") == "1"
