@@ -256,7 +256,10 @@ class TargetVerifyExecutor:
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            elif draft_input.nxt_kv_lens_cpu is not None:
+            elif (
+                draft_input.nxt_kv_lens_cpu is not None
+                and getattr(self.model_runner.attn_backend, "needs_cpu_seq_lens", True)
+            ):
                 batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
                 batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 

@@ -467,11 +467,20 @@ class DraftBlockProposer:
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
-        elif draft_input.nxt_kv_lens_cpu is not None:
+        elif generated_inputs is not None:
+            draft_seq_lens_cpu = None
+            draft_seq_lens_sum = None
+        elif (
+            draft_input.nxt_kv_lens_cpu is not None
+            and self._generated_input_stager() is None
+        ):
             draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
         else:
-            raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
+            # Non-generated/eager preparation still needs the current prefix.
+            # Its blocking copy is an explicit fallback, not part of graph replay.
+            draft_seq_lens_cpu = prefix_lens.cpu() + gamma
+            draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
 
         draft_num_tokens = bs * gamma
         draft_forward_batch = ForwardBatch(
@@ -508,6 +517,11 @@ class DraftBlockProposer:
                 deferred=(generated_inputs is not None and generated_inputs.sampling is not None),
             )
         if not can_run_graph:
+            if draft_seq_lens_cpu is None:
+                draft_forward_batch.seq_lens_cpu = prefix_lens.cpu() + gamma
+                draft_forward_batch.seq_lens_sum = int(
+                    draft_forward_batch.seq_lens_cpu.sum()
+                )
             if generated_inputs is not None:
                 # Eligibility can change with the shared DP graph tier. Materialize
                 # the original private tensors before taking the eager path.

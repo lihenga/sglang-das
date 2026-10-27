@@ -1603,6 +1603,9 @@ class Scheduler(
             )
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
+        self._defer_cpu_seq_lens = getattr(
+            self.draft_worker, "can_defer_cpu_seq_lens", None
+        )
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
         needs_confidence_relay = decide_needs_confidence_relay(self.server_args)
         self.future_map = self.spec_algorithm.create_future_map(
@@ -3944,7 +3947,10 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                self.future_map.resolve_seq_lens_cpu(batch)
+                if self._defer_cpu_seq_lens and self._defer_cpu_seq_lens(batch):
+                    self.future_map.resolve_seq_lens_cpu(batch, defer_cpu=True)
+                else:
+                    self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 

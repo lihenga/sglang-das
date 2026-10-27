@@ -512,7 +512,9 @@ class FutureMap:
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
 
-    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+    def resolve_seq_lens_cpu(
+        self, batch: ScheduleBatch, *, defer_cpu: bool = False
+    ) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
@@ -536,7 +538,13 @@ class FutureMap:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if not self.needs_cpu_seq_lens:
+        # Only the audited HCU generated-graph path can defer the host mirror.
+        # The GPU publish wait and gather above remain ordered as before.
+        defer_cpu = (
+            defer_cpu and self._hcu_early_seq_lens
+            and not self.needs_confidence_relay
+        )
+        if not self.needs_cpu_seq_lens or defer_cpu:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
@@ -593,6 +601,10 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
+        if self._hcu_early_seq_lens and self._seq_lens_cpu_ready is not None:
+            # A deferred host read no longer supplies the old CPU-side fence.
+            # Finish the previous D2H read before overwriting its GPU source.
+            self._seq_lens_cpu_ready.wait()
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:

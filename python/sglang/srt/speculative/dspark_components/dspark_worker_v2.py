@@ -450,6 +450,24 @@ class DSparkWorkerV2(BaseSpecWorker):
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    def can_defer_cpu_seq_lens(self, batch: ScheduleBatch) -> bool:
+        """Keep generated Spark graph preparation ahead of the host readback."""
+        return (
+            self._decode_graph_allowed
+            and not self._target_is_mambaish
+            and not self._verify_planner.carries_confidence
+            and not get_exec().overlap.enable_two_batch_overlap
+            and not getattr(self.model_runner.attn_backend, "needs_cpu_seq_lens", True)
+            and batch.forward_mode.is_decode()
+            and not batch.is_extend_in_batch
+            and batch.can_run_dp_cuda_graph
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and not any(batch.multimodal_inputs or ())
+            and 0 < batch.seq_lens.numel() <= 4
+            and self._proposer._generated_input_stager() is not None
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
