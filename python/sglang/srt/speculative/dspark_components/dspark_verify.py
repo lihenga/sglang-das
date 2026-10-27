@@ -88,6 +88,7 @@ class TargetVerifyExecutor:
         kv_injector: TargetHiddenKvInjector,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
+        attention_tp_group=None,
     ) -> None:
         self.target_worker = target_worker
         self.gamma = int(gamma)
@@ -97,6 +98,7 @@ class TargetVerifyExecutor:
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
+        self._attention_tp_group = attention_tp_group
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
 
     def accept_and_finalize(
@@ -138,6 +140,12 @@ class TargetVerifyExecutor:
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
 
+        from sglang.srt.speculative.dspark_components.spark_attention_tp import (
+            broadcast_attention_tp,
+        )
+
+        for tensor in (correct_len, bonus, cap_trim_lens):
+            broadcast_attention_tp(tensor, self._attention_tp_group)
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,

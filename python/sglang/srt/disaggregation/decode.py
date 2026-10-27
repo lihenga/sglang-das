@@ -1010,6 +1010,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Still poll if any receiver was aborted, otherwise it stays stuck.
         if (
             self.pp_size <= 1
+            # A rank-local failure must not send just one attention-TP rank
+            # into the poll collective while its siblings skip it. With TP>1
+            # every nonempty handshake queue is polled in the same order.
+            and get_parallel().attn_tp_size == 1
             and all(decode_req.waiting_for_input for decode_req in self.queue)
             and not any(
                 decode_req.kv_receiver.conclude_state == KVPoll.Failed

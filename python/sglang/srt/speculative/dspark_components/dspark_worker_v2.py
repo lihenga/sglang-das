@@ -115,10 +115,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._decode_graph_allowed = (
             not get_exec().graph.disable_cuda_graph and not self._is_pd_prefill
         )
+        from sglang.srt.speculative.dspark_components.spark_attention_tp import (
+            supports_spark_attention_tp,
+        )
+
+        self._spark_attention_tp = supports_spark_attention_tp(
+            parallel=ps,
+            target_model=self.model_runner.model,
+            server_args=server_args,
+            graph_disabled=get_exec().graph.disable_cuda_graph,
+            overlap_disabled=get_schedule().disable_overlap_schedule,
+        )
         if (
             get_parallel().enable_dp_attention
             and self._draft_is_moe
             and ps.attn_tp_size > 1
+            and not self._spark_attention_tp
         ):
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
@@ -126,6 +138,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
+        if self._spark_attention_tp:
+            logger.info(
+                "Spark attention TP8 draft: native MoE=%s, full EP32, "
+                "eager draft, static target verification and replica sampling enabled",
+                self._draft_is_moe,
+            )
         with self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -231,6 +249,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            attention_tp_group=(
+                get_parallel().attn_tp_group if self._spark_attention_tp else None
+            ),
         )
         self._verify_epilogue = None
         if (
@@ -282,6 +303,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             kv_injector=self._kv_injector,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            attention_tp_group=(
+                get_parallel().attn_tp_group if self._spark_attention_tp else None
+            ),
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -344,7 +368,12 @@ class DSparkWorkerV2(BaseSpecWorker):
     @contextmanager
     def _draft_context(self):
         with ExitStack() as stack:
-            if self._draft_dp_context_enabled:
+            if self._draft_dp_context_enabled or (
+                self._spark_attention_tp and "_draft_worker" in self.__dict__
+            ):
+                # Construct the MoE with its full EP32 world first. During
+                # execution, Spark attention/vocabulary tensor collectives use
+                # the replica's TP8 group; DeepEP retains its cached EP32 group.
                 stack.enter_context(draft_tp_context(get_parallel().attn_tp_group))
             stack.enter_context(speculative_moe_backend_context())
             stack.enter_context(speculative_moe_a2a_backend_context())
@@ -379,7 +408,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = self._decode_graph_allowed
+        # Spark's idle DP participates through a padding forward. Keep that
+        # draft path eager on every DP, while the target can capture/replay
+        # the shared static verify tiers using the native DP graph protocol.
+        capture_decode_cuda_graph = (
+            self._decode_graph_allowed and not self._spark_attention_tp
+        )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:

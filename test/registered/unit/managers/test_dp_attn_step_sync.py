@@ -55,6 +55,67 @@ def _mlp_sync_info(step_info):
 
 
 class TestPDDecodeStepInfo(CustomTestCase):
+
+    def _gather_tp8dp4(self, mutate=None):
+        info = _mlp_sync_info(_step_info())
+        info.dp_size, info.tp_size = 4, 8
+
+        def gather(outputs, local, group=None):
+            self.assertEqual(len(outputs), 32)
+            for rank, output in enumerate(outputs):
+                output.copy_(local)
+                output[0:2] = rank // 8 + 1
+                output[15] = rank  # Rank-local PD latency is allowed to differ.
+                if mutate is not None:
+                    mutate(rank, output)
+
+        with (
+            patch.object(torch.distributed, "get_world_size", return_value=32),
+            patch.object(torch.distributed, "get_rank", return_value=0),
+            patch.object(torch.distributed, "all_gather", side_effect=gather),
+            patch.object(
+                dp_attn,
+                "get_tp_group",
+                return_value=SimpleNamespace(
+                    active_ranks_cpu=torch.ones(32, dtype=torch.int64)
+                ),
+            ),
+        ):
+            info.all_gather(device="cpu", group=object())
+        return info
+
+    def test_tp8dp4_counts_each_replica_once_and_votes_all_tp_ranks(self):
+        def mutate(rank, output):
+            if rank == 7:
+                output[2] = 0
+
+        info = self._gather_tp8dp4(mutate)
+        self.assertEqual(info.global_num_tokens, [1, 2, 3, 4])
+        self.assertFalse(info.can_run_decode_cuda_graph)
+        self.assertEqual(info.gathered_scheduler_step_info.shape, (4, 10))
+        self.assertEqual(
+            info.gathered_scheduler_step_info[:, 8].tolist(), [7, 15, 23, 31]
+        )
+
+    def test_tp8dp4_rejects_nonleader_epoch_divergence(self):
+        def mutate(rank, output):
+            if rank == 23:
+                output[9] += 1
+
+        with self.assertRaisesRegex(RuntimeError, "epoch mismatch"):
+            self._gather_tp8dp4(mutate)
+
+    def test_tp8dp4_rejects_replica_queue_or_forward_divergence(self):
+        for col in (0, 5, 10, 11, 12, 13):
+            with self.subTest(col=col):
+
+                def mutate(rank, output):
+                    if rank == 31:
+                        output[col] += 1
+
+                with self.assertRaisesRegex(RuntimeError, "replica state mismatch"):
+                    self._gather_tp8dp4(mutate)
+
     def _mock_cpu_all_gather(self, info):
         def copy_local_to_only_rank(outputs, local, group=None):
             self.assertEqual(len(outputs), 1)

@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import os
 
 import torch
 
@@ -58,6 +59,32 @@ def _gather_cp_aux_hidden_states(
     return list(gathered.split(widths, dim=-1))
 
 
+def _gather_tp_aux_hidden_states(hidden_states, aux_hidden_states, tp_group, tp_size):
+    """Align local and already-gathered Spark captures before feature packing."""
+    captures = (
+        [aux_hidden_states]
+        if isinstance(aux_hidden_states, torch.Tensor)
+        else aux_hidden_states
+    )
+    if not captures:
+        return aux_hidden_states
+    rows = hidden_states.shape[0]
+    gathered = []
+    for capture in captures:
+        if capture.ndim != 2 or capture.device != hidden_states.device:
+            raise RuntimeError("Spark TP auxiliary capture has invalid rank/device")
+        if capture.shape[0] == rows:
+            gathered.append(capture)
+        elif capture.shape[0] * tp_size == rows:
+            gathered.append(tp_group.all_gather(capture, dim=0))
+        else:
+            raise RuntimeError(
+                f"Spark TP auxiliary rows {capture.shape[0]} cannot match "
+                f"final rows {rows} with attention TP{tp_size}"
+            )
+    return gathered[0] if isinstance(aux_hidden_states, torch.Tensor) else gathered
+
+
 def install_spark_v1_dspark_cp_adapter() -> bool:
     """Add the missing output gather without replacing native Spark math."""
     from tokenflow.models.sparkv1.model import SparkV1Model
@@ -70,15 +97,29 @@ def install_spark_v1_dspark_cp_adapter() -> bool:
     def forward(self, input_ids, positions, forward_batch, *args, **kwargs):
         result = original(self, input_ids, positions, forward_batch, *args, **kwargs)
         if (
-            get_parallel().attn_cp_size <= 1
-            or getattr(forward_batch, "attn_cp_metadata", None) is None
-            or not forward_batch.forward_mode.is_context_parallel_extend()
-            or not self.pp_group.is_last_rank
+            not self.pp_group.is_last_rank
             or not isinstance(result, tuple)
             or len(result) != 2
         ):
             return result
         hidden_states, aux_hidden_states = result
+        parallel = get_parallel()
+        if (
+            parallel.attn_tp_size > 1
+            and os.getenv("SGLANG_SPARK_DSPARK_ATTENTION_TP8", "0") == "1"
+        ):
+            aux_hidden_states = _gather_tp_aux_hidden_states(
+                hidden_states,
+                aux_hidden_states,
+                parallel.attn_tp_group,
+                parallel.attn_tp_size,
+            )
+        if (
+            parallel.attn_cp_size <= 1
+            or getattr(forward_batch, "attn_cp_metadata", None) is None
+            or not forward_batch.forward_mode.is_context_parallel_extend()
+        ):
+            return hidden_states, aux_hidden_states
         aux_hidden_states = _gather_cp_aux_hidden_states(
             hidden_states, aux_hidden_states, forward_batch, get_parallel().attn_cp_size
         )
@@ -86,5 +127,5 @@ def install_spark_v1_dspark_cp_adapter() -> bool:
 
     forward._sglang_spark_cp_aux_gather = True
     SparkV1Model.forward = forward
-    logger.info("Installed Spark prefill CP auxiliary-hidden gather in global token order")
+    logger.info("Installed Spark CP/TP auxiliary-hidden gather in global token order")
     return True

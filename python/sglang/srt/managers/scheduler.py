@@ -1353,10 +1353,15 @@ class Scheduler(
                 raise RuntimeError(
                     "PD Decode DP sync currently supports pp_size=1 only"
                 )
-            if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
+            if self.ps.attn_cp_size != 1:
+                raise RuntimeError("PD Decode DP sync requires attn_cp_size=1")
+            if (
+                self.ps.attn_tp_size > 1
+                and not self.server_args.enable_dp_attention_local_control_broadcast
+            ):
                 raise RuntimeError(
-                    "PD Decode DP sync currently supports attn_tp_size=1 and "
-                    "attn_cp_size=1 only"
+                    "PD Decode attention TP requires local control broadcast "
+                    "so every rank in a DP replica receives the same requests"
                 )
 
             tp_ranks = list(self.tp_group.ranks)

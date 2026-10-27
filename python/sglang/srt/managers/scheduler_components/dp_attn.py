@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # Shared with the scheduler's PD decode StepInfo protocol.
 DP_DECODE_STEP_PROTOCOL_VERSION = 2
-DP_DECODE_STEP_BUILD_ID = 2026071602
+DP_DECODE_STEP_BUILD_ID = 2026101301
 _MLP_SYNC_INFO_WIDTH = 7
 _DP_DECODE_STEP_INFO_WIDTH = 10
 
@@ -288,7 +288,27 @@ class MLPSyncBatchInfo:
         # tensor is its own stream sync. Copy the whole tensor, not the
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
-        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        all_info_cpu = global_info_tensor.cpu()
+        tp0_info_cpu = all_info_cpu[:, 0, :].clone()
+        if self.scheduler_step_info is not None:
+            # Attention TP ranks replicate one DP scheduler. Count tokens once
+            # per replica, but require every participating rank to agree before
+            # issuing an EP-wide forward. Graph/TBO capability is a vote: a
+            # non-leader may lack the draft seed or graph workspace too.
+            consistent_fields = [0, 1, 3, 5, 10, 11, 12, 13, 14]
+            replica_fields = all_info_cpu[:, :, consistent_fields]
+            mismatched = (replica_fields != replica_fields[:, :1, :]).any(dim=2)
+            if bool(mismatched.any()):
+                raise RuntimeError(
+                    "PD Decode attention-TP replica state mismatch: "
+                    f"dp/attention-rank={mismatched.nonzero().tolist()} "
+                    f"fields={consistent_fields} values={replica_fields.tolist()}"
+                )
+            for col in (2, 4, 6):
+                tp0_info_cpu[:, col] = all_info_cpu[:, :, col].min(dim=1).values
+            # PD timing is diagnostic and can differ between TP ranks.
+            for col in (15, 16):
+                tp0_info_cpu[:, col] = all_info_cpu[:, :, col].max(dim=1).values
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()

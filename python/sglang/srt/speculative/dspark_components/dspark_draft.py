@@ -127,7 +127,12 @@ def sample_draft_block(
     sampling_info,
     markov_head,
     device: torch.device,
+    attention_tp_group=None,
 ) -> DraftBlockResult:
+    from sglang.srt.speculative.dspark_components.spark_attention_tp import (
+        broadcast_attention_tp,
+    )
+
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
@@ -144,7 +149,9 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
-            return torch.argmax(step_logits, dim=-1)
+            return broadcast_attention_tp(
+                torch.argmax(step_logits, dim=-1), attention_tp_group
+            )
 
     else:
 
@@ -154,11 +161,14 @@ def sample_draft_block(
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
                 ).exponential_(1)
-                return SampleStepTokens.execute(
-                    step_logits=step_logits,
-                    temperatures=temperatures,
-                    greedy_mask=greedy_mask,
-                    exp_noise=exp_noise,
+                return broadcast_attention_tp(
+                    SampleStepTokens.execute(
+                        step_logits=step_logits,
+                        temperatures=temperatures,
+                        greedy_mask=greedy_mask,
+                        exp_noise=exp_noise,
+                    ),
+                    attention_tp_group,
                 )
             else:
                 probs = torch.softmax(
@@ -167,7 +177,10 @@ def sample_draft_block(
                 probs = expect(_DRAFT_PROBS, probs)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
+                return broadcast_attention_tp(
+                    torch.where(greedy_mask, argmax_tokens, sampled_tokens),
+                    attention_tp_group,
+                )
 
     draft_tokens, corrected_logits = markov_head.sample_block(
         base_logits,
@@ -184,6 +197,7 @@ def sample_draft_block(
 
 
 class DraftBlockProposer:
+
     def __init__(
         self,
         *,
@@ -193,6 +207,7 @@ class DraftBlockProposer:
         mask_token_id: int,
         draft_block_spec_info,
         dp_moe_sync: bool = False,
+        attention_tp_group=None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -201,6 +216,7 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._attention_tp_group = attention_tp_group
         self._prep_cache_enabled = (
             is_hcu()
             and type(draft_model).__name__ == "SparkV1DSparkDraftModel"
@@ -230,7 +246,6 @@ class DraftBlockProposer:
         tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
         return tensor
 
-
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
         backend = getattr(self.draft_model_runner, "attn_backend", None)
@@ -239,7 +254,9 @@ class DraftBlockProposer:
             bind(draft_sampler)
 
     def _base_logits_context(self):
-        if self._dp_moe_sync:
+        # The opt-in Spark TP8 worker already scopes the whole proposal to this
+        # group. The underlying TP patch is intentionally non-reentrant.
+        if self._dp_moe_sync and getattr(self, "_attention_tp_group", None) is None:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
@@ -362,6 +379,7 @@ class DraftBlockProposer:
                 sampling_info=sampling_info,
                 markov_head=self.draft_model.markov_head,
                 device=device,
+                attention_tp_group=self._attention_tp_group,
             )
         return DraftProposal(
             draft_block_ids=draft_block_ids,
@@ -374,7 +392,13 @@ class DraftBlockProposer:
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
-        if not self._dp_moe_sync or batch.global_num_tokens is None:
+        if not self._dp_moe_sync:
+            return
+        # Spark TP replicas must join EP collectives even when DeepEP omits
+        # global token metadata. Preserve the existing path for other drafts.
+        if getattr(self, "_attention_tp_group", None) is not None:
+            return self._run_spark_tp_idle(batch)
+        if batch.global_num_tokens is None:
             return
         device = self.draft_model_runner.device
         empty_long = torch.empty((0,), dtype=torch.int64, device=device)
@@ -409,6 +433,45 @@ class DraftBlockProposer:
                 empty_hidden = head.weight.new_empty((0, head.weight.shape[1]))
                 with self._base_logits_context():
                     self.draft_model.compute_base_logits(empty_hidden)
+
+    def _run_spark_tp_idle(self, batch: ScheduleBatch) -> None:
+        # TokenFlow's Spark draft skips its IDLE forward before entering MoE.
+        # A small discarded block joins every draft EP collective in order.
+        # Slot zero is the MLA pool's reserved padding slot; no request slot or
+        # allocator entry is allocated or advanced by this participation block.
+        from types import SimpleNamespace
+
+        device, gamma = self.draft_model_runner.device, self.gamma
+        input_ids = torch.full(
+            (gamma,), self._mask_token_id, dtype=torch.int64, device=device
+        )
+        prefix = torch.zeros(1, dtype=torch.int64, device=device)
+        with torch.inference_mode():
+            input_embeds = self.draft_model.get_input_embeddings()(input_ids)
+            forward = ForwardBatch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=1,
+                input_ids=input_ids,
+                req_pool_indices=torch.zeros(1, dtype=torch.int64, device=device),
+                seq_lens=prefix,
+                out_cache_loc=torch.zeros(gamma, dtype=torch.int64, device=device),
+                seq_lens_sum=gamma,
+                seq_lens_cpu=torch.tensor([gamma], dtype=torch.int64),
+                positions=torch.arange(gamma, dtype=torch.int64, device=device),
+                input_embeds=input_embeds,
+                spec_algorithm=SpeculativeAlgorithm.DSPARK,
+                spec_info=self._draft_block_spec_info,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+            metadata = SimpleNamespace(
+                global_num_tokens=[1],
+                global_num_tokens_for_logprob=[1],
+                can_run_dp_cuda_graph=False,
+            )
+            self._fill_num_token_non_padded(forward)
+            self._fill_dp_moe_sync_metadata(forward, metadata)
+            self._detach_eager_count_metadata(forward)
+            self.draft_model_runner.forward(forward)
 
     def _run_forward(
         self,
