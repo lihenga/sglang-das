@@ -240,6 +240,106 @@ def _build_video_config(request: ChatCompletionRequest) -> Optional[Dict[str, An
     return config or None
 
 
+def _unsupported_xgrammar_schema_error(schema) -> Optional[str]:
+    """Reject known unsupported schema forms before scheduling PD work."""
+    def check_pattern(pattern, path):
+        in_class = False
+        escaped = False
+
+        for index, char in enumerate(pattern):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == "[" and not in_class:
+                in_class = True
+                continue
+            if char == "]" and in_class:
+                in_class = False
+                continue
+
+            if not in_class and any(
+                pattern.startswith(prefix, index)
+                for prefix in ("(?=", "(?!", "(?<=", "(?<!")
+            ):
+                return (
+                    f"Unsupported JSON schema at {path}: XGrammar does not "
+                    "support regex lookahead/lookbehind assertions."
+                )
+
+        return None
+
+    pending = [(schema, "$")]
+    seen = set()
+
+    while pending:
+        node, path = pending.pop()
+
+        if not isinstance(node, dict) or id(node) in seen:
+            continue
+        seen.add(id(node))
+
+        if isinstance(node.get("items"), list):
+            return (
+                f"Unsupported JSON schema at {path}.items: XGrammar does not "
+                "support array-valued tuple items; use prefixItems instead."
+            )
+
+        pattern = node.get("pattern")
+        if isinstance(pattern, str):
+            error = check_pattern(pattern, f"{path}.pattern")
+            if error:
+                return error
+
+        for keyword in (
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ):
+            mapping = node.get(keyword)
+            if isinstance(mapping, dict):
+                for name, child in mapping.items():
+                    child_path = f"{path}.{keyword}[{name!r}]"
+
+                    if keyword == "patternProperties":
+                        error = check_pattern(name, child_path)
+                        if error:
+                            return error
+
+                    pending.append((child, child_path))
+
+        for keyword in (
+            "items",
+            "additionalProperties",
+            "additionalItems",
+            "contains",
+            "propertyNames",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "contentSchema",
+            "not",
+            "if",
+            "then",
+            "else",
+        ):
+            pending.append((node.get(keyword), f"{path}.{keyword}"))
+
+        for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+            children = node.get(keyword)
+            if isinstance(children, list):
+                pending.extend(
+                    (child, f"{path}.{keyword}[{index}]")
+                    for index, child in enumerate(children)
+                )
+
+    return None
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -937,6 +1037,10 @@ class OpenAIServingChat(OpenAIServingBase):
             schema = getattr(request.response_format.json_schema, "schema_", None)
             if schema is None:
                 return "schema_ is required for json_schema response format request."
+            if self.tokenizer_manager.server_args.grammar_backend == "xgrammar":
+                error = _unsupported_xgrammar_schema_error(schema)
+                if error:
+                    return error
 
         return None
 
