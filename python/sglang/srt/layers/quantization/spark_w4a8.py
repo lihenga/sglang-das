@@ -175,11 +175,20 @@ def forward_masked(self, dispatch_output):
     groups, capacity, hidden = x.shape
     gate_up = torch.empty((groups, capacity, self.w13_weight_scale.shape[1]), dtype=torch.bfloat16, device=x.device)
     op = torch.ops.sglang.m_grouped_w4a8_gemm_nt_masked_hipc
-    op(x, scale, self.w13_weight, self.w13_weight_scale, gate_up, counts, capacity)
+    # HIPC derives coverage and strides from the full input shape. Its host M
+    # argument selects tuning only; passing receive capacity chooses a large-M
+    # kernel even when decode has only a few rows per expert. Keep every row,
+    # including skewed experts, and tune only the audited Spark EP16 BS1..4
+    # verify geometry. Larger estimates keep the original configuration.
+    tuning_m = capacity
+    if (groups == 16 and hidden == 6144 and gate_up.shape[-1] == 2048
+            and 0 < expected_m <= 32 and _ids.shape[0] <= 36):
+        tuning_m = min(capacity, 64)
+    op(x, scale, self.w13_weight, self.w13_weight_scale, gate_up, counts, tuning_m)
     q, q_scale = _gelu_quant(self, gate_up, counts, min(capacity, max(expected_m, 128)))
     del gate_up
     result = torch.empty((groups, capacity, hidden), dtype=torch.bfloat16, device=x.device)
-    op(q, q_scale, self.w2_weight, self.w2_weight_scale, result, counts, capacity)
+    op(q, q_scale, self.w2_weight, self.w2_weight_scale, result, counts, tuning_m)
     return result
 
 
