@@ -85,9 +85,42 @@ def _gather_tp_aux_hidden_states(hidden_states, aux_hidden_states, tp_group, tp_
     return gathered[0] if isinstance(aux_hidden_states, torch.Tensor) else gathered
 
 
+def _install_cp_target_projection():
+    """Partition token-independent context projection across prefill CP ranks."""
+    from tokenflow.models.sparkv1.dspark_draft import SparkV1DSparkDraftModel
+
+    original = SparkV1DSparkDraftModel.project_target_hidden
+    if getattr(original, "_sglang_cp_target_projection", False):
+        return
+
+    @functools.wraps(original)
+    def project(self, target_hidden):
+        parallel = get_parallel()
+        size = parallel.attn_cp_size
+        rows = target_hidden.shape[0]
+        if size <= 1 or rows < 1024 or torch.cuda.is_current_stream_capturing():
+            return original(self, target_hidden)
+        # The existing auxiliary gather already restored global token order.
+        # Partition that order, then gather the projected rows in the same order.
+        local_rows = (rows + size - 1) // size
+        start = parallel.attn_cp_rank * local_rows
+        local = target_hidden[start:min(start + local_rows, rows)]
+        if local.shape[0] != local_rows:
+            local = torch.nn.functional.pad(local, (0, 0, 0, local_rows - local.shape[0]))
+        projected = original(self, local).contiguous()
+        output = projected.new_empty((size * local_rows, projected.shape[1]))
+        parallel.attn_cp_group.all_gather_into_tensor(output, projected)
+        return output[:rows]
+
+    project._sglang_cp_target_projection = True
+    SparkV1DSparkDraftModel.project_target_hidden = project
+
+
 def install_spark_v1_dspark_cp_adapter() -> bool:
     """Add the missing output gather without replacing native Spark math."""
     from tokenflow.models.sparkv1.model import SparkV1Model
+
+    _install_cp_target_projection()
 
     original = SparkV1Model.forward
     if getattr(original, "_sglang_spark_cp_aux_gather", False):
