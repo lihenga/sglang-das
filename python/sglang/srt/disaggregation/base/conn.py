@@ -35,6 +35,9 @@ class StateType(str, enum.Enum):
     BLOCK_SCALE_SWA = "block_scale_swa"
     # Target aux hidden rows used to bootstrap decode-side draft KV.
     PD_HIDDEN = "pd_hidden"
+    # DSPARK draft sliding layers: the last-window pages of prefill's
+    # full-length draft pool, written into the decode ring sub-pool pages.
+    DSPARK_DRAFT_SWA = "dspark_draft_swa"
 
 
 @dataclasses.dataclass

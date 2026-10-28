@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     all_reduce_min_attn_cp_tp_group,
+    append_state_component,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -87,6 +88,12 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.dspark_components.dspark_disaggregation import (
     resolve_hidden_bootstrap_plan,
+)
+from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+    dspark_draft_swa_state_buf_infos,
+    dspark_draft_swa_window_start,
+    dspark_pd_skip_swa_window,
+    dspark_pd_skipped_draft_layers,
 )
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -413,19 +420,42 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
+        dspark_draft_swa_infos = None
         if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            kept_draft_layers = list(range(len(draft_kv_data_ptrs)))
+            skip_layers = dspark_pd_skipped_draft_layers(
+                self.scheduler.server_args.speculative_draft_model_path
+            )
+            if skip_layers:
+                # The decode peer runs the windowed draft pool: the sliding
+                # layers ship only their last window, as the DSPARK_DRAFT_SWA
+                # state component into the decode ring.
+                swa_layers = sorted(skip_layers)
+                dspark_draft_swa_infos = dspark_draft_swa_state_buf_infos(
+                    [draft_kv_data_ptrs[i] for i in swa_layers],
+                    [draft_kv_data_lens[i] for i in swa_layers],
+                    [draft_kv_item_lens[i] for i in swa_layers],
+                    swa_layers,
+                    self.scheduler.model_config.num_hidden_layers,
+                )
+                kept_draft_layers = [
+                    i for i in kept_draft_layers if i not in skip_layers
+                ]
+                draft_kv_data_ptrs = [draft_kv_data_ptrs[i] for i in kept_draft_layers]
+                draft_kv_data_lens = [draft_kv_data_lens[i] for i in kept_draft_layers]
+                draft_kv_item_lens = [draft_kv_item_lens[i] for i in kept_draft_layers]
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             if has_kv_layer_ids:
                 target_layer_num = self.scheduler.model_config.num_hidden_layers
                 kv_layer_ids += [
-                    target_layer_num + i for i in range(len(draft_kv_data_ptrs))
+                    target_layer_num + i for i in kept_draft_layers
                 ]
 
         kv_args.kv_data_ptrs = kv_data_ptrs
@@ -454,6 +484,19 @@ class PrefillBootstrapQueue:
             req_to_token_pool=req_to_token_pool,
             pd_hidden_pool=getattr(self.metadata_buffers, "pd_hidden_pool", None),
         )
+        if dspark_draft_swa_infos is not None:
+            # Last component on both peers (decode appends it after
+            # setup_state_kv_args too) so the positional state lists align.
+            ptrs, lens, item_lens, layer_ids = dspark_draft_swa_infos
+            append_state_component(
+                kv_args,
+                StateType.DSPARK_DRAFT_SWA,
+                ptrs,
+                lens,
+                item_lens,
+                layer_ids=layer_ids,
+            )
+        logger.info("PD prefill state_types=%s", kv_args.state_types)
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
             # V4's KVCache is organized by compression-ratio
@@ -523,6 +566,33 @@ class PrefillBootstrapQueue:
         req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
         assert req.metadata_buffer_index is not None
         return True
+
+    @property
+    def _dspark_skip_swa_draft_kv(self) -> bool:
+        skip = getattr(self, "_dspark_skip_swa_draft_kv_cached", None)
+        if skip is None:
+            skip = bool(
+                self.draft_token_to_kv_pool is not None
+                and dspark_pd_skipped_draft_layers(
+                    self.scheduler.server_args.speculative_draft_model_path
+                )
+            )
+            self._dspark_skip_swa_draft_kv_cached = skip
+        return skip
+
+    @property
+    def _dspark_skip_swa_window(self) -> int:
+        window = getattr(self, "_dspark_skip_swa_window_cached", None)
+        if window is None:
+            window = (
+                dspark_pd_skip_swa_window(
+                    self.scheduler.server_args.speculative_draft_model_path
+                )
+                if self._dspark_skip_swa_draft_kv
+                else 0
+            )
+            self._dspark_skip_swa_window_cached = window
+        return window
 
     def _requires_pd_hidden_transfer(self, req: Req) -> bool:
         if self.kv_manager.req_to_pd_hidden_meta.get(req.bootstrap_room):
@@ -2572,6 +2642,20 @@ class SchedulerDisaggregationPrefillMixin:
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
+            def _dspark_draft_swa_payload():
+                # Last-window pages of the full-length draft pool, in position
+                # order; decode lists the matching ring pages for its req slot.
+                bootstrap_queue = self.disagg_prefill_bootstrap_queue
+                window_start = dspark_draft_swa_window_start(
+                    seq_len, bootstrap_queue._dspark_skip_swa_window, page_size
+                )
+                return kv_to_page_indices(
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, window_start:seq_len
+                    ],
+                    page_size,
+                )
+
             def _c128_state_payload():
                 online = is_dsv4_c128_online_enabled()
                 ring_size = (
@@ -2620,6 +2704,7 @@ class SchedulerDisaggregationPrefillMixin:
                         StateType.C128_STATE: _c128_state_payload,
                         StateType.BLOCK_SCALE: _full_kv_pages_payload,
                         StateType.BLOCK_SCALE_SWA: _swa_payload,
+                        StateType.DSPARK_DRAFT_SWA: _dspark_draft_swa_payload,
                     }
                 )
             if last_chunk and _is_npu and isinstance(

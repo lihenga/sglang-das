@@ -66,6 +66,10 @@ class SWAKVPool(BaseSWAKVPool):
         self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
+        # Model-local layer ids per sub-pool; the PD transfer registration
+        # enumerates transferable draft layers from these.
+        self.swa_attention_layer_ids = list(swa_attention_layer_ids)
+        self.full_attention_layer_ids = list(full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = 0
         self.page_size = page_size
