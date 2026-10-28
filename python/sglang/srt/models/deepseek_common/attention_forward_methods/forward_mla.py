@@ -475,6 +475,7 @@ class DeepseekMLAForwardMixin:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         _kvb_q = None
+        packed_q = None
         born_q_backend = None
         if (
             _ENABLE_DSA_Q8KV8_BORN_FP8_Q
@@ -554,7 +555,31 @@ class DeepseekMLAForwardMixin:
                         torch.bfloat16,
                     )
             else:
-                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+                # Spark CP prefill: let the existing BLAS BMM write the
+                # 512-column prefix of the final contiguous Q layout.
+                direct_q = (
+                    _is_hip
+                    and type(self).__module__.startswith("tokenflow.models.sparkv1")
+                    and dsa_use_prefill_cp(forward_batch)
+                    and getattr(get_attn_backend(), "dsa_prefill_impl", None)
+                    == "flashmla_sparse"
+                    and forward_batch.spark_mla_preprocess is None
+                    and not get_parallel().dcp_enabled
+                    and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                    and not is_kv_b_lora_active(self)
+                    and q_nope.dtype == self.w_kc.dtype == torch.bfloat16
+                    and q_nope.ndim == 3
+                    and q_nope.shape[0] >= 1024
+                    and q_nope.shape[1:] == (128, 128)
+                    and self.w_kc.shape == (128, 128, 512)
+                    and q_pe.shape == (q_nope.shape[0], 128, 64)
+                )
+                if direct_q:
+                    packed_q = q_nope.new_empty((q_nope.shape[0], 128, 576))
+                    q_nope_out = packed_q[..., :512].transpose(0, 1)
+                    torch.bmm(q_nope.transpose(0, 1), self.w_kc, out=q_nope_out)
+                else:
+                    q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
             q_nope_out = q_nope_out.transpose(0, 1)
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -663,6 +688,11 @@ class DeepseekMLAForwardMixin:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
                 )
+
+        if packed_q is not None:
+            packed_q[..., 512:].copy_(q_pe)
+            q_nope_out = packed_q
+            q_pe = None
 
         return (
             q_pe,

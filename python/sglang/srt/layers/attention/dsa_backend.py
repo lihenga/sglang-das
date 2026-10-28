@@ -2213,15 +2213,24 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
             )
 
-        # HCU FlashMLA can consume a query already assembled by the Spark
-        # preprocessing operator. Other extend paths retain the split-Q ABI.
+        # HCU decode/verify and CP sparse prefill can consume an already
+        # assembled query. CP prefill's BLAS BMM writes its final layout.
         if q_rope is None:
             assert (
                 _is_hcu
-                and dsa_impl == "flashmla_kv"
-                and not save_kv_cache
-                and (forward_mode.is_target_verify() or forward_mode.is_decode())
-            ), "Combined MLA Q is only supported by HCU FlashMLA decode/verify"
+                and (
+                    (
+                        dsa_impl == "flashmla_kv"
+                        and not save_kv_cache
+                        and (forward_mode.is_target_verify() or forward_mode.is_decode())
+                    )
+                    or (
+                        dsa_impl == "flashmla_sparse"
+                        and forward_mode.is_extend()
+                        and dsa_use_prefill_cp(forward_batch)
+                    )
+                )
+            ), "Combined MLA Q requires HCU FlashMLA decode/verify or CP sparse prefill"
         q_all = None
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
@@ -2442,7 +2451,7 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
-            if q_rope is not None:
+            if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             skip_reused_topk_sort = (
                 _is_hcu
