@@ -336,7 +336,9 @@ def cp_all_gather_rerange_finish(handle):
     )
 
 
-def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
+def cp_all_gather_rerange_output(
+    input_tensor, cp_size, forward_batch, stream, *, reorder_feature_block_size=None
+):
     """
     # for in-seq-split
     |   +-----------before allgather------------+|
@@ -379,6 +381,24 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             input_tensor,
         )
         out_shape = output_tensor.shape
+        if cp_size == 1 or input_tensor.shape[0] <= 1:
+            return output_tensor
+        if (
+            reorder_feature_block_size is not None
+            and output_tensor.ndim == 2
+            and 0 < reorder_feature_block_size < out_shape[1]
+        ):
+            # Reorder disjoint feature columns in place. A full packed DSpark
+            # capture needs several GiB; one feature block bounds the temporary.
+            rank_major = output_tensor.view(cp_size, -1, out_shape[1])
+            for start in range(0, out_shape[1], reorder_feature_block_size):
+                end = min(start + reorder_feature_block_size, out_shape[1])
+                block = rank_major[:, :, start:end].transpose(0, 1).reshape(
+                    out_shape[0], end - start
+                )
+                output_tensor[:, start:end].copy_(block)
+                del block
+            return output_tensor
         output_tensor = (
             output_tensor.view(cp_size, -1, *out_shape[1:])
             .transpose(0, 1)

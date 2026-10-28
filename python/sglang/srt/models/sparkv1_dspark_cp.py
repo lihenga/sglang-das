@@ -46,7 +46,11 @@ def _gather_cp_aux_hidden_states(
 
     packed = pack_aux_hidden_states(aux_hidden_states).contiguous()
     gathered = cp_all_gather_rerange_output(
-        packed, cp_size, forward_batch, torch.cuda.current_stream(packed.device)
+        packed,
+        cp_size,
+        forward_batch,
+        torch.cuda.current_stream(packed.device),
+        reorder_feature_block_size=min(hidden_states.shape[-1], 2048),
     )
     if gathered.shape[0] != global_rows:
         raise RuntimeError(
