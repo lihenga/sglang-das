@@ -52,10 +52,13 @@ class SparkW4A8MegaMoEMethod(FusedMoEMethodBase):
         return SlimQuantW4A8Int8MarlinMoEMethod.create_weights(self, *args, **kwargs)
 
     def create_moe_runner(self, layer, moe_runner_config):
+        import json
+        from pathlib import Path
         from sglang.srt.server_args import get_global_server_args
         from sglang.srt.utils import is_hcu
 
         args = get_global_server_args()
+        config = json.loads((Path(args.model_path) / "config.json").read_text())
         if not (is_hcu() and args.disaggregation_mode == "prefill"
                 and args.tp_size == args.ep_size == args.attn_cp_size == 8
                 and args.enable_prefill_cp and layer.moe_tp_size == 1
@@ -63,6 +66,8 @@ class SparkW4A8MegaMoEMethod(FusedMoEMethodBase):
                 and layer.hidden_size == 6144
                 and layer.intermediate_size_per_partition == 1024
                 and moe_runner_config.activation == "gelu"
+                and config.get("num_groups") == 2
+                and config.get("num_experts_per_tok") == 7
                 and not layer.num_fused_shared_experts and not layer.reduce_results
                 and not args.enable_eplb):
             raise ValueError("Spark W4A8 MegaMoE requires CP8/EP8 P with independent shared experts")
@@ -70,6 +75,9 @@ class SparkW4A8MegaMoEMethod(FusedMoEMethodBase):
         self.capacity = (self.capacity + 63) // 64 * 64
         if self.capacity <= 0:
             raise ValueError("Spark MegaMoE requires a bounded positive prefill chunk")
+        # Each EP rank owns 32 consecutive slots inside one 128-slot group.
+        # A token selects seven experts per group, so no rank receives 14.
+        self.rank_route_bound = config["num_experts_per_tok"]
 
     def process_weights_after_loading(self, layer):
         import megamoe
@@ -77,8 +85,8 @@ class SparkW4A8MegaMoEMethod(FusedMoEMethodBase):
         from megamoe.w4a8 import w4a8_mega_moe
         from sglang.srt.runtime_context import get_parallel
 
-        if "activation" not in inspect.signature(w4a8_mega_moe).parameters:
-            raise RuntimeError("Install the MegaMoE wheel with Spark GELU support")
+        if "max_routes_per_token_per_rank" not in inspect.signature(w4a8_mega_moe).parameters:
+            raise RuntimeError("Install the MegaMoE wheel with bounded route workspace support")
         for name in ("w13_weight", "w2_weight"):
             weight = getattr(layer, name)
             setattr(layer, name, torch.nn.Parameter(
@@ -102,10 +110,11 @@ class SparkW4A8MegaMoEMethod(FusedMoEMethodBase):
                                 device=layer.w13_weight.device)
             w4a8_mega_moe(empty, (layer.w13_weight, layer.w13_weight_scale),
                           (layer.w2_weight, layer.w2_weight_scale), buffer,
-                          activation_clamp=8.0, activation="gelu")
+                          activation_clamp=8.0, activation="gelu",
+                          max_routes_per_token_per_rank=self.rank_route_bound)
             torch.cuda.current_stream().synchronize()
             _BUFFERS[key] = buffer
-            logger.info("Spark W4A8 MegaMoE initialized: EP8 capacity=%s GELU/clamp, shared workspace before KV sizing", self.capacity)
+            logger.info("Spark W4A8 MegaMoE initialized: EP8 capacity=%s rank_route_bound=%s GELU/clamp, shared workspace before KV sizing", self.capacity, self.rank_route_bound)
         self.buffer = buffer
 
     def _run(self, layer, x, topk_output, pre_quant=None):
@@ -130,7 +139,8 @@ class SparkW4A8MegaMoEMethod(FusedMoEMethodBase):
         output = torch.empty_like(x)
         w4a8_mega_moe(output, (layer.w13_weight, layer.w13_weight_scale),
                       (layer.w2_weight, layer.w2_weight_scale), self.buffer,
-                      activation_clamp=float(limit), activation="gelu")
+                      activation_clamp=float(limit), activation="gelu",
+                      max_routes_per_token_per_rank=self.rank_route_bound)
         return output
 
     def apply(self, layer, dispatch_output, bias=None, **kwargs):
