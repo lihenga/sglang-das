@@ -35,9 +35,14 @@ from sglang.srt.utils import (
     is_hip,
     next_power_of_2,
 )
-from sgl_kernel.kvcacheio import hcu_alloc_decode_kernel, hcu_alloc_extend_kernel
+from sgl_kernel.kvcacheio import hcu_alloc_decode_kernel
 
 _is_hip = is_hip()
+
+if _is_hip:
+    from lightop.kvcache import hcu_alloc_extend_kernel
+else:
+    from sgl_kernel.kvcacheio import hcu_alloc_extend_kernel
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
