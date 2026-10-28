@@ -233,6 +233,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
     def clear(self) -> None:
         super().clear()
         del self.remote_buffer
+        self._history_payload = None
 
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
@@ -418,6 +419,39 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             self.remote_layer_id = None
         self.pending_layer_id = None
 
+    def _broadcast_history_pages(self, layer_id, src_tensor):
+        """Refresh only active history; retain physical Index-K addressing."""
+        plan = getattr(self.pool, "_active_main_kv_page_plan", None)
+        if plan is None or self.remote_buffer.shape[0] != self.pool.num_pool_pages:
+            self.pool._broadcast_tensor_from_owner(
+                self.remote_buffer, layer_id, src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
+            )
+            return
+        count = plan.history_page_ids.numel()
+        if count == 0:
+            return
+        # The batch plan already validated and copied these IDs to the GPU.
+        # Its history prefix is stable until pending broadcasts are drained.
+        page_ids = self.pool._active_main_kv_compact_page_ids[:count]
+        shape = (count, *self.remote_buffer.shape[1:])
+        payload = getattr(self, "_history_payload", None)
+        if payload is None or payload.shape != shape:
+            payload = self._history_payload = self.remote_buffer.new_empty(shape)
+        if self.pool._is_layer_owned(layer_id):
+            with torch.profiler.record_function(f"layersplit_index_k_pack layer={layer_id} pages={count}"):
+                torch.index_select(src_tensor, 0, page_ids, out=payload)
+        with torch.profiler.record_function(
+            f"layersplit_index_k_broadcast layer={layer_id} pages={count} bytes={payload.nbytes}"
+        ):
+            self.pool._broadcast_tensor_from_owner(
+                payload, layer_id,
+                src_tensor=payload if self.pool._is_layer_owned(layer_id) else None,
+                use_layer_broadcast_comm=True,
+            )
+        with torch.profiler.record_function(f"layersplit_index_k_scatter layer={layer_id} pages={count}"):
+            self.remote_buffer.index_copy_(0, page_ids, payload)
+
     def prefetch(
         self,
         layer_id: int,
@@ -425,7 +459,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         layer_transfer_idx: Optional[int] = None,
         has_history: bool = True,
     ) -> None:
-        """Broadcast a full Index-K buffer ahead of its indexer layer."""
+        """Prefetch active Index-K history before its indexer layer."""
 
         # GLM-5.2 only allocates caches for layers that really run the
         # indexer. skip-topk layers reuse prior results and need no collective.
@@ -458,12 +492,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         if self.pool.layer_broadcast_comm is None:
             if transfer_counter is not None:
                 transfer_counter.wait_until(transfer_idx)
-            self.pool._broadcast_tensor_from_owner(
-                self.remote_buffer,
-                layer_id,
-                src_tensor=src_tensor,
-                use_layer_broadcast_comm=True,
-            )
+            self._broadcast_history_pages(layer_id, src_tensor)
             self.remote_layer_id = layer_id
             return
 
@@ -472,16 +501,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         with self.pool.device_module.stream(self.pool.kv_broadcast_stream):
             if transfer_counter is not None:
                 transfer_counter.wait_until(transfer_idx)
-            with torch.profiler.record_function(
-                "layersplit_index_k_broadcast "
-                f"layer={layer_id} bytes={self.remote_buffer.nbytes}"
-            ):
-                self.pool._broadcast_tensor_from_owner(
-                    self.remote_buffer,
-                    layer_id,
-                    src_tensor=src_tensor,
-                    use_layer_broadcast_comm=True,
-                )
+            self._broadcast_history_pages(layer_id, src_tensor)
             self.pending_event.record()
         self.remote_layer_id = None
         self.pending_layer_id = layer_id
