@@ -44,7 +44,9 @@ class OpenAIServingTokenize(OpenAIServingBase):
     ) -> Union[TokenizeResponse, ErrorResponse]:
         try:
             tokenizer = self.tokenizer_manager.tokenizer
-            max_model_len = getattr(tokenizer, "model_max_length", -1)
+            # The tokenizer may use an unbounded sentinel that JSON cannot
+            # encode. Report the engine's effective context limit instead.
+            max_model_len = self.tokenizer_manager.model_config.context_len
 
             if request.messages is not None:
                 token_ids = self._tokenize_chat_request(request)
