@@ -208,13 +208,20 @@ class TestDisableHostPrefetch(CustomTestCase):
             {"pp_size": 2},
         ):
             with self.subTest(**settings):
-                args = MagicMock()
-                args.mooncake_enable_waiting_queue_dfs_prefetch = True
-                args.schedule_policy = settings.get("schedule_policy", "fcfs")
-                args.disaggregation_mode = settings.get(
-                    "disaggregation_mode", "prefill"
+                args = types.SimpleNamespace(
+                    mooncake_enable_waiting_queue_dfs_prefetch=True,
+                    schedule_policy=settings.get("schedule_policy", "fcfs"),
+                    disaggregation_mode=settings.get("disaggregation_mode", "prefill"),
+                    mooncake_page_wise_load_threshold=10,
+                    mooncake_enable_page_wise_load=False,
+                    hicache_storage_backend_extra_config=None,
+                    model_path="dummy",
+                    tp_size=1,
+                    mooncake_dfs_health_probe_interval_s=None,
+                    mooncake_dfs_health_failure_threshold=None,
+                    mooncake_dfs_health_success_threshold=None,
+                    mooncake_dfs_health_probe_timeout_s=None,
                 )
-                args.mooncake_page_wise_load_threshold = 10
                 params = MagicMock()
                 params.pp_size = settings.get("pp_size", 1)
                 params.attn_cp_cache_group = None
@@ -232,19 +239,12 @@ class TestDisableHostPrefetch(CustomTestCase):
                     f"{module}.HybridCacheController.parse_storage_backend_extra_config",
                     return_value=({},),
                 ), mock.patch(
-                    f"{module}.get_memory",
-                    return_value=types.SimpleNamespace(
-                        hicache_storage_backend_extra_config=None
-                    ),
-                ), mock.patch(
-                    f"{module}.get_model",
-                    return_value=types.SimpleNamespace(model_path="dummy"),
-                ), mock.patch(
                     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
                     side_effect=SetupReached,
                 ) as setup:
                     with self.assertRaises(SetupReached):
                         MooncakeDirectLinker(args, params, components=set())
+                setup.assert_called_once()
                 self.assertIs(setup.call_args.kwargs["enable_dfs_prefetch"], False)
 
 
