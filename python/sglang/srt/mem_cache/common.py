@@ -124,6 +124,12 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         if getattr(req, "allow_radix_cache_insert_once", False):
             req.allow_radix_cache_insert_once = False
         else:
+            if kwargs.get("chunked", False):
+                # Skip shared-cache insertion, but retain this request's KV
+                # progress so the next chunk does not recompute its prefix.
+                req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : req.extend_range.end
+                ].to(dtype=torch.int64, copy=True)
             return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
