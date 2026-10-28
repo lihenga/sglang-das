@@ -36,6 +36,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResu
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
+from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+    is_dspark_swa_ring_pool,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
@@ -339,11 +342,14 @@ class TargetVerifyExecutor:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
         state_slot = None
-        if is_unified_kv_triton():
-            # unified_kv needs the per-token draft req slot to address the SWA ring
-            # (state_slot * ring + pos % ring). Verify tokens are the latest in each
-            # req so they always fall in the window; the commit gate (via commit_lens
-            # + cache_loc_2d) drops rejected tokens, so no final_pos skip is needed.
+        if is_unified_kv_triton() or is_dspark_swa_ring_pool(
+            self.kv_injector.draft_model_runner.token_to_kv_pool
+        ):
+            # unified_kv / the DSPARK ring draft pool need the per-token draft
+            # req slot to address the SWA ring (state_slot * ring + pos % ring).
+            # Verify tokens are the latest in each req so they always fall in
+            # the window; the commit gate (via commit_lens + cache_loc_2d)
+            # drops rejected tokens, so no final_pos skip is needed.
             vlen = verify_window.verify_cache_loc_2d.shape[1]
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)

@@ -150,6 +150,9 @@ class ForwardMetadata:
     swa_attn_logits: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # Untranslated window_kv_indices for windowed layers that live in the full
+    # sub-pool of a SWAKVPool (DSPARK draft ring pool only; else None).
+    window_kv_indices_full: Optional[torch.Tensor] = None
     # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
     # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
@@ -220,6 +223,14 @@ class TritonAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
+        # DSPARK draft SWA ring pool (SGLANG_DSPARK_SWA_KV_POOL): the draft
+        # attention contract windows EVERY draft layer, including the one kept
+        # in the full sub-pool. Window indices translated to ring slots are only
+        # valid for swa sub-pool layers, so the full-pool windowed layer also
+        # needs the untranslated window (window_kv_indices_full).
+        self.window_full_pool_layers = self.use_sliding_window_kv_pool and (
+            getattr(model_runner, "dspark_swa_window", None) is not None
+        )
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
@@ -681,6 +692,13 @@ class TritonAttnBackend(AttentionBackend):
 
         if in_capture:
             assert forward_batch.encoder_lens is None, "Not supported"
+            if self.window_full_pool_layers:
+                # Graph window buffers are translated in place; the full-pool
+                # windowed layer would read ring ids. Draft graph must be off.
+                raise NotImplementedError(
+                    "SGLANG_DSPARK_SWA_KV_POOL=1 requires the draft triton "
+                    "backend to run eager (SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH=1)."
+                )
             if forward_mode.is_decode_or_idle():
                 self._ensure_cuda_graph_decode_scratch()
             # Multi-step spec decode: kv buffers come from spec_info, not the
@@ -812,6 +830,18 @@ class TritonAttnBackend(AttentionBackend):
         )
         return self.cuda_graph_out_cache_loc_full_physical[:n]
 
+    def _window_kv_indices(self, layer: RadixAttention) -> torch.Tensor:
+        """Window KV ids for a windowed layer: ring-translated for swa sub-pool
+        layers, untranslated for a windowed layer kept in the full sub-pool
+        (DSPARK draft ring pool)."""
+        md = self.forward_metadata
+        if (
+            md.window_kv_indices_full is not None
+            and not self.token_to_kv_pool.layers_mapping[layer.layer_id][1]
+        ):
+            return md.window_kv_indices_full
+        return md.window_kv_indices
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
@@ -864,6 +894,7 @@ class TritonAttnBackend(AttentionBackend):
                             bs,
                             self.device,
                             self.token_to_kv_pool,
+                            skip_full_to_swa_translation=self.window_full_pool_layers,
                         )
                     )
                     window_num_kv_splits = torch.empty(
@@ -953,6 +984,7 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
+                    skip_full_to_swa_translation=self.window_full_pool_layers,
                 )
 
             custom_mask = spec_info.custom_mask
@@ -1008,6 +1040,7 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
+                    skip_full_to_swa_translation=self.window_full_pool_layers,
                 )
 
             qo_indptr = self.qo_indptr
@@ -1023,6 +1056,14 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 max_extend_len = int(forward_batch.extend_seq_lens.max())
             num_kv_splits = None
+
+        window_kv_indices_full = None
+        if self.window_full_pool_layers and window_kv_indices is not None:
+            # Eager window buffers are sized exactly to window_kv_indptr[-1].
+            window_kv_indices_full = window_kv_indices
+            window_kv_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                window_kv_indices_full
+            )
 
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -1057,6 +1098,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
             swa_out_cache_loc=swa_out_cache_loc,
+            window_kv_indices_full=window_kv_indices_full,
             out_cache_loc_full_physical=out_cache_loc_full_physical,
         )
 
@@ -1474,7 +1516,7 @@ class TritonAttnBackend(AttentionBackend):
                 layer.sliding_window_size
             )  # Needed for sliding window mask
             kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
+            kv_indices = self._window_kv_indices(layer)
             window_kv_offsets = self.forward_metadata.window_kv_offsets
         else:
             sliding_window_size = -1
@@ -1755,7 +1797,7 @@ class TritonAttnBackend(AttentionBackend):
             sliding_window_size = layer.sliding_window_size
             # Note: for unified kernel, we use full kv_indptr (not window)
             prefix_kv_indptr = self.forward_metadata.window_kv_indptr
-            prefix_kv_indices = self.forward_metadata.window_kv_indices
+            prefix_kv_indices = self._window_kv_indices(layer)
             # Compute window start positions (absolute position of first key in window)
             # window_start_pos = seq_len - window_len
             window_kv_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
@@ -1944,7 +1986,7 @@ class TritonAttnBackend(AttentionBackend):
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
+            kv_indices = self._window_kv_indices(layer)
         else:
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices

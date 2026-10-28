@@ -28,6 +28,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     alloc_verify_window,
 )
+from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+    fill_dspark_swa_ring_for_draft_forward,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -602,6 +605,18 @@ class DraftBlockProposer:
                 draft_forward_batch.out_cache_loc = draft_cache_loc
                 draft_forward_batch.spark_dspark_graph_inputs = None
             self._detach_eager_count_metadata(draft_forward_batch)
+        # Generated graph inputs are materialized at replay: positions /
+        # out_cache_loc still hold the previous step, so let the ring fill
+        # derive this step's block slots from req_to_token.
+        generated_at_replay = draft_forward_batch.spark_dspark_graph_inputs is not None
+        fill_dspark_swa_ring_for_draft_forward(
+            self.draft_model_runner,
+            req_pool_indices=batch.req_pool_indices,
+            prefix_lens=prefix_lens,
+            draft_positions=None if generated_at_replay else draft_forward_batch.positions,
+            draft_cache_locs=None if generated_at_replay else draft_forward_batch.out_cache_loc,
+            block_size=gamma,
+        )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output

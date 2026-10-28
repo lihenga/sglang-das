@@ -11,6 +11,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_unified_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+    is_dspark_swa_ring_pool,
+    scatter_dspark_swa_ring_mapping,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
@@ -82,6 +86,38 @@ class TargetHiddenKvInjector:
             )
 
         pool = self.draft_model_runner.token_to_kv_pool
+        if is_dspark_swa_ring_pool(pool):
+            # Ring draft pool: refresh the loc -> ring-slot mapping for this
+            # injection range before any write reads it. final_pos filters
+            # windowed-out tokens (long prefill chunks) to -1.
+            if state_slot is None:
+                raise ValueError(
+                    "ring draft pool injection requires state_slot "
+                    "(per-token draft req slot)"
+                )
+            scatter_dspark_swa_ring_mapping(
+                pool.full_to_swa_index_mapping,
+                req_slots=state_slot,
+                positions=positions,
+                full_locs=cache_loc,
+                window=self.draft_model_runner.dspark_swa_window,
+                ring=self.draft_model_runner.dspark_swa_ring,
+                final_pos=final_pos,
+            )
+            # The native writer type-checks MLATokenToKVPool and cannot
+            # address the ring sub-pool; write both sub-pools here instead.
+            self._inject_ring_context(
+                pool=pool,
+                hidden=target_hidden,
+                positions=positions,
+                loc_2d=(
+                    cache_loc_2d
+                    if cache_loc_2d is not None
+                    else cache_loc.view(1, -1)
+                ),
+                commit_lens=commit_lens,
+            )
+            return self._record_cuda_event(device)
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             self._inject_mla(
                 pool=pool,
@@ -113,6 +149,42 @@ class TargetHiddenKvInjector:
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(device))
         return event
+
+    def _inject_ring_context(
+        self,
+        *,
+        pool,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        loc_2d: torch.Tensor,
+        commit_lens: Optional[torch.Tensor],
+    ) -> None:
+        """Whole-range context write for the ring draft pool: full layers at
+        the given locs, sliding layers at the ring slots the mapping scatter
+        just wrote (-1 = windowed-out, skipped by the store kernel). Without
+        commit_lens (plain prefill injection) every row is committed."""
+        from sglang.srt.layers.attention.spark_dspark_committed_kv_ops import (
+            store_committed_mla_fp8,
+        )
+
+        if hidden.shape[0] == 0:
+            return
+        if commit_lens is None:
+            commit_lens = torch.full(
+                (loc_2d.shape[0],),
+                loc_2d.shape[1],
+                dtype=torch.int32,
+                device=loc_2d.device,
+            )
+        projected = self.draft_model._project_context_kv(hidden, positions)
+        swa_loc_2d = pool.full_to_swa_index_mapping[loc_2d]
+        for layer, (nope, rope) in zip(self.draft_model.model.layers, projected):
+            layer_id = layer.self_attn.attn_mqa.layer_id
+            sub_layer_id, is_swa = pool.layers_mapping[layer_id]
+            sub_pool = pool.swa_kv_pool if is_swa else pool.full_kv_pool
+            cache = sub_pool.get_key_buffer(sub_layer_id)
+            locs = swa_loc_2d if is_swa else loc_2d
+            store_committed_mla_fp8(cache, locs, commit_lens, nope, rope)
 
     def _inject_mla(
         self,

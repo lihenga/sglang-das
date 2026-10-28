@@ -1830,7 +1830,19 @@ class KVCacheConfigurator:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                if self.draft_swa_full_capacity:
+                if envs.SGLANG_DSPARK_SWA_KV_POOL.get():
+                    # DSPARK ring draft pool: the sliding sub-pool is a
+                    # per-req ring addressed by req_slot*ring + pos%ring;
+                    # dspark_swa_pool.scatter_dspark_swa_ring_mapping fills
+                    # the table before every draft-side windowed access.
+                    # All -1: an unfilled loc translates to skip.
+                    n = sizes.full_max_total_num_tokens + self.pool_page_size
+                    ring_mapping = torch.full(
+                        (n + 1,), -1, dtype=torch.int64, device=self.device
+                    )
+                    ring_mapping[-1] = -1
+                    token_to_kv_pool.register_mapping(ring_mapping)
+                elif self.draft_swa_full_capacity:
                     # Banded depth: the SWA ring is full draft capacity, so use
                     # an IDENTITY full->swa mapping — store and read locs both
                     # equal out_cache_loc, and a slot is never evicted before
@@ -2026,6 +2038,76 @@ class KVCacheConfigurator:
             )
         return max_num_reqs
 
+    def _estimate_dspark_swa_budget_boost(self, available_bytes: int) -> int:
+        """Bytes the windowed draft pool frees vs the full-length one, to be
+        credited into the target KV budget so tokens grow at unchanged
+        --mem-fraction-static. Savings = sliding-layer full-length storage the
+        ring replaces, minus the ring pool itself; clamped to the whole
+        full-length draft pool (the physical upper bound)."""
+        import json
+        import os
+
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        draft_path = self.server_args.speculative_draft_model_path
+        if not draft_path:
+            return 0
+        try:
+            with open(os.path.join(draft_path, "config.json")) as f:
+                draft_cfg = json.load(f)
+            layer_types = draft_cfg["layer_types"]
+            num_swa = sum(
+                1
+                for idx in draft_cfg["target_layer_ids"]
+                if layer_types[idx] == "sliding_attention"
+            )
+            window = int(
+                draft_cfg.get("dspark_sliding_window")
+                or draft_cfg.get("dspark_swa_window")
+                or 0
+            )
+            kv_bytes = int(draft_cfg["kv_lora_rank"]) + int(
+                draft_cfg["qk_rope_head_dim"]
+            )
+        except (OSError, KeyError, ValueError, TypeError) as e:
+            logger.warning(
+                "DSPARK draft pool boost: cannot read draft config at %s (%s); "
+                "skipping target budget boost",
+                draft_path,
+                e,
+            )
+            return 0
+        if num_swa <= 0 or kv_bytes <= 0 or window <= 0:
+            return 0
+        base_tokens = (
+            create_memory_pool_configurator(self)
+            .calculate_pool_sizes(available_bytes, get_schedule().page_size)
+            .max_total_num_tokens
+        )
+        # Ring slots per req: 2x window, page-aligned (mirror
+        # dspark_swa_pool.resolve_dspark_swa_ring_tokens; SGLANG_DSPARK_SWA_RING_TOKENS
+        # override applies to both).
+        ring = envs.SGLANG_DSPARK_SWA_RING_TOKENS.get()
+        ring = ring if ring > 0 else 2 * window
+        page = get_schedule().page_size
+        ring = (ring + page - 1) // page * page
+        # Per-DP req slots: the global running cap is a conservative bound
+        # (attn-TP sharding makes the real number smaller).
+        dp_concurrency = max(
+            1,
+            (get_schedule().max_running_requests or 32)
+            // max(1, get_parallel().attn_dp_size),
+        )
+        ring_pool_bytes = dp_concurrency * ring * kv_bytes * num_swa
+        full_length_savings = num_swa * base_tokens * kv_bytes
+        num_draft_layers = len(draft_cfg["target_layer_ids"])
+        total_draft_pool_bytes = base_tokens * kv_bytes * num_draft_layers
+        return max(
+            0, min(full_length_savings - ring_pool_bytes, total_draft_pool_bytes)
+        )
+
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
@@ -2035,6 +2117,20 @@ class KVCacheConfigurator:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        if (
+            not self.is_draft_worker
+            and self.spec_algorithm.is_dspark()
+            and envs.SGLANG_DSPARK_SWA_KV_POOL.get()
+            and envs.SGLANG_DSPARK_SWA_KV_POOL_TARGET_BOOST.get()
+        ):
+            boost = self._estimate_dspark_swa_budget_boost(available_bytes)
+            if boost > 0:
+                available_bytes += boost
+                logger.info(
+                    "DSPARK windowed draft pool: crediting %.2f GB of draft "
+                    "pool savings back into the target KV budget",
+                    boost / 2**30,
+                )
         config = self.config_from_budget(available_bytes)
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
