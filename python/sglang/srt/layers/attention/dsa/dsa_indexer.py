@@ -1871,6 +1871,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_indices_offset_override=topk_offset_chunk,
             )
             topk_result[start:end] = raw_topk_chunk
+            # Release this chunk before allocating the next logits matrix.
+            del logits_chunk, raw_topk_chunk
             start = end
 
         return topk_result
