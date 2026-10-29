@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -167,6 +168,46 @@ def _dequantize_k_cache_fast_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
+@lru_cache(maxsize=None)
+def _lightop_prefill_gather(device_index):
+    if torch.version.hip is None:
+        return None
+    if not torch.cuda.get_device_properties(device_index).gcnArchName.startswith("gfx936"):
+        return None
+    try:
+        from lightop import op
+    except ImportError:
+        return None
+    # Older native builds encode BF16 NaNs differently from the Triton fallback.
+    if getattr(op, "PREFILL_GATHER_TRITON_NAN_COMPAT_VERSION", 0) < 1:
+        return None
+    return op
+
+
+def _try_lightop_prefill_gather(cache, ids, group_size):
+    if not (
+        group_size == 128
+        and cache.is_cuda
+        and cache.dtype == torch.float8_e4m3fn
+        and cache.ndim in (3, 4)
+        and cache.shape[-2:] == (1, 656)
+        and cache.is_contiguous()
+        and cache.data_ptr() % 16 == 0
+        and ids.is_cuda
+        and ids.device == cache.device
+        and ids.dtype == torch.int32
+        and ids.ndim == 1
+        and ids.is_contiguous()
+    ):
+        return None
+    op = _lightop_prefill_gather(cache.device.index)
+    if op is None:
+        return None
+    output = torch.empty((ids.numel(), 1, 576), device=cache.device, dtype=torch.bfloat16)
+    op.prefill_gather_and_upconvert_fp8_kv_cache(cache, ids, output)
+    return output
+
+
 def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
@@ -180,6 +221,12 @@ def dequantize_k_cache_paged(
     Returns:
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
+    lightop_output = _try_lightop_prefill_gather(
+        quant_k_cache, page_table_1_flattened, group_size
+    )
+    if lightop_output is not None:
+        return lightop_output
+
     dim_quant = quant_k_cache.shape[-1]
     assert (
         dim_quant == 656
