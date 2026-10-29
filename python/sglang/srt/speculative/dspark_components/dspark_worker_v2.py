@@ -56,6 +56,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
+from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+    is_dspark_swa_ring_pool,
+)
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
     InfoSegment,
@@ -140,7 +143,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._spark_attention_tp:
             logger.info(
-                "Spark attention TP8 draft: native MoE=%s, full EP32, "
+                "Spark attention TP draft: native MoE=%s, full EP32, "
                 "eager draft, static target verification and replica sampling enabled",
                 self._draft_is_moe,
             )
@@ -385,11 +388,44 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if (
+            envs.SGLANG_DSPARK_SWA_KV_POOL.get()
+            and memory_pool_config is not None
+        ):
+            memory_pool_config = self._apply_swa_pool_geometry(
+                memory_pool_config, req_to_token_pool
+            )
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+
+    def _apply_swa_pool_geometry(self, memory_pool_config, req_to_token_pool):
+        """Window the draft KV pool (SGLANG_DSPARK_SWA_KV_POOL): flip the
+        draft model_config to hybrid SWA and size the sliding sub-pool as a
+        per-req ring. D-side decode only: the ring is addressed by the shared
+        req_pool_indices, so the draft must run with the target's
+        req_to_token_pool."""
+        if req_to_token_pool is None:
+            raise ValueError(
+                "SGLANG_DSPARK_SWA_KV_POOL=1 requires the draft to share the "
+                "target req_to_token_pool (ring addressing by req slot); got "
+                "None. The windowed draft pool is decode-side only."
+            )
+        from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+            apply_dspark_swa_pool_geometry,
+        )
+
+        draft_config, self._swa_window, self._swa_ring = (
+            apply_dspark_swa_pool_geometry(
+                self.draft_model_runner,
+                self.draft_model,
+                req_to_token_pool,
+                memory_pool_config,
+            )
+        )
+        return draft_config
 
     def init_attention_backends(self):
         with self._draft_context():
@@ -563,9 +599,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         # unified_kv injects into the SWA ring keyed by (draft req slot, position);
         # thread the per-token state_slot + the req's final position so the
         # injector keeps only the last SWA window (older prefill tokens share a
-        # ring slot and would race). Cheap; only consumed under unified_kv.
+        # ring slot and would race). Same for the DSPARK ring draft pool.
+        # Cheap; only consumed under unified_kv / the ring pool.
         state_slot = final_pos = None
-        if is_unified_kv_triton():
+        if (
+            is_unified_kv_triton()
+            or is_dspark_swa_ring_pool(self.draft_model_runner.token_to_kv_pool)
+        ):
             repeats = ctx_lens.to(torch.int64)
             state_slot = torch.repeat_interleave(
                 batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats
@@ -632,10 +672,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         req_pool_idx = int(req.req_pool_idx)
         cache_loc = self.model_runner.req_to_token_pool.req_to_token[req_pool_idx, pos]
+        # Ring draft pool: slot every chunk token to its req ring row; tokens
+        # older than the req's final position minus the window map to -1.
+        state_slot = final_pos = None
+        if is_dspark_swa_ring_pool(self.draft_model_runner.token_to_kv_pool):
+            state_slot = torch.full_like(pos, req_pool_idx)
+            final_pos = torch.full_like(pos, int(hidden_start) + row_len - 1)
         return self._kv_injector.inject_target_hidden(
             target_hidden=hidden,
             cache_loc=cache_loc,
             positions=pos,
+            state_slot=state_slot,
+            final_pos=final_pos,
         )
 
     def _decode_idle_result(

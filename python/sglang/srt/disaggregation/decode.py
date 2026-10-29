@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    append_state_component,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -112,6 +113,13 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+)
+from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+    dspark_draft_swa_ring_pages,
+    dspark_draft_swa_state_buf_infos,
+    dspark_swa_decode_prefix_cap,
+    dspark_swa_decode_prefix_window,
+    resolve_dspark_swa_ring_tokens,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_hcu, is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -518,6 +526,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         )
 
+    def _dspark_swa_decode_prefix_window(self) -> int:
+        window = getattr(self, "_dspark_swa_prefix_window", None)
+        if window is None:
+            window = dspark_swa_decode_prefix_window(self.scheduler.server_args)
+            self._dspark_swa_prefix_window = window
+        return window
+
+    def _dspark_draft_swa_ring_pool(self) -> Optional[SWAKVPool]:
+        """The windowed DSPARK draft pool, None unless SGLANG_DSPARK_SWA_KV_POOL
+        built one."""
+        pool = self.draft_token_to_kv_pool
+        if envs.SGLANG_DSPARK_SWA_KV_POOL.get() and type(pool) is SWAKVPool:
+            return pool
+        return None
+
     def _dsv4_safe_prefix_len(self, prefix_len: int) -> int:
         """Avoid splitting reused prefixes through compressed DSV4 blocks."""
         if not self._uses_dsv4_decode_radix_cache() or prefix_len <= 0:
@@ -660,8 +683,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
             if has_kv_layer_ids:
                 target_layer_num = self.scheduler.model_config.num_hidden_layers
+                if (
+                    envs.SGLANG_DSPARK_SWA_KV_POOL.get()
+                    and isinstance(self.draft_token_to_kv_pool, SWAKVPool)
+                ):
+                    # Windowed draft pool: only the full sub-pool is
+                    # transferable; advertise its model-local layer ids so
+                    # the prefill peer's filtered entries pair up.
+                    draft_layer_ids = (
+                        self.draft_token_to_kv_pool.full_attention_layer_ids
+                    )
+                else:
+                    draft_layer_ids = list(range(len(draft_kv_data_ptrs)))
                 kv_layer_ids += [
-                    target_layer_num + i for i in range(len(draft_kv_data_ptrs))
+                    target_layer_num + i for i in draft_layer_ids
                 ]
 
         kv_args.kv_data_ptrs = kv_data_ptrs
@@ -684,6 +719,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
             pd_hidden_pool=getattr(self.metadata_buffers, "pd_hidden_pool", None),
         )
+        if self._dspark_draft_swa_ring_pool() is not None:
+            # Sliding draft layers arrive as their last-window pages, written
+            # into this req slot's ring pages. Appended last, mirroring prefill.
+            ring_pool = self._dspark_draft_swa_ring_pool()
+            ptrs, lens, item_lens, layer_ids = dspark_draft_swa_state_buf_infos(
+                *ring_pool.swa_kv_pool.get_contiguous_buf_infos(),
+                ring_pool.swa_attention_layer_ids,
+                self.scheduler.model_config.num_hidden_layers,
+            )
+            append_state_component(
+                kv_args,
+                StateType.DSPARK_DRAFT_SWA,
+                ptrs,
+                lens,
+                item_lens,
+                layer_ids=layer_ids,
+            )
+        logger.info("PD decode state_types=%s", kv_args.state_types)
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
@@ -1380,6 +1433,45 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         # them.
                         total_prefix_len = min(total_prefix_len, prefix_len)
 
+                # DSPARK draft SWA ring pool: a reused prefix carries no draft
+                # sliding-layer KV (ring rows die with their req slot), so cap
+                # reuse at the draft window start; prefill then sends KV +
+                # hidden rows for the window and the injection rebuilds it.
+                draft_swa_window = self._dspark_swa_decode_prefix_window()
+                if draft_swa_window > 0 and prefix_len > 0:
+                    draft_swa_prefix_cap = dspark_swa_decode_prefix_cap(
+                        origin_input_len, draft_swa_window, page_size
+                    )
+                    if prefix_len > draft_swa_prefix_cap:
+                        prefix_len = draft_swa_prefix_cap
+                        prefix_indices = prefix_indices[:prefix_len]
+                        total_prefix_len = min(total_prefix_len, prefix_len)
+                    if prefix_len == 0:
+                        # Short prompt (input <= window + page): nothing is
+                        # reusable. Swap the node lock for the root lock a
+                        # natural miss holds, so the later _dec_req_lock in
+                        # cache_unfinished_req stays balanced.
+                        req = decode_req.req
+                        self._release_decode_radix_match(req)
+                        root = self.tree_cache.root_node_handle(
+                            extra_key=req.extra_key
+                        )
+                        req.last_node = req.last_host_node = root
+                        req.best_match_node = root
+                        req.host_hit_length = 0
+                        req.prefix_indices = prefix_indices
+                        req.skip_lock_node_ids = {}
+                        req.swa_uuid_for_lock = self.tree_cache.inc_lock_ref(
+                            root
+                        ).swa_uuid_for_lock
+                        prefix_match = DecodePrefixMatch(
+                            prefix_indices=prefix_indices,
+                            l2_host_hit_length=0,
+                            l3_storage_hit_length=0,
+                            last_device_node=root,
+                        )
+                        locked_prefix_len = 0
+
                 # Decode transfers the SWA tail fresh, so retain only the
                 # full-attention prefix lock needed for reuse. If a later
                 # alignment/cap drops the match, _release_decode_radix_match
@@ -1862,6 +1954,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
+            def _dspark_draft_swa_payload():
+                # Ring pages for the window prefill ships, in position order.
+                window = self._dspark_swa_decode_prefix_window()
+                return dspark_draft_swa_ring_pages(
+                    int(decode_req.req.req_pool_idx),
+                    seq_len,
+                    window,
+                    resolve_dspark_swa_ring_tokens(window, page_size),
+                    page_size,
+                )
+
             def _c128_state_payload():
                 online = is_dsv4_c128_online_enabled()
                 ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
@@ -1888,6 +1991,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.C128_STATE: _c128_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
+                StateType.DSPARK_DRAFT_SWA: _dspark_draft_swa_payload,
             }
 
             def _pd_hidden_payload():

@@ -23,14 +23,16 @@ def _store_committed_mla_bytes(
     row = tl.program_id(0)
     committed = row % VERIFY_STRIDE < tl.load(commit_lens + row // VERIFY_STRIDE)
     # Rejected rows may contain invalid locations. Do not load their location,
-    # their projected values, or form a cache write for them.
+    # their projected values, or form a cache write for them. loc -1 is the
+    # windowed-out sentinel (DSPARK ring draft pool): skip it too.
     if committed:
         loc = tl.load(locs + row)
-        cols = tl.arange(0, BLOCK)
-        k = tl.load(nope + row * NOPE_ROW + cols, cols < NOPE_DIM, other=0)
-        r = tl.load(rope + row * ROPE_ROW + cols, cols < ROPE_DIM, other=0)
-        tl.store(cache + loc * CACHE_ROW + cols, k, cols < NOPE_DIM)
-        tl.store(cache + loc * CACHE_ROW + NOPE_DIM + cols, r, cols < ROPE_DIM)
+        if loc >= 0:
+            cols = tl.arange(0, BLOCK)
+            k = tl.load(nope + row * NOPE_ROW + cols, cols < NOPE_DIM, other=0)
+            r = tl.load(rope + row * ROPE_ROW + cols, cols < ROPE_DIM, other=0)
+            tl.store(cache + loc * CACHE_ROW + cols, k, cols < NOPE_DIM)
+            tl.store(cache + loc * CACHE_ROW + NOPE_DIM + cols, r, cols < ROPE_DIM)
 
 
 def store_committed_mla_fp8(cache, loc_2d, commit_lens, nope, rope):

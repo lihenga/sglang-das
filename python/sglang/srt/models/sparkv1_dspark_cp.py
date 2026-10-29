@@ -145,7 +145,13 @@ def install_spark_v1_dspark_cp_adapter() -> bool:
         hidden_states, aux_hidden_states = result
         if (
             parallel.attn_tp_size > 1
-            and os.getenv("SGLANG_SPARK_DSPARK_ATTENTION_TP8", "0") == "1"
+            and (
+                os.getenv("SGLANG_SPARK_DSPARK_ATTENTION_TP8", "0") == "1"
+                or (
+                    parallel.attn_tp_size == 2
+                    and os.getenv("SGLANG_SPARK_DSPARK_ATTENTION_TP2", "0") == "1"
+                )
+            )
         ):
             aux_hidden_states = _gather_tp_aux_hidden_states(
                 hidden_states,

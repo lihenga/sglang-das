@@ -501,6 +501,21 @@ class Envs:
     # Force the DSpark draft's SlimQuant W4A8 MoE method to a selected backend
     # without changing the target model's W4A8 or generic MoE backend.
     SGLANG_DSPARK_FORCE_W4A8_TPMOE_BACKEND = EnvStr(None)
+    # Window the draft KV pool: sliding draft layers (SWA 512) get a per-req
+    # ring sub-pool instead of full-length storage, freeing ~2 GiB/card that
+    # is credited back to the target KV budget. Rollback: unset (= full pool).
+    SGLANG_DSPARK_SWA_KV_POOL = EnvBool(False)
+    # Ring slots per request for the windowed draft pool, 0 = derive from the
+    # draft SWA window (2x window, page-aligned).
+    SGLANG_DSPARK_SWA_RING_TOKENS = EnvInt(0)
+    # Credit the draft pool savings back into the target KV budget. Requires
+    # SGLANG_DSPARK_SWA_KV_POOL=1; off leaves the freed memory unused.
+    SGLANG_DSPARK_SWA_KV_POOL_TARGET_BOOST = EnvBool(True)
+    # P-side only: skip the draft sliding layers in the P->D draft KV transfer.
+    # The decode peer runs SGLANG_DSPARK_SWA_KV_POOL=1 and rebuilds those
+    # layers from the transferred target hidden rows, so sending them would
+    # fail the PD layer pairing (decode registers only the draft full layer).
+    SGLANG_DSPARK_PD_SKIP_SWA_DRAFT_KV = EnvBool(False)
     # PD hidden-state receive pool size, in tokens (-1 = derive from the
     # decode-side chunk budget).
     SGLANG_PD_HIDDEN_RECV_POOL_TOKENS = EnvInt(-1)
