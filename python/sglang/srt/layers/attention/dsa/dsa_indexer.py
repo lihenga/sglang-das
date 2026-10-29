@@ -70,6 +70,48 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hcu = is_hcu()
+# SGLANG_HCU_QUANT_REUSE=1: forward_mla_rocm sets Indexer._hcu_quant_reuse to
+# ((q_lora, its fp8 quant) | None, (hidden_states, its fp8 quant) | None) around the indexer
+# call; the HCU branch of _get_q_k_bf16 feeds wq_b / wk a pair whose source is its input.
+_hcu_quant_reuse = _is_hcu and get_bool_env_var("SGLANG_HCU_QUANT_REUSE")
+_hcu_reuse_logged = set()
+# SGLANG_HCU_MQA_PCTAS=<n>: persistent CTAs of lightop page_mqa_logits_sparse_mask[_grouped]
+# (0 = lightop default, min(chunks, 32)); test_mqa_pctas.py checks the bits do not change.
+_hcu_mqa_pctas = 0
+if _is_hcu:
+    import os as _os
+
+    _hcu_mqa_pctas = int(_os.environ.get("SGLANG_HCU_MQA_PCTAS", "0"))
+# SGLANG_HCU_MQA_LOGITS=1: the sparse-mask indexer logits run hcu_ops.mqa_logits (same bits as
+# lightop page_mqa_logits_sparse_mask[_grouped], tuned launch) when it covers the operands.
+# SGLANG_HCU_MQA_HIST=1: that kernel also builds the first histogram pass of the paired
+# hcu_ops sparse_mask_topk_transform (dsa_indexer_metadata's SGLANG_HCU_FAST_MASK_TOPK path).
+_hcu_mqa = None
+_hcu_mqa_hist = False
+_hcu_mqa_logged = set()
+if _is_hcu and _os.environ.get("SGLANG_HCU_MQA_LOGITS", "0") == "1":
+    import hcu_ops as _hcu_mqa
+
+    _hcu_mqa_hist = (
+        _os.environ.get("SGLANG_HCU_MQA_HIST", "0") == "1"
+        and _os.environ.get("SGLANG_HCU_FAST_MASK_TOPK", "1") == "1"
+    )
+
+
+def _hcu_reused_quant(pair, t):
+    """pair[1] when pair = (source, quant args) has ``t`` as its source, else None."""
+    if pair is None:
+        return None
+    src, args = pair
+    if src is t or (
+        isinstance(t, torch.Tensor)
+        and src.data_ptr() == t.data_ptr()
+        and src.shape == t.shape
+        and src.stride() == t.stride()
+        and src.dtype == t.dtype
+    ):
+        return args
+    return None
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -649,9 +691,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ):
         weights_raw = None
         if _is_hcu:
-            query, _ = self.wq_b(q_lora)
+            qa = xa = None
+            reuse = getattr(self, "_hcu_quant_reuse", None) if _hcu_quant_reuse else None
+            if reuse is not None:
+                qa = _hcu_reused_quant(reuse[0], q_lora)
+                xa = _hcu_reused_quant(reuse[1], x)
+                hit = (qa is not None, xa is not None)
+                if hit not in _hcu_reuse_logged:
+                    _hcu_reuse_logged.add(hit)
+                    logger.info("SGLANG_HCU_QUANT_REUSE: wq_b reuse=%s wk reuse=%s", *hit)
+            if qa is None:
+                query, _ = self.wq_b(q_lora)
+            else:
+                query, _ = self.wq_b(q_lora, quant_args=qa)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-            key, _ = self.wk(x)
+            if xa is None:
+                key, _ = self.wk(x)
+            else:
+                key, _ = self.wk(x, quant_args=xa)
             if key.ndim == 2:
                 key = key.view(key.shape[0], -1, self.head_dim)
 
@@ -1253,6 +1310,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     paged_schedule_metadata,
                     max_seq_len,
                 )
+            elif _hcu_mqa is not None and _hcu_mqa.mqa_logits_supported(
+                active_q,
+                kv_cache,
+                active_weights,
+                sparse_route.group_size,
+                seqlens_32,
+                block_tables,
+                max_seq_len,
+            ):
+                # SGLANG_HCU_MQA_LOGITS: lightop's logits / mask bits, tuned launch
+                logits, sparse_mask = _hcu_mqa.mqa_logits(
+                    active_q,
+                    kv_cache,
+                    active_weights,
+                    seqlens_32,
+                    block_tables,
+                    max_seq_len,
+                    sparse_route.group_size,
+                    hist_lens=(
+                        metadata.get_seqlens_expanded() if _hcu_mqa_hist else None
+                    ),
+                )
+                if sparse_route.group_size not in _hcu_mqa_logged:
+                    _hcu_mqa_logged.add(sparse_route.group_size)
+                    logger.info(
+                        "SGLANG_HCU_MQA_LOGITS: hcu_ops.mqa_logits group_size=%d hist=%s",
+                        sparse_route.group_size,
+                        _hcu_mqa_hist,
+                    )
             elif sparse_route.group_size == 1:
                 from lightop.gemmopt import page_mqa_logits_sparse_mask
 
@@ -1266,6 +1352,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     max_seq_len,
                     clean_logits=True,
                     num_warps=4,
+                    persistent_ctas=_hcu_mqa_pctas,
                 )
             else:
                 from lightop.gemmopt import page_mqa_logits_sparse_mask_grouped
@@ -1280,6 +1367,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     max_seq_len,
                     clean_logits=True,
                     num_warps=4,
+                    persistent_ctas=_hcu_mqa_pctas,
                     group_size=sparse_route.group_size,
                 )
             if use_int8_index_cache and not hasattr(

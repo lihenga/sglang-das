@@ -1789,10 +1789,10 @@ class RowParallelLinear(LinearBase):
                 output = torch.empty(
                     output_shape, device=input_.device, dtype=input_.dtype
                 )
-                deepgemm.fp8_gemm(
-                    (input_x, x_scale),
-                    (self.weight, self.weight_scale),
-                    output,
+                from sglang.srt.layers.quantization.fp8_utils import _hcu_fp8_gemm
+
+                _hcu_fp8_gemm(
+                    input_x, x_scale, self.weight, self.weight_scale, output
                 )
                 output_parallel = output.view(*output_shape)
                 if sm is not None:

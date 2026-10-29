@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import os
+
 import torch
 
 from sglang.srt.environ import envs
@@ -17,6 +19,10 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa_backend import DSAMetadata
+
+
+# Exact multi-CTA TopK-2048 kernel for HCU (hcu_ops); 0 falls back to LightOp.
+_HCU_FAST_MASK_TOPK = os.environ.get("SGLANG_HCU_FAST_MASK_TOPK", "1") == "1"
 
 
 class BaseIndexerMetadata(ABC):
@@ -211,6 +217,13 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         ):
             raise RuntimeError(
                 "Sparse Page-MQA metadata rows must match its paired paged TopK"
+            )
+
+        if _HCU_FAST_MASK_TOPK:
+            from hcu_ops import sparse_mask_topk_transform
+
+            return sparse_mask_topk_transform(
+                logits, nonzero_mask, lengths, page_table_size_1, cu_seqlens_q, topk
             )
 
         from lightop.attention import fast_topk_transform_sparse_mask_fused

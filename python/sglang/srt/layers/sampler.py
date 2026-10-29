@@ -85,6 +85,8 @@ class Sampler(nn.Module):
         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
 
         self.output_logprob_processor = OutputLogprobProcessor()
+        if _hcu_sampler_warmup and torch.cuda.is_available():
+            _hcu_warmup_sampling_kernels()
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -562,6 +564,51 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     raise ValueError(
         f"Unknown sampling backend '{backend}'. Register it via register_sampler_backend()."
     )
+
+
+# --- HCU patch (SGLANG_HCU_SAMPLER_WARMUP=1) ---------------------------------------------
+# Server and bench warmups are greedy, so the T>0 sampling kernels (multinomial: max/min/sum/
+# exponential_/div/argmax; top-p: sort/cumsum/masked fill/gather) were first launched -- and
+# their HIP code objects lazily loaded -- on the first real request of each DP rank, where
+# some ranks intermittently died with hipErrorNoBinaryForGpu ("no kernel image").  Run the
+# same code paths once when the sampler is created, so the first use happens at startup with
+# no other work in flight, and retry a failed load instead of failing a request later.
+_hcu_sampler_warmup = get_bool_env_var("SGLANG_HCU_SAMPLER_WARMUP")
+
+
+def _hcu_warmup_sampling_kernels(vocab: int = 155648, tries: int = 3):
+    dev = torch.device("cuda", torch.cuda.current_device())
+    for attempt in range(1, tries + 1):
+        try:
+            for bs in (1, 8):
+                # next_token_logits are always float32 here (logits_processor casts them)
+                logits = torch.randn(bs, vocab, device=dev, dtype=torch.float32)
+                temps = torch.full((bs, 1), 0.7, device=dev, dtype=torch.float32)
+                logits.div_(temps)
+                logits[:] = torch.softmax(logits, dim=-1)
+                probs = logits
+                torch.log(probs)
+                sampling_from_probs_torch(probs)
+                top_k_top_p_min_p_sampling_from_probs_torch(
+                    probs,
+                    torch.full((bs,), TOP_K_ALL, device=dev, dtype=torch.int32),
+                    torch.full((bs,), 0.95, device=dev, dtype=torch.float32),
+                    torch.zeros((bs,), device=dev, dtype=torch.float32),
+                    False,
+                    None,
+                    None,
+                )
+                torch.argmax(probs, -1)
+            torch.cuda.synchronize(dev)
+            torch.cuda.empty_cache()  # runs before KV-pool sizing; give the scratch back
+            if attempt > 1:
+                logger.warning("HCU sampler warmup succeeded on attempt %d", attempt)
+            return
+        except RuntimeError as e:  # torch.AcceleratorError derives from RuntimeError
+            if attempt == tries:
+                raise
+            logger.warning("HCU sampler warmup attempt %d failed, retrying: %s",
+                           attempt, str(e).splitlines()[0])
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(

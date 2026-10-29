@@ -63,6 +63,22 @@ _is_hcu = is_hcu()
 _use_hcu_lightop_gemma_rmsnorm = _is_hcu and get_bool_env_var(
     "SGLANG_USE_LIGHTOP_GEMMA_RMSNORM"
 )
+# SGLANG_HCU_STRIDED_RMS=1: RMSNorm.forward_hip normalizes a row-strided 2-D bf16 x (GLM-5.3's
+# q_a / kv_a slices of the packed qkv latent, width 2048 / 512) without the .contiguous()
+# copy; lightop rms_norm_opt honours the row stride and gives the same bits.
+_hcu_strided_rms = _is_hcu and get_bool_env_var("SGLANG_HCU_STRIDED_RMS")
+# SGLANG_HCU_NORM_QUANT=1: an RMSNorm flagged _hcu_norm_quant (GLM-5.3 decoder input /
+# post-attention norms) runs its residual path as hcu_ops.fused_add_rms_quant -- the x /
+# residual bits of lightop fused_add_rms_norm_opt plus the per-token fp8 quant of x -- and
+# stashes (x, q, s) for the CHANNEL-fp8 linears reading x (compressed_tensors_w8a8_fp8.py).
+_hcu_norm_quant = _is_hcu and get_bool_env_var("SGLANG_HCU_NORM_QUANT")
+_hcu_norm_quant_max_m = 0
+if _hcu_norm_quant:
+    import os
+
+    import hcu_ops as _hcu_ops
+
+    _hcu_norm_quant_max_m = int(os.environ.get("SGLANG_HCU_NORM_QUANT_MAX_M", "4096"))
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
 
@@ -826,6 +842,18 @@ class RMSNorm(BaseFusedOp):
                 self.variance_epsilon,
             )
 
+        if (
+            _hcu_strided_rms
+            and residual is None
+            and x.dim() == 2
+            and x.stride(-1) == 1
+            and x.shape[-1] in (512, 2048)
+            and x.dtype == torch.bfloat16
+        ):
+            out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+            op.rms_norm_opt(out, x, self.weight.data, self.variance_epsilon)
+            return out
+
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -833,6 +861,18 @@ class RMSNorm(BaseFusedOp):
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             if _is_hcu:
+                if (
+                    _hcu_norm_quant
+                    and getattr(self, "_hcu_norm_quant", False)
+                    and 0 < x.shape[0] <= _hcu_norm_quant_max_m
+                    and not torch.compiler.is_compiling()
+                    and _hcu_ops.norm_quant_supported(x, residual, self.weight.data)
+                ):
+                    q, s = _hcu_ops.fused_add_rms_quant(
+                        x, residual, self.weight.data, self.variance_epsilon
+                    )
+                    _hcu_ops.norm_quant_stash_set(x, q, s)
+                    return x, residual
                 op.fused_add_rms_norm_opt(
                     x,
                     residual,

@@ -256,6 +256,37 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
 
 logger = logging.getLogger(__name__)
 
+# SGLANG_HCU_QUANT_REUSE=1: on decode / target-verify batches prepare_qkv_latent quantizes
+# hidden_states once for fused_qkv_a_proj_with_mqa and keeps the pair as self._hcu_x_quant;
+# forward_mla_rocm passes it on to the indexer's wk, which reads the same hidden_states.
+_hcu_quant_reuse = False
+if _is_hcu:
+    from sglang.srt.utils import get_bool_env_var as _get_bool_env_var
+
+    _hcu_quant_reuse = _get_bool_env_var("SGLANG_HCU_QUANT_REUSE")
+if _hcu_quant_reuse:
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (  # noqa: E501
+        hcu_quant_input,
+        hcu_reusable_fp8_input,
+    )
+
+# SGLANG_HCU_NORM_QUANT=1: the decoder layers' input / post-attention RMSNorms (flagged
+# _hcu_norm_quant below) also emit the per-token fp8 quant of their output for the
+# CHANNEL-fp8 linears reading it (fused_qkv_a_proj_with_mqa + indexer wk, shared-expert /
+# dense gate_up).  SGLANG_HCU_SILU_QUANT=1: DeepseekV2MLP's SiluAndMul and down_proj's input
+# quant run as one hcu_ops.silu_mul_quant kernel.  Same bits as the unfused ops.
+_hcu_norm_quant = _hcu_silu_quant = False
+if _is_hcu:
+    _hcu_norm_quant = _get_bool_env_var("SGLANG_HCU_NORM_QUANT")
+    _hcu_silu_quant = _get_bool_env_var("SGLANG_HCU_SILU_QUANT")
+if _hcu_silu_quant:
+    import hcu_ops as _hcu_ops
+
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (  # noqa: E501
+        HcuQuantArgs,
+        hcu_reusable_fp8_input,
+    )
+
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
 
@@ -465,6 +496,19 @@ class DeepseekV2MLP(nn.Module):
                 x = gate_up.new_empty((M, N // 2))
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
+            if (
+                _hcu_silu_quant
+                and self.down_proj.input_is_parallel
+                and hcu_reusable_fp8_input(self.down_proj, gate_up)
+                and _hcu_ops.silu_mul_quant_supported(gate_up)
+                and not torch.compiler.is_compiling()
+            ):
+                # SGLANG_HCU_SILU_QUANT: down_proj takes the fused kernel's fp8 pair
+                x, _ = self.down_proj(
+                    gate_up,
+                    input_quant_args=HcuQuantArgs(_hcu_ops.silu_mul_quant(gate_up)),
+                )
+                return x
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -2316,6 +2360,8 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        if _hcu_quant_reuse:
+            self._hcu_x_quant = None
         if self._use_min_latency_fused_a_gemm is None:
             self._use_min_latency_fused_a_gemm = (
                 self.has_fused_proj
@@ -2329,6 +2375,19 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 backend=self.fused_a_gemm_backend,
             )
+        if (
+            _hcu_quant_reuse
+            and self.use_dsa
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and hcu_reusable_fp8_input(self.fused_qkv_a_proj_with_mqa, hidden_states)
+            and hcu_reusable_fp8_input(getattr(self.indexer, "wk", None), hidden_states)
+        ):
+            qx = hcu_quant_input(hidden_states)
+            self._hcu_x_quant = (hidden_states, qx)
+            return self.fused_qkv_a_proj_with_mqa(hidden_states, quant_args=qx)[0]
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
     def q_b_proj_forward(
@@ -2480,6 +2539,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        if _hcu_norm_quant:
+            self.input_layernorm._hcu_norm_quant = True
+            self.post_attention_layernorm._hcu_norm_quant = True
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 

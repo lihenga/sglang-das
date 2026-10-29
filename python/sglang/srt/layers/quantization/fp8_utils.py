@@ -253,6 +253,20 @@ if _is_cuda:
 if _is_hcu:
     import deepgemm
 
+    # SGLANG_HCU_SKINNY_GEMM=1: decode-sized M with a tuned config in hcu_ops
+    # (skinny_cfg.json) runs hcu_ops.skinny_gemm, which streams the fp8 weight at
+    # ~1.5-1.6 TB/s where hipBLASLt's decode tiles reach ~1 TB/s; every other
+    # shape / M stays on deepgemm.fp8_gemm (hipBLASLt).
+    _hcu_try_skinny_fp8 = None
+    if get_bool_env_var("SGLANG_HCU_SKINNY_GEMM"):
+        from hcu_ops import try_skinny_fp8 as _hcu_try_skinny_fp8
+
+    def _hcu_fp8_gemm(qinput, x_scale, weight, weight_scale, output):
+        if _hcu_try_skinny_fp8 is None or not _hcu_try_skinny_fp8(
+            qinput, x_scale, weight, weight_scale, output
+        ):
+            deepgemm.fp8_gemm((qinput, x_scale), (weight, weight_scale), output)
+
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
 if _use_lightop_channel_fp8:
@@ -1951,7 +1965,7 @@ def apply_fp8_linear(
         # skip quantization entirely and run the DeepGEMM FP8 GEMM directly.
         output_shape = [*input[0].shape[:-1], weight.shape[1]]
         output = torch.empty(output_shape, device=input[0].device, dtype=torch.bfloat16)
-        deepgemm.fp8_gemm((input[0], input[1]), (weight, weight_scale), output)
+        _hcu_fp8_gemm(input[0], input[1], weight, weight_scale, output)
         if bias is not None:
             output += bias
 
@@ -2068,7 +2082,7 @@ def apply_fp8_linear(
 
     if _is_hcu:
         output = torch.empty(output_shape, device=input.device, dtype=output_dtype)
-        deepgemm.fp8_gemm((qinput, x_scale), (weight, weight_scale), output)
+        _hcu_fp8_gemm(qinput, x_scale, weight, weight_scale, output)
         if bias is not None:
             output += bias
 
