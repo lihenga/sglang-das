@@ -561,9 +561,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        from sglang.srt.models.sparkv1_dspark_cp import (
+            cp_prefill_aux_projection,
+            projected_target_hidden_input,
         )
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        # The narrow capture is consumed only by this step's native KV writer.
+        # Other draft classes and hybrid/ring pools retain their established path.
+        with cp_prefill_aux_projection(
+            self.draft_model,
+            enabled=type(self.draft_model_runner.token_to_kv_pool) is MLATokenToKVPool,
+        ) as cp_projection:
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
@@ -613,13 +625,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos = torch.repeat_interleave(
                 (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
             )
-        self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
-            cache_loc=batch.out_cache_loc,
-            positions=positions,
-            state_slot=state_slot,
-            final_pos=final_pos,
-        )
+        with projected_target_hidden_input(
+            self.draft_model, enabled=cp_projection.projected
+        ):
+            self._kv_injector.inject_target_hidden(
+                target_hidden=logits_output.hidden_states,
+                cache_loc=batch.out_cache_loc,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 

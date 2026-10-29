@@ -3,6 +3,9 @@
 import functools
 import logging
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 
 import torch
 
@@ -11,6 +14,42 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class _LocalAuxProjection:
+    model: object
+    projected: bool = False
+
+
+_LOCAL_AUX_PROJECTION = ContextVar("spark_cp_local_aux_projection", default=None)
+_PROJECTED_TARGET_INPUT = ContextVar("spark_cp_projected_target_input", default=None)
+
+
+@contextmanager
+def cp_prefill_aux_projection(model, *, enabled=True):
+    """Lease a request-local projector only for the actual Spark draft class."""
+    state = _LocalAuxProjection(model)
+    supported = (
+        enabled
+        and type(model).__name__ == "SparkV1DSparkDraftModel"
+        and type(model).__module__ == "tokenflow.models.sparkv1.dspark_draft"
+    )
+    token = _LOCAL_AUX_PROJECTION.set(state if supported else None)
+    try:
+        yield state
+    finally:
+        _LOCAL_AUX_PROJECTION.reset(token)
+
+
+@contextmanager
+def projected_target_hidden_input(model, *, enabled=True):
+    """Keep the native KV writer interface; the target projection is done."""
+    token = _PROJECTED_TARGET_INPUT.set(model if enabled else None)
+    try:
+        yield
+    finally:
+        _PROJECTED_TARGET_INPUT.reset(token)
+
 
 
 def _gather_cp_aux_hidden_states(
@@ -45,6 +84,53 @@ def _gather_cp_aux_hidden_states(
         )
 
     packed = pack_aux_hidden_states(aux_hidden_states).contiguous()
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
+    )
+
+    projection = _LOCAL_AUX_PROJECTION.get()
+    actual_rows = getattr(forward_batch, "num_token_non_padded_cpu", None)
+    if type(actual_rows) is not int:
+        lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        actual_rows = sum(lengths) if isinstance(lengths, (list, tuple)) else None
+    if (
+        projection is not None
+        and not projection.projected
+        and cp_size > 1
+        and type(actual_rows) is int
+        and actual_rows >= 1024
+        and (actual_rows + cp_size - 1) // cp_size == packed.shape[0]
+        and packed.is_cuda
+        and packed.dtype == torch.bfloat16
+        and not torch.cuda.is_current_stream_capturing()
+        and is_dsa_prefill_cp_round_robin_split()
+        and packed.shape[0] * cp_size == global_rows
+        and packed.shape[1]
+        == projection.model.config.hidden_size * projection.model.num_context_features
+    ):
+        method = type(projection.model).project_target_hidden
+        if not getattr(method, "_sglang_cp_target_projection", False):
+            raise RuntimeError("Spark CP target projector adapter is not installed")
+        local = method.__wrapped__(projection.model, packed).contiguous()
+        if (
+            local.ndim != 2
+            or local.shape != (packed.shape[0], projection.model.config.hidden_size)
+            or local.dtype != packed.dtype
+            or local.device != packed.device
+        ):
+            raise RuntimeError("Spark local target projection changed its contract")
+        gathered = cp_all_gather_rerange_output(
+            local,
+            cp_size,
+            forward_batch,
+            torch.cuda.current_stream(local.device),
+            reorder_feature_block_size=min(local.shape[1], 2048),
+        )
+        if gathered.shape[0] != global_rows:
+            raise RuntimeError("Spark projected CP gather has inconsistent token rows")
+        projection.projected = True
+        return gathered
+
     gathered = cp_all_gather_rerange_output(
         packed,
         cp_size,
@@ -99,6 +185,10 @@ def _install_cp_target_projection():
 
     @functools.wraps(original)
     def project(self, target_hidden):
+        if _PROJECTED_TARGET_INPUT.get() is self:
+            if target_hidden.ndim != 2 or target_hidden.shape[1] != self.config.hidden_size:
+                raise RuntimeError("Spark preprojected target hidden has invalid shape")
+            return target_hidden
         parallel = get_parallel()
         size = parallel.attn_cp_size
         rows = target_hidden.shape[0]
