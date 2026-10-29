@@ -99,7 +99,7 @@ class DecodeKVCacheOffloadManager:
             )
 
             hicache_storage_backend_extra_config = inject_dfs_health_config(
-                hicache_storage_backend_extra_config, server_args=server_args
+                hicache_storage_backend_extra_config, server_args=get_memory()
             )
 
         self.cache_controller = HiCacheController(

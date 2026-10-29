@@ -166,7 +166,6 @@ class SchedulerRequestReceiver:
     def _local_control_broadcast() -> bool:
         return (
             get_parallel().enable_dp_attention_local_control_broadcast
-            or is_ep_scale_joiner()
         )
 
     def ingress_sync_groups(self) -> List[Any]:
@@ -204,8 +203,7 @@ class SchedulerRequestReceiver:
             # all-ranks gloo sync.
             if (
                 get_parallel().enable_dp_attention_local_control_broadcast
-                or is_ep_scale_joiner()
-            ):
+                ):
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif self.ps.tp_size != 1:
                 control_reqs = broadcast_pyobj(
