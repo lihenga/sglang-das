@@ -149,6 +149,11 @@ _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
+# SGLANG_HCU_FUSED_ACT=1: masked SwiGLU + fp8 quant over the masked_m rows only
+# (hcu_ops.silu_mul_fp8_quant_masked, same numerics as lightop's limit=None kernel)
+_hcu_act = None
+if get_bool_env_var("SGLANG_HCU_FUSED_ACT"):
+    import hcu_ops as _hcu_act
 
 if _use_aiter and not _is_hcu:
     from aiter import ActivationType, QuantType
@@ -1926,11 +1931,15 @@ class DeepEPMoE(FusedMoE):
             expected_m,
         )
 
-        q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
-            input = gateup_output,
-            fp8type = 0,
-            tokens_per_expert = masked_m,
-            limit = self.moe_runner_config.swiglu_limit)
+        q_a2 = None
+        if _hcu_act is not None and self.moe_runner_config.swiglu_limit is None:
+            q_a2 = _hcu_act.try_silu_mul_fp8_quant_masked(gateup_output, masked_m)
+        if q_a2 is None:
+            q_a2 = fuse_silu_mul_fp8_quant_ep(
+                input=gateup_output, fp8type=0, tokens_per_expert=masked_m,
+                limit=self.moe_runner_config.swiglu_limit,
+            )
+        q_a2_all, q_a2_scale = q_a2
         # The first-stage BF16 activation is no longer needed after quantization.
         # Releasing it here lowers peak memory during low-latency graph capture.
         del gateup_output

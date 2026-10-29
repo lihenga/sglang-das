@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 """
 Unit tests for _release_finished_req in DecodeKVCacheOffloadManager.
 

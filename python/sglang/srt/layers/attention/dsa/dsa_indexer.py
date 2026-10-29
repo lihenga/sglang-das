@@ -65,6 +65,48 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hcu = is_hcu()
+# SGLANG_HCU_QUANT_REUSE=1: forward_mla_rocm sets Indexer._hcu_quant_reuse to
+# ((q_lora, its fp8 quant) | None, (hidden_states, its fp8 quant) | None) around the indexer
+# call; the HCU branch of _get_q_k_bf16 feeds wq_b / wk a pair whose source is its input.
+_hcu_quant_reuse = _is_hcu and get_bool_env_var("SGLANG_HCU_QUANT_REUSE")
+_hcu_reuse_logged = set()
+# SGLANG_HCU_MQA_PCTAS=<n>: persistent CTAs of lightop page_mqa_logits_sparse_mask[_grouped]
+# (0 = lightop default, min(chunks, 32)); test_mqa_pctas.py checks the bits do not change.
+_hcu_mqa_pctas = 0
+if _is_hcu:
+    import os as _os
+
+    _hcu_mqa_pctas = int(_os.environ.get("SGLANG_HCU_MQA_PCTAS", "0"))
+# SGLANG_HCU_MQA_LOGITS=1: the sparse-mask indexer logits run hcu_ops.mqa_logits (same bits as
+# lightop page_mqa_logits_sparse_mask[_grouped], tuned launch) when it covers the operands.
+# SGLANG_HCU_MQA_HIST=1: that kernel also builds the first histogram pass of the paired
+# hcu_ops sparse_mask_topk_transform (dsa_indexer_metadata's SGLANG_HCU_FAST_MASK_TOPK path).
+_hcu_mqa = None
+_hcu_mqa_hist = False
+_hcu_mqa_logged = set()
+if _is_hcu and _os.environ.get("SGLANG_HCU_MQA_LOGITS", "0") == "1":
+    import hcu_ops as _hcu_mqa
+
+    _hcu_mqa_hist = (
+        _os.environ.get("SGLANG_HCU_MQA_HIST", "0") == "1"
+        and _os.environ.get("SGLANG_HCU_FAST_MASK_TOPK", "1") == "1"
+    )
+
+
+def _hcu_reused_quant(pair, t):
+    """pair[1] when pair = (source, quant args) has ``t`` as its source, else None."""
+    if pair is None:
+        return None
+    src, args = pair
+    if src is t or (
+        isinstance(t, torch.Tensor)
+        and src.data_ptr() == t.data_ptr()
+        and src.shape == t.shape
+        and src.stride() == t.stride()
+        and src.dtype == t.dtype
+    ):
+        return args
+    return None
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -488,6 +530,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         forward_batch: ForwardBatch,
     ):
         weights_raw = None
+        reuse = getattr(self, "_hcu_quant_reuse", None) if _hcu_quant_reuse else None
+        qa = _hcu_reused_quant(reuse[0], q_lora) if reuse is not None else None
+        xa = _hcu_reused_quant(reuse[1], x) if reuse is not None else None
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -495,7 +540,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.half_device_sm_count
             ):
-                query, _ = self.wq_b(q_lora)
+                query, _ = self.wq_b(q_lora, quant_args=qa) if qa is not None else self.wq_b(q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
                 q_rope, _ = torch.split(
                     query,
@@ -506,7 +551,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
-                    key, _ = self.wk(x)
+                    key, _ = self.wk(x, quant_args=xa) if xa is not None else self.wk(x)
                 key = self.k_norm(key)
 
                 k_rope, _ = torch.split(
@@ -517,7 +562,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             current_stream.wait_stream(self.alt_stream)
         else:
-            query, _ = self.wq_b(q_lora)
+            query, _ = self.wq_b(q_lora, quant_args=qa) if qa is not None else self.wq_b(q_lora)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -525,7 +570,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if self.use_dsa_indexer_fusion:
                 key, weights_raw = self._fused_k_weights(x)
             else:
-                key, _ = self.wk(x)
+                key, _ = self.wk(x, quant_args=xa) if xa is not None else self.wk(x)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
