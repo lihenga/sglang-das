@@ -52,6 +52,77 @@ def projected_target_hidden_input(model, *, enabled=True):
 
 
 
+def project_global_aux_hidden_states(aux_hidden_states, global_rows, actual_rows):
+    """Pack only this CP rank's global-token slice before draft projection.
+
+    FULL capture may already contain global rows (including TP-gathered
+    captures). Packing those rows first temporarily duplicates the whole wide
+    auxiliary tensor. Use exactly the partition/padding and native projector
+    of the existing CP target-projection adapter, then gather narrow rows.
+    Only the current DSpark prefill lease may consume this representation.
+    """
+    projection = _LOCAL_AUX_PROJECTION.get()
+    if (
+        projection is None
+        or projection.projected
+        or not isinstance(aux_hidden_states, list)
+        or not aux_hidden_states
+    ):
+        return None
+    captures = aux_hidden_states
+    first = captures[0]
+    parallel = get_parallel()
+    size = parallel.attn_cp_size
+    if (
+        size <= 1
+        or type(actual_rows) is not int
+        or actual_rows < 1024
+        or actual_rows > global_rows
+        or (actual_rows + size - 1) // size != (global_rows + size - 1) // size
+        or not isinstance(first, torch.Tensor)
+        or first.ndim != 2
+        or first.shape[0] != global_rows
+        or first.shape[0] < 1024
+        or not first.is_cuda
+        or first.dtype != torch.bfloat16
+        or torch.is_grad_enabled()
+        or torch.cuda.is_current_stream_capturing()
+        or not all(
+            isinstance(x, torch.Tensor)
+            and x.ndim == 2
+            and x.shape[0] == first.shape[0]
+            and x.device == first.device
+            and x.dtype == first.dtype
+            for x in captures
+        )
+        or sum(x.shape[1] for x in captures)
+        != projection.model.config.hidden_size * projection.model.num_context_features
+    ):
+        return None
+    method = type(projection.model).project_target_hidden
+    if not getattr(method, "_sglang_cp_target_projection", False):
+        return None
+    rows = first.shape[0]
+    local_rows = (actual_rows + size - 1) // size
+    start = parallel.attn_cp_rank * local_rows
+    local = pack_aux_hidden_states(
+        [x[start : min(start + local_rows, actual_rows)] for x in captures]
+    )
+    if local.shape[0] != local_rows:
+        local = torch.nn.functional.pad(local, (0, 0, 0, local_rows - local.shape[0]))
+    projected = method.__wrapped__(projection.model, local).contiguous()
+    if (
+        projected.shape != (local_rows, projection.model.config.hidden_size)
+        or projected.dtype != first.dtype
+        or projected.device != first.device
+    ):
+        raise RuntimeError("Spark global auxiliary projection changed its contract")
+    output = projected.new_empty((size * local_rows, projected.shape[1]))
+    parallel.attn_cp_group.all_gather_into_tensor(output, projected)
+    projection.projected = True
+    return output[:rows]
+
+
 def _gather_cp_aux_hidden_states(
     hidden_states, aux_hidden_states, forward_batch, cp_size
 ):

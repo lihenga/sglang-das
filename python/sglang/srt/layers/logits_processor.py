@@ -660,7 +660,29 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    hidden_states_to_store = pack_aux_hidden_states(aux_hidden_states)
+                    # DSpark's request-local lease permits narrow FULL capture.
+                    # Before-norm capture overrides this value below, so it must
+                    # never mark the draft input as already projected.
+                    from sglang.srt.models.sparkv1_dspark_cp import (
+                        project_global_aux_hidden_states,
+                    )
+
+                    lengths = logits_metadata.extend_seq_lens_cpu
+                    actual_rows = (
+                        sum(lengths) if isinstance(lengths, (list, tuple)) else None
+                    )
+                    projected = (
+                        project_global_aux_hidden_states(
+                            aux_hidden_states, hidden_states.shape[0], actual_rows
+                        )
+                        if hidden_states_before_norm is None
+                        else None
+                    )
+                    hidden_states_to_store = (
+                        projected
+                        if projected is not None
+                        else pack_aux_hidden_states(aux_hidden_states)
+                    )
                 else:
                     hidden_states_to_store = hidden_states
                 hidden_states_to_store_before_norm = hidden_states_before_norm
