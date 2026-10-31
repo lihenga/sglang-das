@@ -433,11 +433,165 @@ def _build_deepseek_v4_device_pool_group(
     )
 
 
+def _dsa_layer_split_buffers(pool: Any, page_size: int):
+    """Select persistent layers, never the empty placeholders or read scratch."""
+    if pool.page_size != page_size:
+        raise ValueError("DSA target/draft page sizes must match the tree page size.")
+    start = pool.start_layer
+    kv_layers = list(range(start, start + pool.layer_num))
+    indexer_layers = list(getattr(pool, "indexer_layer_ids", kv_layers))
+    indexer_buffers = pool.index_k_with_scale_buffer
+    if indexer_buffers is None:
+        raise ValueError("DSA direct LayerSplit requires scaled Index-K buffers.")
+    if len(indexer_layers) != len(set(indexer_layers)) or any(
+        layer not in kv_layers for layer in indexer_layers
+    ):
+        raise ValueError("DSA Index-K layer ids must be distinct local model layers.")
+
+    def select(buffers, layers):
+        if len(buffers) != len(layers):
+            raise ValueError("DSA buffer count does not match its layer mapping.")
+        selected, mapping = [], {}
+        sharded = getattr(pool, "layer_shard_enabled", False)
+        for layer, buffer in zip(layers, buffers):
+            owned = not sharded or pool._is_layer_owned(layer)
+            if not owned:
+                if buffer.shape[0] != 0:
+                    raise ValueError("Non-owned DSA layers must have empty buffers.")
+                continue
+            if buffer.shape[0] == 0:
+                raise ValueError("An owned DSA layer has no persistent buffer.")
+            mapping[layer - start] = len(selected)
+            selected.append(buffer)
+        return selected, mapping
+
+    kv_buffers, kv_mapping = select(pool.kv_buffer, kv_layers)
+    indexer_buffers, indexer_mapping = select(indexer_buffers, indexer_layers)
+    return kv_buffers, kv_mapping, indexer_buffers, indexer_mapping
+
+
+def _dsa_layer_split_storage_tag(kvcache, draft_pools, entries, page_size):
+    """Separate owned-layer bytes from replicated and incompatible DSA layouts."""
+    layout = {
+        "page_size": page_size,
+        "pools": [
+            {
+                "stage": [pool.start_layer, pool.start_layer + pool.layer_num],
+                "shard_size": getattr(pool, "layer_shard_size", 1),
+                "rank_offset": getattr(pool, "layer_shard_rank_offset", 0),
+                "dtype": str(getattr(pool, "dtype", None)),
+                "store_dtype": str(getattr(pool, "store_dtype", None)),
+                "index_mode": str(getattr(pool, "index_k_cache_mode", None)),
+                "indexer_layers": list(
+                    getattr(
+                        pool,
+                        "indexer_layer_ids",
+                        range(pool.start_layer, pool.start_layer + pool.layer_num),
+                    )
+                ),
+            }
+            for pool in (kvcache, *draft_pools)
+        ],
+        "entries": [
+            {
+                "name": str(entry.name),
+                "layers": entry.layer_mapping,
+                "buffers": [
+                    [
+                        [
+                            str(buffer.dtype),
+                            list(buffer.shape[1:]),
+                            list(buffer.stride()),
+                        ]
+                        for buffer in component
+                    ]
+                    for component in entry.components
+                ],
+            }
+            for entry in entries
+        ],
+    }
+    digest = hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest()[
+        :16
+    ]
+    return f"dsals_v1_cp{kvcache.layer_shard_size}_{digest}"
+
+
+def _build_dsa_layer_split_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...],
+) -> DevicePoolGroup:
+    kv_buffers, kv_mapping, indexer_buffers, indexer_mapping = (
+        _dsa_layer_split_buffers(kvcache, page_size)
+    )
+    num_layers = kvcache.layer_num
+    draft_depth = 0
+    for draft in mtp_draft_device_pools:
+        if draft_depth + draft.layer_num > num_layers:
+            raise ValueError(
+                "Packed draft layers exceed the target transfer layer count."
+            )
+        draft_kv, draft_kv_mapping, draft_indexer, draft_indexer_mapping = (
+            _dsa_layer_split_buffers(draft, page_size)
+        )
+        # A GLM draft can itself be LayerSplit (including a rotated owner),
+        # unlike V4's replicated draft. Its local depth is the counter index;
+        # its global layer id is only used to decide physical ownership.
+        for buffers, mapping, extra_buffers, extra_mapping in (
+            (kv_buffers, kv_mapping, draft_kv, draft_kv_mapping),
+            (indexer_buffers, indexer_mapping, draft_indexer, draft_indexer_mapping),
+        ):
+            offset = len(buffers)
+            for depth, buffer_index in extra_mapping.items():
+                layer = draft_depth + depth
+                target = (mapping[layer],) if layer in mapping else ()
+                mapping[layer] = (*target, offset + buffer_index)
+            buffers.extend(extra_buffers)
+        draft_depth += draft.layer_num
+
+    entries = []
+    for name, buffers, mapping, rows_are_pages in (
+        (PoolName.KV, kv_buffers, kv_mapping, False),
+        (PoolName.INDEXER, indexer_buffers, indexer_mapping, True),
+    ):
+        if buffers:
+            entries.append(
+                DevicePoolEntry(
+                    name=name,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=kvcache,
+                    components=[buffers],
+                    layer_mapping=mapping,
+                    page_size=page_size,
+                    rows_are_pages=rows_are_pages,
+                )
+            )
+    if not entries:
+        raise ValueError(
+            "DSA direct LayerSplit requires at least one persistent KV or draft "
+            "buffer on every CP rank; use no more CP ranks than target layers."
+        )
+    return DevicePoolGroup(
+        entries,
+        num_layers,
+        page_size,
+        rank_replicated=True,
+        storage_layout_tag=_dsa_layer_split_storage_tag(
+            kvcache, mtp_draft_device_pools, entries, page_size
+        ),
+    )
+
+
 def _build_dsa_device_pool_group(
     kvcache: Any,
     page_size: int,
     mtp_draft_device_pools: tuple[Any, ...] = (),
 ) -> DevicePoolGroup:
+    if getattr(kvcache, "layer_shard_enabled", False):
+        return _build_dsa_layer_split_device_pool_group(
+            kvcache, page_size, mtp_draft_device_pools
+        )
     if kvcache.page_size != page_size:
         raise ValueError(
             "DSA KV page size must match the tree page size: "

@@ -1542,6 +1542,10 @@ class _DsaStrategy(StackStrategy):
             _build_dsa_device_pool_group,
         )
 
+        if getattr(kvcache, "layer_shard_enabled", False) and params.pp_size != 1:
+            raise ValueError(
+                "DSA LayerSplit Mooncake direct linker requires pp_size=1."
+            )
         return _build_dsa_device_pool_group(
             kvcache, page_size, params.mtp_draft_device_pools
         )

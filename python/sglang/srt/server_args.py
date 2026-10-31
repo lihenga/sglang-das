@@ -6118,9 +6118,11 @@ class ServerArgs:
                     and self.hicache_storage_backend is not None
                 ):
                     raise NotImplementedError(
-                        "HCU --enable-dsa-cache-layer-split currently supports "
-                        "HiCache L1/L2 only. --hicache-storage-backend (L3) is "
-                        "not layer-shard-aware yet."
+                        "HCU --enable-dsa-cache-layer-split does not support "
+                        "staged HiCache --hicache-storage-backend (L3). Use the "
+                        "Mooncake direct external linker for owned-layer "
+                        "storage (--enable-unified-cache-external-linker "
+                        "--unified-cache-external-linker-backend mooncake)."
                     )
 
             else:
