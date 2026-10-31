@@ -4049,8 +4049,38 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
+def _trim_cpu_heap_after_gc(context: str):
+    if sys.platform != "linux":
+        return
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (AttributeError, OSError):
+        return
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    try:
+        process = psutil.Process()
+        before = process.memory_info().rss
+        start = time.perf_counter()
+        trim(0)
+        after = process.memory_info().rss
+        logger.info(
+            "CPU heap cleanup in %s process: RSS %.2f -> %.2f GiB "
+            "(%.2f GiB returned, %.3f s)",
+            context,
+            before / (1 << 30),
+            after / (1 << 30),
+            max(0, before - after) / (1 << 30),
+            time.perf_counter() - start,
+        )
+    except (OSError, psutil.Error):
+        logger.debug("CPU heap cleanup unavailable in %s process", context, exc_info=True)
+
+
 def freeze_gc(context: str):
     g0_before, g1_before, g2_before = gc_object_counts()
+    gc.collect()
+    _trim_cpu_heap_after_gc(context)
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
     logger.info(
