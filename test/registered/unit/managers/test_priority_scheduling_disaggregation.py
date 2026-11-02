@@ -426,6 +426,31 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
 
 
 class TestDecodePrebuilt(unittest.TestCase):
+    def _new_restored_req(self):
+        req = SimpleNamespace(
+            rid="restored",
+            last_node=None,
+            prefix_indices=torch.empty(0, dtype=torch.int64),
+            is_dllm=lambda: False,
+            _refresh_fill_ids=lambda: None,
+            full_untruncated_fill_ids=list(range(129)),
+            session=None,
+            _compute_max_prefix_len=lambda size: size - 1,
+            external_cache_hit_length=None,
+            positional_embed_overrides=None,
+            cache_salt=None,
+            extra_key="tenant",
+            is_retracted=False,
+            kv_committed_len=128,
+            cache_protected_len=0,
+            swa_uuid_for_lock=None,
+            skip_lock_node_ids={},
+            swa_prefix_lock_released=False,
+            set_extend_range=MagicMock(),
+        )
+        req.init_next_round_input = lambda cache: Req.init_next_round_input(req, cache)
+        return req
+
     def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = MagicMock()
@@ -508,6 +533,118 @@ class TestDecodePrebuilt(unittest.TestCase):
             scheduler.forward_stream
         )
         self.assertEqual(call_order, ["prepare", "wait", "process"])
+
+    def test_restored_prebuilt_preserves_shared_prefix_locks(self):
+        for rebootstrap in (False, True):
+            for shared_refs in (0, 1):
+                with self.subTest(rebootstrap=rebootstrap, shared_refs=shared_refs):
+                    scheduler = self._new_scheduler(enable_overlap=False)
+                    req = self._new_restored_req()
+                    req.pd_rebootstrap_in_progress = rebootstrap
+                    scheduler.waiting_queue = [req]
+                    cache = scheduler.tree_cache
+                    cache.root_node_handle.return_value = "root"
+                    cache.swa_reprefill_tail_tokens.return_value = 0
+                    cache.supports_mamba.return_value = False
+                    cache.match_prefix.return_value = SimpleNamespace(
+                        device_indices=torch.arange(64),
+                        last_device_node="shared",
+                        last_host_node="shared",
+                        best_match_node="shared",
+                        host_hit_length=0,
+                        swa_host_hit_length=0,
+                        mamba_host_hit_length=0,
+                        mamba_branching_seqlen=None,
+                        cache_protected_len=64,
+                    )
+                    refs = {"root": 0, "shared": shared_refs}
+                    lock_result = SimpleNamespace(
+                        swa_uuid_for_lock=None, skip_lock_node_ids={}
+                    )
+
+                    def acquire(node):
+                        refs[node] += 1
+                        return lock_result
+
+                    def release(node):
+                        self.assertGreater(refs[node], 0)
+                        refs[node] -= 1
+
+                    cache.inc_lock_ref.side_effect = acquire
+                    cache.dec_lock_ref.side_effect = release
+                    new_batch = MagicMock()
+                    new_batch.process_prebuilt.side_effect = (
+                        lambda _: cache.dec_lock_ref(req.last_node)
+                    )
+                    with patch(
+                        "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                        return_value=new_batch,
+                    ), get_context().override_server_args(
+                        disaggregation_decode_enable_radix_cache=True
+                    ):
+                        SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                            scheduler, scheduler.running_batch
+                        )
+
+                    cache.match_prefix.assert_not_called()
+                    cache.root_node_handle.assert_called_once_with(extra_key="tenant")
+                    cache.inc_lock_ref.assert_called_once_with("root")
+                    self.assertEqual(refs, {"root": 0, "shared": shared_refs})
+                    self.assertEqual(req.last_node, "root")
+                    self.assertEqual(req.last_host_node, "root")
+                    self.assertEqual(req.best_match_node, "root")
+                    self.assertEqual(len(req.prefix_indices), 0)
+                    self.assertEqual(req.cache_protected_len, 0)
+                    self.assertIs(req.skip_lock_node_ids, lock_result.skip_lock_node_ids)
+                    req.set_extend_range.assert_called_once_with(0, 128)
+
+    def test_prebuilt_keeps_admission_prefix_lock(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        req = self._new_restored_req()
+        req.last_node = "admission"
+        req.prefix_indices = torch.arange(64)
+        req.cache_protected_len = 64
+        req.swa_uuid_for_lock = 7
+        req.skip_lock_node_ids = {"component": {3}}
+        scheduler.waiting_queue = [req]
+        prefix_indices = req.prefix_indices
+        new_batch = MagicMock()
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=new_batch,
+        ), get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=True
+        ):
+            SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        scheduler.tree_cache.root_node_handle.assert_not_called()
+        scheduler.tree_cache.inc_lock_ref.assert_not_called()
+        scheduler.tree_cache.match_prefix.assert_not_called()
+        self.assertEqual(req.last_node, "admission")
+        self.assertIs(req.prefix_indices, prefix_indices)
+        self.assertEqual(req.cache_protected_len, 64)
+        self.assertEqual(req.swa_uuid_for_lock, 7)
+        self.assertEqual(req.skip_lock_node_ids, {"component": {3}})
+        req.set_extend_range.assert_called_once_with(64, 128)
+
+    def test_queued_restored_req_does_not_acquire_lock(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        req = self._new_restored_req()
+        scheduler.waiting_queue = [req]
+        scheduler.running_batch.batch_size.return_value = 1
+        with get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=True
+        ):
+            result = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(scheduler.waiting_queue, [req])
+        scheduler.tree_cache.inc_lock_ref.assert_not_called()
+        self.assertIsNone(req.last_node)
 
 
 if __name__ == "__main__":

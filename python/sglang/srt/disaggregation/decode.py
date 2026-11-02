@@ -3587,11 +3587,18 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                # Decode-radix path: new requests already matched in
-                # `pop_preallocated`. Retracted requests reset `last_node`,
-                # so re-match only when that state is missing.
                 if get_disagg().disaggregation_decode_enable_radix_cache:
-                    tree_cache = self.tree_cache if req.last_node is None else None
+                    if req.last_node is None:
+                        assert len(req.prefix_indices) == 0
+                        root = self.tree_cache.root_node_handle(extra_key=req.extra_key)
+                        lock_result = self.tree_cache.inc_lock_ref(root)
+                        req.last_node = req.last_host_node = req.best_match_node = root
+                        req.host_hit_length = 0
+                        req.cache_protected_len = 0
+                        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+                        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+                        req.swa_prefix_lock_released = False
+                    tree_cache = None
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
