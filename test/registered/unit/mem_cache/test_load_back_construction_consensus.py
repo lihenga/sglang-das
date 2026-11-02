@@ -121,15 +121,20 @@ def _prefetch_backend(other_holder, claim="ok"):
 
         linker.claim_ready_host_prefetch = raising_claim
     ended = []
-    linker.pool_group = types.SimpleNamespace(resolve_transfers=lambda transfers, **_: transfers)
+    linker.pool_group = types.SimpleNamespace(
+        resolve_transfers=lambda transfers, **_: transfers
+    )
     linker.storage = types.SimpleNamespace(
         _get_hybrid_page_component_keys=lambda keys, transfer: (["k0"], None),
         _tag_keys=lambda keys: keys,
         store=types.SimpleNamespace(
-            batch_get_session_start_with_sources=lambda keys: ([0] * len(keys), ["dfs"] * len(keys)),
+            batch_get_session_start_with_sources=lambda keys: (
+                [0] * len(keys),
+                ["dfs"] * len(keys),
+            ),
             batch_get_session_refresh=lambda keys: [0] * len(keys),
             batch_get_session_end=lambda keys: ended.append(list(keys)),
-        )
+        ),
     )
     return linker, ended
 
@@ -153,13 +158,18 @@ def _no_prefetch_needed_backend():
     linker.session_refcounts = {}
     linker.session_sources = {}
     ended = []
-    linker.pool_group = types.SimpleNamespace(resolve_transfers=lambda transfers, **_: transfers)
+    linker.pool_group = types.SimpleNamespace(
+        resolve_transfers=lambda transfers, **_: transfers
+    )
     linker.storage = types.SimpleNamespace(
         _get_hybrid_page_component_keys=lambda keys, transfer: (["k0"], None),
         _tag_keys=lambda keys: keys,
         _batch_exist=lambda keys: [1] * len(keys),
         store=types.SimpleNamespace(
-            batch_get_session_start_with_sources=lambda keys: ([0] * len(keys), ["memory"] * len(keys)),
+            batch_get_session_start_with_sources=lambda keys: (
+                [0] * len(keys),
+                ["memory"] * len(keys),
+            ),
             batch_get_session_refresh=lambda keys: [0] * len(keys),
             batch_get_session_end=lambda keys: ended.append(list(keys)),
         ),
@@ -323,10 +333,14 @@ def _rank(rank, world_size, port, results):
                     backend, ended = MagicMock(), None
                 if path.startswith("normal_session") and rank == 2:
                     if path.endswith("raise"):
-                        backend.prepare_load.side_effect = RuntimeError("refresh failed")
+                        backend.prepare_load.side_effect = RuntimeError(
+                            "refresh failed"
+                        )
                     else:
                         backend.prepare_load.return_value = False
                 backend.revalidate_load = revalidate_load
+                # Construction/session consensus is tested before physical I/O.
+                backend.load = MagicMock(return_value=True)
                 wrapper = _wrapper(
                     cache,
                     backend,
@@ -344,6 +358,10 @@ def _rank(rank, world_size, port, results):
                     # The failing rank re-raises after the shared cleanup;
                     # report it rather than dying so the others finish.
                     result = f"raised:{error}"
+                if result == "prepare":
+                    backend.load.assert_called_once()
+                else:
+                    backend.load.assert_not_called()
                 allocated = [c.allocated for c in components]
                 if result == "prepare":
                     for c in components:  # the load owns them now
@@ -845,9 +863,10 @@ def _offload_completion_rank(rank, port, outputs):
         )
         cache.dec_lock_ref = lambda node_id, _params: unlocked.append(node_id)
         cache.tree_core = types.SimpleNamespace(
-            mark_write_through_pending=lambda node_id: setattr(
-                nodes[node_id], "write_through_pending_id", node_id
-            )
+            mark_write_through_pending=lambda node_ids, ack_id: [
+                setattr(nodes[node_id], "write_through_pending_id", ack_id)
+                for node_id in node_ids
+            ]
         )
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
         wrapper.cache = cache

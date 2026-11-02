@@ -40,7 +40,6 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.utils import (
     EXTERNAL_KV_LOAD_ERR_TYPE,
-    is_external_kv_load_failure,
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
@@ -69,7 +68,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.cleanup import CleanupOutcomeUnknown, run_cleanup_step
+from sglang.srt.mem_cache.cleanup import CleanupOutcomeUnknown
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -105,9 +104,7 @@ DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def trace_disagg_prefill(
-    event: str, rid, bootstrap_room, rank, **state
-) -> None:
+def trace_disagg_prefill(event: str, rid, bootstrap_room, rank, **state) -> None:
     """Emit an opt-in, content-free timestamp for a disagg prefill request."""
     if not DAS_PREFETCH_TRACE_ENABLED:
         return
@@ -123,6 +120,7 @@ def trace_disagg_prefill(
         time.monotonic_ns(),
         f" {details}" if details else "",
     )
+
 
 _is_npu = is_npu()
 
@@ -1242,9 +1240,8 @@ class SchedulerDisaggregationPrefillMixin:
             if not req.external_kv_cache_released:
                 # Bootstrap may fail before any KV or Mamba allocation exists.
                 if (
-                    req.kv.req_pool_idx is not None
-                    or req.kv is not None
-                    or req.kv.mamba_pool_idx is not None
+                    req.kv.holds_kv
+                    or req.kv.holds_mamba
                     or any(
                         name.startswith("kv.")
                         for name in getattr(req, "external_kv_cleanup_steps", {})
@@ -1406,7 +1403,9 @@ class SchedulerDisaggregationPrefillMixin:
         }
         done_reqs = [req for req in done_reqs if id(req) in ready_ids]
         undone_reqs = [
-            req for req in self.disagg_prefill_inflight_queue if id(req) not in ready_ids
+            req
+            for req in self.disagg_prefill_inflight_queue
+            if id(req) not in ready_ids
         ]
 
         for req in done_reqs:
@@ -1452,8 +1451,6 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
         self.disagg_prefill_inflight_queue = undone_reqs
-        if getattr(self, "enable_unified_cache_external_linker", False):
-            self.tree_cache.retry_stranded_failed_linker_chains()
 
         return done_reqs
 
@@ -1514,7 +1511,8 @@ class SchedulerDisaggregationPrefillMixin:
         if req.external_kv_abort_requested:
             req.pending_bootstrap = False
             self.abort_external_kv_request(
-                req, forward_drained=True,
+                req,
+                forward_drained=True,
                 sender_terminal=self.prefill_abort_sender_terminal(req),
                 emit_response=True,
             )
@@ -1585,9 +1583,6 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        # Also covers the external KV linker: a waiting-queue prefetch taken
-        # at arrival would otherwise keep its budget slot and pinned session.
-        self._release_aborted_request(req.rid)
 
     def get_transferred_rids(
         self: Scheduler,

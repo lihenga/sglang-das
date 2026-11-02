@@ -261,12 +261,14 @@ class TestRuntimeInit(CustomTestCase):
         s.attn_tp_cpu_group = "tp_attn"
         s.tp_cpu_group = "tp"
         created = []
-        with patch.object(
-            scheduler_module,
-            "create_custom_parallel_group",
-            side_effect=lambda ranks, backend: created.append(ranks) or "dup",
-        ), patch("torch.distributed.get_world_size", return_value=2), patch(
-            "torch.distributed.get_process_group_ranks", return_value=[0, 1]
+        with (
+            patch.object(
+                scheduler_module,
+                "create_custom_parallel_group",
+                side_effect=lambda ranks, backend: created.append(ranks) or "dup",
+            ),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]),
         ):
             s._init_waiting_queue_prefetch_runtime()
         return s, created
@@ -344,6 +346,8 @@ class TestRunBatchOffRoute(CustomTestCase):
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.server_args = types.SimpleNamespace(pp_size=1)
+        scheduler.scheduler_stage_metrics = None
+        scheduler.metrics_reporter = MagicMock()
         scheduler.forward_ct = 0
         scheduler._sched_idled = False
         scheduler.scripted_scheduler_hook = None
@@ -376,7 +380,9 @@ class TestRunBatchOffRoute(CustomTestCase):
             with self.assertRaises(StopForward):
                 scheduler.run_batch(batch)
 
-        scheduler.model_worker.forward_batch_generation.assert_called_once_with(batch)
+        scheduler.model_worker.forward_batch_generation.assert_called_once_with(
+            batch, pp_proxy_tensors=None
+        )
         scheduler._forward_with_waiting_queue_ingress.assert_not_called()
 
 
