@@ -319,6 +319,27 @@ class TestIngressAcrossDpDomains(CustomTestCase):
 
 
 class TestHealthCheckDuringForward(CustomTestCase):
+
+    def test_metric_counts_only_generation_requests_handled_during_forward(self):
+        health = FakeRequest(HEALTH_CHECK_RID_PREFIX + "metric")
+        control = object()
+        s = _ingress_scheduler(
+            _slow_forward(0.2),
+            _ScriptedReceiver([health, FakeRequest("a"), control, FakeRequest("b")]),
+        )
+        collector = SimpleNamespace(
+            labels={"tp_rank": "0"}, waiting_queue_prefetch_events_total=MagicMock()
+        )
+        s.metrics_reporter = SimpleNamespace(metrics_collector=collector)
+        _run_ingress(s)
+        collector.waiting_queue_prefetch_events_total.labels.assert_called_once_with(
+            tp_rank="0", event="forward_received"
+        )
+        collector.waiting_queue_prefetch_events_total.labels.return_value.inc.assert_called_once_with(
+            1
+        )
+        self.assertEqual(s.handled, ["a"])
+
     def test_answered_as_busy_not_dispatched(self):
         health = FakeRequest(HEALTH_CHECK_RID_PREFIX + "x", ipc="ipc-1")
         s = _ingress_scheduler(

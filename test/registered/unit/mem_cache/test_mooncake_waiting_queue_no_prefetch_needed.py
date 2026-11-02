@@ -6,6 +6,7 @@ re-checks them and, if any is gone, sends every rank back to the normal path.
 """
 
 import threading
+import time
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -49,7 +50,11 @@ def _linker(exist=None, error=None):
 
 
 def _finish_no_prefetch(linker, rid="rid", keys=("k0", "k1")):
-    entry = {"state": "preparing", "session_rid": "session"}
+    entry = {
+        "state": "preparing",
+        "session_rid": "session",
+        "queued_at": time.monotonic(),
+    }
     linker.host_prefetch_entries[rid] = entry
     linker._finish_host_prefetch(
         rid, entry, "session", "no_prefetch_needed", keys=list(keys)
