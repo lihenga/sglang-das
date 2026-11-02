@@ -22,6 +22,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.compat import (
+    disable_dfs_prefetch,
+    resolve_read_plan_options,
+    supports_feature,
+)
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
@@ -292,11 +297,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             dp_rank=getattr(params, "dp_rank", None),
         )
         if storage is None:
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
-            )
             from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
                 resolve_dfs_health_config,
+            )
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
             )
 
             self.storage = MooncakeStore(
@@ -332,6 +337,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
         self.read_plan_reuse_ranges = (
             os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
+        )
+        self.read_plan_enabled, self.read_plan_reuse_ranges = resolve_read_plan_options(
+            self.storage.store, self.read_plan_enabled, self.read_plan_reuse_ranges
         )
         # Skip the admission-time lease refresh of a prefetched request whose
         # oldest session key was leased less than this many seconds ago. The
@@ -373,11 +381,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "page-wise Mooncake loads"
             )
         if self.read_plan_enabled:
-            if not callable(getattr(self.storage.store, "create_read_plan", None)):
-                raise RuntimeError(
-                    "Mooncake ReadPlan requires a package with create_read_plan. "
-                    "Install the ReadPlan-enabled Mooncake package."
-                )
             logger.info(
                 "Mooncake ReadPlan enabled; address reuse=%s",
                 self.read_plan_reuse_ranges,
@@ -502,11 +505,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "batch_get_session_prefetch",
                 "batch_get_session_refresh",
                 "dfs_prefetch_arena_available",
+                "disable_dfs_prefetch",
             )
             if not callable(getattr(store, name, None))
         ]
         if missing:
             return False, "Mooncake package lacks " + ", ".join(missing)
+        if not supports_feature(store, "dfs_prefetch"):
+            return False, "Mooncake client mode does not support waiting-queue prefetch"
         try:
             if store.dfs_prefetch_arena_available():
                 return True, "ready"
@@ -574,10 +580,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def disable_waiting_queue_prefetch(self) -> None:
         # Startup only, before any request or prefetch submission. Keep the
         # native client and its pinned arena consistent with the final switch.
-        if not self.storage.store.disable_dfs_prefetch():
-            raise RuntimeError(
-                "Mooncake cannot disable DFS prefetch after requests have started."
-            )
+        disable_dfs_prefetch(self.storage.store)
         self.host_prefetch_enabled = False
 
     def register_buffers(self) -> None:
@@ -752,9 +755,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     else:
                         new_keys.append(key)
 
-                lease_base = (
-                    time.monotonic() if self.host_prefetch_enabled else 0.0
-                )
+                lease_base = time.monotonic() if self.host_prefetch_enabled else 0.0
                 try:
                     if new_keys and self.host_prefetch_enabled:
                         results, sources = (
