@@ -504,106 +504,59 @@ If all tests pass, the message "✅ All tests passed" will be printed at the end
 
 ## 等待队列 DFS 预取效果监控
 
-本节只针对 `--mooncake-enable-waiting-queue-dfs-prefetch` 控制的预取：
-`_forward_with_waiting_queue_ingress()` 在 forward 期间接收请求，
-`_prefetch_kvcache()` 将任务放入 `_bg_prefetch_jobs`，后台轮次提交 host 预取，
-请求准入后消费预取缓冲。实时 L4 读取同时作为分母统计。
+本节只针对 `--mooncake-enable-waiting-queue-dfs-prefetch`：forward 期间接收新请求，经后台队列提前读取 DFS；请求加载时再消费准备好的数据。
 
-启动时保留该参数并开启 `--enable-metrics`，抓取 SGLang 的 `/metrics`；
-同时抓取同一进程内 Mooncake 客户端的 `/metrics`，其 `MC_STORE_CLIENT_METRIC`
-默认开启。新指标不依赖 trace 日志，不给请求 ID、key 等高基数信息添加标签。
+**SGLang 导出队列与任务指标，Mooncake master 导出实际读取和成功消费指标。** Prometheus 抓取两个服务入口即可，不需要配置或抓取每个 Mooncake 客户端端口。
 
-Mooncake 客户端端口默认由系统分配。需要静态抓取时，在启动 SGLang 前设置
-`MOONCAKE_CLIENT_METRICS_PORT_BASE=19000`，每个 global rank 使用 base + rank；
-同机部署多组实例时使用不同 base，抓取所有参与传输的 rank 端口。例如单 rank：
+### SGLang：队列与任务
+
+启动 SGLang 时加 `--enable-metrics`，从业务端口 `/metrics` 抓取：
+
+| 指标 | 口径 |
+| --- | --- |
+| `sglang:waiting_queue_prefetch_scheduler_events_total{event}` | forward_received、enqueued、submitted、skipped；forward 生成请求按子请求计数，健康检查及延迟处理消息不计 |
+| `sglang:waiting_queue_prefetch_events_total{event}` | host 预取 submitted、请求 claimed、就绪未领取即取消 discarded_ready |
+| `sglang:waiting_queue_prefetch_duration_seconds{result}` | host 排队、session 准备和 DFS 读取总耗时；结果为 dfs_prefetched、no_prefetch_needed、failed、cancelled |
+| `sglang:waiting_queue_prefetch_ready_lead_seconds` | DFS 预取就绪到请求领取的时间余量 |
+
+事件和任务数按 rank 记录。看请求数量时固定 TP0/PP0/CP0 并保留 DP 副本，避免重复计数；`no_prefetch_needed` 不是 L4 预取成功，`claimed` 也不保证最终 DMA 成功。提前量不能直接当成节省的 TTFT。
+
+### Mooncake master：实际 L4 读取与成功消费
+
+SGLang 已自动注册服务地址；配套更新 master 和 SGLang 使用的 Mooncake 包后，每约 5 秒通过现有后台 RPC 上报累计快照。该链路不依赖客户端 HTTP 或 `MC_STORE_CLIENT_METRIC`，也不增加逐请求 RPC。master 按 `service_endpoint`（SGLang 业务 IP:端口）汇总，支持 UUID/sequence 去重与断报恢复。
+
+| master 指标 | 标签及口径 |
+| --- | --- |
+| `mooncake_master_service_l4_read_operations_total` | service_endpoint、mode=prefetch/on_demand、result=success/failure；实际 DFS BatchGet 批次 |
+| `mooncake_master_service_l4_read_bytes_total` | 同上；成功读取的物理字节，部分失败批次的成功字节计入 failure |
+| `mooncake_master_service_l4_read_duration_seconds` | 同上；实际读取耗时直方图，包含 bucket、sum、count |
+| `mooncake_master_service_l4_restore_ranges_total` | service_endpoint、mode=prefetched/on_demand；成功消费的数据段数，不是 chunk 或请求数 |
+| `mooncake_master_service_l4_restore_bytes_total` | 同上；完成 scatter 后的成功消费有效字节 |
+| `mooncake_master_service_reporting_clients` | service_endpoint；30 秒内仍有有效上报的客户端数量，0 表示断报，历史 Counter 保留 |
+
+客户端原有 `mooncake_l4_*` 指标保留排障使用；SGLang 开启 `--enable-metrics` 时仍可自动开启客户端 HTTP，但无需给 Prometheus 配置这些客户端端口。本次扩展了服务上报快照，应配套升级 master 和客户端 Mooncake 包。
+
+### 抓取与看板
 
 ```yaml
 scrape_configs:
   - job_name: sglang
     static_configs:
-      - targets: ["<sglang-host>:30000"]
-  - job_name: mooncake-client
+      - targets: ["<sglang-host>:<business-port>"]
+  - job_name: mooncake-master
     static_configs:
-      - targets: ["<sglang-host>:19000"]
+      - targets: ["<master-host>:<master-metrics-port>"]
 ```
 
-将地址和 SGLang 业务端口替换成实际部署值，并在两类 target 上配置相同的业务标签。
-
-### 指标与观察顺序
-
-| 指标 | 观察内容 |
-| --- | --- |
-| `sglang:waiting_queue_prefetch_scheduler_events_total{event}` | `forward_received`：forward 期间直接处理的生成请求数（批量按子请求计，健康检查、控制消息及延迟处理消息不计）；`enqueued`：入后台队列；`submitted`：各 rank 同意提交；`skipped`：未能提交 |
-| `sglang:waiting_queue_prefetch_events_total{event}` | host 预取任务的 `submitted`、请求 `claimed`、就绪后尚未领取即被取消的 `discarded_ready` |
-| `sglang:waiting_queue_prefetch_duration_seconds{result}` | 从 host 预取提交到 worker 结果的耗时，含 host 队列等待、session 准备和 DFS 读取；结果为 `dfs_prefetched`、`no_prefetch_needed`、`failed`、`cancelled` |
-| `sglang:waiting_queue_prefetch_ready_lead_seconds` | host 预取完成到请求领取之间的时间，反映提前准备的余量，不等于节省的 TTFT |
-| `mooncake_l4_read_operations_total{mode,result}` | 实际 DFS BatchGet 次数，`mode=prefetch/on_demand`，`result=success/failure` |
-| `mooncake_l4_read_bytes_total{mode,result}` | 同上，成功读取的物理字节；部分失败的成功字节计入 `failure` |
-| `mooncake_l4_read_duration_seconds{mode,result}` | 同上，实际 DFS 批次读取耗时 |
-| `mooncake_l4_restore_ranges_total{mode}` | 请求成功消费的 L4 ranges，`mode=prefetched/on_demand` |
-| `mooncake_l4_restore_bytes_total{mode}` | 请求成功消费的 L4 有效字节，`mode=prefetched/on_demand` |
-
-`no_prefetch_needed` 表示 session 已选择 MEMORY 等来源，无需读 DFS，不能当成
-L4 预取成功。`claimed` 表示请求领取了准备好的 session，不保证最终加载成功；
-只有 Mooncake 在成功完成 scatter 后记录的 `prefetched` 消费量才进入预取收益。
-原有 `prefetched_tokens_total` 仍保留，其包含普通请求加载，不适合作为本机制命中率。
-
-### 建议的 Prometheus / Grafana 查询
-
-1. **预取覆盖率**：预取缓冲成功供给的 L4 字节 / 全部成功加载的 L4 字节。
-   这是判断请求依赖提前预取还是实时获取的核心比例；没有 L4 消费时应显示无数据。
+核心预取覆盖率，分子与分母均为成功消费字节；将服务地址替换为实际值：
 
 ```promql
-100 * (sum(rate(mooncake_l4_restore_bytes_total{mode="prefetched"}[5m])) or vector(0))
-/ sum(rate(mooncake_l4_restore_bytes_total[5m]))
+100 * (
+  sum(rate(mooncake_master_service_l4_restore_bytes_total{service_endpoint="<sglang-ip:port>",mode="prefetched"}[5m]))
+  or 0 * sum(rate(mooncake_master_service_l4_restore_bytes_total{service_endpoint="<sglang-ip:port>"}[5m]))
+) / sum(rate(mooncake_master_service_l4_restore_bytes_total{service_endpoint="<sglang-ip:port>"}[5m]))
 ```
 
-2. **预取 / 实时读取量**：并排展示请求消费带宽和物理读取带宽。
+没有 L4 消费时比例没有有效值，不能解释为 0% 命中。客户端停止上报时要结合 reporting_clients 判定，不能将历史窗口没有增量当成服务闲置。物理读取可能含整对象、对齐和重复读取，不与有效消费字节混用。
 
-```promql
-sum by (mode) (rate(mooncake_l4_restore_bytes_total[5m]))
-```
-
-```promql
-sum by (mode) (rate(mooncake_l4_read_bytes_total[5m]))
-```
-
-3. **任务漏斗**：forward 收到多少、入队多少、成功提交多少；再看 worker 结果分布。
-   入队也可能发生在 forward 外，不能用 enqueued / forward_received 当命中率。
-
-```promql
-sum by (event) (rate(sglang:waiting_queue_prefetch_scheduler_events_total[5m]))
-```
-
-```promql
-sum by (result) (rate(sglang:waiting_queue_prefetch_duration_seconds_count[5m]))
-```
-
-4. **就绪后被领取比例**：观察准备好的任务有多少进入请求加载；同时看 discarded_ready。
-   滑动窗口两端存在跨窗口的就绪/领取，该比例可能短暂超过 100%，不是严格命中率。
-
-```promql
-100 * (sum(rate(sglang:waiting_queue_prefetch_events_total{event="claimed"}[5m])) or vector(0))
-/ sum(rate(sglang:waiting_queue_prefetch_duration_seconds_count{result="dfs_prefetched"}[5m]))
-```
-
-5. **预取总耗时与提前量**：对比两个 P95，帮助判断预取是否能及时完成。
-
-```promql
-histogram_quantile(0.95,
-  sum by (le) (rate(sglang:waiting_queue_prefetch_duration_seconds_bucket{result="dfs_prefetched"}[5m])))
-```
-
-```promql
-histogram_quantile(0.95,
-  sum by (le) (rate(sglang:waiting_queue_prefetch_ready_lead_seconds_bucket[5m])))
-```
-
-看覆盖率时应同时看实时读取量和失败任务。任务完成多但覆盖率低，可能是完成后未被
-使用或请求仍需回源；discarded_ready 高说明有已准备但取消的任务。提前量小、耗时高
-时，可结合原有 TTFT 指标对比同负载下开关该参数的表现，不能只凭计数宣称延迟改善。
-
-SGLang 事件按 rank 记录：TP/CP 副本会重复计数，观察请求数量时固定一个 rank 或按
-rank 展示；Mooncake 字节按实际数据传输记录。所有比值须使用相同实例/模型和 rank
-范围，按业务添加相同标签过滤。消费字节、整对象物理读取字节和 token 不是同一口径，
-不应相互相除作为命中率。MEMORY/LOCAL_DISK 不进入这里的 L4 消费分母。
+后台上报与 Prometheus 抓取存在延迟；窗口速率反映收到的上报，首次补报累计数据也可能产生脉冲。原有 `prefetched_tokens_total` 包含普通请求加载，不用来计算本机制覆盖率。压测时比较相同负载下开关预取的覆盖率、实时回源量、TTFT 与吞吐；SGLang 任务计数与 master 字节不直接相除。
