@@ -83,9 +83,11 @@ def _pp_ordered_union(left: List[str], right: List[str]) -> List[str]:
             merged.append(rid)
     return merged
 
+
 def _pp_ordered_intersection(left: List[str], right: List[str]) -> List[str]:
     right_set = set(right)
     return [rid for rid in left if rid in right_set]
+
 
 def _pp_merge_transfer_status(
     previous: PPTransferStatus,
@@ -1110,14 +1112,10 @@ class SchedulerPPMixin:
         self: Scheduler, batch: ScheduleBatch
     ) -> set[str]:
         failed = set(self.tree_cache.drain_linker_loads(wait_for_completion=True))
-        if self.tree_cache.has_outstanding_failed_linker_chains():
-            failed.update(
-                req.rid
-                for req in self._iter_external_linker_candidates(batch)
-                if self.tree_cache.is_on_failed_linker_chain(
-                    getattr(req, "last_node", None)
-                )
-            )
+        # run_batch already confirmed this stage's private loads.
+        failed.update(
+            req.rid for req in batch.reqs if req.discard_output_reason is not None
+        )
         return failed
 
     def _pp_send_output_to_next_stage(

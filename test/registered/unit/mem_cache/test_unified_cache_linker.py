@@ -54,14 +54,8 @@ class _FakeLinker(UnifiedCacheLinker):
         del self.queued_loads[rid]
         return True
 
-    def wait_for_pending_loads(self):
-        pass
-
-    def num_completed_loads(self):
-        return len(self.completed_loads)
-
-    def pop_completed_load(self):
-        return self.completed_loads.pop(0)
+    def finish_layer_wise_loading(self, counter_index):
+        return self.load_landed
 
     def offload(self, transfers):
         self.queued_offloads.append(list(transfers))
@@ -94,6 +88,7 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "_all_reduce_attn_groups": lambda _tensor, _op: None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -149,7 +144,7 @@ def test_async_offload_pins_node_until_completion():
     node_id = 7
     node = SimpleNamespace(
         id=node_id,
-        external_cache_stored=False, detached=False,
+        external_cache_stored=False,
         write_through_pending_id=None,
     )
     cache = _cache_for_wrapper(
@@ -213,22 +208,17 @@ def test_finish_loads_adopts_a_peer_rank_failure():
     wrapper.inflight_load_rids = ["a", "b"]
     wrapper.start_layer_wise_loading()
 
-    wrapper._queue_load("rid", node_id, [object()], anchor=node_id)
-
-    assert locks == [node_id]
-    assert not unlocks
-
-    linker.completed_loads.append((["rid"], True))
-    wrapper.commit_completed_loads(wrapper.take_completed_loads(finish_count=1))
-
-    assert unlocks == [(node_id, lock_params)]
+    assert wrapper.finish_loads() == ["a", "b"]  # this rank landed, a peer did not
+    assert wrapper.finish_loads() == []  # nothing loaded: no collective
+    reduce.assert_called_once()
 
 
 def test_release_request_cancels_queued_load():
     linker = _FakeLinker()
     wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), linker)
     wrapper.hit_markers["rid"] = object()
-    wrapper.pending_loads["rid"] = (7, lock_params, 7)
+    wrapper.inflight_load_rids = ["rid"]
+    wrapper.private_load_indices["rid"] = torch.arange(4)
     linker.queued_loads["rid"] = [object()]
 
     wrapper.release_request("rid")
@@ -249,12 +239,12 @@ def test_failed_offload_rolls_back_split_fragments():
     unlocks = []
     child = SimpleNamespace(
         id=7,
-        external_cache_stored=False, detached=False,
+        external_cache_stored=False,
         write_through_pending_id=None,
     )
     parent = SimpleNamespace(
         id=8,
-        external_cache_stored=False, detached=False,
+        external_cache_stored=False,
         write_through_pending_id=None,
     )
     nodes = {child.id: child, parent.id: parent}
@@ -329,7 +319,7 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
     linker = _QuiescentFakeLinker()
     node = SimpleNamespace(
         id=7,
-        external_cache_stored=False, detached=False,
+        external_cache_stored=False,
         write_through_pending_id=None,
     )
     cache = _cache_for_wrapper(
@@ -345,7 +335,8 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         resolve_node_handle=lambda node_id: node,
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper._queue_load("rid", node.id, [object()], anchor=node.id)
+    wrapper.inflight_load_rids = ["rid"]
+    wrapper.private_load_indices["rid"] = torch.arange(4)
     wrapper.offload_nodes([node.id])
 
     wrapper.reset()
@@ -371,7 +362,8 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id))
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.pending_loads["rid"] = (7, object(), 7)
+    wrapper.inflight_load_rids = ["rid"]
+    wrapper.private_load_indices["rid"] = torch.arange(4)
 
     wrapper.close()
 
@@ -385,9 +377,6 @@ def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.linker = SimpleNamespace(
-        num_completed_loads=lambda: 1,
-        take_completed_loads=lambda count: [True] * count,
-        commit_completed_loads=lambda successes: committed.append(("load", successes)) or [],
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
@@ -404,13 +393,11 @@ def test_check_hicache_events_commits_common_rank_results():
         else:
             value.fill_(0)
 
-    cache._sync_dfs_health_policy = lambda: None
-    cache._failed_linker_rids = []
     cache._all_reduce_attn_groups = reduce_to_common_state
 
     cache.check_hicache_events()
 
-    assert committed == [("load", [False]), [False]]
+    assert committed == [[False]]
 
 
 @pytest.mark.parametrize("landed", [True, False])

@@ -27,6 +27,7 @@ class _Req:
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.discard_output_reason = None
+        self.external_kv_abort_requested = False
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
