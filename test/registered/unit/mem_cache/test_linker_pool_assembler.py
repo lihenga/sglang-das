@@ -416,7 +416,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
-                params=SimpleNamespace(),
+                params=SimpleNamespace(mtp_draft_device_pools=()),
                 components={ComponentType.FULL, ComponentType.MAMBA},
             )
 

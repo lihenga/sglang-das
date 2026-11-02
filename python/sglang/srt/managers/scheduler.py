@@ -4155,8 +4155,14 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        if self.disaggregation_mode == DisaggregationMode.NULL:
+            for pending in tuple(self._external_kv_chunked_abort_reqs.values()):
+                self._process_external_kv_chunked_abort(pending)
         req = self._pending_chunked_abort_req
         if req is None:
+            return
+        if req.external_kv_abort_requested:
+            self._process_external_kv_chunked_abort(req)
             return
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
@@ -5598,6 +5604,11 @@ class Scheduler(
                 is_insert=False,
                 emit_response=False,
             )
+            if self.disaggregation_mode == DisaggregationMode.NULL:
+                # Suppress the sampled token from a forward that consumed missing KV.
+                if req.to_finish is not None:
+                    req.update_finish_state()
+                self._external_kv_chunked_abort_reqs[req.rid] = req
             handled_rids.add(req.rid)
 
             if req is self.chunked_req:
@@ -5658,6 +5669,13 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        if self.disaggregation_mode == DisaggregationMode.NULL:
+            for req in batch.reqs:
+                if req.external_kv_abort_requested:
+                    if req.inflight_middle_chunks <= 0:
+                        req.external_kv_response_sent = True
+                    self._process_external_kv_chunked_abort(req)
 
         self._record_step_counters(batch, result)
 

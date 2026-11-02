@@ -298,11 +298,6 @@ def _pp_failure_worker(rank, port, pp_size):
                         ),
                         patch.object(pp, "set_time_batch", lambda *_a, **_k: None),
                         patch.object(
-                            pp,
-                            "get_pd_hidden_capture_layer_ids",
-                            return_value=[],
-                        ),
-                        patch.object(
                             pp.envs,
                             "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM",
                             SimpleNamespace(get=lambda: pure_chunk),

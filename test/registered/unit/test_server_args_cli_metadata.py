@@ -163,7 +163,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
     def test_mooncake_page_wise_load_options(self):
         defaults = self.parser.parse_args(["--model", "dummy"])
         self.assertEqual(defaults.mooncake_page_wise_load_threshold, 10)
-        self.assertEqual(defaults.mooncake_page_wise_load_batch_size, 128)
+        self.assertFalse(defaults.mooncake_enable_page_wise_load)
 
         args = self.parser.parse_args(
             [
@@ -171,13 +171,12 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 "dummy",
                 "--mooncake-page-wise-load-threshold",
                 "24",
-                "--mooncake-page-wise-load-batch-size",
-                "64",
+                "--mooncake-enable-page-wise-load",
             ]
         )
         server_args = ServerArgs.from_cli_args(args)
         self.assertEqual(server_args.mooncake_page_wise_load_threshold, 24)
-        self.assertEqual(server_args.mooncake_page_wise_load_batch_size, 64)
+        self.assertTrue(server_args.mooncake_enable_page_wise_load)
 
 
 if __name__ == "__main__":

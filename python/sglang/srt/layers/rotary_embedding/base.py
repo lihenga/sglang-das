@@ -430,6 +430,14 @@ class RotaryEmbedding(BaseFusedOp):
                 self.cos_sin_cache = self.cos_sin_cache.to(
                     query.device, dtype=query.dtype
                 )
+                if (
+                    _hcu_rope is not None and query.dtype in (torch.bfloat16, torch.float16)
+                    and self.cos_sin_cache.dtype == query.dtype
+                    and query.dim() in (2, 3) and query.stride(-1) == 1
+                    and (key is None or (key.dim() in (2, 3) and key.stride(-1) == 1))
+                ):
+                    _hcu_rope(positions, query, key, self.head_size, self.cos_sin_cache, self.is_neox_style)
+                    return query, key
                 self.fallback_rotary_embedding(
                     positions,
                     query,

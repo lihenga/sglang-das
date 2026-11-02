@@ -85,6 +85,24 @@ class _DsaPool:
 
 
 class TestDsaLayerSplitLinker(unittest.TestCase):
+    def test_target_glm_pool_uses_real_rotated_ownership(self):
+        from sglang.srt.mem_cache.glm5_next import Glm5NextDSATokenToKVPool
+
+        for rank in range(4):
+            fixture = _DsaPool(rank, cp_size=4, layers=9, rank_offset=3)
+            pool = Glm5NextDSATokenToKVPool.__new__(Glm5NextDSATokenToKVPool)
+            for name, value in vars(fixture).items():
+                setattr(pool, name, value)
+            group = _DsaStrategy().build_direct_linker_pool_group(
+                kvcache=pool,
+                params=SimpleNamespace(pp_size=1, mtp_draft_device_pools=()),
+                page_size=2,
+            )
+            self.assertEqual(
+                set(group.entry_map[PoolName.KV].layer_mapping),
+                {layer for layer in range(9) if pool._is_layer_owned(layer)},
+            )
+
     def test_uneven_layer_counts_cover_the_model_once(self):
         for layers in (8, 9, 60, 61, 78):
             for cp_size in (2, 4, 8):

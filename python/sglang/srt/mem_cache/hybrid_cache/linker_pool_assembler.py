@@ -246,16 +246,22 @@ def _with_packed_draft_mapping(
     *,
     target_device_layer_num: int,
     draft_layer_num: int,
+    transfer_layer_num: int | None = None,
 ) -> dict[int, int | tuple[int, ...]]:
     """Attach draft depth N to the same transfer layer as target layer N."""
-    if draft_layer_num > len(layer_mapping):
+    layer_count = (
+        len(layer_mapping) if transfer_layer_num is None else transfer_layer_num
+    )
+    if draft_layer_num > layer_count:
         raise ValueError(
             "Packed draft layers exceed the target transfer layer count: "
-            f"{draft_layer_num} > {len(layer_mapping)}."
+            f"{draft_layer_num} > {layer_count}."
         )
     result: dict[int, int | tuple[int, ...]] = dict(layer_mapping)
     for depth in range(draft_layer_num):
-        result[depth] = (layer_mapping[depth], target_device_layer_num + depth)
+        # Draft KV is replicated even when this rank does not own target depth N.
+        target = (layer_mapping[depth],) if depth in layer_mapping else ()
+        result[depth] = (*target, target_device_layer_num + depth)
     return result
 
 

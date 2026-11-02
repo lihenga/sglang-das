@@ -57,7 +57,7 @@ def _make_scheduler(rank, tp_group, cp_group, mode, state):
         skip_radix_cache_insert=False,
         return_logprob=False,
         req_pool_idx=1,
-        kv=object(),
+        kv=SimpleNamespace(req_pool_idx=1, mamba_pool_idx=None),
         mamba_pool_idx=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,
@@ -95,6 +95,7 @@ def _make_scheduler(rank, tp_group, cp_group, mode, state):
 
     req.update_finish_state = apply_finish
     scheduler = SimpleNamespace(
+        disaggregation_mode=prefill.DisaggregationMode.PREFILL,
         disagg_prefill_inflight_queue=[req],
         attn_cp_cpu_group=cp_group,
         attn_tp_cpu_group=tp_group,
