@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
     UnifiedCacheLinker,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -88,75 +89,6 @@ def _session_refresh_age_config() -> float:
     return age_s
 
 
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures: dict[int, list[Future]] = {}
-        # Batch indices already logged: one line per failed load, not per layer.
-        self.reported: set[int] = set()
-
-    def update_producer(self) -> int:
-        self.producer_index += 1
-        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
-        return self.producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self.futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        # A private copy, because wait_until clears the traceback of what it
-        # catches and the caller still needs its own exception for the
-        # logger.exception() that follows.
-        failure = RuntimeError(f"{type(error).__name__}: {error}")
-        for future in self.futures.get(index, ()):
-            if not future.done():
-                future.set_exception(failure)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self.futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-        except BaseException as error:
-            # Never raise: this runs inside the model forward, where nothing
-            # catches before the scheduler's top-level handler and the whole
-            # engine goes down. The failure travels out through
-            # pop_completed_load(), which aborts the affected requests.
-            if index not in self.reported:
-                self.reported.add(index)
-                logger.error(
-                    "Mooncake layer-wise KV load failed for batch %d; affected "
-                    "requests will be aborted after this forward: %s",
-                    index,
-                    error,
-                )
-            # Every layer re-raises this same exception object, and each
-            # appended traceback entry roots a frame chain that pins that
-            # layer's activations: +31.9 GiB on one faulted 61-layer forward at
-            # --chunked-prefill-size 2048, until the engine OOMed. Nothing
-            # reads the traceback.
-            error.__traceback__ = None
-        finally:
-            if threshold == self.num_layers - 1:
-                self.futures.pop(index, None)
-                self.reported.discard(index)
-
-    def reset(self) -> None:
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures.clear()
-        self.reported.clear()
-
-
 class ReadPlanLoadCounter:
     """Publish one Mooncake ReadPlan; wait for each layer without holding the GIL."""
 
@@ -179,9 +111,10 @@ class ReadPlanLoadCounter:
         self.plans[index].set_result(plan)
 
     def fail(self, index: int, error: BaseException) -> None:
+        self.reported.add(index)
         future = self.plans.get(index)
         if future is not None and not future.done():
-            future.set_exception(error)
+            future.set_exception(RuntimeError(f"{type(error).__name__}: {error}"))
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
@@ -193,9 +126,8 @@ class ReadPlanLoadCounter:
         except BaseException as error:
             # Do not raise from the model forward. A rank-local failure here can
             # strand peer TP/CP ranks in a later model collective and brings the
-            # scheduler down. load_layer_wise reports False through the linker
-            # completion queue; the cache MIN-reduces that verdict across the
-            # attention group and aborts the affected requests after forward.
+            # scheduler down. finish() retains the failure for the cache's
+            # post-forward MIN reduction across the attention group.
             if index not in self.reported:
                 self.reported.add(index)
                 logger.error(
@@ -207,10 +139,20 @@ class ReadPlanLoadCounter:
             # Repeated waits otherwise grow a traceback chain that keeps each
             # layer's activations alive until the failed plan is retired.
             error.__traceback__ = None
+
+    def finish(self, index: int) -> bool:
+        future = self.plans.get(index)
+        if future is None:
+            return True
+        landed = index not in self.reported
+        try:
+            future.result().wait(self.num_layers - 1)
+        except BaseException:
+            landed = False
         finally:
-            if threshold == self.num_layers - 1:
-                self.plans.pop(index, None)
-                self.reported.discard(index)
+            self.plans.pop(index, None)
+            self.reported.discard(index)
+        return landed
 
     def reset(self) -> None:
         self.producer_index = self.consumer_index = -1
@@ -428,9 +370,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
         ] = Queue()
-        # (rids, success) per started load batch. Pushed from a finally so a
-        # failed batch still releases the tree-side locks it pinned.
-        self.completed_loads: Queue[tuple[list[str], bool]] = Queue()
         self.offload_queue: Queue[
             tuple[list[PoolTransfer], int, float, object] | None
         ] = Queue()
@@ -1202,14 +1141,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.abort_prepared_load(rid)
         return cancelled
 
-    def num_completed_loads(self) -> int:
-        return self.completed_loads.qsize()
+    def finish_layer_wise_loading(self, counter_index: int) -> bool:
+        # Drain session cleanup too before a failed request can free its slots.
+        self.load_queue.join()
+        return self.layer_done_counter.finish(counter_index)
 
     def wait_for_pending_loads(self) -> None:
         self.load_queue.join()
-
-    def pop_completed_load(self) -> tuple[list[str], bool]:
-        return self.completed_loads.get_nowait()
 
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
@@ -1258,7 +1196,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
                     self._finish_prefetch_metrics(list(pending), success is True)
-                    self.completed_loads.put((list(pending), success))
             finally:
                 self.load_queue.task_done()
 
@@ -1511,7 +1448,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 buffer_indices = (
                     ()
                     if mapped is None
-                    else (mapped,) if isinstance(mapped, int) else tuple(mapped)
+                    else (mapped,)
+                    if isinstance(mapped, int)
+                    else tuple(mapped)
                 )
                 layout.append(
                     [

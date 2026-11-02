@@ -34,6 +34,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
             counter.wait_until(1)
 
         self.assertEqual(len(logs.output), 1)
+        self.assertFalse(counter.finish(index))
         self.assertNotIn(index, counter.plans)
         self.assertNotIn(index, counter.reported)
 

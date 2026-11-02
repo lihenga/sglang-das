@@ -659,9 +659,7 @@ class Scheduler(
                 tree_cache=self.tree_cache,
                 attn_cp_group=self.attn_cp_cpu_group,
                 pp_group=(
-                    self.pp_group.cpu_group
-                    if self.pp_group is not None
-                    else None
+                    self.pp_group.cpu_group if self.pp_group is not None else None
                 ),
             )
         else:
@@ -3686,9 +3684,7 @@ class Scheduler(
             and self.ps.pp_size == 1
         ):
             try:
-                final_poll_timeout_ms = (
-                    envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
-                )
+                final_poll_timeout_ms = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
                 final_poll_on = final_poll_timeout_ms > 0
             except Exception:
                 final_poll_on, final_poll_valid = False, False
@@ -4976,8 +4972,9 @@ class Scheduler(
         def launch_forward():
             if self.device != "cpu":
                 self.device_module.set_device(self.tp_worker.gpu_id)
-            with DynamicGradMode(), self.device_module.StreamContext(
-                self.forward_stream
+            with (
+                DynamicGradMode(),
+                self.device_module.StreamContext(self.forward_stream),
             ):
                 self.forward_stream.wait_stream(self.schedule_stream)
                 return self.model_worker.forward_batch_generation(batch, **fwd_kwargs)
@@ -5125,7 +5122,11 @@ class Scheduler(
                     req, cache_load_pending=batch.hicache_consumer_index >= 0
                 )
 
-        forward_generation = self._forward_with_waiting_queue_ingress
+        forward_generation = (
+            self._forward_with_waiting_queue_ingress
+            if self._forward_ingress_enabled
+            else self.model_worker.forward_batch_generation
+        )
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -5556,21 +5557,26 @@ class Scheduler(
         """Mark requests whose external-linker KV load failed for this batch.
 
         Runs before the result processing that would otherwise stream their
-        output: the forward consumed the published pages before the transfer
-        could be verified, so those requests ran against KV that never arrived.
+        output: the forward may have consumed private slots whose transfer
+        failed, so their results must be discarded before publishing any KV.
         Granularity is the load batch, not the request -- the linker merges
         every rid in a batch into shared plans.
         """
         deferred = self._deferred_linker_rids
         self._deferred_linker_rids = set()
-        failed = set(
-            self.tree_cache.drain_linker_loads() if failed_rids is None else failed_rids
-        ) | deferred
-        # A request that matched the chain while the load was in flight holds
-        # its pages too, and issued no load of its own -- so it is in no rid
-        # list and has to be found by where it points.
-        sweep_chains = self.tree_cache.has_outstanding_failed_linker_chains()
-        if not failed and not sweep_chains:
+        failed = (
+            set(
+                self.tree_cache.drain_linker_loads()
+                if failed_rids is None
+                else failed_rids
+            )
+            | deferred
+        )
+        # run_batch confirms private slots before any result can publish them.
+        failed.update(
+            req.rid for req in batch.reqs if req.discard_output_reason is not None
+        )
+        if not failed:
             return
         message = "Aborted: external KV cache load failed."
         # Collect candidates from all possible request holding locations
@@ -5580,11 +5586,7 @@ class Scheduler(
 
         for req in candidates:
             rid_match = req.rid in failed
-            chain_match = sweep_chains and self.tree_cache.is_on_failed_linker_chain(
-                getattr(req, "last_node", None)
-            )
-
-            if not rid_match and not chain_match:
+            if not rid_match:
                 continue
 
             # Cache release state belongs to this request, not its reusable RID.

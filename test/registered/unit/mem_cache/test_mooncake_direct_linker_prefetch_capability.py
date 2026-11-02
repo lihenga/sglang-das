@@ -225,24 +225,34 @@ class TestDisableHostPrefetch(CustomTestCase):
                 class SetupReached(Exception):
                     pass
 
-                with mock.patch(
-                    f"{module}.resolve_hybrid_device_pool_group",
-                    return_value=pool_group,
-                ), mock.patch(
-                    f"{module}.HybridCacheController.parse_storage_backend_extra_config",
-                    return_value=({},),
-                ), mock.patch(
-                    f"{module}.get_memory",
-                    return_value=types.SimpleNamespace(
-                        hicache_storage_backend_extra_config=None
+                with (
+                    mock.patch(
+                        f"{module}.resolve_hybrid_device_pool_group",
+                        return_value=pool_group,
                     ),
-                ), mock.patch(
-                    f"{module}.get_model",
-                    return_value=types.SimpleNamespace(model_path="dummy"),
-                ), mock.patch(
-                    "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
-                    side_effect=SetupReached,
-                ) as setup:
+                    mock.patch(
+                        f"{module}.HybridCacheController.parse_storage_backend_extra_config",
+                        return_value=({},),
+                    ),
+                    mock.patch(
+                        f"{module}.get_memory",
+                        return_value=types.SimpleNamespace(
+                            hicache_storage_backend_extra_config=None
+                        ),
+                    ),
+                    mock.patch(
+                        f"{module}.get_parallel",
+                        return_value=types.SimpleNamespace(tp_size=1),
+                    ),
+                    mock.patch(
+                        f"{module}.get_model",
+                        return_value=types.SimpleNamespace(model_path="dummy"),
+                    ),
+                    mock.patch(
+                        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
+                        side_effect=SetupReached,
+                    ) as setup,
+                ):
                     with self.assertRaises(SetupReached):
                         MooncakeDirectLinker(args, params, components=set())
                 self.assertIs(setup.call_args.kwargs["enable_dfs_prefetch"], False)

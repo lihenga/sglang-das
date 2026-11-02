@@ -46,6 +46,7 @@ class _StopLoop(Exception):
 class _Req:
     def __init__(self, rid):
         self.rid = rid
+        self.discard_output_reason = None
         self.to_finish = None
         self.finished_reason = None
         self.last_node = None
@@ -54,6 +55,10 @@ class _Req:
 
     def finished(self):
         return self.finished_reason is not None
+
+    def update_finish_state(self):
+        self.finished_reason = self.to_finish
+        self.to_finish = None
 
 
 class _SendWork:
@@ -137,7 +142,6 @@ class _Stage(pp.SchedulerPPMixin):
         }
         self.tree_cache = SimpleNamespace(
             drain_linker_loads=self.drain_loads,
-            has_outstanding_failed_linker_chains=lambda: False,
         )
         self.request_receiver = SimpleNamespace(recv_requests=self.recv_requests)
         self._deferred_linker_rids = set()
@@ -222,6 +226,7 @@ class _Stage(pp.SchedulerPPMixin):
                 {"hidden_states": torch.tensor([self.tick], dtype=torch.int64)}
             ),
             logits_output=None,
+            next_draft_input=None,
             next_token_ids=torch.tensor([self.tick], dtype=torch.int64),
         )
 
@@ -265,7 +270,15 @@ class _Stage(pp.SchedulerPPMixin):
             assert _result.skipped_output_comm
         Scheduler._mark_failed_linker_loads(self, batch, failed_rids=linker_failed_rids)
         for request in batch.reqs:
-            self.responses.append((request.rid, 500 if request.to_finish else 200))
+            self.responses.append(
+                (
+                    request.rid,
+                    500
+                    if request.to_finish
+                    or isinstance(request.finished_reason, FINISH_ABORT)
+                    else 200,
+                )
+            )
 
     def on_idle(self):
         if (
@@ -368,21 +381,14 @@ class _CacheDrainHarness:
 
     def __init__(self, linker):
         self.linker = linker
-        self._failed_linker_rids = []
 
     def _all_reduce_attn_groups(self, _tensor, _op):
         pass
-
-    def _collect_failed_linker_loads(self, finish_count):
-        UnifiedRadixCache._collect_failed_linker_loads(self, finish_count)
 
     def drain_linker_loads(self, *, wait_for_completion=False):
         if wait_for_completion:
             return UnifiedRadixCache.drain_linker_loads(self, wait_for_completion=True)
         return UnifiedRadixCache.drain_linker_loads(self)
-
-    def has_outstanding_failed_linker_chains(self):
-        return False
 
 
 class TestPPLinkerFailureConsensus(unittest.TestCase):
@@ -397,7 +403,6 @@ class TestPPLinkerFailureConsensus(unittest.TestCase):
         backend.gc_frozen = True
         backend.stats = {"load": 0}
         backend.load_queue = _ObservedJoinQueue(on_join=cleanup_release.set)
-        backend.completed_loads = queue.Queue()
         backend.layer_done_counter = LayerWiseLoadCounter(1)
 
         def fail_then_wait_for_cleanup(counter_index, _request_transfers):
@@ -416,7 +421,7 @@ class TestPPLinkerFailureConsensus(unittest.TestCase):
             "device_module",
             SimpleNamespace(Event=lambda: ready_event),
         ):
-            backend.start_layer_wise_loading()
+            counter_index = backend.start_layer_wise_loading()
 
         worker = threading.Thread(target=backend.load_thread_func, daemon=True)
         worker.start()
@@ -425,7 +430,6 @@ class TestPPLinkerFailureConsensus(unittest.TestCase):
                 failure_signalled.wait(timeout=5),
                 "backend worker did not signal the layer failure",
             )
-            self.assertEqual(backend.num_completed_loads(), 0)
 
             wrapper_cache = SimpleNamespace(
                 tree_core=SimpleNamespace(
@@ -436,11 +440,12 @@ class TestPPLinkerFailureConsensus(unittest.TestCase):
                 dec_lock_ref=Mock(),
             )
             linker = UnifiedCacheLinkerWrapper(wrapper_cache, backend)
-            linker.pending_loads["failed-load"] = (1, object(), 0)
+            linker.inflight_load_rids = ["failed-load"]
+            linker.private_load_indices["failed-load"] = torch.arange(1)
+            linker.inflight_load_index = counter_index
+            linker.cache._all_reduce_attn_groups = lambda _tensor, _op: None
             cache = _CacheDrainHarness(linker)
 
-            # The public drain remains nonblocking unless PP explicitly opts in.
-            self.assertEqual(cache.drain_linker_loads(), [])
             self.assertFalse(backend.load_queue.join_entered.is_set())
 
             stage = _Stage(rank=0, pp_size=2, failing_rank=None)

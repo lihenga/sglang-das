@@ -774,7 +774,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
-    ) -> bool:
+    ) -> None:
         try:
             ready_event.synchronize()
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
@@ -816,11 +816,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 # granularity for fewer times each object is named on the wire.
                 for logical_layer in group:
                     self.layer_done_counter.complete(counter_index, logical_layer)
-            return True
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
-            return False
 
     def _layer_groups(self) -> list[list[int]]:
         return [
@@ -978,9 +976,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             except Empty:
                 break
         self.layer_done_counter.reset()
-    def wait_for_pending_loads(self) -> None:
-        self._load_queue.join()
-
 
     def close(self) -> None:
         if self._closed:

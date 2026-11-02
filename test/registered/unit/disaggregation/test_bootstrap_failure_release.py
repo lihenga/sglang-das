@@ -20,6 +20,8 @@ from sglang.srt.disaggregation.prefill import (  # noqa: E402
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.schedule_batch import ReqKvInfo  # noqa: E402
+from sglang.srt.disaggregation.utils import DisaggregationMode, KVPoll  # noqa: E402
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (  # noqa: E402
     MooncakeDirectLinker,
 )
@@ -35,14 +37,44 @@ def _req(rid="r"):
     req = MagicMock()
     req.rid = rid
     req.req_pool_idx = None
-    req.kv = None
+    req.kv = ReqKvInfo()
+    req.to_finish = None
+    req.finished_reason = None
+    req.inflight_middle_chunks = 0
+    req.return_logprob = False
+    req.metadata_buffer_index = -1
+    req.disagg_kv_sender.poll.return_value = KVPoll.Failed
     req.mamba_pool_idx = None
     req.disagg_kv_sender.failure_exception.side_effect = RuntimeError("boom")
+    for name in (
+        "external_kv_abort_requested",
+        "external_kv_pending_chunk_cleared",
+        "external_kv_linker_released",
+        "external_kv_sender_abort_requested",
+        "external_kv_metadata_released",
+        "external_kv_cache_released",
+        "external_kv_finish_state_applied",
+        "external_kv_response_sent",
+        "external_kv_abort_response_via_chunked",
+        "external_kv_cleanup_done",
+    ):
+        setattr(req, name, False)
+    req.external_kv_cleanup_steps = {}
     return req
 
 
+class _BootstrapScheduler(SchedulerDisaggregationPrefillMixin):
+    pass
+
+
 def _scheduler(*, hicache, external_linker, tree_cache):
-    s = types.SimpleNamespace(
+    s = _BootstrapScheduler()
+    fields = dict(
+        enable_hierarchical_cache=False,
+        enable_unified_cache_external_linker=external_linker,
+        disaggregation_mode=DisaggregationMode.PREFILL,
+        _external_kv_abort_rids=set(),
+        disagg_prefill_inflight_queue=[],
         enable_hicache_storage=hicache,
         server_args=types.SimpleNamespace(
             enable_unified_cache_external_linker=external_linker
@@ -55,14 +87,17 @@ def _scheduler(*, hicache, external_linker, tree_cache):
         output_streamer=MagicMock(),
         metrics_reporter=types.SimpleNamespace(enable_metrics=False),
     )
+    for name, value in fields.items():
+        setattr(s, name, value)
     s._release_aborted_request = lambda rid: Scheduler._release_aborted_request(s, rid)
     return s
 
 
 def _fail(s, req):
-    with patch(
-        "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
-    ), patch("sglang.srt.disaggregation.prefill.prepare_abort"):
+    with (
+        patch("sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"),
+        patch("sglang.srt.disaggregation.prefill.prepare_abort"),
+    ):
         SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(s, req)
 
 
@@ -70,7 +105,9 @@ class TestBootstrapFailureRelease(CustomTestCase):
     def test_external_linker_releases_the_request(self):
         tree_cache = MagicMock()
         s = _scheduler(hicache=False, external_linker=True, tree_cache=tree_cache)
-        _fail(s, _req("r"))
+        with patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release:
+            _fail(s, _req("r"))
+        release.assert_not_called()
         tree_cache.release_aborted_request.assert_called_once_with("r")
 
     def test_hicache_still_releases_once(self):
@@ -118,7 +155,8 @@ class TestReleaseFreesThePrefetch(CustomTestCase):
         wrapper.hit_markers = {"r": hit}
         wrapper.host_prefetch_hits = {"r": hit}
         wrapper.pending_host_prefetch_submissions = {}
-        wrapper.pending_loads = {}
+        wrapper.inflight_load_rids = []
+        wrapper.private_load_indices = {}
         return wrapper
 
     def test_completed_prefetch_frees_its_slot_and_session(self):
@@ -221,7 +259,8 @@ class TestReleaseAcrossBackgroundSubmitStages(CustomTestCase):
         )
         wrapper.hit_markers = {"r": hit}
         wrapper.host_prefetch_hits = {}
-        wrapper.pending_loads = {}
+        wrapper.inflight_load_rids = []
+        wrapper.private_load_indices = {}
         self.transfers = (PoolTransfer(name=PoolName.KV, keys=[self.KEY]),)
         self.job = PreparedHostPrefetch(
             rid="r",

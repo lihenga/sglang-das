@@ -20,6 +20,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+import sglang.srt.distributed.communication_op as communication_module  # noqa: E402
 import sglang.srt.managers.scheduler as scheduler_module  # noqa: E402
 import sglang.srt.managers.scheduler_components.request_receiver as receiver_module  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
@@ -50,6 +51,7 @@ def _ingress_scheduler(forward, receiver):
     s.enable_waiting_queue_dfs_prefetch = True
     s._forward_ingress_enabled = True
     s._bg_error = None
+    s.server_args = SimpleNamespace(enable_dp_attention=False)
     s.forward_ct = 0
     s.enable_overlap = False
     s.device = "cpu"
@@ -122,9 +124,7 @@ class TestIngressSyncGroups(CustomTestCase):
             enable_dp_attention=dp,
             enable_dp_attention_local_control_broadcast=local,
         )
-        with patch.object(
-            receiver_module, "get_parallel", return_value=parallel
-        ), patch.object(receiver_module, "is_ep_scale_joiner", return_value=False):
+        with patch.object(receiver_module, "get_parallel", return_value=parallel):
             return receiver.ingress_sync_groups()
 
     def test_mapping_follows_the_receive_broadcasts(self):
@@ -157,7 +157,7 @@ class TestIngressSyncGroupsCoverRealBroadcasts(CustomTestCase):
         # This rank is the leader (rank 0) of every group, which is valid for
         # any group size, including size-1 groups; groups of size 1 hold only it.
         group = lambda name, size: SimpleNamespace(
-            rank=0, ranks=list(range(size)), name=name
+            rank=0, ranks=list(range(size)), name=name, world_size=size, cpu_group=name
         )
         fields = dict(
             ps=SimpleNamespace(
@@ -189,7 +189,6 @@ class TestIngressSyncGroupsCoverRealBroadcasts(CustomTestCase):
             (4, 1, 1, True, True, False),
             (8, 2, 2, True, True, False),
             (8, 2, 2, True, False, False),
-            (8, 2, 2, True, False, True),  # EP scale joiner: local control
             (4, 1, 4, True, False, False),
         ]
         for tp, attn_tp, attn_cp, dp, local, joiner in cases:
@@ -212,12 +211,28 @@ class TestIngressSyncGroupsCoverRealBroadcasts(CustomTestCase):
                     broadcasts.append(group)
                     return []
 
-                with patch.object(
-                    receiver_module, "get_parallel", return_value=parallel
-                ), patch.object(
-                    receiver_module, "is_ep_scale_joiner", return_value=joiner
-                ), patch.object(
-                    receiver_module, "broadcast_pyobj", side_effect=fake_broadcast
+                with (
+                    patch.object(
+                        receiver_module, "get_parallel", return_value=parallel
+                    ),
+                    patch.object(
+                        communication_module,
+                        "get_attn_tp_group",
+                        return_value=receiver.attn_tp_group,
+                    ),
+                    patch.object(
+                        communication_module,
+                        "get_attn_cp_group",
+                        return_value=receiver.attn_cp_group,
+                    ),
+                    patch.object(
+                        communication_module,
+                        "broadcast_pyobj",
+                        side_effect=fake_broadcast,
+                    ),
+                    patch.object(
+                        receiver_module, "broadcast_pyobj", side_effect=fake_broadcast
+                    ),
                 ):
                     # The leader splits what it received; an empty batch
                     # gives two empty lists and still drives every broadcast.
@@ -588,24 +603,22 @@ class TestFailFast(CustomTestCase):
 
         parent = MagicMock()
         # Never signal the real process group, whatever the environment says.
-        with envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.override(
-            killpg_enabled
-        ), patch.object(scheduler_module.os, "killpg") as killpg, patch.object(
-            scheduler_module, "load_plugins"
-        ), patch.object(
-            scheduler_module, "publish"
-        ), patch.object(
-            scheduler_module, "configure_scheduler_process", return_value=0
-        ), patch.object(
-            scheduler_module.psutil, "Process"
-        ) as process, patch.object(
-            scheduler_module,
-            "get_observability",
-            return_value=SimpleNamespace(enable_trace=False),
-        ), patch.object(
-            scheduler_module, "Scheduler", FakeScheduler
-        ), patch.object(
-            scheduler_module, "TokenizedGenerateReqInput", FakeRequest
+        with (
+            envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.override(killpg_enabled),
+            patch.object(scheduler_module.os, "killpg") as killpg,
+            patch.object(scheduler_module, "load_plugins"),
+            patch.object(scheduler_module, "publish"),
+            patch.object(
+                scheduler_module, "configure_scheduler_process", return_value=0
+            ),
+            patch.object(scheduler_module.psutil, "Process") as process,
+            patch.object(
+                scheduler_module,
+                "get_observability",
+                return_value=SimpleNamespace(enable_trace=False),
+            ),
+            patch.object(scheduler_module, "Scheduler", FakeScheduler),
+            patch.object(scheduler_module, "TokenizedGenerateReqInput", FakeRequest),
         ):
             process.return_value.parent.return_value = parent
             scheduler_module.run_scheduler_process(
