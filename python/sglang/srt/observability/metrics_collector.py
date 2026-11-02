@@ -267,6 +267,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
+        self.waiting_queue_prefetch_events_total = Counter(
+            name="sglang:waiting_queue_prefetch_scheduler_events_total",
+            documentation="Waiting-queue DFS prefetch scheduler events per rank.",
+            labelnames=[*labels.keys(), "event"],
+        )
 
         # =================================================================
         # Basics
@@ -1945,6 +1950,23 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=l4_result_labels,
             buckets=duration_buckets,
         )
+        self.waiting_queue_prefetch_events_total = Counter(
+            name="sglang:waiting_queue_prefetch_events_total",
+            documentation="Waiting-queue DFS prefetch task events per rank.",
+            labelnames=[*labels.keys(), "event"],
+        )
+        self.waiting_queue_prefetch_duration_seconds = Histogram(
+            name="sglang:waiting_queue_prefetch_duration_seconds",
+            documentation="Time from host-prefetch submission to worker outcome.",
+            labelnames=[*labels.keys(), "result"],
+            buckets=duration_buckets,
+        )
+        self.waiting_queue_prefetch_ready_lead_seconds = Histogram(
+            name="sglang:waiting_queue_prefetch_ready_lead_seconds",
+            documentation="Time from DFS prefetch readiness to request claim.",
+            labelnames=labels.keys(),
+            buckets=duration_buckets,
+        )
         self.l4_backup_duration_seconds = Histogram(
             name="sglang:l4_backup_duration_seconds",
             documentation="L4 backup wall-clock duration in seconds.",
@@ -2016,6 +2038,24 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
+
+    def log_waiting_queue_prefetch_event(self, event: str) -> None:
+        self.waiting_queue_prefetch_events_total.labels(
+            **self.labels, event=event
+        ).inc()
+
+    def log_waiting_queue_prefetch_result(
+        self, result: str, duration_seconds: float
+    ) -> None:
+        self.waiting_queue_prefetch_duration_seconds.labels(
+            **self.labels, result=result
+        ).observe(duration_seconds)
+
+    def log_waiting_queue_prefetch_claim(self, lead_seconds: float) -> None:
+        self.log_waiting_queue_prefetch_event("claimed")
+        self.waiting_queue_prefetch_ready_lead_seconds.labels(**self.labels).observe(
+            lead_seconds
+        )
 
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:

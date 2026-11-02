@@ -2287,6 +2287,9 @@ class Scheduler(
         job = self._bg_pending_prefetch_jobs.pop(rid, None)
         self._bg_prefetch_join_age.pop(rid, None)
         if job is not None:
+            self._log_waiting_queue_prefetch_event(
+                "submitted" if submitted else "skipped"
+            )
             if DAS_PREFETCH_TRACE_ENABLED:
                 trace_disagg_prefill(
                     "bg_prefetch_ack_enqueued",
@@ -2296,6 +2299,19 @@ class Scheduler(
                     submitted=submitted,
                 )
             self._bg_prefetch_acks.put((job, submitted))
+
+    def _log_waiting_queue_prefetch_event(self, event: str, count: int = 1) -> None:
+        reporter = getattr(self, "metrics_reporter", None)
+        collector = getattr(reporter, "metrics_collector", None)
+        if collector is not None:
+            try:
+                collector.waiting_queue_prefetch_events_total.labels(
+                    **collector.labels, event=event
+                ).inc(count)
+            except Exception:
+                logger.warning(
+                    "Failed to record waiting-queue prefetch event.", exc_info=True
+                )
 
     def _all_reduce_bg_prefetch_groups(
         self,
@@ -3485,6 +3501,7 @@ class Scheduler(
                         completed_epoch=self._bg_completed_epoch,
                     )
                 self._bg_prefetch_jobs.put(job)
+                self._log_waiting_queue_prefetch_event("enqueued")
                 if DAS_PREFETCH_TRACE_ENABLED:
                     trace_disagg_prefill(
                         "bg_prefetch_job_enqueued",
@@ -4708,11 +4725,15 @@ class Scheduler(
                         and can_prepare_now(recv_req)
                     ):
                         self.handle_generate_request(recv_req)
+                        self._log_waiting_queue_prefetch_event("forward_received")
                         received_generate = True
                     elif isinstance(recv_req, BatchTokenizedGenerateReqInput) and all(
                         can_prepare_now(req) for req in recv_req
                     ):
                         self.handle_batch_generate_request(recv_req)
+                        self._log_waiting_queue_prefetch_event(
+                            "forward_received", len(recv_req)
+                        )
                         received_generate = True
                     else:
                         deferred_reqs.append(recv_req)
