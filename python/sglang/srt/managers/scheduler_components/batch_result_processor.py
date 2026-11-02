@@ -299,6 +299,14 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                should_commit_output = (
+                    not req.finished()
+                    and not req.is_retracted
+                    and req.inflight_middle_chunks <= 0
+                )
+                discard_finish_reason = (
+                    req.discard_output_reason if should_commit_output else None
+                )
                 if (
                     batch.return_hidden_states
                     and logits_output.hidden_states is not None
@@ -310,11 +318,7 @@ class SchedulerBatchResultProcessor:
                         hidden_state_offset=hidden_state_offset,
                         capture_hidden_mode=prefill_hidden_capture_mode,
                         extend_input_len=extend_input_len_per_req[i],
-                        store=(
-                            not req.finished()
-                            and not req.is_retracted
-                            and req.inflight_middle_chunks <= 0
-                        ),
+                        store=(should_commit_output and discard_finish_reason is None),
                     )
 
                 if (
@@ -328,7 +332,10 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    if req.beam_group is not None:
+                    if discard_finish_reason is not None:
+                        req.to_finish = discard_finish_reason
+                        req.update_finish_state(0)
+                    elif req.beam_group is not None:
                         # The relay point already replaced the sampled-token
                         # append; the group owns all finish semantics.
                         self.beam_coordinator.commit_prefill(
@@ -351,16 +358,20 @@ class SchedulerBatchResultProcessor:
                     ):
                         req.kv.kv_committed_len += 1
                     if req.finished():
-                        self._maybe_collect_routed_experts(req)
-                        self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(req, self.tree_cache)
+                        if discard_finish_reason is None:
+                            self._maybe_collect_routed_experts(req)
+                            self._maybe_collect_indexer_topk(req)
+                        release_kv_cache(
+                            req, self.tree_cache, is_insert=discard_finish_reason is None
+                        )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    self._maybe_collect_customized_info(i, req, logits_output)
+                    if discard_finish_reason is None:
+                        self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
@@ -371,7 +382,11 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
+                            store=discard_finish_reason is None,
                         )
+
+                    if discard_finish_reason is not None:
+                        continue
 
                     if req.return_sampling_mask:
                         self.add_sampling_mask_return_values(i, req, logits_output)
@@ -427,6 +442,16 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
+                    continue
+
+                if (
+                    req.discard_output_reason is not None
+                    and req.inflight_middle_chunks <= 0
+                ):
+                    req.to_finish = req.discard_output_reason
+                    req.update_finish_state(0)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.time_stats.set_completion_time()
                     continue
 
                 req.embedding = embeddings[i]
@@ -520,6 +545,7 @@ class SchedulerBatchResultProcessor:
         extend_logprob_start_len_per_req: Optional[List[int]],
         next_token_ids: List[int],
         logprob_pt: int,
+        store: bool = True,
     ) -> int:
         assert extend_logprob_start_len_per_req is not None
         assert extend_input_len_per_req is not None
@@ -532,7 +558,7 @@ class SchedulerBatchResultProcessor:
             extend_logprob_start_len,
         )
 
-        if req.return_logprob:
+        if req.return_logprob and store:
             self.logprob_result_processor.add_logprob_return_values(
                 i,
                 req,

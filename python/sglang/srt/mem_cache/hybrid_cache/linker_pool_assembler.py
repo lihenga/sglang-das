@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
@@ -26,7 +28,7 @@ class DevicePoolEntry:
         indices_from_pool: PoolName,
         device_pool: Any,
         components: Sequence[Sequence[torch.Tensor]],
-        layer_mapping: dict[int, int],
+        layer_mapping: dict[int, int | Sequence[int]],
         page_size: int,
         rows_are_pages: bool,
         packed: bool = True,
@@ -127,14 +129,16 @@ class DevicePoolEntry:
         return self._rows(indices)
 
     def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
-        buffer_index = self.layer_mapping.get(layer)
-        if buffer_index is None:
+        mapped = self.layer_mapping.get(layer)
+        if mapped is None:
             return None
+        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
 
         items = []
         for component, offsets in zip(self.buffer_meta, self._component_offsets):
-            base_ptr, row_stride, size = component[buffer_index]
-            items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+            for buffer_index in buffer_indices:
+                base_ptr, row_stride, size = component[buffer_index]
+                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:
@@ -234,8 +238,28 @@ def _deepseek_v4_state_views(state_pools: list[Any], global_layers: list[int]):
     return views
 
 
+def _with_packed_draft_mapping(
+    layer_mapping: dict[int, int],
+    *,
+    target_device_layer_num: int,
+    draft_layer_num: int,
+) -> dict[int, int | tuple[int, ...]]:
+    """Attach draft depth N to the same transfer layer as target layer N."""
+    if draft_layer_num > len(layer_mapping):
+        raise ValueError(
+            "Packed draft layers exceed the target transfer layer count: "
+            f"{draft_layer_num} > {len(layer_mapping)}."
+        )
+    result: dict[int, int | tuple[int, ...]] = dict(layer_mapping)
+    for depth in range(draft_layer_num):
+        result[depth] = (layer_mapping[depth], target_device_layer_num + depth)
+    return result
+
+
 def _build_deepseek_v4_device_pool_group(
-    kvcache: Any, page_size: int
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
 ) -> DevicePoolGroup:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -256,13 +280,23 @@ def _build_deepseek_v4_device_pool_group(
             f"{kvcache.swa_page_size} != {page_size}."
         )
 
+    draft_swa_buffers = [
+        buffer
+        for pool in mtp_draft_device_pools
+        for buffer in pool.swa_kv_pool.kv_buffer
+    ]
+    swa_mapping = _with_packed_draft_mapping(
+        mappings.swa,
+        target_device_layer_num=len(kvcache.swa_kv_pool.kv_buffer),
+        draft_layer_num=len(draft_swa_buffers),
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.SWA,
             indices_from_pool=PoolName.SWA,
             device_pool=kvcache.swa_kv_pool,
-            components=[kvcache.swa_kv_pool.kv_buffer],
-            layer_mapping=mappings.swa,
+            components=[[*kvcache.swa_kv_pool.kv_buffer, *draft_swa_buffers]],
+            layer_mapping=swa_mapping,
             page_size=page_size,
             rows_are_pages=True,
         )
@@ -332,21 +366,41 @@ def _build_deepseek_v4_device_pool_group(
     )
 
 
-def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGroup:
+def _build_dsa_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
     if kvcache.page_size != page_size:
         raise ValueError(
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
     num_layers = kvcache.layer_num
-    identity = {layer: layer for layer in range(num_layers)}
+    if any(pool.page_size != page_size for pool in mtp_draft_device_pools):
+        raise ValueError("DSA MTP page size must match the tree page size.")
+    draft_kv_buffers = [
+        buffer for pool in mtp_draft_device_pools for buffer in pool.kv_buffer
+    ]
+    draft_indexer_buffers = [
+        buffer
+        for pool in mtp_draft_device_pools
+        for buffer in pool.index_k_with_scale_buffer
+    ]
+    if len(draft_kv_buffers) != len(draft_indexer_buffers):
+        raise ValueError("DSA MTP KV and indexer draft layer counts must match.")
+    layer_mapping = _with_packed_draft_mapping(
+        {layer: layer for layer in range(num_layers)},
+        target_device_layer_num=num_layers,
+        draft_layer_num=len(draft_kv_buffers),
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.kv_buffer],
-            layer_mapping=identity,
+            components=[[*kvcache.kv_buffer, *draft_kv_buffers]],
+            layer_mapping=layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
@@ -354,13 +408,183 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
-            layer_mapping=identity,
+            components=[[*kvcache.index_k_with_scale_buffer, *draft_indexer_buffers]],
+            layer_mapping=layer_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def _build_glm5_next_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    """GLM DSA pages and KDA checkpoints, including locally owned MTP pages."""
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.pool_host.glm5_next import is_hcu_glm_pool
+    from sglang.srt.runtime_context import get_memory, get_parallel
+
+    memory = get_memory()
+    if (
+        memory.enable_unified_memory
+        or memory.enable_hisparse
+        or get_parallel().attn_dcp_size != 1
+        or params.pp_size != 1
+        or memory.unified_cache_external_linker_backend != "mooncake"
+        or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() != "python"
+    ):
+        raise ValueError(
+            "GLM direct linker requires Mooncake, Python TreeCore, PP=1 and DCP=1 "
+            "without unified memory or HiSparse (prefill CP is supported)."
+        )
+    req_pool = params.req_to_token_pool
+    if getattr(req_pool, "mamba_ckpt_pool", None) is not None:
+        raise ValueError("GLM direct linker does not support int8 Mamba checkpoints.")
+    for name in ("short_conv_pool", "ngram_pool"):
+        if getattr(getattr(req_pool, name, None), "enabled", False):
+            raise ValueError(
+                "GLM direct linker does not support auxiliary slot states."
+            )
+    if kvcache.mamba_pool is not req_pool.mamba_pool:
+        raise ValueError("GLM direct linker requires the target request's Mamba pool.")
+
+    target = kvcache.full_kv_pool
+    full_mapping = {
+        layer - kvcache.start_layer: index
+        for layer, index in kvcache.full_attention_layer_id_mapping.items()
+    }
+    mamba_mapping = {
+        layer - kvcache.start_layer: index
+        for layer, index in req_pool.mamba_map.items()
+    }
+    if (
+        not full_mapping
+        or not mamba_mapping
+        or min((*full_mapping, *mamba_mapping)) < 0
+    ):
+        raise ValueError("GLM direct linker requires valid FULL and MAMBA layer maps.")
+    num_layers = max(*full_mapping, *mamba_mapping) + 1
+    pools_and_mappings = [(target, full_mapping)]
+    draft_depth = 0
+    for draft in params.mtp_draft_device_pools:
+        if isinstance(draft, HybridLinearKVPool):
+            if draft.mamba_pool is not req_pool.mamba_pool:
+                raise ValueError(
+                    "GLM direct linker cannot omit separate draft Mamba state."
+                )
+            draft = draft.full_kv_pool
+        # Draft loads ride the first transfer layers, before target forward ends.
+        mapping = {draft_depth + i: i for i in range(draft.layer_num)}
+        draft_depth += draft.layer_num
+        if draft_depth > num_layers:
+            raise ValueError("GLM draft layers exceed the target transfer layer count.")
+        pools_and_mappings.append((draft, mapping))
+
+    entries = []
+    for name, rows_are_pages in ((PoolName.KV, False), (PoolName.INDEXER, True)):
+        buffers, layer_mapping = [], {}
+        for pool, mapping in pools_and_mappings:
+            if not is_hcu_glm_pool(pool) or not pool.use_dsa:
+                raise ValueError(
+                    "GLM direct linker requires GLM DSA target/draft pools."
+                )
+            if pool.page_size != page_size or page_size % pool.index_kpool:
+                raise ValueError(
+                    "GLM KV/tree pages must match and contain whole index groups."
+                )
+            source = (
+                pool.kv_buffer
+                if name == PoolName.KV
+                else (
+                    pool.index_k_with_scale_buffer
+                    if pool.use_fp8_index_k_cache
+                    else pool.index_k_buffer
+                )
+            )
+            if len(source) != pool.layer_num:
+                raise ValueError(
+                    "GLM linker buffer count does not match the layer map."
+                )
+            for layer, index in mapping.items():
+                buffer = source[index]
+                owned = pool._is_layer_owned(pool.start_layer + index)
+                if not owned:
+                    if buffer.numel():
+                        raise ValueError(
+                            "GLM linker cannot persist remote scratch buffers."
+                        )
+                    continue
+                if not buffer.numel():
+                    raise ValueError("GLM owned KV/indexer layer has an empty buffer.")
+                layer_mapping.setdefault(layer, []).append(len(buffers))
+                buffers.append(buffer)
+        # A CP rank can own no DSA layers. Its checkpoint still participates in
+        # the rank-wide restorable-prefix intersection; no dummy KV is stored.
+        if buffers:
+            entries.append(
+                DevicePoolEntry(
+                    name=name,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=target,
+                    components=[buffers],
+                    layer_mapping=layer_mapping,
+                    page_size=page_size,
+                    rows_are_pages=rows_are_pages,
+                )
+            )
+
+    state = req_pool.mamba_pool.mamba_cache
+    components = [
+        [value[index] for index in range(req_pool.mamba_pool.num_mamba_layers)]
+        for value in (state.temporal, *state.conv)
+        if value.numel()
+    ]
+    entries.append(
+        DevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=req_pool.mamba_pool,
+            components=components,
+            layer_mapping=mamba_mapping,
+            page_size=1,
+            rows_are_pages=True,
+        )
+    )
+    for entry in entries:
+        for buffer in entry.kv_buffer:
+            # A row may be transposed internally, but its physical bytes must
+            # form one dense region for the zero-copy range transfer.
+            row_elements = buffer.numel() // buffer.shape[0]
+            row_span = 1 + sum(
+                (size - 1) * stride
+                for size, stride in zip(buffer.shape[1:], buffer.stride()[1:])
+            )
+            if row_span != row_elements or buffer.stride(0) < row_elements:
+                raise ValueError(
+                    "GLM direct linker requires dense, non-overlapping state rows."
+                )
+    group = DevicePoolGroup(entries, num_layers, page_size, rank_replicated=False)
+    # Different ownership, draft, dtype or index compression must never read
+    # each other's packed objects, even for the same model and token hashes.
+    layout = [
+        (
+            str(entry.name),
+            entry.page_size,
+            entry.layer_mapping,
+            [
+                (list(buffer.shape[1:]), list(buffer.stride()), str(buffer.dtype))
+                for buffer in entry.kv_buffer
+            ],
+        )
+        for entry in entries
+    ]
+    digest = hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest()[
+        :20
+    ]
+    group.storage_layout_tag = f"glm53_direct_v1_{digest}"
+    return group
 
 
 def resolve_hybrid_device_pool_group(

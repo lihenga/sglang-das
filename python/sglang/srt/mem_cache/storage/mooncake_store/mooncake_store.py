@@ -771,7 +771,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Mooncake zips object keys with registered buffer pointers.
         pool_name = transfer.name
         suffixes = []
-        if pool_name == PoolName.KV:
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            DevicePoolEntry,
+        )
+
+        if isinstance(host_pool, DevicePoolEntry):
+            # Direct pools pack all layer/component buffers into one object.
+            name = "k" if pool_name == PoolName.KV else str(pool_name)
+            suffixes = [f"_{self.mla_suffix}_{name}"]
+        elif pool_name == PoolName.KV:
             suffixes = [f"_{self.mla_suffix}_k"]
         elif pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.

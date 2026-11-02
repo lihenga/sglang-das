@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from http import HTTPStatus
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -2952,20 +2953,36 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
+    def load_back_is_cache_owned(self) -> bool:
+        # Failed linker loads must remain outside cache_protected_len.
+        return self.linker is None
+
+    def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
+        """Confirm the batch's private loads before committing any output."""
+        if self.linker is None:
+            return []
+        failed_rids = set(self.linker.finish_loads())
+        failed = [req for req in reqs if req.rid in failed_rids]
+        if failed:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            for req in failed:
+                req.skip_radix_cache_insert = True
+                req.discard_output_reason = FINISH_ABORT(
+                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                )
+        return failed
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
             finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
+                [self.linker.num_completed_offloads()],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
-            self.linker.drain_loads(load_count)
+            offload_count = int(finish_counts.item())
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
