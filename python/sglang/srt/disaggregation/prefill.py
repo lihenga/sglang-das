@@ -38,12 +38,15 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     staging_grid_tokens,
 )
 from sglang.srt.disaggregation.utils import (
+    EXTERNAL_KV_LOAD_ERR_TYPE,
+    is_external_kv_load_failure,
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_min_attn_cp_tp_group,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -65,6 +68,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.cleanup import CleanupOutcomeUnknown, run_cleanup_step
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -622,11 +626,16 @@ class SchedulerDisaggregationPrefillMixin:
 
     def maybe_supplemental_poll_final_chunks(self: Scheduler) -> List[Req]:
         """Give newly submitted final chunks one bounded chance to finish."""
-        final_rooms = getattr(self, "_disagg_final_chunk_rooms", set())
-        self._disagg_final_chunk_rooms = set()
-        timeout_ms = envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get()
-        if timeout_ms <= 0 or not final_rooms:
+        timeout_ms = self._mooncake_final_poll_timeout_ms
+        if timeout_ms <= 0:
+            final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+            if final_rooms:
+                final_rooms.clear()
             return []
+        final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+        if not final_rooms:
+            return []
+        self._disagg_final_chunk_rooms = set()
 
         remaining_rooms = {
             req.bootstrap_room
@@ -746,7 +755,8 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
-        self._begin_scheduler_iteration()
+        if self.enable_waiting_queue_dfs_prefetch:
+            self._begin_scheduler_iteration()
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -782,7 +792,8 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
-            self._process_deferred_reqs()
+            if self._forward_ingress_enabled:
+                self._process_deferred_reqs()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -813,7 +824,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
-            self.maybe_supplemental_poll_final_chunks()
+            if self._mooncake_final_poll_timeout_ms > 0:
+                self.maybe_supplemental_poll_final_chunks()
 
             # Update last_batch
             self.last_batch = batch
@@ -861,7 +873,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
-            self.maybe_supplemental_poll_final_chunks()
+            if self._mooncake_final_poll_timeout_ms > 0:
+                self.maybe_supplemental_poll_final_chunks()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1091,6 +1104,179 @@ class SchedulerDisaggregationPrefillMixin:
         self.maybe_send_health_check_signal()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    def abort_disagg_prefill_request(self: Scheduler, req: Req) -> None:
+        """Close publication now; the request's queue owns drained cleanup."""
+        if req.to_finish is None and req.finished_reason is None:
+            req.to_finish = FINISH_ABORT("Aborted by AbortReq.")
+        self.abort_external_kv_request(
+            req,
+            forward_drained=False,
+            sender_terminal=False,
+            emit_response=False,
+        )
+
+    def prefill_abort_sender_terminal(self: Scheduler, req: Req) -> bool:
+        """A failure on a peer rank does not prove the local sender stopped."""
+        if req.disagg_kv_sender is None:
+            return True
+        try:
+            sender = req.disagg_kv_sender
+            if sender.poll() not in (KVPoll.Success, KVPoll.Failed):
+                return False
+            # Mooncake logical Failed is immediate; source ownership is separate.
+            drained = getattr(sender, "is_transfer_drained", None)
+            return bool(drained()) if drained is not None else True
+        except Exception:
+            logger.exception("Failed to poll aborting sender for request %s", req.rid)
+            return False
+
+    def prefill_abort_forward_drained(self: Scheduler, req: Req) -> bool:
+        """Do not reclaim a chunk still referenced by an unresolved result."""
+        if req.inflight_middle_chunks > 0:
+            return False
+        return not any(
+            any(candidate is req for candidate in batch.reqs)
+            for batch, _ in getattr(self, "result_queue", ())
+        )
+
+    def abort_external_kv_request(
+        self: Scheduler,
+        req: Req,
+        *,
+        forward_drained: bool,
+        sender_terminal: bool,
+        abort_message: str = "External KV load failed",
+        is_insert: bool = False,
+        emit_response: bool = False,
+    ) -> bool:
+        """Retry incomplete cleanup stages; callers must keep the Req reachable.
+
+        With emit_response=False, completion covers resources only. The caller
+        owns response delivery and must track external_kv_response_sent.
+        """
+        try:
+            if getattr(self, "_pending_chunked_abort_req", None) is req:
+                req.external_kv_abort_response_via_chunked = True
+            if getattr(req, "external_kv_abort_response_via_chunked", False):
+                emit_response = False
+            # A resource-only caller may return later to deliver the response.
+            if req.external_kv_cleanup_done:
+                if emit_response and not req.external_kv_response_sent:
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    req.external_kv_response_sent = True
+                return True
+
+            if not req.external_kv_abort_requested:
+                req.skip_radix_cache_insert = True
+                if req.to_finish is None and req.finished_reason is None:
+                    req.to_finish = FINISH_ABORT(
+                        message=abort_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+                    )
+                req.external_kv_abort_requested = True
+                self._external_kv_abort_rids.add(req.rid)
+
+            if not req.external_kv_pending_chunk_cleared:
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.clear_pending_chunk_send(req)
+                req.external_kv_pending_chunk_cleared = True
+
+            if not req.external_kv_linker_released:
+                self._release_aborted_request(req.rid)
+                req.external_kv_linker_released = True
+
+            sender = req.disagg_kv_sender
+            if sender is None:
+                req.external_kv_sender_abort_requested = True
+            elif not req.external_kv_sender_abort_requested:
+                sender.abort()
+                req.external_kv_sender_abort_requested = True
+
+            if (
+                not forward_drained
+                or not sender_terminal
+                # Recheck after abort closes publication; the caller's earlier
+                # observation may precede the final enqueue.
+                or not self.prefill_abort_sender_terminal(req)
+            ):
+                return False
+
+            # A decode request can only be failed safely after every local
+            # source transfer has drained. The Mooncake sender fans this
+            # terminal marker out to its saved/current decode targets.
+            notify_drained_abort = getattr(sender, "notify_drained_abort", None)
+            if notify_drained_abort is not None:
+                notify_drained_abort()
+
+            if not req.external_kv_finish_state_applied:
+                if req.to_finish is not None:
+                    req.update_finish_state()
+                elif req.finished_reason is None:
+                    req.finished_reason = FINISH_ABORT(
+                        message=abort_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+                    )
+                # Keep the existing failure response shape for logprob requests.
+                # prepare_abort initializes the empty logprob lists, but its new
+                # reason must not replace the original error type or message.
+                if req.return_logprob:
+                    reason = req.finished_reason
+                    prepare_abort(req, reason.message, status_code=reason.status_code)
+                    req.finished_reason = reason
+                req.external_kv_finish_state_applied = True
+
+            if not req.external_kv_metadata_released:
+                if self.disaggregation_mode in (
+                    DisaggregationMode.PREFILL,
+                    DisaggregationMode.DECODE,
+                ):
+                    maybe_release_metadata_buffer(
+                        req,
+                        self.req_to_metadata_buffer_idx_allocator,
+                        getattr(
+                            getattr(self, "disagg_metadata_buffers", None),
+                            "pd_hidden_pool",
+                            None,
+                        ),
+                    )
+                req.external_kv_metadata_released = True
+
+            if not req.external_kv_cache_released:
+                # Bootstrap may fail before any KV or Mamba allocation exists.
+                if (
+                    req.req_pool_idx is not None
+                    or req.kv is not None
+                    or req.mamba_pool_idx is not None
+                    or any(
+                        name.startswith("kv.")
+                        for name in getattr(req, "external_kv_cleanup_steps", {})
+                    )
+                ):
+                    release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                req.external_kv_cache_released = True
+
+            if emit_response and not req.external_kv_response_sent:
+                req.time_stats.set_completion_time()
+                self.output_streamer.stream_output([req], req.return_logprob)
+                req.external_kv_response_sent = True
+
+            self._external_kv_abort_rids.discard(req.rid)
+            # The chunked protocol owner clears its marker after delivery.
+            req.external_kv_cleanup_done = True
+            return True
+        except CleanupOutcomeUnknown:
+            # The original exception was logged on the first attempt. Keep the
+            # request reachable without flooding logs on every scheduler tick.
+            return False
+        except Exception:
+            logger.exception(
+                "External KV abort cleanup failed for request %s; pending cleanup retained",
+                req.rid,
+            )
+            return False
+
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -1112,6 +1298,11 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if req.external_kv_cleanup_done:
+                # Local cleanup is terminal; only the shared removal verdict
+                # remains pending. Do not re-enter failure or success cleanup.
+                done_reqs.append(req)
+                continue
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1159,6 +1350,29 @@ class SchedulerDisaggregationPrefillMixin:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                 )
+
+        # Local cleanup can finish before its TP/CP peers. Keep the request in
+        # every inflight queue until all peers agree it can be removed.
+        keep_ids = {id(req) for req in undone_reqs}
+        remove_flags = [
+            int(id(req) not in keep_ids) for req in self.disagg_prefill_inflight_queue
+        ]
+        global_remove_flags = all_reduce_min_attn_cp_tp_group(
+            remove_flags,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+        ready_ids = {
+            id(req)
+            for req, remove_flag in zip(
+                self.disagg_prefill_inflight_queue, global_remove_flags
+            )
+            if remove_flag
+        }
+        done_reqs = [req for req in done_reqs if id(req) in ready_ids]
+        undone_reqs = [
+            req for req in self.disagg_prefill_inflight_queue if id(req) not in ready_ids
+        ]
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
@@ -1213,18 +1427,20 @@ class SchedulerDisaggregationPrefillMixin:
             exc = e
             error_message += f" with exception {e}"
         # Mute error message for propagated exceptions to avoid duplicate logging
-        if getattr(exc, "is_from_another_rank", False):
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        if not req.prefill_transfer_failure_reported:
+            req.prefill_transfer_failure_reported = True
+            if getattr(exc, "is_from_another_rank", False):
+                logger.debug(error_message)
+            else:
+                logger.warning(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            if self.metrics_reporter.enable_metrics:
+                self.metrics_collector.increment_transfer_failed_reqs()
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        if self.metrics_reporter.enable_metrics:
-            self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
@@ -1371,7 +1587,9 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
-    def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(
+        self: Scheduler, req: Req, *, cache_load_pending: bool = False
+    ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1383,7 +1601,9 @@ class SchedulerDisaggregationPrefillMixin:
                 0, len(req.prefix_indices) - req.host_hit_length
             )
 
-        if req.pending_bootstrap:
+        # Keep the staging boundary above stable even when this batch's send
+        # is deferred: the next chunk must not snapshot a different prefix.
+        if req.pending_bootstrap or cache_load_pending:
             return
 
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
@@ -1424,7 +1644,7 @@ class SchedulerDisaggregationPrefillMixin:
         if (
             last_chunk
             and self.ps.pp_size == 1
-            and envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+            and self._mooncake_final_poll_timeout_ms > 0
         ):
             final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
             if final_rooms is None:

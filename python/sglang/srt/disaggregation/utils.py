@@ -202,6 +202,34 @@ def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     return tensor_to_reduce.tolist()
 
 
+def _all_reduce_decode_polls(
+    polls: List[int], decode_reqs, group: dist.ProcessGroup
+) -> List[int]:
+    """Preserve drained-abort proof through the decode MIN reduction.
+
+    KVPoll states 0..3 retain their existing ordering. Encode a locally proven
+    drained abort as 4 and Success as 5 so an active peer state wins the MIN;
+    decode the terminal aggregate back to KVPoll values afterwards.
+    """
+    encoded_polls = list(polls)
+    for i, poll in enumerate(polls):
+        if poll == int(KVPoll.Failed):
+            receiver = decode_reqs[i].kv_receiver
+            is_drained_abort_ready = getattr(receiver, "is_drained_abort_ready", None)
+            if is_drained_abort_ready is not None and is_drained_abort_ready():
+                encoded_polls[i] = int(KVPoll.Success)
+        elif poll == int(KVPoll.Success):
+            encoded_polls[i] = int(KVPoll.Success) + 1
+
+    reduced_polls = _all_reduce_polls(encoded_polls, group)
+    for i, poll in enumerate(reduced_polls):
+        if poll == int(KVPoll.Success):
+            reduced_polls[i] = int(KVPoll.Failed)
+        elif poll == int(KVPoll.Success) + 1:
+            reduced_polls[i] = int(KVPoll.Success)
+    return reduced_polls
+
+
 def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
@@ -214,6 +242,8 @@ def poll_and_all_reduce(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
+    if decode_reqs is not None:
+        return _all_reduce_decode_polls(polls, decode_reqs, gloo_group)
     return _all_reduce_polls(polls, gloo_group)
 
 
@@ -229,6 +259,16 @@ def poll_and_all_reduce_attn_cp_tp_group(
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
     return _all_reduce_polls(polls, attn_cp_cpu_group)
+
+
+def all_reduce_min_attn_cp_tp_group(
+    values: List[int],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> List[int]:
+    """MIN-reduce per-request integer flags across attention TP, then CP."""
+    values = _all_reduce_polls(values, attn_tp_cpu_group)
+    return _all_reduce_polls(values, attn_cp_cpu_group)
 
 
 def poll_and_all_reduce_with_staging(
@@ -263,7 +303,7 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(raw_polls, gloo_group)
+    return _all_reduce_decode_polls(raw_polls, decode_reqs, gloo_group)
 
 
 #########################
@@ -590,22 +630,32 @@ class KVClassType(Enum):
 
 
 @overload
+
+
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.KVARGS]
 ) -> Type[KVArgs]: ...
 @overload
+
+
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.MANAGER]
 ) -> Type[CommonKVManager]: ...
 @overload
+
+
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.SENDER]
 ) -> Type[CommonKVSender]: ...
 @overload
+
+
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.RECEIVER]
 ) -> Type[CommonKVReceiver]: ...
 @overload
+
+
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.BOOTSTRAP_SERVER]
 ) -> Type[CommonKVBootstrapServer]: ...
@@ -1611,4 +1661,23 @@ def is_aborted(req: Req) -> bool:
 
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
+    )
+
+
+EXTERNAL_KV_LOAD_ERR_TYPE = "ExternalKVLoadError"
+
+
+def is_external_kv_load_failure(req: Req) -> bool:
+    """Whether this request was aborted by a failed external-linker KV load.
+
+    Narrower than is_aborted() on purpose: the prefill-side drop this gates
+    would otherwise also change what happens to a user abort racing the same
+    forward, which is a separate concern.
+    """
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    reason = req.to_finish or req.finished_reason
+    return (
+        isinstance(reason, FINISH_ABORT)
+        and reason.err_type == EXTERNAL_KV_LOAD_ERR_TYPE
     )
