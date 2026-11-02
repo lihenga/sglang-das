@@ -240,6 +240,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
+        self._failed_linker_rids = []
+        self._stranded_linker_nodes = []
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
@@ -349,11 +351,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        self.tree_core.enable_external_cache_linker = True
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
+        self._failed_linker_rids.clear()
+        self._stranded_linker_nodes.clear()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -1079,6 +1084,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(req)
+
+        self._reclaim_failed_linker_chain(req.rid)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -3124,7 +3131,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            offload_count = int(finish_counts.item())
+            load_count, offload_count = map(int, finish_counts.tolist())
+            self._collect_failed_linker_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")

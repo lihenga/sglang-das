@@ -247,23 +247,28 @@ def rocm_absorb_q_bmm(
                 )
             )
         else:
-            if token_major_output and not is_in_tc_piecewise_cuda_graph():
+            if (
+                out is None
+                and token_major_output
+                and not is_in_tc_piecewise_cuda_graph()
+            ):
                 output = torch.empty(
                     (q_nope.shape[0], attn.num_local_heads, attn.kv_lora_rank),
                     dtype=torch.bfloat16,
                     device=q_nope.device,
                 )
-                q_nope_out = output.transpose(0, 1)
-                torch.bmm(
-                    q_nope.to(torch.bfloat16).transpose(0, 1),
-                    _absorb_weight_bf16(attn.w_kc, attn.w_scale),
-                    out=q_nope_out,
-                )
-            else:
-                q_nope_out = torch.bmm(
-                    q_nope.to(torch.bfloat16).transpose(0, 1),
-                    _absorb_weight_bf16(attn.w_kc, attn.w_scale),
-                )
+                out = output.transpose(0, 1)
+            x = q_nope.to(torch.bfloat16).transpose(0, 1)
+            weight = _absorb_weight_bf16(attn.w_kc, attn.w_scale)
+            q_nope_out = (
+                _hcu_bmm.try_bmm_bf16(x, weight, out)
+                if _hcu_bmm is not None and q_nope.dtype == torch.bfloat16 else None
+            )
+            if q_nope_out is None:
+                q_nope_out = torch.bmm(x, weight) if out is None else torch.bmm(x, weight, out=out)
+    if out is not None and q_nope_out.data_ptr() != out.data_ptr():
+        out.copy_(q_nope_out)
+        q_nope_out = out
     return q_nope_out
 
 
@@ -973,7 +978,7 @@ class DeepseekMLARocmForwardMixin:
         topk_indices,
         llama_4_scaling,
     ):
-        save_kv_cache = True
+        save_kv_cache = k_nope is not None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
