@@ -976,6 +976,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             except Empty:
                 break
         self.layer_done_counter.reset()
+    def wait_for_pending_loads(self) -> None:
+        self._load_queue.join()
+
 
     def close(self) -> None:
         if self._closed:
