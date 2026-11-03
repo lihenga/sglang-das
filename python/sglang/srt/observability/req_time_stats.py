@@ -355,10 +355,6 @@ class ReqTimeStatsBase:
             "disagg_mode": self.disagg_mode.value if self.disagg_mode else None,
             "enable_metrics": False,
             "trace_ctx": trace_ctx_state,
-            "queue_wait_reason": self.queue_wait_reason,
-            "queue_wait_reason_start_time": self.queue_wait_reason_start_time,
-            "queue_reason_durations": dict(self.queue_reason_durations),
-            "queue_reason_checks": dict(self.queue_reason_checks),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
 
@@ -731,10 +727,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 if self.output_emit_time > 0
                 else time.perf_counter()
             ),
-            "queue_wait_reason": self.queue_wait_reason,
-            "queue_wait_reason_start_time": self.queue_wait_reason_start_time,
-            "queue_reason_durations": dict(self.queue_reason_durations),
-            "queue_reason_checks": dict(self.queue_reason_checks),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         if not (self.enable_metrics or self.has_timing_data):

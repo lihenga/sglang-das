@@ -351,7 +351,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if server_args.extra_metric_labels:
                 labels.update(server_args.extra_metric_labels)
             collector_cls = resolve_collector_class(
-                server_args, STAT_LOGGER_ROLE_STORAGE, StorageMetricsCollector
+                STAT_LOGGER_ROLE_STORAGE, StorageMetricsCollector
             )
             self.storage_metrics_collector = collector_cls(labels=labels)
 
