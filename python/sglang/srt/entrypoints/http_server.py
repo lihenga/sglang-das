@@ -2923,7 +2923,8 @@ def launch_server(
         if launch_callback is not None:
             launch_callback()
         scheduler_init_result.block_until_scheduler_exits()
-    else:
+    elif tokenizer_manager is not None:
+        # Nonzero nodes return without a tokenizer after their schedulers exit.
         _setup_and_run_http_server(
             server_args,
             tokenizer_manager,

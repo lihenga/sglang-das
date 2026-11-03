@@ -2,9 +2,12 @@
 
 from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import torch
 
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -13,9 +16,41 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("pp_size, boundary", [(1, None), (2, None), (2, 2)])
+def test_real_request_initializes_external_boundary_before_prefix_matching(
+    pp_size, boundary
+):
+    req = Req(
+        rid="decode-request",
+        origin_input_text="",
+        origin_input_ids=array("q", [1, 2, 3, 4]),
+        sampling_params=SamplingParams(max_new_tokens=1),
+    )
+    assert req.external_cache_hit_length is None
+    req.external_cache_hit_length = boundary
+    cache = SimpleNamespace(
+        pp_size=pp_size,
+        linker=object() if pp_size > 1 else None,
+        swa_reprefill_tail_tokens=lambda: 0,
+        supports_mamba=lambda: False,
+        match_prefix=Mock(
+            return_value=MatchResult(
+                device_indices=torch.empty(0, dtype=torch.int64),
+                last_device_node=None,
+                last_host_node=None,
+                best_match_node=None,
+            )
+        ),
+    )
+    req.init_next_round_input(cache)
+    key = cache.match_prefix.call_args.args[0].key
+    assert len(key) == (boundary if boundary is not None else 3)
 
 
 def test_every_pp_stage_probes_l3_and_agrees_on_extend_boundary():
@@ -72,8 +107,12 @@ def test_every_pp_stage_probes_l3_and_agrees_on_extend_boundary():
     assert [rank for rank, _rid, _pages in lookups] == [0, 1]
     assert pp0_req.external_cache_hit_length == canonical_hit_len
     assert pp1_req.external_cache_hit_length == canonical_hit_len
-    assert len(pp0_match.device_indices) + pp0_match.host_hit_length == canonical_hit_len
-    assert len(pp1_match.device_indices) + pp1_match.host_hit_length == canonical_hit_len
+    assert (
+        len(pp0_match.device_indices) + pp0_match.host_hit_length == canonical_hit_len
+    )
+    assert (
+        len(pp1_match.device_indices) + pp1_match.host_hit_length == canonical_hit_len
+    )
     assert prompt_len - canonical_hit_len == 2
 
 
