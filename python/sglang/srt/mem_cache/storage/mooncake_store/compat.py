@@ -201,7 +201,7 @@ def setup_store(store, args, kwargs):
 def resolve_read_plan_options(store, enabled: bool, reuse: bool) -> tuple[bool, bool]:
     if enabled and not supports_feature(store, "read_plan"):
         logger.warning(
-            "Mooncake package lacks ReadPlan support; using session range reads "
+            "Mooncake package lacks ReadPlan support; using compatible session reads "
             "and disabling ReadPlan address reuse."
         )
         return False, False

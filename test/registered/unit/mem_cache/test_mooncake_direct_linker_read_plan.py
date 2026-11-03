@@ -2,11 +2,12 @@ import threading
 import types
 import unittest
 from queue import Queue
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
     ReadPlanLoadCounter,
@@ -18,6 +19,104 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
+    def _layout_linker(self, *, packed=True, bad_result=False):
+        linker = self._read_plan_linker(prefetch=False)
+        linker.read_plan_enabled = False
+        linker.read_layout_enabled = True
+        linker.num_layers = 2
+        buffers = [
+            [torch.zeros((4, 2), dtype=torch.uint8) for _ in range(2)] for _ in range(2)
+        ]
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=buffers,
+            layer_mapping={0: 0, 1: 1},
+            page_size=1,
+            rows_are_pages=True,
+            packed=packed,
+        )
+        pool.get_prepared_layer_range_meta = Mock(
+            side_effect=AssertionError("ReadLayout must expand addresses in C++")
+        )
+        linker.pools = {PoolName.KV: pool}
+        linker.layer_done_counter = Mock()
+        linker.storage._get_hybrid_page_component_keys = lambda keys, _: (
+            keys if packed else [f"{key}:{i}" for key in keys for i in range(2)],
+            1 if packed else 2,
+        )
+        linker.storage._tag_keys = lambda keys: keys
+        linker.storage.store.batch_get_session_start.return_value = (
+            [0, 0] if packed else [0, 0, 0, 0]
+        )
+        linker.storage.store.batch_get_into_layouts.return_value = (
+            [[-707]] if bad_result else [[4, 4]] if packed else [[2, 2, 2, 2]]
+        )
+        transfers = [
+            [
+                PoolTransfer(
+                    name=PoolName.KV, keys=["a", "b"], host_indices=torch.tensor([3, 1])
+                )
+            ]
+        ]
+        native = types.SimpleNamespace(
+            ReadComponent=lambda **kw: types.SimpleNamespace(**kw),
+            ReadLayout=lambda **kw: types.SimpleNamespace(**kw),
+            ReadKeyMapping=types.SimpleNamespace(
+                PER_ROW="row", PER_ROW_COMPONENT="component"
+            ),
+        )
+        return linker, transfers, native
+
+    def test_read_layout_uses_native_strides_and_preserves_key_mapping(self):
+        for packed in (False, True):
+            with self.subTest(packed=packed):
+                linker, transfers, native = self._layout_linker(packed=packed)
+                with patch.dict("sys.modules", {"mooncake.store": native}):
+                    self.assertTrue(linker.load_layer_wise(0, transfers))
+                store = linker.storage.store
+                self.assertEqual(store.batch_get_into_layouts.call_count, 2)
+                store.batch_get_into_multi_buffer_ranges.assert_not_called()
+                store.batch_get_session_end.assert_called_once()
+                for layer, invocation in enumerate(
+                    store.batch_get_into_layouts.call_args_list
+                ):
+                    layout = invocation.args[0][0]
+                    self.assertEqual(layout.rows, [3, 1])
+                    self.assertEqual(
+                        layout.key_mapping, "row" if packed else "component"
+                    )
+                    self.assertEqual(
+                        [c.source_offset for c in layout.components],
+                        [layer * 2, 4 + layer * 2] if packed else [layer * 2] * 2,
+                    )
+                self.assertEqual(
+                    linker.layer_done_counter.complete.call_args_list,
+                    [call(0, 0), call(0, 1)],
+                )
+
+    def test_read_layout_failure_releases_sessions_without_exposing_layer(self):
+        linker, transfers, native = self._layout_linker(bad_result=True)
+        with patch.dict("sys.modules", {"mooncake.store": native}), self.assertLogs(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
+            level="ERROR",
+        ):
+            self.assertFalse(linker.load_layer_wise(0, transfers))
+        linker.storage.store.batch_get_session_end.assert_called_once()
+        linker.layer_done_counter.fail.assert_called_once()
+        linker.layer_done_counter.complete.assert_not_called()
+
+    def test_read_layout_skips_unmapped_layers(self):
+        linker, transfers, native = self._layout_linker()
+        linker.pools[PoolName.KV].layer_mapping = {1: 1}
+        with patch.dict("sys.modules", {"mooncake.store": native}):
+            self.assertTrue(linker.load_layer_wise(0, transfers))
+        linker.storage.store.batch_get_into_layouts.assert_called_once()
+        self.assertEqual(
+            linker.layer_done_counter.complete.call_args_list, [call(0, 0), call(0, 1)]
+        )
+
     def test_read_plan_failure_is_deferred_until_after_forward(self):
         counter = ReadPlanLoadCounter(num_layers=2)
         index = counter.update_producer()
@@ -404,6 +503,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         self.assertEqual(queued_rid, "rid")
         self.assertEqual(queued_transfers, [transfer])
         linker.host_prefetch_queue.task_done()
+
 
 if __name__ == "__main__":
     unittest.main()

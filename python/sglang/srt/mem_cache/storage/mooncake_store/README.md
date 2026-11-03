@@ -496,10 +496,26 @@ variant appropriate for your Linux device and driver.
 | Optional feature | Community / HYGON L3 | L4 with the corresponding APIs |
 | --- | --- | --- |
 | Basic Store and session range reads | Existing API path | Existing API path |
+| Native strided ReadLayout | Selected automatically when present for layer-wise loads | Selected automatically when ReadPlan is not selected |
 | Waiting-queue DFS prefetch | Disabled with a startup warning when requested | Negotiated across ranks; requires an available arena |
-| `SGLANG_MOONCAKE_READ_PLAN=1` | Falls back to session range reads; address reuse disabled | Native ReadPlan |
+| `SGLANG_MOONCAKE_READ_PLAN=1` | Uses native ReadLayout when available, otherwise session ranges; address reuse disabled | Native ReadPlan |
 | DFS health and access policy | Original package behavior; no SGLang health-based failover | Native probes and coordinated policy |
 | Client HTTP metrics | Automatic port zero disables the optional endpoint with a warning; an explicit nonzero `MOONCAKE_CLIENT_METRICS_PORT_BASE` is retained | Automatic ports enabled when declared by the package |
+
+The same SGLang code and configuration can use either package. Optional API
+selection first respects local capability declarations, then checks callable
+methods for older packages without a query. Layer-wise loads automatically use
+native ReadLayout when available, so Mooncake expands strided addresses in C++.
+An existing ReadPlan request selects ReadPlan on a supporting L4 package and
+falls back on L3; page-wise loads keep their aggregated read path. No package
+version-string comparison or per-package SGLang patch is required.
+
+An older SGLang caller can keep its existing setup, batch-put, session, and range
+calls with the L4 wheel. It uses the L4 implementation behind those interfaces;
+caller-driven features such as ReadPlan and waiting-queue prefetch still require
+SGLang code that calls their APIs. Python API compatibility alone does not carry
+over native hardware fixes: the installed L4 build must also retain the needed
+L3 transport fixes.
 
 Disabling prefetch omits the L4-only setup argument on packages that predate
 prefetch arenas. Packages with a prefetch arena must support either the setup

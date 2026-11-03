@@ -341,6 +341,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.read_plan_enabled, self.read_plan_reuse_ranges = resolve_read_plan_options(
             self.storage.store, self.read_plan_enabled, self.read_plan_reuse_ranges
         )
+        self.read_layout_enabled = supports_feature(self.storage.store, "read_layout")
         # Skip the admission-time lease refresh of a prefetched request whose
         # oldest session key was leased less than this many seconds ago. The
         # master never evicts a leased object, so the refresh only buys lease
@@ -1287,6 +1288,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 success = True
                 return success
 
+            if getattr(self, "read_layout_enabled", False):
+                self._load_with_read_layout(counter_index, batches, maybe_fail)
+                success = True
+                return success
+
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
                     meta = self.pools[name].get_prepared_layer_range_meta(
@@ -1333,6 +1339,52 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         )
                         success = False
         return success
+
+    def _load_with_read_layout(self, counter_index: int, batches, maybe_fail) -> None:
+        from mooncake.store import ReadComponent, ReadKeyMapping, ReadLayout
+
+        for layer in range(self.num_layers):
+            layouts = []
+            expected = []
+            for name, (keys, locations) in batches.items():
+                pool = self.pools[name]
+                items = pool.get_layer_range_components(layer)
+                if not items:
+                    continue
+                maybe_fail(name, f"layer={layer}")
+                layouts.append(
+                    ReadLayout(
+                        keys=keys,
+                        rows=locations,
+                        key_mapping=(
+                            ReadKeyMapping.PER_ROW
+                            if pool.packed
+                            else ReadKeyMapping.PER_ROW_COMPONENT
+                        ),
+                        components=[
+                            ReadComponent(
+                                destination_base=base,
+                                destination_stride=stride,
+                                byte_count=size,
+                                source_offset=offset,
+                            )
+                            for base, stride, size, offset in items
+                        ],
+                    )
+                )
+                expected.append(
+                    [sum(item[2] for item in items)] * len(keys)
+                    if pool.packed
+                    else [item[2] for _ in locations for item in items]
+                )
+            if layouts:
+                result = self.storage.store.batch_get_into_layouts(layouts)
+                if result is None or list(map(list, result)) != expected:
+                    raise RuntimeError(
+                        f"Mooncake layout get failed for layer={layer}: "
+                        f"transferred={result}, expected={expected}"
+                    )
+            self.layer_done_counter.complete(counter_index, layer)
 
     def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
         pending_load_tokens = getattr(self, "pending_load_tokens", {})
