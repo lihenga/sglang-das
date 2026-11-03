@@ -46,6 +46,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ContinueGenerationReqInput,
     DetokenizerCompletionReq,
+    EncoderURLsUpdateReq,
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
@@ -67,6 +68,7 @@ from sglang.srt.managers.load_snapshot import (
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_serving,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -486,6 +488,20 @@ class MultiTokenizerRouter:
         self.warmup_result: Optional[bool] = None
 
         self._loop = asyncio.new_event_loop()
+        self.encoder_bootstrap_server = None
+        if get_disagg().language_only:
+            from sglang.srt.disaggregation.encoder.receiver import (
+                EncoderBootstrapServer,
+            )
+
+            self.encoder_bootstrap_server = EncoderBootstrapServer(
+                host=get_serving().host,
+                port=get_disagg().encoder_bootstrap_port,
+                urls=list(get_disagg().encoder_urls),
+                on_urls_changed=lambda: self._loop.call_soon_threadsafe(
+                    self._send_encoder_urls, self.all_worker_ipcs
+                ),
+            )
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._task = asyncio.run_coroutine_threadsafe(
@@ -515,6 +531,13 @@ class MultiTokenizerRouter:
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
+
+    def _send_encoder_urls(self, worker_ipcs: set[str]) -> None:
+        if self.encoder_bootstrap_server is None:
+            return
+        message = EncoderURLsUpdateReq(urls=self.encoder_bootstrap_server.list_urls())
+        for ipc_name in worker_ipcs:
+            self.socket_mapping.send_output(ipc_name, message, is_tokenizer=True)
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -548,6 +571,7 @@ class MultiTokenizerRouter:
                         f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
                         f"(total: {len(self.all_worker_ipcs)})"
                     )
+                self._send_encoder_urls({recv_obj.worker_ipc_name})
                 self.socket_mapping.send_output(
                     recv_obj.worker_ipc_name,
                     TokenizerWorkerRegistrationAckReq(
@@ -877,6 +901,7 @@ class TokenizerWorker(TokenizerManager):
         self._result_dispatcher += TypeBasedDispatcher(
             [
                 (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
+                (EncoderURLsUpdateReq, self._handle_encoder_urls_update),
                 (
                     TokenizerWorkerRegistrationAckReq,
                     self._handle_tokenizer_worker_registration_ack,
@@ -927,6 +952,10 @@ class TokenizerWorker(TokenizerManager):
         if obj.warmup_result is not None:
             self._set_server_warmup_result(obj.warmup_result)
         self._registration_ack_event.set()
+
+    def _handle_encoder_urls_update(self, obj: EncoderURLsUpdateReq):
+        # MMReceiver holds this list by reference.
+        self.encoder_urls[:] = obj.urls
 
     def _handle_tokenizer_warmup_result(self, obj: TokenizerWarmupResultBroadcastReq):
         self._set_server_warmup_result(obj.success)

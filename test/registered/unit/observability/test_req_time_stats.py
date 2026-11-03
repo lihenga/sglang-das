@@ -111,7 +111,9 @@ class TestWaitingQueueReasonStats(CustomTestCase):
         self.assertEqual(stats.queue_reason_checks, {})
 
         untouched = rts.SchedulerReqTimeStats(track_queue_wait_reasons=True)
-        self.assertEqual(untouched.__getstate__(), {})
+        state = untouched.__getstate__()
+        self.assertEqual(set(state), {"output_emit_time", "diff_realtime_monotonic"})
+        self.assertGreater(state["output_emit_time"], 0.0)
         untouched.reset_prefill_retry_time()
         self.assertIsNone(untouched.queue_reason_durations)
         self.assertIsNone(untouched.queue_reason_checks)
