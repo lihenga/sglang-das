@@ -3671,10 +3671,13 @@ class Scheduler(
             and self.tree_cache.waiting_queue_prefetch_enabled()
         )
         prefetch_local = self._waiting_queue_prefetch_configured() and linker_prefetch
-        # Forward ingress matches (and may split) radix nodes while the
-        # forward runs; KV canary's sweep walks them from the forward thread.
+        # Forward ingress owns a separate launch thread and assumes synchronous
+        # batch completion. Overlap already pipelines batches, sampling and relay
+        # on the forward stream; keep its launch on the scheduler thread.
+        # KV canary also walks radix nodes that ingress may split.
         ingress_local = (
-            str(getattr(self.server_args, "kv_canary", "none")).strip().lower()
+            not self.enable_overlap
+            and str(getattr(self.server_args, "kv_canary", "none")).strip().lower()
             == "none"
         )
         final_poll_on, final_poll_valid = False, True
@@ -3728,7 +3731,8 @@ class Scheduler(
         if enabled and not forward_ingress:
             logger.info(
                 "Waiting-queue DFS prefetch runs without receiving requests "
-                "during forward because KV canary is enabled."
+                "during forward because overlap scheduling or KV canary "
+                "is enabled on a scheduler rank."
             )
         return enabled, forward_ingress
 
