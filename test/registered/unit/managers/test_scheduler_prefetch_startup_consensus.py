@@ -33,7 +33,14 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _scheduler(
-    *, flag=True, capable=True, canary="none", mode="prefill", pp=1, policy="fcfs"
+    *,
+    flag=True,
+    capable=True,
+    canary="none",
+    mode="prefill",
+    pp=1,
+    policy="fcfs",
+    overlap=False,
 ):
     s = Scheduler.__new__(Scheduler)
     s.server_args = types.SimpleNamespace(
@@ -48,6 +55,7 @@ def _scheduler(
         "null": DisaggregationMode.NULL,
     }[mode]
     s.schedule_policy = policy
+    s.enable_overlap = overlap
     s.ps = types.SimpleNamespace(pp_size=pp)
     s.tree_cache = MagicMock()
     s.tree_cache.waiting_queue_prefetch_enabled.return_value = capable
@@ -64,6 +72,11 @@ class TestSingleRank(CustomTestCase):
     def test_canary_keeps_prefetch_but_not_ingress(self):
         s = _scheduler(canary="log")
         self.assertEqual(s._resolve_prefetch_startup_switches(None), (True, False))
+
+    def test_overlap_keeps_prefetch_but_not_forward_ingress(self):
+        s = _scheduler(overlap=True)
+        self.assertEqual(s._resolve_prefetch_startup_switches(None), (True, False))
+        s.tree_cache.disable_waiting_queue_prefetch.assert_not_called()
 
     def test_not_configured_skips_the_capability_query(self):
         s = _scheduler(flag=False)
@@ -102,6 +115,8 @@ class TestSingleRank(CustomTestCase):
 # {0, 1} and {2, 3}. Each case: (settings per rank, expected result or "raise").
 CASES = {
     "all_on": ([{}] * 4, (True, True)),
+    "all_overlap": ([{"overlap": True}] * 4, (True, False)),
+    "overlap_on_one_rank": ([{}, {"overlap": True}, {}, {}], (True, False)),
     "one_domain_lacks_capability": (
         [{}, {}, {"capable": False}, {"capable": False}],
         (False, False),
@@ -200,6 +215,12 @@ def _gloo_rank(rank, world_size, port, case, results):
 
 
 class TestWorldConsensus(CustomTestCase):
+    def test_overlap_consensus(self):
+        for case in ("all_overlap", "overlap_on_one_rank"):
+            with self.subTest(case=case):
+                outcomes = self._run(case)
+                self.assertEqual(outcomes, [((True, False), 1, 0)] * 4)
+
     def _run(self, case):
         import torch.multiprocessing as mp
 
@@ -300,6 +321,24 @@ class TestRuntimeInit(CustomTestCase):
         ):
             self.assertFalse(hasattr(s, name), name)
 
+    def test_overlap_prefetch_uses_direct_forward_without_executor(self):
+        s, created = self._init(overlap=True)
+        self.assertTrue(s.enable_waiting_queue_dfs_prefetch)
+        self.assertFalse(s._forward_ingress_enabled)
+        self.assertEqual(len(created), 5)
+        self.assertIsNotNone(s._bg_thread)
+        self.assertIsNone(s._forward_launch_executor)
+        s.tree_cache.disable_waiting_queue_prefetch.assert_not_called()
+        s.model_worker = MagicMock()
+        s.model_worker.forward_batch_generation.return_value = "overlap-forward"
+        self.assertEqual(
+            s._forward_with_waiting_queue_ingress("batch", on_publish="publish"),
+            "overlap-forward",
+        )
+        s.model_worker.forward_batch_generation.assert_called_once_with(
+            "batch", on_publish="publish"
+        )
+
     def test_on_creates_the_executor(self):
         s, created = self._init()
         self.assertTrue(s._forward_ingress_enabled)
@@ -336,6 +375,11 @@ class TestRuntimeInit(CustomTestCase):
 
 class TestRunBatchOffRoute(CustomTestCase):
     def test_disabled_ingress_calls_worker_directly(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                self._assert_disabled_ingress_calls_worker_directly(overlap)
+
+    def _assert_disabled_ingress_calls_worker_directly(self, overlap):
         from contextlib import nullcontext
         from unittest.mock import patch
 
@@ -355,7 +399,7 @@ class TestRunBatchOffRoute(CustomTestCase):
         scheduler.forward_sleep_time = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.is_generation = True
-        scheduler.enable_overlap = False
+        scheduler.enable_overlap = overlap
         scheduler.enable_pdmux = False
         scheduler._forward_ingress_enabled = False
         scheduler.server_args = types.SimpleNamespace(
@@ -364,6 +408,11 @@ class TestRunBatchOffRoute(CustomTestCase):
             speculative_algorithm=None,
         )
         scheduler.future_map = MagicMock()
+        scheduler.future_map.resolve_seq_lens_cpu.return_value = None
+        scheduler._confidence_budget_prepare = None
+        scheduler.forward_stream_ctx = nullcontext()
+        scheduler.forward_stream = MagicMock()
+        scheduler.schedule_stream = MagicMock()
         scheduler._forward_isolation = MagicMock(return_value=nullcontext())
         scheduler.model_worker = MagicMock()
         scheduler.model_worker.forward_batch_generation.side_effect = StopForward
@@ -371,8 +420,13 @@ class TestRunBatchOffRoute(CustomTestCase):
             side_effect=AssertionError("disabled ingress wrapper called")
         )
         batch = types.SimpleNamespace(
-            forward_mode=types.SimpleNamespace(is_prebuilt=lambda: False),
-            spec_algorithm=types.SimpleNamespace(is_none=lambda: False),
+            forward_mode=types.SimpleNamespace(
+                is_prebuilt=lambda: False, is_decode=lambda: False
+            ),
+            spec_algorithm=types.SimpleNamespace(
+                is_none=lambda: False, supports_grammar_overlap=lambda: False
+            ),
+            req_pool_indices="request-slots",
             reqs=[],
         )
 
@@ -380,9 +434,18 @@ class TestRunBatchOffRoute(CustomTestCase):
             with self.assertRaises(StopForward):
                 scheduler.run_batch(batch)
 
-        scheduler.model_worker.forward_batch_generation.assert_called_once_with(
-            batch, pp_proxy_tensors=None
-        )
+        if overlap:
+            scheduler.model_worker.forward_batch_generation.assert_called_once()
+            args, kwargs = scheduler.model_worker.forward_batch_generation.call_args
+            self.assertEqual(args, (batch,))
+            kwargs["on_publish"]("published-lengths")
+            scheduler.future_map.publish.assert_called_once_with(
+                "request-slots", "published-lengths"
+            )
+        else:
+            scheduler.model_worker.forward_batch_generation.assert_called_once_with(
+                batch, pp_proxy_tensors=None
+            )
         scheduler._forward_with_waiting_queue_ingress.assert_not_called()
 
 
