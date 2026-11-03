@@ -100,6 +100,12 @@ from sglang.srt.utils import (
 
 _is_hcu = is_hcu()
 
+# SGLANG_HCU_MLA_QCAT=1: flashmla_kv takes q_nope / q_rope that forward_mla_rocm already
+# wrote side by side into one [T, H, 576] buffer as q_all (a view) instead of concatenating.
+_hcu_qcat = None
+if _is_hcu and get_bool_env_var("SGLANG_HCU_MLA_QCAT"):
+    import hcu_ops as _hcu_qcat
+
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
 # per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
 # TP4: 16 heads, d_v=512, tail=64). Reads q_nope/q_rope directly (skips the
@@ -2363,7 +2369,11 @@ class DeepseekSparseAttnBackend(
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = None
+                if _hcu_qcat is not None:
+                    q_all = _hcu_qcat.adjacent_q_all(q_nope, q_rope)
+                if q_all is None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2524,7 +2534,11 @@ class DeepseekSparseAttnBackend(
             )
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = None
+                if _hcu_qcat is not None:
+                    q_all = _hcu_qcat.adjacent_q_all(q_nope, q_rope)
+                if q_all is None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,

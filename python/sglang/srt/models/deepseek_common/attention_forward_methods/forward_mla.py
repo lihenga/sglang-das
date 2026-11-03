@@ -87,6 +87,12 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
+# SGLANG_HCU_SKINNY_BMM=1: decode-sized bf16 absorb bmm's (q_nope @ w_kc, attn @ w_vc)
+# run hcu_ops' batched skinny GEMM; it returns None (-> torch.bmm) when it doesn't apply.
+_hcu_bmm = None
+if __import__("os").environ.get("SGLANG_HCU_SKINNY_BMM", "0").lower() in ("1", "true"):
+    import hcu_ops as _hcu_bmm
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -561,7 +567,11 @@ class DeepseekMLAForwardMixin:
                         torch.bfloat16,
                     )
             else:
-                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+                q_nope_out = None
+                if _hcu_bmm is not None:
+                    q_nope_out = _hcu_bmm.try_bmm_bf16(q_nope.transpose(0, 1), self.w_kc)
+                if q_nope_out is None:
+                    q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
             q_nope_out = q_nope_out.transpose(0, 1)
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -903,13 +913,17 @@ class DeepseekMLAForwardMixin:
                     dtype=attn_output.dtype,
                     device=attn_output.device,
                 )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    self.w_vc,
-                    out=attn_bmm_output.view(
-                        -1, self.num_local_heads, self.v_head_dim
-                    ).transpose(0, 1),
-                )
+                _vc_out = attn_bmm_output.view(
+                    -1, self.num_local_heads, self.v_head_dim
+                ).transpose(0, 1)
+                if (
+                    _hcu_bmm is None
+                    or _hcu_bmm.try_bmm_bf16(
+                        attn_output.transpose(0, 1), self.w_vc, _vc_out
+                    )
+                    is None
+                ):
+                    torch.bmm(attn_output.transpose(0, 1), self.w_vc, out=_vc_out)
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_apply,

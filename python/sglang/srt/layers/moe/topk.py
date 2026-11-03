@@ -158,6 +158,45 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
+# SGLANG_HCU_FUSED_GATE=1: hcu_ops.moe_gate_topk = lightop moe_fused_gate (one expert
+# group, same numerics) + the HCU DeepEP id postprocess (padded rows -> -1, int64 ids)
+# in one kernel, for the configurations where that postprocess is all that follows.
+_hcu_gate = None
+if get_bool_env_var("SGLANG_HCU_FUSED_GATE"):
+    import hcu_ops as _hcu_gate
+_hcu_gate_path_ok = None
+
+
+def _hcu_gate_usable(
+    router_logits, correction_bias, top_k, renormalize, num_expert_group, topk_group,
+    num_fused_shared_experts,
+):
+    global _hcu_gate_path_ok
+    if (
+        _hcu_gate is None
+        or correction_bias is None
+        or num_expert_group != 1
+        or topk_group != 1
+        or num_fused_shared_experts != 0
+        or not renormalize
+    ):
+        return False
+    if _hcu_gate_path_ok is None:
+        # static server configuration: the branch _post_process_topk_ids takes on HIP
+        _hcu_gate_path_ok = bool(
+            _is_hcu
+            and _use_lightop
+            and get_moe_a2a_backend().is_deepep()
+            and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+            and not _eplb_remap_enabled()
+            and not _simulated_expert_balance
+            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        )
+    return _hcu_gate_path_ok and _hcu_gate.moe_gate_supported(
+        router_logits, correction_bias, top_k
+    )
+
 
 if _is_cuda:
     try:
@@ -2615,6 +2654,21 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 scoring_func=scoring_func,
             )
+        elif _hcu_gate is not None and _hcu_gate_usable(
+            router_logits, correction_bias, num_routed_topk, renormalize,
+            num_expert_group, topk_group, num_fused_shared_experts,
+        ):
+            topk_weights, topk_ids = _hcu_gate.moe_gate_topk(
+                router_logits,
+                correction_bias,
+                num_routed_topk,
+                routed_scaling_factor,
+                apply_routed_scaling_factor_on_output,
+                num_token_non_padded,
+            )
+            # ids are already final (int64, padded rows -1), so the HIP DeepEP
+            # postprocess in _post_process_topk_ids has nothing left to do
+            num_token_non_padded = None
         else:
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -78,6 +79,37 @@ from sglang.srt.utils import is_hcu
 _is_hcu = is_hcu()
 
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
+
+_hcu_linear_nn = _is_hcu and get_bool_env_var("SGLANG_HCU_LINEAR_NN", "true")
+_HCU_LINEAR_NN_MIN_N = int(os.environ.get("SGLANG_HCU_LINEAR_NN_MIN_N", "1024"))
+
+
+def _maybe_relayout_linear_weight_nn(layer: torch.nn.Module) -> None:
+    """Store a large bf16 linear weight as [K, N]-contiguous, viewed as [N, K].
+
+    On HCU rocBLAS picks slow kernels for the NT layout used by F.linear on
+    large bf16 weights; with this layout the GEMM runs as NN (about 2x faster
+    for the decode shapes of the dense/shared-expert/eh_proj layers). Tiny-N
+    weights (router, indexer) are faster as NT and are left alone. Decided once
+    per layer; a layer first seen under CUDA graph capture is never moved.
+    """
+    if getattr(layer, "_hcu_nn_checked", False):
+        return
+    layer._hcu_nn_checked = True
+    w = layer.weight
+    if (
+        torch.cuda.is_current_stream_capturing()
+        or type(w.data) is not torch.Tensor
+        or w.dim() != 2
+        or not w.is_cuda
+        or w.dtype not in (torch.bfloat16, torch.float16)
+        or not w.is_contiguous()
+        or w.shape[0] < _HCU_LINEAR_NN_MIN_N
+        or w.shape[1] < 1024
+    ):
+        return
+    w.data = w.data.t().contiguous().t()
+
 _use_aiter_w16a16_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE")
 if _use_aiter_w16a16_moe:
     from aiter.moe import (
@@ -427,6 +459,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         if x.dtype != layer.weight.dtype:
             x = x.to(layer.weight.dtype)
+        if _hcu_linear_nn:
+            _maybe_relayout_linear_weight_nn(layer)
         return F.linear(x, layer.weight, bias)
 
     def apply_into(

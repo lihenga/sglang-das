@@ -73,6 +73,43 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _K3_FUSED_MLA_FRONT = get_bool_env_var("SGLANG_K3_FUSED_MLA_FRONT", "false")
 _K3_FUSED_MLA_POST = get_bool_env_var("SGLANG_K3_FUSED_MLA_POST", "false")
+# SGLANG_HCU_QUANT_REUSE=1: q_b_proj and the indexer's wq_b share one per-token fp8 quant of
+# q_lora, and the indexer's wk takes the hidden_states quant prepare_qkv_latent made for
+# fused_qkv_a_proj_with_mqa (both handed over as Indexer._hcu_quant_reuse around the call).
+_hcu_quant_reuse = _is_hcu and get_bool_env_var("SGLANG_HCU_QUANT_REUSE", "false")
+if _hcu_quant_reuse:
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (  # noqa: E501
+        hcu_quant_input,
+        hcu_reusable_fp8_input,
+    )
+# SGLANG_HCU_SKINNY_BMM=1: decode-sized bf16 absorb bmm's (q_nope @ w_kc, attn @ w_vc)
+# run hcu_ops' batched skinny GEMM; it returns None (-> torch.bmm) when it doesn't apply.
+_hcu_bmm = None
+if _is_hcu and get_bool_env_var("SGLANG_HCU_SKINNY_BMM", "false"):
+    import hcu_ops as _hcu_bmm
+# SGLANG_HCU_MLA_QCAT=1: on decode-like batches the absorb bmm and the q rope write into
+# one [T, H, kv_lora_rank + rope] buffer, which dsa_backend's flashmla_kv path then takes
+# as q_all without concat_mla_absorb_q (_hcu_qcat_buffer lists the conditions).
+_hcu_qcat = None
+if _is_hcu and get_bool_env_var("SGLANG_HCU_MLA_QCAT", "false"):
+    import hcu_ops as _hcu_qcat
+    from sglang.srt.layers.rotary_embedding.base import (
+        RotaryEmbedding as _RotaryEmbedding,
+    )
+# SGLANG_HCU_MLA_KV_FUSED=1: on DSA decode-like batches kv_a_layernorm, the q / k rope and the
+# fp8 KV-cache store run as one hcu_ops.rope_qout_kv_store launch with the same bits: the
+# latent is normed in place in the packed qkv buffer and attn_mqa gets k=None with
+# save_kv_cache=False (_hcu_kv_fused_buffer lists the conditions).
+_hcu_kv = None
+_hcu_kv_logged = set()
+if _is_hcu and get_bool_env_var("SGLANG_HCU_MLA_KV_FUSED", "false"):
+    import hcu_ops as _hcu_kv
+    from sglang.srt.layers.rotary_embedding.base import (
+        RotaryEmbedding as _RotaryEmbedding,
+    )
+    from sglang.srt.model_executor.forward_context import (
+        get_attn_backend as _hcu_get_attn_backend,
+    )
 
 
 if TYPE_CHECKING:
@@ -146,8 +183,11 @@ def rocm_absorb_q_bmm(
     q_nope: torch.Tensor,
     *,
     is_capture_mode: bool,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Absorb ``q_nope @ w_kc`` on HIP/AITER (pre-transpose layout)."""
+    """Absorb ``q_nope @ w_kc`` on HIP/AITER (pre-transpose layout).
+
+    ``out``: optional [H, T, kv_lora_rank] destination (SGLANG_HCU_MLA_QCAT)."""
     # TODO(haishaw): add bmm_fp8 to ROCm
     if _use_aiter_gfx95 and attn.w_kc.dtype == torch.uint8:
         x = q_nope.transpose(0, 1)
@@ -184,11 +224,150 @@ def rocm_absorb_q_bmm(
                 )
             )
         else:
-            q_nope_out = torch.bmm(
-                q_nope.to(torch.bfloat16).transpose(0, 1),
-                _scaled_bmm_weight(attn.w_kc, attn.w_scale),
-            )
+            w_kc = _scaled_bmm_weight(attn.w_kc, attn.w_scale)
+            q_nope_out = None
+            if _hcu_bmm is not None and q_nope.dtype == torch.bfloat16:
+                q_nope_out = _hcu_bmm.try_bmm_bf16(q_nope.transpose(0, 1), w_kc, out)
+            if q_nope_out is None:
+                x = q_nope.to(torch.bfloat16).transpose(0, 1)
+                if out is None:
+                    q_nope_out = torch.bmm(x, w_kc)
+                else:
+                    q_nope_out = torch.bmm(x, w_kc, out=out)
+    if out is not None and q_nope_out.data_ptr() != out.data_ptr():
+        out.copy_(q_nope_out)
+        q_nope_out = out
     return q_nope_out
+
+
+def _hcu_qcat_buffer(attn, q_pe, forward_batch, q_replicate_active):
+    """SGLANG_HCU_MLA_QCAT: the [T, H, kv_lora_rank + rope] buffer the absorb bmm and the
+    q rope write into, or None to keep the split q_nope_out / q_pe.  Only decode-like
+    batches (flashmla_kv in dsa_backend) and the plain bf16 bmm + RotaryEmbedding fallback
+    rope (the SGLANG_HCU_FUSED_ROPE kernel) path."""
+    mode = forward_batch.forward_mode
+    rope = attn.rotary_emb
+    if (
+        q_replicate_active
+        or attn.use_deep_gemm_bmm
+        or _SGLANG_EXPERIMENTAL_LORA_OPTI
+        or is_kv_b_lora_active(attn)
+        or get_parallel().dcp_enabled
+        or not (
+            mode.is_decode_or_idle()
+            or mode.is_target_verify()
+            or mode.is_draft_extend_v2()
+        )
+        or attn.current_attention_backend not in ("dsa", "nsa")
+        or attn._fuse_rope_for_trtllm_mla(forward_batch)
+        or type(rope) is not _RotaryEmbedding
+        or not getattr(rope, "use_fallback_kernel", False)
+        or rope.head_size != rope.rotary_dim
+        or q_pe.dtype != torch.bfloat16
+        or q_pe.dim() != 3
+        or q_pe.shape[2] != rope.head_size
+    ):
+        return None
+    if rope.cos_sin_cache.dtype != q_pe.dtype or rope.cos_sin_cache.device != q_pe.device:
+        # what RotaryEmbedding.forward_cuda's fallback branch does on its first call
+        rope.cos_sin_cache = rope.cos_sin_cache.to(q_pe.device, dtype=q_pe.dtype)
+    return q_pe.new_empty(
+        q_pe.shape[0], q_pe.shape[1], attn.kv_lora_rank + q_pe.shape[2]
+    )
+
+
+def _hcu_kv_fused_buffer(attn, k_nope, forward_batch, q_replicate_active):
+    """SGLANG_HCU_MLA_KV_FUSED: this layer's fp8 KV-cache buffer when its kv_a_layernorm can
+    be deferred into the rope + store launch (_hcu_kv_rope_norm_store), else None.  Only
+    decode-like batches on dsa_backend's flashmla_kv with MLATokenToKVPool's lightop fp8 store
+    (not overridden), the RotaryEmbedding fallback rope and a plain-tensor out_cache_loc."""
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    mode = forward_batch.forward_mode
+    rope = attn.rotary_emb
+    be = _hcu_get_attn_backend()  # ForwardBatch has no attn_backend in this sglang
+    pool = getattr(be, "token_to_kv_pool", None)
+    if (
+        q_replicate_active
+        or not attn.use_dsa
+        or get_parallel().dcp_enabled
+        or not (
+            mode.is_decode_or_idle()
+            or mode.is_target_verify()
+            or mode.is_draft_extend_v2()
+        )
+        or attn.current_attention_backend not in ("dsa", "nsa")
+        or attn.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+        or attn._fuse_rope_for_trtllm_mla(forward_batch)
+        or attn._skip_rope_for_dsa_tilelang_fused()
+        or attn._skip_rope_for_aiter_fused_mla()
+        or attn.attn_mqa.is_cross_attention
+        or type(rope) is not _RotaryEmbedding
+        or not getattr(rope, "use_fallback_kernel", False)
+        or rope.head_size != rope.rotary_dim
+        or k_nope.dtype != torch.bfloat16
+        or getattr(be, "dsa_decode_impl", None) != "flashmla_kv"
+        or getattr(be, "use_mha", True)
+        or getattr(be, "hisparse_coordinator", None) is not None
+        or not isinstance(pool, MLATokenToKVPool)
+        or not getattr(pool, "dsa_kv_cache_store_fp8", False)
+        or type(pool).set_mla_kv_buffer is not MLATokenToKVPool.set_mla_kv_buffer
+        or type(pool)._write_mla_kv_buffer
+        is not MLATokenToKVPool._write_mla_kv_buffer
+        or not isinstance(forward_batch.out_cache_loc, torch.Tensor)
+    ):
+        return None
+    if rope.cos_sin_cache.dtype != k_nope.dtype or rope.cos_sin_cache.device != k_nope.device:
+        # what RotaryEmbedding.forward_cuda's fallback branch does on its first call
+        rope.cos_sin_cache = rope.cos_sin_cache.to(k_nope.device, dtype=k_nope.dtype)
+    return pool.kv_buffer[attn.attn_mqa.layer_id - pool.start_layer]
+
+
+def _hcu_kv_rope_norm_store(
+    attn, positions, q_pe, q_cat, k_nope, k_pe, kv_buf, forward_batch
+):
+    """SGLANG_HCU_MLA_KV_FUSED: the rope step for a layer whose kv_a_layernorm was deferred.
+    Returns (q_pe, k_pe, k_nope); k_nope is None when hcu_ops.rope_qout_kv_store normed the
+    latent in place and stored this layer's slots, else the normed latent (unfused ops)."""
+    rope = attn.rotary_emb
+    q_out = q_pe if q_cat is None else q_cat[..., attn.kv_lora_rank :]
+    loc = forward_batch.out_cache_loc
+    norm = attn.kv_a_layernorm
+    if _hcu_kv.kv_fused_supported(
+        positions, q_pe, q_out, k_nope, norm.weight, k_pe, rope.cos_sin_cache, kv_buf, loc
+    ):
+        _hcu_kv.rope_qout_kv_store(
+            positions,
+            q_pe,
+            q_out,
+            k_nope,
+            norm.weight,
+            norm.variance_epsilon,
+            k_pe,
+            rope.cos_sin_cache,
+            rope.is_neox_style,
+            kv_buf,
+            loc,
+        )
+        if "fused" not in _hcu_kv_logged:
+            _hcu_kv_logged.add("fused")
+            logger.info("SGLANG_HCU_MLA_KV_FUSED: kv norm + rope + fp8 store in one launch")
+        return q_out, k_pe, None
+    if "unfused" not in _hcu_kv_logged:
+        _hcu_kv_logged.add("unfused")
+        logger.info(
+            "SGLANG_HCU_MLA_KV_FUSED: operands not covered (T %d, loc %d), unfused ops",
+            positions.numel(),
+            loc.numel(),
+        )
+    k_nope = norm(k_nope.squeeze(1)).unsqueeze(1)
+    if q_cat is not None:
+        _hcu_kv.rope_qout(
+            positions, q_pe, q_out, k_pe, rope.head_size, rope.cos_sin_cache, rope.is_neox_style
+        )
+        return q_out, k_pe, k_nope
+    q_pe, k_pe = rope(positions, q_pe, k_pe)
+    return q_pe, k_pe, k_nope
 
 
 def rocm_absorb_v_bmm(
@@ -257,11 +436,17 @@ def rocm_absorb_v_bmm(
                     dtype=torch.bfloat16,
                     device=attn_output.device,
                 )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    _scaled_bmm_weight(attn.w_vc, attn.w_scale),
-                    out=output.transpose(0, 1),
-                )
+                w_vc = _scaled_bmm_weight(attn.w_vc, attn.w_scale)
+                if (
+                    _hcu_bmm is None
+                    or _hcu_bmm.try_bmm_bf16(
+                        attn_output.transpose(0, 1), w_vc, output.transpose(0, 1)
+                    )
+                    is None
+                ):
+                    torch.bmm(
+                        attn_output.transpose(0, 1), w_vc, out=output.transpose(0, 1)
+                    )
                 return output.flatten(1, 2)
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
@@ -403,9 +588,14 @@ class DeepseekMLARocmForwardMixin:
         q_lora = None
         q_input_quant_args = None
         topk_indices = None
+        hcu_kv_buf = None
         if self.q_lora_rank is not None:
             # Keep the packed buffer to let HIPC read both norm inputs directly.
             packed_qkv = get_attn_tp_context().fetch_qkv_latent()
+            hcu_x_quant = hcu_q_quant = None
+            if _hcu_quant_reuse:
+                hcu_x_quant = getattr(self, "_hcu_x_quant", None)
+                self._hcu_x_quant = None
             q, latent_cache = packed_qkv.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
@@ -504,7 +694,12 @@ class DeepseekMLARocmForwardMixin:
                 )
             else:
                 q = self.q_a_layernorm(q)
-                k_nope = self.kv_a_layernorm(k_nope)
+                if _hcu_kv is not None:
+                    hcu_kv_buf = _hcu_kv_fused_buffer(
+                        self, k_nope, forward_batch, q_replicate_active
+                    )
+                if hcu_kv_buf is None:
+                    k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -548,6 +743,15 @@ class DeepseekMLARocmForwardMixin:
                         self.qk_head_dim,
                     )
                 else:
+                    if (
+                        _hcu_quant_reuse
+                        and q_input_quant_args is None
+                        and q_lora is q
+                        and hcu_reusable_fp8_input(self.q_b_proj, q)
+                        and hcu_reusable_fp8_input(getattr(self.indexer, "wq_b", None), q)
+                    ):
+                        q_input_quant_args = hcu_quant_input(q)
+                        hcu_q_quant = (q, q_input_quant_args)
                     if q_input_quant_args is None:
                         q = self.q_b_proj_forward(q)
                     else:
@@ -557,13 +761,19 @@ class DeepseekMLARocmForwardMixin:
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
+                        if _hcu_quant_reuse:
+                            self.indexer._hcu_quant_reuse = (hcu_q_quant, hcu_x_quant)
+                        try:
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
+                        finally:
+                            if _hcu_quant_reuse:
+                                self.indexer._hcu_quant_reuse = None
                     else:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
@@ -586,6 +796,9 @@ class DeepseekMLARocmForwardMixin:
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+        q_cat = None
+        if _hcu_qcat is not None:
+            q_cat = _hcu_qcat_buffer(self, q_pe, forward_batch, q_replicate_active)
 
         if q_replicate_active:
             q_nope_out = (
@@ -626,7 +839,14 @@ class DeepseekMLARocmForwardMixin:
                 q_nope_out = q_nope_out[:, :expected_m, :]
             else:
                 q_nope_out = rocm_absorb_q_bmm(
-                    self, q_nope, is_capture_mode=get_is_capture_mode()
+                    self,
+                    q_nope,
+                    is_capture_mode=get_is_capture_mode(),
+                    out=(
+                        None
+                        if q_cat is None
+                        else q_cat[..., : self.kv_lora_rank].transpose(0, 1)
+                    ),
                 )
 
             q_nope_out = q_nope_out.transpose(0, 1)
@@ -652,8 +872,29 @@ class DeepseekMLARocmForwardMixin:
                 or self.current_attention_backend == "triton"
             )
         ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            if hcu_kv_buf is not None:
+                # SGLANG_HCU_MLA_KV_FUSED: kv_a_layernorm + rope + fp8 KV store
+                q_pe, k_pe, k_nope = _hcu_kv_rope_norm_store(
+                    self, positions, q_pe, q_cat, k_nope, k_pe, hcu_kv_buf, forward_batch
+                )
+                hcu_kv_buf = None
+            elif q_cat is not None:
+                # rotated q_pe straight into q_cat's rope tail, k_pe in place
+                _hcu_qcat.rope_qout(
+                    positions,
+                    q_pe,
+                    q_cat[..., self.kv_lora_rank :],
+                    k_pe,
+                    self.rotary_emb.head_size,
+                    self.rotary_emb.cos_sin_cache,
+                    self.rotary_emb.is_neox_style,
+                )
+                q_pe = q_cat[..., self.kv_lora_rank :]
+            else:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
+        if hcu_kv_buf is not None:  # deferred kv_a_layernorm, rope step skipped
+            k_nope = self.kv_a_layernorm(k_nope.squeeze(1)).unsqueeze(1)
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
         mla_prefill_cp = mla_use_prefill_cp(forward_batch)
         defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
@@ -841,6 +1082,8 @@ class DeepseekMLARocmForwardMixin:
                         forward_batch,
                         q_rope=q_pe,
                         k_rope=k_pe,
+                        # k_nope None: SGLANG_HCU_MLA_KV_FUSED stored the KV already
+                        save_kv_cache=k_nope is not None,
                         **extra_args,
                         **sink_args,
                         **(

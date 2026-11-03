@@ -3,11 +3,37 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Sequence, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# SGLANG_HCU_SKINNY_DRAFT_VP=1 (experimental, default off): under CUDA graph capture assume
+# every rank of the VP group runs the same padded batch, so project_top1 only gathers /
+# projects / exchanges those rows instead of the fixed max_rows_per_rank buffer, and the
+# shard GEMM runs hcu_ops' skinny NN GEMM when vp_size * rows <= 48.  Eager calls are
+# unchanged.  Unsafe with DP attention: a rank replaying the decode graph exchanges
+# vp_size * rows while a rank in an eager prefill / draft extend exchanges the fixed buffer,
+# and the mismatched all_gather hangs NCCL.
+_hcu_uniform_rows = os.environ.get("SGLANG_HCU_SKINNY_DRAFT_VP", "0") == "1"
+_hcu_lm_head = None
+if _hcu_uniform_rows:
+    try:
+        import hcu_ops as _hcu_lm_head
+    except ImportError:
+        pass
+
+
+def _hcu_gemm_rows(rows: int, cap: int) -> int:
+    """Row count to run the shard GEMM at: rocBLAS picks slow kernels for some M of GLM-5.3's
+    [M, 6144] x [6144, 19360] shard GEMM on BW1100 (M 40 / 72 / 136-152 / 200: 370-500 us vs
+    216 / 238 / 346 at M 64 / 128 / 256), so round up to those."""
+    for bucket in (64, 128, 256):
+        if rows <= bucket:
+            return min(bucket, cap)
+    return rows
 
 
 def build_node_local_vp_groups(
@@ -243,6 +269,15 @@ class DraftLMHeadVocabParallelTop1:
                 f"{(self.vocab_size, self.hidden_size)}."
             )
 
+        if (
+            _hcu_uniform_rows
+            and local_rows
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            return self._project_top1_uniform_rows(
+                hidden_states, logit_scale, final_logit_softcapping
+            )
+
         if local_rows:
             self.local_hidden[:local_rows].copy_(hidden_states)
         if local_rows < self.max_rows_per_rank:
@@ -286,6 +321,68 @@ class DraftLMHeadVocabParallelTop1:
         )
         local_start = self.vp_rank * self.max_rows_per_rank
         local_end = local_start + local_rows
+        return (
+            global_scores[local_start:local_end],
+            global_token_ids[local_start:local_end],
+        )
+
+    def _project_top1_uniform_rows(
+        self,
+        hidden_states: torch.Tensor,
+        logit_scale: float | None,
+        final_logit_softcapping: float | None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """project_top1 when every VP rank has the same row count (graph capture)."""
+        rows = hidden_states.shape[0]
+        total = self.vp_size * rows
+        local_hidden = self.local_hidden[:rows]
+        local_hidden.copy_(hidden_states)
+        gathered_hidden = self.gathered_hidden[:total]
+        torch.distributed.all_gather_into_tensor(
+            gathered_hidden,
+            local_hidden,
+            group=self.process_group,
+        )
+
+        local_logits = self.local_logits[:total]
+        if (
+            _hcu_lm_head is None
+            or _hcu_lm_head.try_skinny_nn_bf16(
+                gathered_hidden, self.weight_shard_t, local_logits
+            )
+            is None
+        ):
+            # padding rows of the gathered buffer are stale; their logits are never read
+            mm_rows = _hcu_gemm_rows(total, self.total_rows)
+            torch.mm(
+                self.gathered_hidden[:mm_rows],
+                self.weight_shard_t,
+                out=self.local_logits[:mm_rows],
+            )
+        if logit_scale is not None:
+            local_logits.mul_(logit_scale)
+        if final_logit_softcapping:
+            local_logits.div_(final_logit_softcapping)
+            local_logits.tanh_()
+            local_logits.mul_(final_logit_softcapping)
+
+        local_scores, local_token_ids = torch.max(local_logits, dim=-1)
+        local_candidates = self.local_candidates[:total]
+        local_candidates[:, 0].copy_(local_scores)
+        local_candidates[:, 1].copy_(local_token_ids)
+        gathered_candidates = self.gathered_candidates[: self.vp_size * total]
+        torch.distributed.all_gather_into_tensor(
+            gathered_candidates,
+            local_candidates,
+            group=self.process_group,
+        )
+
+        global_scores, global_token_ids = select_global_top1_from_candidates(
+            gathered_candidates.view(self.vp_size, total, 2),
+            self.shard_size,
+        )
+        local_start = self.vp_rank * rows
+        local_end = local_start + rows
         return (
             global_scores[local_start:local_end],
             global_token_ids[local_start:local_end],

@@ -41,6 +41,40 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_lightop_channel_fp8 = (
     get_bool_env_var("SGLANG_USE_LIGHTOP_CHANNEL_FP8") and _is_hip
 )
+# SGLANG_HCU_QUANT_REUSE=1: a caller feeding one bf16 activation to two CHANNEL-fp8 linears
+# (GLM-5.3: q_lora -> q_b_proj + indexer wq_b, hidden_states -> fused_qkv_a_proj + indexer
+# wk) quantizes it once with hcu_quant_input and passes the HcuQuantArgs pair as
+# input_quant_args.  It is the scaled_fp8_quant call apply_fp8_linear makes for such a layer,
+# so the GEMM sees the same operands.
+_hcu_quant_reuse = False
+if get_bool_env_var("SGLANG_HCU_QUANT_REUSE"):
+    from sglang.srt.utils import is_hcu
+
+    _hcu_quant_reuse = is_hcu()
+# SGLANG_HCU_NORM_QUANT=1 / SGLANG_HCU_SILU_QUANT=1: the per-token fp8 quant of a CHANNEL-fp8
+# linear's bf16 input comes from the kernel producing that input (hcu_ops.fused_add_rms_quant
+# in RMSNorm.forward_hip, stashed per tensor; hcu_ops.silu_mul_quant in DeepseekV2MLP) with
+# the bits of the scaled_fp8_quant below.  apply_weights / hcu_quant_input take a stashed pair
+# whose source tensor is x itself.
+_hcu_norm_quant = _hcu_silu_quant = False
+if get_bool_env_var("SGLANG_HCU_NORM_QUANT") or get_bool_env_var("SGLANG_HCU_SILU_QUANT"):
+    from sglang.srt.utils import is_hcu as _is_hcu_fn
+
+    if _is_hcu_fn():
+        _hcu_norm_quant = get_bool_env_var("SGLANG_HCU_NORM_QUANT")
+        _hcu_silu_quant = get_bool_env_var("SGLANG_HCU_SILU_QUANT")
+_hcu_prequant = _hcu_quant_reuse or _hcu_norm_quant or _hcu_silu_quant
+if _hcu_prequant:
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        scaled_fp8_quant as _scaled_fp8_quant,
+    )
+if _hcu_norm_quant:
+    import logging
+
+    import hcu_ops as _hcu_ops
+
+    _hcu_nq_logger = logging.getLogger(__name__)
+    _hcu_nq_logged = set()
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
@@ -254,6 +288,33 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 bias=bias,
             )
 
+        if isinstance(input_quant_args, HcuQuantArgs):
+            # SGLANG_HCU_QUANT_REUSE: x was already quantized by hcu_quant_input
+            return apply_fp8_linear(
+                input=(input_quant_args[0], input_quant_args[1]),
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                bias=bias,
+            )
+
+        if _hcu_norm_quant and input_quant_args is None and isinstance(x, torch.Tensor):
+            qs = _hcu_ops.norm_quant_stash_get(x)
+            if qs is not None and hcu_reusable_fp8_input(layer, x):
+                # SGLANG_HCU_NORM_QUANT: x is an RMSNorm output its kernel already quantized
+                key = tuple(layer.weight.shape)
+                if key not in _hcu_nq_logged:
+                    _hcu_nq_logged.add(key)
+                    _hcu_nq_logger.info(
+                        "SGLANG_HCU_NORM_QUANT: fp8 linear weight %s takes the norm's quant",
+                        key,
+                    )
+                return apply_fp8_linear(
+                    input=qs,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                )
+
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
@@ -301,3 +362,35 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,
             )
+
+
+class HcuQuantArgs(tuple):
+    """(fp8 activation, per-token fp32 scale) made by hcu_quant_input."""
+
+
+def hcu_reusable_fp8_input(layer, x) -> bool:
+    """SGLANG_HCU_QUANT_REUSE: whether ``layer`` would quantize ``x`` exactly like
+    hcu_quant_input (CHANNEL fp8 weight, dynamic per-token activation, plain
+    apply_fp8_linear path), i.e. may take hcu_quant_input(x) as input_quant_args."""
+    scheme = getattr(layer, "scheme", None)
+    return (
+        _hcu_prequant
+        and isinstance(scheme, CompressedTensorsW8A8Fp8)
+        and scheme.strategy == QuantizationStrategy.CHANNEL
+        and scheme.weight_block_size is None
+        and not _use_aiter
+        and not _use_lightop_channel_fp8
+        and getattr(layer, "input_scale", None) is None
+        and isinstance(x, torch.Tensor)
+        and x.dtype == torch.bfloat16
+        and x.dim() == 2
+        and x.shape[0] > 0
+    )
+
+
+def hcu_quant_input(x: torch.Tensor) -> HcuQuantArgs:
+    if _hcu_norm_quant:
+        qs = _hcu_ops.norm_quant_stash_get(x)
+        if qs is not None:
+            return HcuQuantArgs(qs)
+    return HcuQuantArgs(_scaled_fp8_quant(x, None, use_per_token_if_dynamic=True))
