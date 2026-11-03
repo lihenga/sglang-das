@@ -1179,6 +1179,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     return
                 counter_index, pending, ready_event = task
                 success = False
+                started = time.perf_counter()
                 try:
                     ready_event.synchronize()
                     if self.host_prefetch_enabled:
@@ -1195,7 +1196,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
-                    self._finish_prefetch_metrics(list(pending), success is True)
+                    self._finish_prefetch_metrics(
+                        list(pending), success is True, time.perf_counter() - started
+                    )
             finally:
                 self.load_queue.task_done()
 
@@ -1322,12 +1325,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         success = False
         return success
 
-    def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
+    def _finish_prefetch_metrics(
+        self, rids: list[str], success: bool, duration: float
+    ) -> None:
         pending_load_tokens = getattr(self, "pending_load_tokens", {})
-        tokens = sum(pending_load_tokens.pop(rid, 0) for rid in rids)
+        token_counts = [pending_load_tokens.pop(rid, 0) for rid in rids]
+        for tokens in token_counts:
+            self._log_l4_prefetch_metric(tokens, duration, success)
+        tokens = sum(token_counts)
         if not success or tokens <= 0:
             return
-        self._log_prefetched_tokens(tokens)
         recorder = getattr(
             getattr(self.storage, "store", None), "record_prefetched_tokens", None
         )
@@ -1340,12 +1347,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     exc_info=True,
                 )
 
-    def _log_prefetched_tokens(self, tokens: int) -> None:
+    def _log_l4_prefetch_metric(
+        self, tokens: int, duration: float, success: bool
+    ) -> None:
         collector = getattr(self, "storage_metrics_collector", None)
         if collector is None or tokens <= 0:
             return
         try:
-            collector.log_prefetched_tokens(tokens)
+            collector.log_l4_prefetch("mooncake", tokens, duration, success)
         except BaseException:
             logger.warning(
                 "Failed to record SGLang direct-storage prefetch metrics.",

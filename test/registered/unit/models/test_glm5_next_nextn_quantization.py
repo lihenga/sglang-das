@@ -103,9 +103,10 @@ class TestMixedPrecisionDeepEPDispatch(unittest.TestCase):
 
     def test_w4a8_uses_local_experts_and_existing_activation_scales(self):
         method = SimpleNamespace(
+            use_deepgemm=False,
             moe_runner_config=SimpleNamespace(
                 activation="silu", apply_router_weight_on_input=False
-            )
+            ),
         )
         layer = SimpleNamespace(
             w13_weight=torch.empty((2, 8, 2), dtype=torch.int8),
