@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import contextvars
 import ctypes
 import hashlib
 import logging
@@ -1948,7 +1949,10 @@ class MMEncoder:
             with torch.cuda.stream(stream):
                 return fn(*args, **kwargs)
 
-        future = asyncio.wrap_future(executor.submit(run))
+        # Propagate contextvars (request-scoped state) into the worker thread.
+        future = asyncio.wrap_future(
+            executor.submit(contextvars.copy_context().run, run)
+        )
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:

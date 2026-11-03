@@ -130,8 +130,12 @@ def _resolve_encoder_batch_policy(
 ) -> Tuple[int, bool]:
     """Return effective batch size and same-turn coalescing policy."""
     max_batch_size = max(1, int(configured_max_batch_size))
-    coalesce_same_turn = model_type == "kimi_k3"
-    if coalesce_same_turn and not max_batch_size_is_explicit:
+    # GLM Mooncake splits one upstream multi-image request into one /encode
+    # part per image. Yield once so those same-turn parts enter the FIFO before
+    # dispatch; otherwise the first image runs as a batch of one and the other
+    # seven run separately (1+7), adding a full ViT launch.
+    coalesce_same_turn = model_type == "kimi_k3" or model_type.startswith("glm")
+    if model_type == "kimi_k3" and not max_batch_size_is_explicit:
         max_batch_size = min(max_batch_size, _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE)
     return max_batch_size, coalesce_same_turn
 

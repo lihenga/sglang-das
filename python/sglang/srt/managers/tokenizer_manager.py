@@ -96,7 +96,10 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    strip_local_decode_mm_features,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -1041,6 +1044,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
+        decode_mm_layout = (
+            self._decode_builds_mm_layout_from_media()
+            and obj.contains_mm_input()
+            and not obj.need_wait_for_mm_inputs
+        )
         if obj.input_embeds is not None:
             if not get_memory().disable_radix_cache:
                 raise ValueError(
@@ -1062,12 +1070,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # For audio-only requests (e.g., Whisper), text may be empty.
             # The multimodal processor will provide input_ids later.
-            glm_local_mm = getattr(
-                self.mm_processor, "tokenizes_input_text", False
-            ) and (
-                not get_disagg().language_only
-                or get_disagg().encoder_transfer_backend == "zmq_to_tokenizer"
-                or not obj.need_wait_for_mm_inputs
+            # Decode layout tokenizes like prefill: both expand the same token IDs.
+            glm_local_mm = (
+                getattr(self.mm_processor, "tokenizes_input_text", False)
+                and not decode_mm_layout
+                and (
+                    not get_disagg().language_only
+                    or get_disagg().encoder_transfer_backend == "zmq_to_tokenizer"
+                    or not obj.need_wait_for_mm_inputs
+                )
             )
             if (
                 self.mm_processor
@@ -1151,6 +1162,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
+            elif decode_mm_layout:
+                mm_inputs = await self.mm_processor.process_mm_layout_async(
+                    image_data=obj.image_data,
+                    input_ids=input_ids,
+                    request_obj=obj,
+                )
             elif (
                 get_disagg().language_only
                 and get_disagg().encoder_transfer_backend
@@ -1214,6 +1231,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         item.set_pad_value()
         else:
             mm_inputs = None
+
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and get_disagg().language_only
+            and get_disagg().encoder_transfer_backend in ("mooncake", "zmq_to_scheduler")
+            and not obj.need_wait_for_mm_inputs
+            and getattr(self.mm_processor, "tokenizes_input_text", False)
+        ):
+            # GLM already built token IDs, grid metadata and M-RoPE locally.
+            # The decoder reuses Prefill KV and never runs the vision encoder.
+            strip_local_decode_mm_features(mm_inputs)
 
         if getattr(self.model_config.hf_text_config, "model_type", None) in (
             "glm5_next",
@@ -3756,6 +3784,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._forward_encoder_dispatch_error, error
         )
 
+    def _decode_builds_mm_layout_from_media(self) -> bool:
+        """Whether decode rebuilds prefill's mm layout itself, without the encoder."""
+        return (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and get_disagg().language_only
+            and get_disagg().encoder_transfer_backend in ("mooncake", "zmq_to_scheduler")
+            and self.mm_processor is not None
+            and self.mm_processor.builds_epd_layout_from_media
+        )
+
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> bool:
@@ -3788,7 +3826,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
             # dispatch to encoder by default
             should_dispatch = True
-            if get_disagg().enable_adaptive_dispatch_to_encoder:
+            if self._decode_builds_mm_layout_from_media():
+                # Decode reuses prefill KV and never consumes vision embeddings;
+                # it only needs input_ids / mrope layout. Dispatching here would
+                # run a second full ViT encode (+ RDMA) per request on the
+                # shared encoder. Other processors have no local layout that
+                # matches prefill's, so they keep dispatching.
+                should_dispatch = False
+            elif get_disagg().enable_adaptive_dispatch_to_encoder:
                 should_dispatch = self._should_dispatch_to_encoder(obj)
 
             # Set need_wait_for_mm_inputs flag based on whether we dispatch to encoder

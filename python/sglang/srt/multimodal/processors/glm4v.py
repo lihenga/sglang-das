@@ -22,6 +22,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -476,11 +477,30 @@ def _passthrough_video_metadata(video, video_config):
     return _glm_video_metadata(num_frames, fps, num_frames / fps, range(num_frames))
 
 
+def glm_video_timestamps(video_metadata):
+    """Per-video timestamps of each temporal patch, as the GLM-V prompt prints them."""
+    video_timestamps = []
+    for metadata in video_metadata:
+        ts = getattr(metadata, "timestamps", None)
+        if ts is None and isinstance(metadata, dict):
+            ts = metadata.get("timestamps", None)
+        if ts is None and isinstance(metadata, dict):
+            fps = metadata.get("fps", 0)
+            indices = metadata.get("frames_indices")
+            if fps and indices is not None:
+                ts = [index / fps for index in indices]
+        if ts is None:
+            raise ValueError(f"GLM-V video metadata missing timestamps: {metadata}")
+        video_timestamps.append(list(ts)[::2])
+    return video_timestamps
+
+
 class Glm4vImageProcessor(SGLangBaseProcessor):
     tokenizes_input_text = True
     # EPD must reuse the request tokenizer output. Re-encoding the escaped GLM
     # image markers can split them into ordinary tokens with newer tokenizers.
     prefer_tokenized_input = True
+    builds_epd_layout_from_media = True
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
     models = [
@@ -823,90 +843,24 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        # Bare base64 video must use SGLang's decoder because HF treats it as a path-like string.
-        video_urls, video_configs = split_glm_video_items(request_obj.video_data)
-        video_processor = getattr(self._processor, "video_processor", None)
-        default_video_config = glm_processor_video_config(video_processor)
-        default_video_config.update(self.video_config)
-        video_configs = _merge_glm_video_configs(default_video_config, video_configs)
-
+        video_urls, video_configs, video_processor = self._glm_video_configs(
+            request_obj
+        )
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=video_urls,
             multimodal_tokens=self.mm_tokens,
         )
-
-        video_metadata = None
-        videos_kwargs = None
-        if base_output.videos and not isinstance(base_output.videos[0], dict):
-            videos_kwargs = glm_budget_kwargs(
-                video_processor,
-                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
-                count=len(base_output.videos),
-                split=True,
-            )
-            effective_max_image_tokens = (videos_kwargs or {}).get("max_image_tokens")
-            loop = asyncio.get_running_loop()
-            decode_tasks = []
-            for index, video in enumerate(base_output.videos):
-                video_config = _glm_effective_presize_budget(
-                    video_configs[index] if index < len(video_configs) else {},
-                    effective_max_image_tokens,
-                )
-                if isinstance(video, VideoDecoderWrapper):
-                    decode_tasks.append(
-                        loop.run_in_executor(
-                            self.io_executor,
-                            glm_sample_and_decode_sync,
-                            video,
-                            video_config,
-                            video_processor,
-                        )
-                    )
-                elif isinstance(video, list) and (
-                    not video or isinstance(video[0], dict)
-                ):
-                    decode_tasks.append(
-                        loop.run_in_executor(
-                            self.io_executor, preprocess_video_frames_sync, video
-                        )
-                    )
-                else:
-                    decode_tasks.append(
-                        asyncio.sleep(
-                            0,
-                            result=(
-                                video,
-                                _passthrough_video_metadata(video, video_config),
-                            ),
-                        )
-                    )
-
-            try:
-                videos_processed = await asyncio.gather(*decode_tasks)
-            finally:
-                for video in base_output.videos:
-                    close = getattr(video, "close", None)
-                    if callable(close):
-                        close()
-            base_output.videos, metadata = map(list, zip(*videos_processed))
-            if metadata and all(item is not None for item in metadata):
-                video_metadata = metadata
-
-        combine_kwargs = {}
-        if video_metadata is not None:
-            # Skip HF resampling because these frames already carry their original indices.
-            combine_kwargs["video_metadata"] = video_metadata
-            combine_kwargs["do_sample_frames"] = False
-            processor_video_config = {
-                key: value
-                for key, value in self.video_config.items()
-                if key not in {"fps", "max_frames", "max_tokens_per_frame"}
-            }
-            if videos_kwargs is not None:
-                processor_video_config.update(videos_kwargs)
-            combine_kwargs["processor_video_config"] = processor_video_config
+        video_metadata, videos_kwargs = await self._sample_glm_videos(
+            base_output,
+            video_configs=video_configs,
+            video_processor=video_processor,
+            sampler=video_processor,
+        )
+        combine_kwargs = self._glm_video_processor_kwargs(
+            video_metadata=video_metadata, videos_kwargs=videos_kwargs
+        )
 
         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens, **combine_kwargs
@@ -930,3 +884,219 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
+
+    async def process_mm_layout_async(self, image_data, input_ids, request_obj):
+        """EPD decode: build mm_inputs with the layout prefill builds from encoder output.
+
+        Decode receives prefill's KV, so its input_ids and M-RoPE must match
+        prefill's token for token. Grids and timestamps are computed from the
+        media alone, sampled as the encoder samples them, and the prompt is laid
+        out by the same ``get_mm_data`` prefill runs; mm tokens in the prompt are
+        never matched against the data here, so decode accepts what prefill does.
+        """
+        video_urls, video_configs, video_processor = self._glm_video_configs(
+            request_obj, base_config=self._encoder_mm_config("video")
+        )
+        loaded = await self.fast_load_mm_data(
+            prompt="",
+            multimodal_tokens=self.mm_tokens,
+            image_data=image_data,
+            video_data=video_urls,
+            return_text=False,
+        )
+        if any(isinstance(item, dict) for item in loaded.images + loaded.videos):
+            # Preprocessed inputs carry no media to derive the layout from.
+            return await self.process_mm_data_async(
+                image_data=image_data, input_text=input_ids, request_obj=request_obj
+            )
+        framed = any(isinstance(video, list) for video in loaded.videos)
+        # The encoder samples frames with glm_sample_frame_indices, not with the
+        # HF processor's sample_frames; the two can disagree on frame count.
+        video_metadata, videos_kwargs = await self._sample_glm_videos(
+            loaded,
+            video_configs=video_configs,
+            video_processor=video_processor,
+            sampler=None,
+        )
+        # The encoder's video config only steers sampling; its processor call
+        # gets the budget kwargs alone.
+        processor_kwargs = self._glm_video_processor_kwargs(
+            video_metadata=video_metadata,
+            videos_kwargs=videos_kwargs,
+            base_config={},
+        )
+        processor_kwargs.setdefault("processor_video_config", videos_kwargs or {})
+        processor_kwargs["processor_image_config"] = self._encoder_mm_config("image")
+        if (
+            framed
+            and video_metadata is not None
+            and envs.SGLANG_SKIP_VIDEO_PREPROCESS.get()
+        ):
+            processor_kwargs["processor_video_config"]["do_resize"] = False
+        ret = await self._process_media_only(
+            images=loaded.images, videos=loaded.videos, **processor_kwargs
+        )
+
+        image_grid_thw = ret.get("image_grid_thw")
+        video_grid_thw = ret.get("video_grid_thw")
+        output = self.get_mm_data(
+            list(input_ids),
+            None,
+            img_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            video_timestamps=(
+                glm_video_timestamps(video_metadata)
+                if video_metadata is not None
+                else None
+            ),
+        )
+        _attach_layout_features(
+            output.mm_items,
+            image_pixels=ret.get("pixel_values"),
+            image_grid_thw=image_grid_thw,
+            video_pixels=ret.get("pixel_values_videos"),
+            video_grid_thw=video_grid_thw,
+        )
+        return output
+
+    async def _process_media_only(self, **kwargs):
+        # An empty prompt: the processor only computes pixels and grids here.
+        if self.mm_processor_executor is None:
+            return self.process_mm_data(input_text="", **kwargs)
+        return await self.mm_processor_executor.run(
+            self.process_mm_data, input_text="", **kwargs
+        )
+
+    @staticmethod
+    def _encoder_mm_config(modality):
+        # EncoderPreprocessor._build_vision_config reads vision_config, while
+        # self.image_config / self.video_config are the top-level keys.
+        vision_config = (get_mm().mm_process_config or {}).get("vision_config") or {}
+        return vision_config.get(modality) or {}
+
+    def _glm_video_configs(self, request_obj, base_config=None):
+        # Bare base64 video must use SGLang's decoder because HF treats it as a path-like string.
+        video_urls, video_configs = split_glm_video_items(request_obj.video_data)
+        video_processor = getattr(self._processor, "video_processor", None)
+        default_video_config = glm_processor_video_config(video_processor)
+        default_video_config.update(
+            self.video_config if base_config is None else base_config
+        )
+        video_configs = _merge_glm_video_configs(default_video_config, video_configs)
+        return video_urls, video_configs, video_processor
+
+    async def _sample_glm_videos(
+        self, base_output, *, video_configs, video_processor, sampler
+    ):
+        """Sample and decode ``base_output.videos`` in place.
+
+        ``sampler`` is the HF video processor whose ``sample_frames`` picks the
+        frames, or None for ``glm_sample_frame_indices``.
+        """
+        if not base_output.videos or isinstance(base_output.videos[0], dict):
+            return None, None
+        videos_kwargs = glm_budget_kwargs(
+            video_processor,
+            user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
+            count=len(base_output.videos),
+            split=True,
+        )
+        effective_max_image_tokens = (videos_kwargs or {}).get("max_image_tokens")
+        loop = asyncio.get_running_loop()
+        decode_tasks = []
+        for index, video in enumerate(base_output.videos):
+            video_config = _glm_effective_presize_budget(
+                video_configs[index] if index < len(video_configs) else {},
+                effective_max_image_tokens,
+            )
+            if isinstance(video, VideoDecoderWrapper):
+                decode_tasks.append(
+                    loop.run_in_executor(
+                        self.io_executor,
+                        glm_sample_and_decode_sync,
+                        video,
+                        video_config,
+                        sampler,
+                    )
+                )
+            elif isinstance(video, list) and (not video or isinstance(video[0], dict)):
+                decode_tasks.append(
+                    loop.run_in_executor(
+                        self.io_executor, preprocess_video_frames_sync, video
+                    )
+                )
+            else:
+                decode_tasks.append(
+                    asyncio.sleep(
+                        0,
+                        result=(
+                            video,
+                            _passthrough_video_metadata(video, video_config),
+                        ),
+                    )
+                )
+
+        try:
+            videos_processed = await asyncio.gather(*decode_tasks)
+        finally:
+            for video in base_output.videos:
+                close = getattr(video, "close", None)
+                if callable(close):
+                    close()
+        base_output.videos, metadata = map(list, zip(*videos_processed))
+        if metadata and all(item is not None for item in metadata):
+            return metadata, videos_kwargs
+        return None, videos_kwargs
+
+    def _glm_video_processor_kwargs(
+        self, *, video_metadata, videos_kwargs, base_config=None
+    ):
+        if video_metadata is None:
+            return {}
+        processor_video_config = {
+            key: value
+            for key, value in (
+                self.video_config if base_config is None else base_config
+            ).items()
+            if key not in {"fps", "max_frames", "max_tokens_per_frame"}
+        }
+        if videos_kwargs is not None:
+            processor_video_config.update(videos_kwargs)
+        # Skip HF resampling because these frames already carry their original indices.
+        return {
+            "video_metadata": video_metadata,
+            "do_sample_frames": False,
+            "processor_video_config": processor_video_config,
+        }
+
+
+def _attach_layout_features(
+    mm_items, *, image_pixels, image_grid_thw, video_pixels, video_grid_thw
+):
+    """Give layout-only items their pixels so pad values hash the media content.
+
+    Raises when the prompt placeholders consumed fewer items than were sent,
+    which prefill rejects too when the encoder rows are left unconsumed.
+    """
+    image_items = [item for item in mm_items if item.modality == Modality.IMAGE]
+    video_items = [item for item in mm_items if item.modality == Modality.VIDEO]
+    num_images = 0 if image_grid_thw is None else len(image_grid_thw)
+    if len(image_items) != num_images:
+        raise ValueError(
+            f"GLM-V prompt has {len(image_items)} image placeholders "
+            f"for {num_images} images"
+        )
+    num_video_frames = 0 if video_grid_thw is None else int(video_grid_thw[:, 0].sum())
+    num_video_offsets = sum(len(item.offsets) for item in video_items)
+    if num_video_offsets != num_video_frames:
+        raise ValueError(
+            f"GLM-V prompt has {num_video_offsets} video frame placeholders "
+            f"for {num_video_frames} video frames"
+        )
+
+    if image_items:
+        rows = image_grid_thw.prod(dim=-1).tolist()
+        for item, pixels in zip(image_items, image_pixels.split(rows)):
+            item.feature = pixels
+    if video_items:
+        video_items[0].feature = video_pixels

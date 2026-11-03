@@ -1760,11 +1760,33 @@ class GlmWaitingRDMARequest(WaitingRDMARequest):
             )
         return super()._extract_embedding_from_buffer(recv_obj, parts)
 
+    def send_encode_request(self):
+        # Older tokenizers omit explicit routes, but their assignments still
+        # define the same modality-major part IDs. Never fall back to waiting
+        # for every part's metadata before posting the first RDMA transfer.
+        if not self.recv_req.encoder_part_routes:
+            routes = []
+            for counts in self.num_items_assigned.values():
+                for encoder_idx, count in enumerate(counts):
+                    if count:
+                        part_idx = len(routes)
+                        routes.append({
+                            "encoder_idx": encoder_idx,
+                            "part_idx": part_idx,
+                            "req_id": create_part_req_id(self.rid, part_idx),
+                        })
+            self.recv_req.encoder_part_routes = routes
+        if not self.recv_req.encoder_part_routes:
+            raise ValueError(f"No encoder parts assigned for {self.rid}")
+        if getattr(self.mm_processor, "tp_rank", 0) == 0:
+            logger.debug(
+                "EPD per-part RDMA pipeline: rid=%s parts=%d",
+                self.rid, len(self.recv_req.encoder_part_routes),
+            )
+        super().send_encode_request()
+
     async def _pull_meta_and_receive_embedding(self):
         routes = self.recv_req.encoder_part_routes
-        if not routes:
-            # Requests emitted by older tokenizer workers retain main's layout.
-            return await super()._pull_meta_and_receive_embedding()
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
         ) as session:
@@ -1819,6 +1841,13 @@ class GlmWaitingRDMARequest(WaitingRDMARequest):
                         "buffer_address": address,
                         "receive_count": self.receive_count,
                     }
+                    # No sibling metadata/encode barrier: publish this
+                    # destination as soon as this part's embedding is ready.
+                    if getattr(self.mm_processor, "tp_rank", 0) == 0:
+                        logger.debug(
+                            "EPD part send: rid=%s part=%d bytes=%d",
+                            self.rid, route["part_idx"], nbytes,
+                        )
                     async with session.post(
                         f"{url}/send", json=payload, headers=headers
                     ) as response:
