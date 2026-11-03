@@ -13,7 +13,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -157,11 +157,13 @@ class EncoderBootstrapServer:
         health_check_interval: Optional[float] = None,
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
+        on_urls_changed: Optional[Callable[[], None]] = None,
     ):
 
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
+        self._on_urls_changed = on_urls_changed
         self._lock = threading.Lock()
         self._server: Optional[uvicorn.Server] = None  # set in _run_server
         self._health_check_interval = (
@@ -249,9 +251,12 @@ class EncoderBootstrapServer:
             if url not in self._urls:
                 self._urls.append(url)
                 logger.info(f"Registered encoder URL: {url}")
-                return True
-            logger.debug(f"Encoder URL already registered: {url}")
-            return False
+            else:
+                logger.debug(f"Encoder URL already registered: {url}")
+                return False
+        if self._on_urls_changed is not None:
+            self._on_urls_changed()
+        return True
 
     def unregister(self, url: str) -> bool:
         """Remove *url* if present.  Returns True if removed.
@@ -267,7 +272,9 @@ class EncoderBootstrapServer:
             self._health_fail_counts.pop(url, None)
             if removed:
                 logger.info(f"Unregistered encoder URL: {url}")
-            return removed
+        if removed and self._on_urls_changed is not None:
+            self._on_urls_changed()
+        return removed
 
     def list_urls(self) -> List[str]:
         """Return a snapshot of all registered encoder URLs."""
@@ -358,6 +365,8 @@ class EncoderBootstrapServer:
                         f"{self._health_fail_threshold} consecutive failures "
                         f"(will re-add when healthy): {evicted}"
                     )
+                if (evicted or revived) and self._on_urls_changed is not None:
+                    self._on_urls_changed()
             except asyncio.CancelledError:
                 raise
             except Exception as e:

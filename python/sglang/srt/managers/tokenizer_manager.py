@@ -745,11 +745,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # list.  Pre-populated with static --encoder-urls so the legacy
             # CLI flag still works (alongside dynamic registrations).
             self.encoder_urls: List[str] = list(get_disagg().encoder_urls)
-            self.encoder_bootstrap_server = EncoderBootstrapServer(
-                host=get_serving().host,
-                port=get_disagg().encoder_bootstrap_port,
-                urls=self.encoder_urls,
-            )
+            # The router owns the shared registry in multi-worker mode.
+            if get_serving().tokenizer_worker_num == 1:
+                self.encoder_bootstrap_server = EncoderBootstrapServer(
+                    host=get_serving().host,
+                    port=get_disagg().encoder_bootstrap_port,
+                    urls=self.encoder_urls,
+                )
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
@@ -1722,13 +1724,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         # Batch tokenize all texts using unified method
+        tokenization_timing = {}
         input_ids_list, token_type_ids_list = await self._tokenize_texts(
-            texts, is_cross_encoder_request
+            texts, is_cross_encoder_request, tokenization_timing=tokenization_timing
         )
 
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
+            req.tokenize_queue_entry_ts = tokenization_timing.get("queue_entry", 0.0)
+            req.tokenize_exec_start_ts = tokenization_timing.get("exec_start", 0.0)
+            req.tokenize_exec_finish_ts = tokenization_timing.get("exec_finish", 0.0)
             self._validate_one_request(obj[i], input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None

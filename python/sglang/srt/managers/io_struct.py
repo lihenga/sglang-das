@@ -1785,6 +1785,12 @@ class TokenizerWorkerRegistrationAckReq(BaseReq, kw_only=True):
     warmup_result: Optional[bool] = None
 
 
+class EncoderURLsUpdateReq(BaseReq, kw_only=True):
+    """Synchronize the router's encoder registry with tokenizer workers."""
+
+    urls: List[str]
+
+
 class TokenizerWarmupResultReq(BaseReq, kw_only=True):
     """Report the warmup owner's terminal result to the tokenizer router."""
 
