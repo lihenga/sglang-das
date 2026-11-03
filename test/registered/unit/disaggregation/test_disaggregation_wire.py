@@ -176,6 +176,7 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
         manager.attn_cp_size = 8
         manager.attn_cp_rank = 3
         manager.is_hybrid_mla_backend = False
+        manager.kv_args = SimpleNamespace(hcu_kda_state_sharded=False)
 
         with get_context().override_server_args(
             enable_dsa_cache_layer_split=False,
@@ -335,6 +336,17 @@ class TestMooncakePPStaging(unittest.TestCase):
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
+    def setUp(self):
+        # Generic DSA cases must not load an HCU model from the dummy test path.
+        config = patch(
+            "sglang.srt.layers.attention.dsa.utils.process_model_config",
+            return_value=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="deepseek_v3")
+            ),
+        )
+        config.start()
+        self.addCleanup(config.stop)
+
     @staticmethod
     def _make_req(seed, metadata_buffer_index=0):
         return SimpleNamespace(
