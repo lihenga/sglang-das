@@ -1,10 +1,12 @@
 """Unit tests for full-attention KV transfer with prefill pp_size > 1 on
 hybrid-linear models (HybridLinearKVPool)."""
 
+import ctypes
 import unittest
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
@@ -149,7 +151,10 @@ class TestGetMhaKvPtrsWithPp(CustomTestCase):
     draft case intact."""
 
     def test_draft_kv_geometry_selects_main_v_block(self):
-        manager = SimpleNamespace(kv_args=SimpleNamespace(prefill_start_layer=0))
+        manager = SimpleNamespace(
+            kv_args=SimpleNamespace(prefill_start_layer=0),
+            model_config=SimpleNamespace(is_draft_model=True),
+        )
         src_kv_ptrs = list(range(30))
         dst_kv_ptrs = list(range(100, 132))
         src_k, src_v, dst_k, dst_v, num_layers = (
@@ -180,6 +185,7 @@ class TestBuildTransferEntryPairsDuplicateIds(CustomTestCase):
 
 def _hybrid_pool_with_ids(*, layer_ids: list) -> HybridLinearKVPool:
     pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+    pool.full_kv_pool = SimpleNamespace()
     pool.full_attention_layer_id_mapping = layer_ids
     pool.use_mla = False
     return pool
@@ -278,6 +284,46 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
                 (2 * len(stage1) + 1, 2 * len(full) + 1),
             ],
         )
+
+
+def test_glm_cp8_kda_state_reassembles_on_a_single_attention_tp_decode_rank():
+    """Replay the configured CP8 -> DP16/attention-TP1 state transfer in bytes."""
+    destination = torch.full((2, 2, 16, 3), 255, dtype=torch.uint8)
+    expected = destination.clone()
+    manager = MooncakeKVManager.__new__(MooncakeKVManager)
+    manager.attn_cp_size, manager.attn_tp_size, manager.pp_size = 8, 1, 1
+
+    def transfer(_session, blocks):
+        for source, target, count in blocks:
+            ctypes.memmove(target, source, count)
+        return 0
+
+    manager._transfer_data = transfer
+    for rank in range(8):
+        source = torch.full((2, 2, 2, 3), rank + 1, dtype=torch.uint8)
+        manager.attn_cp_rank = rank
+        manager.kv_args = SimpleNamespace(engine_rank=rank)
+        assert (
+            manager._send_hcu_kda_state(
+                SimpleNamespace(mooncake_session_id="decode"),
+                [1],
+                [source.data_ptr()],
+                [source[0].nbytes],
+                [2],
+                [destination.data_ptr()],
+                [1],
+                [destination[0].nbytes],
+                [16],
+                SimpleNamespace(dst_attn_tp_size=1, dst_tp_rank=9),
+                [],
+                [2],
+                [0],
+                [0],
+            )
+            == 0
+        )
+        expected[1, :, rank * 2 : (rank + 1) * 2] = source[1]
+    assert torch.equal(destination, expected)
 
 
 if __name__ == "__main__":
