@@ -1446,6 +1446,23 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     return value
 
 
+def strip_local_decode_mm_features(mm_inputs):
+    """Keep layout/identity after local preprocessing for EPD KV-only decode.
+
+    Call before publishing CPU processor output to a feature transport. Decode
+    consumes Prefill's KV cache, so sending pixels/embeddings through tokenizer
+    IPC and the DP controller only delays its KV receive allocation/handshake.
+    Materialize padding identity first: scheduler padding must not hash None.
+    """
+    if mm_inputs is None:
+        return
+    for item in mm_inputs.mm_items:
+        item.set_pad_value()
+        item.feature = None
+        item.precomputed_embeddings = None
+        item.keep_device_embedding = False
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.

@@ -44,6 +44,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_mm,
     get_serving,
@@ -216,6 +217,9 @@ class BaseMultimodalProcessor(ABC):
     smart_rgb_conversion = False
     video_preprocessing_device = None
     prefer_tokenized_input = False
+    # Set by processors implementing process_mm_layout_async, which EPD decode
+    # uses to rebuild prefill's layout from the media alone.
+    builds_epd_layout_from_media = False
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
@@ -729,6 +733,8 @@ class BaseMultimodalProcessor(ABC):
             return False
         if self.disable_fast_image_processor:
             return False
+        if get_disagg().disaggregation_mode == "decode":
+            return False
         image_processor = getattr(self._processor, "image_processor", None)
         return isinstance(image_processor, BaseImageProcessor)
 
@@ -762,6 +768,11 @@ class BaseMultimodalProcessor(ABC):
         """
         server_args = self.server_args
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
+            return "cpu"
+        if get_disagg().disaggregation_mode == "decode":
+            # EPD decode only needs the image layout (input_ids / mrope); it
+            # never runs the ViT. Keep its preprocessing off the serving GPU,
+            # where it would stall every DP rank's decode step.
             return "cpu"
         if _is_xpu:
             return "xpu"
@@ -828,6 +839,7 @@ class BaseMultimodalProcessor(ABC):
         videos=None,
         audios=None,
         processor=None,
+        processor_image_config: Optional[Dict[str, Any]] = None,
         processor_video_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> dict:
@@ -838,8 +850,13 @@ class BaseMultimodalProcessor(ABC):
 
         if images:
             kwargs["images"] = images
-            if self.image_config:
-                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
+            image_config = (
+                self.image_config
+                if processor_image_config is None
+                else processor_image_config
+            )
+            if image_config:
+                kwargs.setdefault("images_kwargs", {}).update(image_config)
         if videos:
             kwargs["videos"] = videos
             video_config = (

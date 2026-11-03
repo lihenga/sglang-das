@@ -36,6 +36,7 @@ from sglang.srt.multimodal.processors.glm4v import (
     glm_processor_video_config,
     glm_sample_and_decode_sync,
     glm_sample_frame_indices,
+    glm_video_timestamps,
     preprocess_video_frames_sync,
     split_glm_video_items,
 )
@@ -1076,23 +1077,11 @@ class EncoderPreprocessor:
                     processor_input["_reported_grid"] = None
             else:
                 video_metadata = processor_input.get("video_metadata", None)
-                video_timestamps = []
-                if video_metadata is not None:
-                    for metadata in video_metadata:
-                        ts = getattr(metadata, "timestamps", None)
-                        if ts is None and isinstance(metadata, dict):
-                            ts = metadata.get("timestamps", None)
-                        if ts is None and isinstance(metadata, dict):
-                            fps = metadata.get("fps", 0)
-                            indices = metadata.get("frames_indices")
-                            if fps and indices is not None:
-                                ts = [index / fps for index in indices]
-                        if ts is None:
-                            raise ValueError(
-                                f"GLM-V video metadata missing timestamps: {metadata}"
-                            )
-                        video_timestamps.append(list(ts)[::2])
-                processor_input["video_timestamps"] = video_timestamps
+                processor_input["video_timestamps"] = (
+                    glm_video_timestamps(video_metadata)
+                    if video_metadata is not None
+                    else []
+                )
                 processor_input.pop("video_metadata", None)
         elif (
             self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
