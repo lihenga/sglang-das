@@ -12,6 +12,29 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+def test_nonzero_node_does_not_start_http_after_its_schedulers_exit():
+    from sglang.srt.entrypoints import http_server
+
+    with (
+        http_server.envs.SGLANG_RUST_SERVER.override(False),
+        patch.object(
+            http_server.Engine,
+            "_launch_subprocesses",
+            return_value=(
+                None,
+                None,
+                None,
+                SimpleNamespace(scheduler_infos=[{}]),
+                None,
+                [],
+            ),
+        ),
+        patch.object(http_server, "_setup_and_run_http_server") as setup,
+    ):
+        http_server.launch_server(SimpleNamespace())
+    setup.assert_not_called()
+
+
 class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
     async def test_sends_concurrent_scalar_request_to_each_dp_rank(self):
         from sglang.srt.runtime_context import get_context

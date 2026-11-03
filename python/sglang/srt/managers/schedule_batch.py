@@ -1143,6 +1143,8 @@ class Req(ReqDllmMixin):
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
+        # Keep the admitted external-cache boundary consistent across PP stages.
+        self.external_cache_hit_length: Optional[int] = None
         # FULL host-hit tokens actually spliced to device by init_load_back at
         # admission; less than host_hit_length when the load-back was declined
         # or the staged splice dropped (that shortfall is re-prefilled).
