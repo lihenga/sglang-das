@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -13,6 +14,8 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
+    _build_deepseek_v4_device_pool_group,
+    _with_packed_draft_mapping,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -159,6 +162,46 @@ class TestDevicePoolGroup(CustomTestCase):
 
 
 class TestHybridDevicePoolAssembler(CustomTestCase):
+    def test_packed_draft_mapping_preserves_target_and_checks_capacity(self):
+        target = {0: 0, 1: 1, 2: 2}
+        self.assertEqual(
+            _with_packed_draft_mapping(
+                target, target_device_layer_num=3, draft_layer_num=0
+            ),
+            target,
+        )
+        self.assertEqual(
+            _with_packed_draft_mapping(
+                target, target_device_layer_num=3, draft_layer_num=2
+            ),
+            {0: (0, 3), 1: (1, 4), 2: 2},
+        )
+        self.assertEqual(target, {0: 0, 1: 1, 2: 2})
+        with self.assertRaisesRegex(ValueError, "exceed the target"):
+            _with_packed_draft_mapping(
+                target, target_device_layer_num=3, draft_layer_num=4
+            )
+
+    def test_deepseek_v4_keeps_unsupported_layout_guards(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
+
+        pools = (
+            SimpleNamespace(_unified_kv=True),
+            SimpleNamespace(
+                _unified_kv=False,
+                c4_kv_pool=HiSparseC4DevicePool.__new__(HiSparseC4DevicePool),
+            ),
+        )
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+            "_resolve_deepseek_v4_layer_mappings",
+            return_value=SimpleNamespace(),
+        ):
+            for pool in pools:
+                with self.subTest(pool=pool):
+                    with self.assertRaisesRegex(ValueError, "unified-KV or HiSparse"):
+                        _build_deepseek_v4_device_pool_group(pool, 2)
+
     def test_deepseek_v4_maps_sparse_sidecars(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4LayerItem,
@@ -203,11 +246,21 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             None,
             state_pool(),
         ]
+        draft_swa_buffers = [
+            torch.zeros((8, 13), dtype=torch.uint8),
+            torch.zeros((8, 17), dtype=torch.uint8),
+        ]
 
         group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
             page_size=2,
-            params=SimpleNamespace(),
+            params=SimpleNamespace(
+                mtp_draft_device_pools=(
+                    SimpleNamespace(
+                        swa_kv_pool=SimpleNamespace(kv_buffer=draft_swa_buffers)
+                    ),
+                )
+            ),
             components={ComponentType.FULL, ComponentType.SWA},
         )
 
@@ -236,27 +289,37 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(offsets, [[5]])
         self.assertIsNone(c4_pool.get_prepared_layer_range_meta([0], 1))
 
+        swa_pool = group.entry_map[PoolName.SWA]
+        _, sizes, offsets = swa_pool.get_prepared_layer_range_meta([0], 0)
+        self.assertEqual(sizes, [[3, 13]])
+        self.assertEqual(offsets, [[0, 9]])
+        _, sizes, offsets = swa_pool.get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(sizes, [[3, 17]])
+        self.assertEqual(offsets, [[3, 22]])
+
     def test_dsa_uses_hybrid_assembler_strategy(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-        kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
-        kvcache.page_size = 2
+        def dsa_pool(kv_width, index_width):
+            pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+            pool.page_size = 2
+            pool.layer_num = 1
+            pool.kv_buffer = [torch.zeros((8, kv_width), dtype=torch.uint8)]
+            pool.index_key_cache = SimpleNamespace(
+                buffer=[torch.zeros((4, index_width), dtype=torch.uint8)]
+            )
+            return pool
+
+        kvcache = dsa_pool(3, 7)
         kvcache.layer_num = 2
-        kvcache.kv_buffer = [
-            torch.zeros((8, 3), dtype=torch.uint8),
-            torch.zeros((8, 5), dtype=torch.uint8),
-        ]
-        kvcache.index_key_cache = SimpleNamespace(
-            buffer=[
-                torch.zeros((4, 7), dtype=torch.uint8),
-                torch.zeros((4, 11), dtype=torch.uint8),
-            ]
-        )
+        kvcache.kv_buffer.append(torch.zeros((8, 5), dtype=torch.uint8))
+        kvcache.index_key_cache.buffer.append(torch.zeros((4, 11), dtype=torch.uint8))
+        draft_pools = (dsa_pool(13, 17), dsa_pool(19, 23))
 
         group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
             page_size=2,
-            params=SimpleNamespace(),
+            params=SimpleNamespace(mtp_draft_device_pools=draft_pools),
             components={ComponentType.FULL},
         )
 
@@ -270,6 +333,77 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 PoolName.INDEXER: PoolName.KV,
             },
         )
+
+        _, sizes, offsets = group.entry_map[PoolName.KV].get_prepared_layer_range_meta(
+            [0], 0
+        )
+        self.assertEqual(sizes, [[6, 26]])
+        self.assertEqual(offsets, [[0, 16]])
+        _, sizes, offsets = group.entry_map[
+            PoolName.INDEXER
+        ].get_prepared_layer_range_meta([0], 0)
+        self.assertEqual(sizes, [[7, 17]])
+        self.assertEqual(offsets, [[0, 18]])
+        _, sizes, offsets = group.entry_map[
+            PoolName.INDEXER
+        ].get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(sizes, [[11, 23]])
+        self.assertEqual(offsets, [[7, 35]])
+
+    def test_linker_requires_packed_draft(self):
+        """Do not accept draft state that the linker would omit from storage."""
+        from sglang.srt.speculative import base_spec_worker as spec
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        draft = SimpleNamespace(
+            token_to_kv_pool=object(),
+            model_config=SimpleNamespace(
+                num_nextn_predict_layers=0,
+                hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            ),
+        )
+        target = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.EAGLE)
+        worker = SimpleNamespace(
+            target_worker=SimpleNamespace(model_runner=target),
+            _draft_model_runners=lambda: (draft,),
+        )
+        for linker_enabled, nextn_layers in (
+            (False, 0),
+            (True, 0),
+            (False, 1),
+            (True, 1),
+        ):
+            draft.model_config.num_nextn_predict_layers = nextn_layers
+            with (
+                self.subTest(linker=linker_enabled, nextn=nextn_layers),
+                patch.object(
+                    spec,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        enable_hierarchical_cache=not linker_enabled,
+                        enable_unified_cache_external_linker=linker_enabled,
+                    ),
+                ),
+            ):
+                if linker_enabled and not nextn_layers:
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "only supports packed"
+                    ):
+                        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+                    self.assertEqual(target.mtp_draft_device_pools, ())
+                else:
+                    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+                    self.assertEqual(
+                        plan.mode,
+                        spec.HiCacheDraftMode.PACKED
+                        if nextn_layers
+                        else spec.HiCacheDraftMode.SIDECAR,
+                    )
+                    self.assertEqual(plan.device_pools, (draft.token_to_kv_pool,))
+                    self.assertEqual(
+                        target.mtp_draft_device_pools,
+                        plan.device_pools if nextn_layers else (),
+                    )
 
     def test_unsupported_strategy_fails_with_context(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool

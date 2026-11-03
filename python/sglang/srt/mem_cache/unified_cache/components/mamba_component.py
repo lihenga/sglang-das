@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -655,9 +656,53 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            # A recurrent checkpoint is valid only at its node's end boundary.
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value,
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        if not keys:
+            return None
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[keys[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
+        if phase == LinkerTransferPhase.LOAD:
+            transfer.device_indices = self._alloc_mamba_slot()
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+    ) -> Optional[PoolTransfer]:
+        pool = self.cache.req_to_token_pool
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            pool.mamba_allocator.free(transfer.device_indices)
+            return None
+        assert phase == ExternalLinkerLoadPhase.PREPARE
+        if req.kv.holds_mamba:
+            pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = transfer.device_indices[0]
+        # Supersede an earlier device CoW match; it must not overwrite the load.
+        write_pos = pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None:
+            write_pos[pool.translate_mamba_indices(transfer.device_indices)] = 0
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        return transfer
 
     # ---- HiCache Hooks ----
 

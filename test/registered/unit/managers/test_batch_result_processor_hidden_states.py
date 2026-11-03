@@ -1,9 +1,11 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -64,6 +66,7 @@ class _PrefillReq:
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
+        self.discard_output_reason = None
 
     def finished(self):
         return False
@@ -163,6 +166,118 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 
                 self.assertEqual(middle.hidden_states, [])
                 self.assertEqual(last.hidden_states, [[22.0]])
+
+
+class TestExternalLoadFailureOutputs(CustomTestCase):
+    def _failed_req(self):
+        req = _PrefillReq(
+            rid="failed", inflight_middle_chunks=0, return_hidden_states="last"
+        )
+        req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
+        req.finished_reason = None
+        req.finished_len = None
+        req.to_finish = None
+        req.finished = lambda: req.finished_reason is not None
+
+        def finish(_accepted=1):
+            req.finished_reason = req.to_finish
+            req.finished_len = len(req.output_ids)
+
+        req.update_finish_state = finish
+        return req
+
+    def test_failed_generation_drops_output_but_keeps_offsets(self):
+        processor = _make_processor(self)
+        req = self._failed_req()
+        req.return_logprob = True
+        healthy = _PrefillReq(
+            rid="healthy", inflight_middle_chunks=0, return_hidden_states="last"
+        )
+        healthy.return_logprob = True
+        healthy.finished_len = None
+        batch = SimpleNamespace(
+            reqs=[req, healthy],
+            decoding_reqs=[],
+            return_logprob=True,
+            return_hidden_states=True,
+            return_hidden_states_mode=CaptureHiddenMode.FULL,
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        auxiliary = Mock()
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=auxiliary,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(
+                hidden_states=torch.tensor([[10.0], [11.0], [20.0], [21.0], [22.0]]),
+                customized_info=None,
+            ),
+            next_token_ids=torch.tensor([11, 22]),
+            extend_input_len_per_req=[2, 3],
+            extend_logprob_start_len_per_req=[0, 0],
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+        processor = replace(processor, logprob_result_processor=Mock())
+        processor.logprob_result_processor.calculate_num_input_logprobs.side_effect = [
+            2,
+            3,
+        ]
+        with (
+            patch.object(SchedulerBatchResultProcessor, "move_logprobs_to_cpu"),
+            patch(
+                "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+            ) as release,
+            patch(
+                "sglang.srt.managers.scheduler_components.batch_result_processor.maybe_cache_unfinished_req"
+            ) as insert,
+            patch(
+                "sglang.srt.managers.scheduler_components.batch_result_processor.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        assert req.output_ids == [] and req.hidden_states == []
+        assert req.finished_reason.status_code == 503
+        assert healthy.output_ids == [22] and healthy.hidden_states == [[22.0]]
+        release.assert_called_once_with(req, processor.tree_cache, is_insert=False)
+        insert.assert_called_once_with(healthy, processor.tree_cache)
+        logprobs = processor.logprob_result_processor.add_logprob_return_values
+        logprobs.assert_called_once()
+        assert logprobs.call_args.args[:3] == (1, healthy, 2)
+        commits = auxiliary.consume.call_args.args[1]
+        assert commits[0] is None and commits[1].token_ids == (22,)
+
+    def test_failed_embedding_drops_output(self):
+        processor = replace(_make_processor(self), is_generation=False)
+        req = self._failed_req()
+        req.embedding = None
+        req.return_pooled_hidden_states = False
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            embeddings=torch.tensor([[1.0, 2.0]]),
+            pooled_hidden_states=None,
+            can_run_cuda_graph=False,
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+        ) as release:
+            processor.process_batch_result_prefill(batch, result)
+
+        assert req.embedding is None and req.output_ids == []
+        assert req.finished_reason.status_code == 503
+        release.assert_called_once_with(req, processor.tree_cache, is_insert=False)
 
 
 class TestDecodeHiddenStateRetention(CustomTestCase):

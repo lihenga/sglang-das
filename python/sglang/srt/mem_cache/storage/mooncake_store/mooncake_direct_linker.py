@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Future
 from queue import Empty, Queue
 
 import torch
@@ -19,7 +18,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
+    UnifiedCacheLinker,
+)
 from sglang.srt.runtime_context import (
     get_memory,
     get_model,
@@ -39,50 +41,6 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
-
-
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures: dict[int, list[Future]] = {}
-
-    def update_producer(self) -> int:
-        self.producer_index += 1
-        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
-        return self.producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self.futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        for future in self.futures.get(index, ()):
-            if not future.done():
-                future.set_exception(error)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self.futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-        except BaseException as error:
-            raise RuntimeError("Mooncake layer-wise KV load failed.") from error
-        finally:
-            if threshold == self.num_layers - 1:
-                self.futures.pop(index, None)
-
-    def reset(self) -> None:
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures.clear()
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -145,6 +103,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
         )
+        layout_tag = getattr(self.pool_group, "storage_layout_tag", None)
+        if layout_tag is not None:
+            storage_suffix += f"_{layout_tag}_tpn{tp_size}_cpn{params.attn_cp_size}"
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
         logger.info(
@@ -168,7 +129,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
         ] = Queue()
-        self.completed_loads: Queue[list[str]] = Queue()
         self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
             Queue()
         )
@@ -224,9 +184,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return restorable
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        # Query establishes a boundary at which every component is restorable;
-        # insert then removes pages already resident in L1. Loading is therefore
-        # intentionally partial and may contain only a side pool such as SWA.
+        # Lookup established a restorable boundary; these slots stay private
+        # to the loading request until the load is confirmed.
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
@@ -240,11 +199,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def cancel_queued_load(self, rid: str) -> bool:
         return self.pending_loads.pop(rid, None) is not None
 
-    def num_completed_loads(self) -> int:
-        return self.completed_loads.qsize()
-
-    def pop_completed_load(self) -> list[str]:
-        return self.completed_loads.get_nowait()
+    def finish_layer_wise_loading(self, counter_index: int) -> bool:
+        return self.layer_done_counter.finish(counter_index)
 
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
@@ -281,8 +237,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
-                finally:
-                    self.completed_loads.put(list(pending))
             finally:
                 self.load_queue.task_done()
 
@@ -399,11 +353,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         while True:
             try:
                 self.offload_results.get_nowait()
-            except Empty:
-                break
-        while True:
-            try:
-                self.completed_loads.get_nowait()
             except Empty:
                 break
         self.layer_done_counter.reset()

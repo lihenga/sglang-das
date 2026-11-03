@@ -179,6 +179,18 @@ def _create_unified_radix_cache(
         }
 
     params.tree_components = tuple(tree_components)
+    if ctx.is_hybrid_ssm and get_memory().enable_unified_cache_external_linker:
+        from sglang.srt.mem_cache.pool_host.glm5_next import is_hcu_glm_pool
+
+        kv_pool = params.token_to_kv_pool_allocator.get_kvcache()
+        if (
+            is_hcu_glm_pool(kv_pool)
+            and server_args.cuda_graph_backend_prefill != "disabled"
+        ):
+            raise ValueError(
+                "GLM direct linker currently requires "
+                "--cuda-graph-backend-prefill disabled so per-layer load waits run."
+            )
     if use_mlx() and ctx.is_hybrid_ssm:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
             MlxAuxiliaryStateComponent,

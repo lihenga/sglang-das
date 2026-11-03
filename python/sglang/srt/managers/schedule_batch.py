@@ -1301,6 +1301,8 @@ class Req(ReqDllmMixin):
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST and not _FAKE_BOOTSTRAP_USE_RADIX
         )
+        # Drop output from a forward whose external KV load did not land.
+        self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank

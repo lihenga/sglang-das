@@ -446,6 +446,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def load_back_is_cache_owned(self) -> bool:
+        """Whether loaded slots belong to the cache rather than the request."""
+        return True
+
     def finish_storage_prefetch_admission(
         self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
