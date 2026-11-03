@@ -71,7 +71,11 @@ class L4Store(L3Store):
                 compat.inspect.signature(CommunityStore.setup).parameters
             )
             + ["enable_dfs_prefetch"],
-            "features": {"dfs_prefetch": True, "dfs_health": True},
+            "features": {
+                "dfs_prefetch": True,
+                "dfs_health": True,
+                "client_http_auto_port": True,
+            },
         }
 
     def disable_dfs_prefetch(self):
@@ -198,10 +202,36 @@ class TestPackageCompatibility(unittest.TestCase):
                         self.assertTrue(store.options["enable_ssd_offload"])
                         self.assertEqual(store.options["ssd_offload_path"], "/dfs")
                         self.assertEqual(
-                            store.options["enable_client_http_server"], metrics
+                            store.options["enable_client_http_server"],
+                            metrics and cls is L4Store,
                         )
                         if cls is L4Store:
                             self.assertEqual(store.prefetch, prefetch)
+
+    def test_legacy_metrics_port_zero_is_disabled_before_setup(self):
+        for cls in (CommunityStore, L3Store):
+            with self.subTest(package=cls.__name__):
+                store = cls()
+                with self.assertLogs(compat.logger, level="WARNING"):
+                    compat.setup_store(
+                        store,
+                        _ARGS,
+                        {"enable_client_http_server": True, "client_http_port": 0},
+                    )
+                self.assertFalse(store.options["enable_client_http_server"])
+                self.assertEqual(store.options["client_http_port"], 9300)
+
+    def test_legacy_metrics_explicit_port_is_preserved(self):
+        for cls in (CommunityStore, L3Store):
+            with self.subTest(package=cls.__name__):
+                store = cls()
+                compat.setup_store(
+                    store,
+                    _ARGS,
+                    {"enable_client_http_server": True, "client_http_port": 15000},
+                )
+                self.assertTrue(store.options["enable_client_http_server"])
+                self.assertEqual(store.options["client_http_port"], 15000)
 
     def test_feature_matrix_without_version_strings(self):
         for cls, layout, l4 in (

@@ -499,7 +499,7 @@ variant appropriate for your Linux device and driver.
 | Waiting-queue DFS prefetch | Disabled with a startup warning when requested | Negotiated across ranks; requires an available arena |
 | `SGLANG_MOONCAKE_READ_PLAN=1` | Falls back to session range reads; address reuse disabled | Native ReadPlan |
 | DFS health and access policy | Original package behavior; no SGLang health-based failover | Native probes and coordinated policy |
-| Client HTTP metrics | Unsupported setup options may be omitted with a warning | Enabled when supported |
+| Client HTTP metrics | Automatic port zero disables the optional endpoint with a warning; an explicit nonzero `MOONCAKE_CLIENT_METRICS_PORT_BASE` is retained | Automatic ports enabled when declared by the package |
 
 Disabling prefetch omits the L4-only setup argument on packages that predate
 prefetch arenas. Packages with a prefetch arena must support either the setup

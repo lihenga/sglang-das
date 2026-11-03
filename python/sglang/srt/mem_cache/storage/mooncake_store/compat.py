@@ -134,6 +134,22 @@ def setup_store(store, args, kwargs):
     """
     kwargs = dict(kwargs)
     disable_after_setup = False
+    if (
+        kwargs.get("enable_client_http_server")
+        and kwargs.get("client_http_port") == 0
+        and _declared_capabilities(store)
+        .get("features", {})
+        .get("client_http_auto_port")
+        is not True
+    ):
+        # L3 rejects port zero after allocating client state; do not retry setup.
+        kwargs["enable_client_http_server"] = False
+        kwargs.pop("client_http_port")
+        logger.warning(
+            "Mooncake package does not declare automatic client HTTP ports; "
+            "disabling its optional client HTTP metrics endpoint. Set "
+            "MOONCAKE_CLIENT_METRICS_PORT_BASE to a nonzero base port to enable it."
+        )
 
     def omit(unsupported):
         nonlocal disable_after_setup
