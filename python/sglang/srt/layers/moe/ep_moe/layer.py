@@ -2483,7 +2483,6 @@ class DeepEPMoE(FusedMoE):
                 masked_m,
                 expected_m,
                 shuffle_unique=0,
-                backend="cooperative",
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
             from deepgemm import m_grouped_w8a8_gemm_nt_masked_gfx936
@@ -2546,7 +2545,6 @@ class DeepEPMoE(FusedMoE):
                 masked_m,
                 expected_m,
                 shuffle_unique=0,
-                backend="cooperative",
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
             from deepgemm import m_grouped_w8a8_gemm_nt_masked_gfx936
