@@ -910,6 +910,53 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         if not remote_kv_updatable and self.remote_kv_layer_id == layer_id:
             self.remote_kv_layer_id = None
 
+    def set_mla_kv_buffer_fused(
+        self, layer: RadixAttention, loc: torch.Tensor,
+        cache_k_nope: torch.Tensor, cache_k_rope: torch.Tensor,
+        *, return_concat: bool = False,
+    ) -> tuple[bool, Optional[torch.Tensor]]:
+        if not (
+            torch.version.hip is not None
+            and self.use_dsa and self.dsa_kv_cache_store_fp8
+            and getattr(self.set_mla_kv_buffer, "__func__", None)
+            is LayerSplitDSATokenToKVPool.set_mla_kv_buffer
+            and getattr(self._write_mla_kv_buffer, "__func__", None)
+            is DSATokenToKVPool._write_mla_kv_buffer
+            and cache_k_nope.is_cuda
+            and cache_k_nope.dtype == cache_k_rope.dtype == torch.bfloat16
+            and cache_k_nope.ndim == cache_k_rope.ndim == 3
+            and cache_k_nope.shape[1:] == (1, 512)
+            and cache_k_rope.shape == (cache_k_nope.shape[0], 1, 64)
+            and cache_k_nope.stride(-1) == cache_k_rope.stride(-1) == 1
+            and cache_k_nope.stride(0) % 16 == 0
+            and cache_k_rope.stride(0) % 8 == 0
+            and cache_k_nope.data_ptr() % 32 == 0
+            and cache_k_rope.data_ptr() % 16 == 0
+            and loc.dtype == torch.int64 and loc.ndim == 1
+            and loc.is_contiguous() and loc.numel() == cache_k_nope.shape[0]
+        ):
+            return False, None
+        from lightop import kvcache as op
+
+        fused = getattr(op, "fused_quantize_and_store_mla_kv_cache_dual", None)
+        if fused is None:
+            return False, None
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
+        layer_id = layer.layer_id
+        if self.pending_remote_kv_layer_id == layer_id:
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
+        remote_kv_updatable = self.remote_kv_layer_id == layer_id
+        owned = self._is_layer_owned(layer_id)
+        if not remote_kv_updatable and not owned:
+            return False, None
+        primary = self.remote_kv_buffer if remote_kv_updatable else self.kv_buffer[layer_id - self.start_layer]
+        primary_loc = self.translate_main_kv_loc_to_compact(loc) if remote_kv_updatable else loc
+        mirror = self.kv_buffer[layer_id - self.start_layer] if remote_kv_updatable and owned else None
+        output = cache_k_nope.new_empty((loc.numel(), 1, 576)) if return_concat else None
+        fused(cache_k_nope, cache_k_rope, primary, primary_loc,
+              mirror, loc if mirror is not None else None, output, 1e-6)
+        return True, output
+
     def configure_main_kv_page_plan(
         self,
         page_plan: Optional[MainKVPagePlan],
@@ -1012,6 +1059,20 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
         if self._active_main_kv_page_plan is None:
             return loc
+
+        if (
+            torch.version.hip is not None
+            and loc.is_cuda
+            and loc.is_contiguous()
+            and loc.dtype in (torch.int32, torch.int64)
+            and self.page_size > 0
+            and self.page_size & (self.page_size - 1) == 0
+        ):
+            from lightop import kvcache as op
+
+            transform = getattr(op, "main_kv_loc_to_compact", None)
+            if transform is not None:
+                return transform(loc, self.physical_to_compact_main_kv_page, self.page_size)
 
         valid = loc >= 0
         safe_loc = loc.clamp_min(0)

@@ -2237,6 +2237,7 @@ class DeepseekSparseAttnBackend(
                 is_prefill=not forward_mode.is_decode_or_idle(),
             )
 
+        prepared_kv = None
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -2245,12 +2246,25 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
+                handled = False
+                fused_store = getattr(self.token_to_kv_pool, "set_mla_kv_buffer_fused", None)
+                if (
+                    _is_hcu and dsa_impl == "flashmla_sparse"
+                    and self.dsa_kv_cache_store_fp8
+                    and forward_mode.is_extend_without_speculative()
+                    and not layer.is_cross_attention
+                    and k_rope is not None and fused_store is not None
+                ):
+                    want_concat = (
+                        self.get_topk_transform_method(forward_mode) == TopkTransformMethod.RAGGED
+                        and not any(forward_batch.extend_prefix_lens_cpu)
+                    )
+                    handled, prepared_kv = fused_store(
+                        layer, cache_loc, k, k_rope, return_concat=want_concat)
+                if not handled:
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer, cache_loc, k, k_rope)
+
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -2504,7 +2518,7 @@ class DeepseekSparseAttnBackend(
                         kv_cache, page_table_1_flattened
                     )
                 else:
-                    kv_cache = _cat([k, k_rope], dim=-1)
+                    kv_cache = prepared_kv if prepared_kv is not None else _cat([k, k_rope], dim=-1)
 
             if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
