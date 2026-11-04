@@ -185,6 +185,10 @@ pub(crate) fn init_metrics() {
         "smg_router_request_errors_total",
         "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type"
     );
+    describe_counter!(
+        "smg_router_stream_outcome_total",
+        "Final outcomes of 2xx HTTP streams by router_type, backend_type, model, worker_url, outcome"
+    );
     describe_histogram!(
         "smg_router_stage_duration_seconds",
         "Pipeline stage duration by router_type and stage (gRPC only)"
@@ -598,6 +602,24 @@ impl Metrics {
             "model" => model,
             "endpoint" => endpoint,
             "error_type" => error_type
+        )
+        .increment(1);
+    }
+
+    /// Record one final outcome of a committed 2xx HTTP stream.
+    pub fn record_http_stream_outcome(
+        backend_type: &'static str,
+        model_id: &str,
+        worker_url: &str,
+        outcome: &'static str,
+    ) {
+        counter!(
+            "smg_router_stream_outcome_total",
+            "router_type" => metrics_labels::ROUTER_HTTP,
+            "backend_type" => backend_type,
+            "model" => intern_string(model_id),
+            "worker_url" => intern_string(worker_url),
+            "outcome" => outcome
         )
         .increment(1);
     }
