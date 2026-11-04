@@ -1,4 +1,5 @@
 """Opt-in Spark norm/quant fusion. No MTP, cache or collective changes."""
+from contextvars import ContextVar
 import functools
 import logging
 import math
@@ -11,6 +12,9 @@ _PENDING = '_spark_native_rms_pending'
 _MARKER = '_spark_native_rms_quant_target'
 _TARGET = '_spark_native_rms_norm_target'
 _CONSUMER_TYPES = set()
+_CLAMPED = '_spark_native_rms_clamped_output'
+_DUAL_TARGET = '_spark_native_rms_dual_target'
+_RMS_SCOPE = ContextVar('spark_native_rms_scope', default=None)
 
 
 def take_prequantized(linear, x):
@@ -55,6 +59,23 @@ class _ClampProxy:
         return getattr(self.original, name)
 
     def clamp(self, x, *args, **kwargs):
+        if isinstance(x, torch.Tensor) and kwargs.get('out') is None:
+            low = kwargs.get('min', args[0] if args else None)
+            high = kwargs.get('max', args[1] if len(args) > 1 else None)
+            saved = getattr(x, _CLAMPED, None)
+            marker = getattr(x, _MARKER, None)
+            if saved is not None and marker is not None:
+                clipped, limit, scope = saved
+                linear, original_limit = marker
+                pending = getattr(linear, _PENDING, None)
+                if (scope is _RMS_SCOPE.get() and scope is not None
+                        and isinstance(low, (int, float)) and isinstance(high, (int, float))
+                        and low == -limit and high == limit and original_limit == limit
+                        and pending is not None and pending[0] is x):
+                    x.__dict__.pop(_CLAMPED, None)
+                    clipped.record_stream(torch.cuda.current_stream(clipped.device))
+                    _transfer(x, clipped, low, high)
+                    return clipped
         result = self.original.clamp(x, *args, **kwargs)
         if kwargs.get('out') is None:
             low = kwargs.get('min', args[0] if args else None)
@@ -82,6 +103,10 @@ def install_rms_quant():
         raise RuntimeError('RMS fusion requires FP32-sum/out-of-place-residual LightOp; old wheel is unsafe')
     if getattr(RMSNorm.forward, '_spark_native_rms_fused', False):
         return True
+    dual_output = get_bool_env_var('SGLANG_DSA_FUSED_RMS_CLAMP_OUTPUT', 'false')
+    strided_input = get_bool_env_var('SGLANG_DSA_STRIDED_RMS_INPUT', 'false')
+    if (dual_output or strided_input) and rms_ops.SGLANG_NATIVE_RMS_QUANT_VERSION < 2:
+        raise RuntimeError('RMS dual output/row stride requires LightOp RMS ABI2')
     fused = rms_ops.rms_norm_dynamic_per_token_quant_sglang
     original_norm = RMSNorm.forward
     clamped_cls = attention.SparkV1ClampedRMSNorm
@@ -118,16 +143,24 @@ def install_rms_quant():
         smooth = getattr(target, 'input_smooth_scale', None)
         if target is not None and (not valid_linear(target, x.shape[-1]) or smooth.device != x.device):
             return None
-        # This contiguous copy matches native's treatment of packed q/kv views.
-        x_contiguous = x.contiguous()
-        normalized = torch.empty_like(x_contiguous)
+        use_stride = (strided_input and residual is None and x.shape[-1] == 1536
+                      and x.stride(1) == 1 and x.stride(0) >= x.shape[1]
+                      and x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0)
+        x_contiguous = x if use_stride else x.contiguous()
+        normalized = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        clipped = (torch.empty_like(normalized) if dual_output and not clamp_output
+                   and target is not None and getattr(norm, _DUAL_TARGET, None) is target
+                   and _RMS_SCOPE.get() is not None else None)
+        extra = {'clamped_output': clipped} if dual_output else {}
         residual_out = torch.empty_like(residual) if residual is not None else None
         q, scale = fused(x_contiguous, norm.weight, norm.variance_epsilon,
                          residual=residual, residual_output=residual_out,
                          update_input=False, limit=float(limit), smooth_scale=smooth,
-                         norm_output=normalized, clamp_norm_output=clamp_output)
+                         norm_output=normalized, clamp_norm_output=clamp_output, **extra)
         if target is not None:
             _bind(target, normalized, q, scale, float(limit))
+            if clipped is not None:
+                setattr(normalized, _CLAMPED, (clipped, float(limit), _RMS_SCOPE.get()))
         label = (x.shape[-1], residual is not None, target is not None, clamp_output)
         if label not in logged:
             logger.info('Spark native-rounding RMS fusion active width=%s residual=%s prequant=%s clamp_output=%s', *label)
@@ -196,12 +229,18 @@ def install_rms_quant():
                     logger.info('Spark RMS binding: norm=%s linear=%s width=%s forward=%s', *binding_kind)
                     binding_kinds.add(binding_kind)
                 setattr(norm, _TARGET, (linear, limit));active.append((norm, linear))
+                if dual_output and norm is self.input_layernorm:
+                    setattr(norm, _DUAL_TARGET, linear)
+        scope_token = _RMS_SCOPE.set(object()) if dual_output else None
         try:
             return original_decoder(self, *args, **kwargs)
         finally:
             for norm, linear in active:
                 norm.__dict__.pop(_TARGET, None)
+                norm.__dict__.pop(_DUAL_TARGET, None)
                 linear.__dict__.pop(_PENDING, None)
+            if scope_token is not None:
+                _RMS_SCOPE.reset(scope_token)
 
     @functools.wraps(original_q_b)
     def q_b_forward(self, q_lora):

@@ -351,7 +351,100 @@ def install_spark_v1_0512_adapters(config):
     result = {"grouped_topk": install_grouped_topk(config),
               "deepep_prepare": install_deepep_prepare(),
               "smooth_quant": install_smooth_quant(),
-              "dense_quant": install_dense_quant()}
+              "dense_quant": install_dense_quant(),
+              "mla_clamp_smooth": install_mla_clamp_smooth(config)}
     from sglang.srt.models.sparkv1_rms_quant import install_rms_quant
     result["rms_quant"] = install_rms_quant()
     return result
+
+
+def install_mla_clamp_smooth(config):
+    import inspect
+    from contextvars import ContextVar
+
+    import torch
+    from lightop import op
+    import tokenflow.models.sparkv1.layers.attention as attention
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    cls = attention.SparkV1AttentionMLA
+    original = cls.forward_absorb_prepare
+    if getattr(original, '_sglang_mla_clamp_smooth', False):
+        return True
+    if not hasattr(op, 'fused_clamp_smooth'):
+        return False
+    enabled = attention.input_smooth_enabled
+    if list(inspect.signature(enabled).parameters) != ['config']:
+        return False
+    if not enabled(config):
+        return False
+    real_torch = attention.torch
+    original_smooth = attention.apply_input_smooth
+    scope = ContextVar('spark_mla_clamp_smooth', default=None)
+
+    def supported(attn, x):
+        scale = getattr(attn.kv_b_proj, 'input_smooth_scale', None)
+        return (
+            isinstance(x, torch.Tensor) and x.is_cuda
+            and x.dtype == torch.bfloat16 and x.ndim == 3
+            and x.shape[0] > 0 and x.shape[1:] == (1, 512) and x.stride(-1) == 1
+            and x.stride(0) >= 512 and x.stride(0) % 8 == 0
+            and x.data_ptr() % 16 == 0
+            and isinstance(scale, torch.Tensor)
+            and scale.dtype == torch.float32 and scale.shape == (512,)
+            and scale.is_contiguous() and scale.device == x.device
+            and scale.data_ptr() % 32 == 0
+        )
+
+    class TorchProxy:
+        def __getattr__(self, name):
+            return getattr(real_torch, name)
+
+        def clamp(self, x, min=None, max=None, *, out=None):
+            state = scope.get()
+            if (state is not None and out is None
+                    and isinstance(min, (int, float))
+                    and isinstance(max, (int, float))
+                    and min == -8 and max == 8
+                    and supported(state[0], x)):
+                if id(x) in state[1]:
+                    raise RuntimeError('Repeated deferred MLA clamp')
+                state[1][id(x)] = (x, min, max)
+                return x
+            return real_torch.clamp(x, min=min, max=max, out=out)
+
+    def smooth(module, hidden_states, *, parameter_name='input_smooth_scale'):
+        layer, x = module, hidden_states
+        state = scope.get()
+        pending = state[1].pop(id(x), None) if state is not None else None
+        if pending is not None:
+            original_x, lower, upper = pending
+            if (original_x is x and layer is state[0].kv_b_proj
+                    and parameter_name == 'input_smooth_scale'
+                    and supported(state[0], x)):
+                return op.fused_clamp_smooth(x, layer.input_smooth_scale, lower, upper)
+            x = real_torch.clamp(x, min=lower, max=upper)
+        return original_smooth(layer, x, parameter_name=parameter_name)
+
+    def forward(self, *args, **kwargs):
+        batch = kwargs.get('forward_batch', args[2] if len(args) > 2 else None)
+        if (batch is None or getattr(self, 'cp_size', None) != 8
+                or not batch.forward_mode.is_extend_without_speculative()
+                or is_cp_v2_active(batch) or not enabled(config)):
+            return original(self, *args, **kwargs)
+        token = scope.set((self, {}))
+        try:
+            result = original(self, *args, **kwargs)
+            if scope.get()[1]:
+                raise RuntimeError('Unconsumed deferred MLA clamp')
+            return result
+        finally:
+            scope.reset(token)
+
+    forward._sglang_mla_clamp_smooth = True
+    forward._sglang_original = original
+    smooth._sglang_original = original_smooth
+    attention.torch = TorchProxy()
+    attention.apply_input_smooth = smooth
+    cls.forward_absorb_prepare = forward
+    return True
