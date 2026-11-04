@@ -33,6 +33,7 @@ class HiCacheDraftMode(str, Enum):
 class HiCacheDraftPlan:
     mode: HiCacheDraftMode = HiCacheDraftMode.NONE
     device_pools: tuple[object, ...] = ()
+    swa_reprefill_tail_tokens: int = 0
 
 
 def _can_pack_hicache_mtp(
@@ -71,10 +72,20 @@ def _can_pack_direct_linker_spark_dspark(target_runner, draft_runners) -> bool:
         return False
     target_pool = target_runner.token_to_kv_pool
     draft_pool = runner.token_to_kv_pool
+    from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+        is_dspark_swa_ring_pool,
+    )
+
+    draft_layer_num = getattr(config, "num_draft_layers", 0)
+    if is_dspark_swa_ring_pool(draft_pool):
+        if set(draft_pool.layers_mapping) != set(range(draft_layer_num)):
+            return False
+        draft_layer_num = len(draft_pool.full_attention_layer_ids)
+        draft_pool = draft_pool.full_kv_pool
     return (
         isinstance(target_pool, DSATokenToKVPool)
         and type(draft_pool) is MLATokenToKVPool
-        and draft_pool.layer_num == getattr(config, "num_draft_layers", 0) > 0
+        and draft_pool.layer_num == draft_layer_num > 0
         and draft_pool.start_layer == 0
         and draft_pool.size == target_pool.size
         and draft_pool.page_size == target_pool.page_size
@@ -273,7 +284,23 @@ class BaseSpecWorker(ABC):
         draft_runners = self._draft_model_runners()
         if not draft_runners:
             return HiCacheDraftPlan()
-        draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+            is_dspark_swa_ring_pool,
+        )
+
+        raw_draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        draft_pools = tuple(
+            pool.full_kv_pool if is_dspark_swa_ring_pool(pool) else pool
+            for pool in raw_draft_pools
+        )
+        ring_windows = [
+            int(runner.dspark_swa_window)
+            for runner, pool in zip(draft_runners, raw_draft_pools)
+            if is_dspark_swa_ring_pool(pool)
+        ]
+        if any(window <= 0 for window in ring_windows):
+            raise ValueError("DSPARK ring draft requires a positive cache rebuild window")
+        reprefill_tail = max(ring_windows, default=0)
         if (
             "InklingForConditionalGenerationMTP"
             in draft_runners[0].model_config.hf_config.architectures
@@ -303,6 +330,7 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
+                swa_reprefill_tail_tokens=reprefill_tail,
             )
 
         return HiCacheDraftPlan(
@@ -310,6 +338,7 @@ class BaseSpecWorker(ABC):
             # Preserve the legacy non-packed HiCache behavior: multi-layer
             # EAGLE registers only the first draft runner as the sidecar.
             device_pools=draft_pools[:1],
+            swa_reprefill_tail_tokens=reprefill_tail,
         )
 
     def init_hicache_draft_plan(self) -> None:

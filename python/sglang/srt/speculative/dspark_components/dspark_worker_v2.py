@@ -400,6 +400,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        pool = self.draft_model_runner.token_to_kv_pool
+        if envs.SGLANG_DSPARK_SWA_KV_POOL.get() and is_dspark_swa_ring_pool(pool):
+            pool.full_to_swa_index_mapping[:1].zero_()
 
     def _apply_swa_pool_geometry(self, memory_pool_config, req_to_token_pool):
         """Window the draft KV pool (SGLANG_DSPARK_SWA_KV_POOL): flip the
@@ -571,7 +574,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Other draft classes and hybrid/ring pools retain their established path.
         with cp_prefill_aux_projection(
             self.draft_model,
-            enabled=type(self.draft_model_runner.token_to_kv_pool) is MLATokenToKVPool,
+            enabled=(
+                type(self.draft_model_runner.token_to_kv_pool) is MLATokenToKVPool
+                or is_dspark_swa_ring_pool(self.draft_model_runner.token_to_kv_pool)
+            ),
         ) as cp_projection:
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=CaptureHiddenMode.FULL

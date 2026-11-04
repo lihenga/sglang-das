@@ -562,8 +562,13 @@ class TritonAttnBackend(AttentionBackend):
                 req_pool_indices,
                 bs,
                 token_to_kv_pool=self.token_to_kv_pool,
-                window_kv_indices=self.cuda_graph_window_kv_indices,
-                skip_full_to_swa_translation=(self._translate_kv_loc is not None),
+                window_kv_indices=(
+                    self.cuda_graph_window_kv_indices_full
+                    if self.window_full_pool_layers else self.cuda_graph_window_kv_indices
+                ),
+                skip_full_to_swa_translation=(
+                    self._translate_kv_loc is not None or self.window_full_pool_layers
+                ),
             )
         return kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens
 
@@ -599,7 +604,10 @@ class TritonAttnBackend(AttentionBackend):
         window_num_kv_splits = None
         window_kv_offsets = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            window_kv_indices = self.cuda_graph_window_kv_indices
+            window_kv_indices = (
+                self.cuda_graph_window_kv_indices_full
+                if self.window_full_pool_layers else self.cuda_graph_window_kv_indices
+            )
             window_num_kv_splits = self.cuda_graph_window_num_kv_splits
             window_kv_offsets = self.cuda_graph_window_kv_offsets
             window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
@@ -612,8 +620,11 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     token_to_kv_pool=self.token_to_kv_pool,
                     window_kv_indices=window_kv_indices,
+                    skip_full_to_swa_translation=self.window_full_pool_layers,
                 )
             )
+            if self.window_full_pool_layers:
+                window_kv_indices = self.cuda_graph_window_kv_indices
         custom_mask = (
             self._verify_mask.buffer if self._verify_mask is not None else None
         )
@@ -692,13 +703,6 @@ class TritonAttnBackend(AttentionBackend):
 
         if in_capture:
             assert forward_batch.encoder_lens is None, "Not supported"
-            if self.window_full_pool_layers:
-                # Graph window buffers are translated in place; the full-pool
-                # windowed layer would read ring ids. Draft graph must be off.
-                raise NotImplementedError(
-                    "SGLANG_DSPARK_SWA_KV_POOL=1 requires the draft triton "
-                    "backend to run eager (SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH=1)."
-                )
             if forward_mode.is_decode_or_idle():
                 self._ensure_cuda_graph_decode_scratch()
             # Multi-step spec decode: kv buffers come from spec_info, not the
@@ -1163,6 +1167,11 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
 
+            self.cuda_graph_window_kv_indices_full = (
+                torch.zeros_like(self.cuda_graph_window_kv_indices)
+                if self.window_full_pool_layers else None
+            )
+
             self.cuda_graph_window_num_kv_splits = torch.full(
                 (max_num_tokens,),
                 self.max_kv_splits,
@@ -1258,6 +1267,10 @@ class TritonAttnBackend(AttentionBackend):
                 ),
                 window_kv_offsets=None,
                 swa_attn_logits=self.cuda_graph_swa_attn_logits,
+                window_kv_indices_full=(
+                    self.cuda_graph_window_kv_indices_full
+                    if self.window_full_pool_layers and swa else None
+                ),
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
@@ -1291,6 +1304,10 @@ class TritonAttnBackend(AttentionBackend):
                     self.cuda_graph_window_num_kv_splits if swa else None
                 ),
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
+                window_kv_indices_full=(
+                    self.cuda_graph_window_kv_indices_full
+                    if self.window_full_pool_layers and swa else None
+                ),
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
@@ -1361,6 +1378,15 @@ class TritonAttnBackend(AttentionBackend):
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
+            )
+
+        if self.window_full_pool_layers and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
+            self.cuda_graph_window_kv_indices.copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    self.cuda_graph_window_kv_indices_full
+                )
             )
 
     def get_cuda_graph_seq_len_fill_value(self):

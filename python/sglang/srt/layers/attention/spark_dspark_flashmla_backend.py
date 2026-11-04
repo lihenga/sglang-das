@@ -8,6 +8,7 @@ rows retain their BF16 values and bidirectional visibility.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import os
@@ -39,14 +40,22 @@ class SparkDSparkFlashMLAAttnBackend(TritonAttnBackend):
 
     def __init__(self, model_runner):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         if not model_runner.is_draft_worker:
             raise ValueError("spark_draft_flashmla is a Spark DSpark draft backend")
         architecture = model_runner.model_config.hf_config.architectures
         if architecture != ["SparkV1DSparkDraftModel"]:
             raise ValueError(f"Unsupported draft architecture: {architecture}")
-        if not isinstance(model_runner.token_to_kv_pool, MLATokenToKVPool):
-            raise ValueError("Spark draft FlashMLA requires the native MLA KV pool")
+        pool = model_runner.token_to_kv_pool
+        ring_pool = (
+            type(pool) is SWAKVPool
+            and pool.full_to_swa_index_mapping is not None
+            and isinstance(pool.full_kv_pool, MLATokenToKVPool)
+            and isinstance(pool.swa_kv_pool, MLATokenToKVPool)
+        )
+        if not isinstance(pool, MLATokenToKVPool) and not ring_pool:
+            raise ValueError("Spark draft FlashMLA requires a native or DSpark ring MLA KV pool")
         if model_runner.sliding_window_size != WINDOW:
             raise ValueError("Spark draft's historical-prefix window must be 512")
 
@@ -66,9 +75,9 @@ class SparkDSparkFlashMLAAttnBackend(TritonAttnBackend):
         )
         if self._graph_metadata_enabled:
             if (
-                type(self.token_to_kv_pool).__name__ != "MLATokenToKVPool"
+                (type(pool) is not MLATokenToKVPool and not ring_pool)
                 or self._translate_kv_loc is not None
-                or self.use_sliding_window_kv_pool
+                or (self.use_sliding_window_kv_pool and not self.window_full_pool_layers)
             ):
                 raise ValueError("Graph metadata requires the native Spark draft MLA pool")
             logger.info(
@@ -160,6 +169,12 @@ class SparkDSparkFlashMLAAttnBackend(TritonAttnBackend):
             return
         return super().init_forward_metadata_out_graph(forward_batch, in_capture)
 
+    def _update_target_verify_buffers(self, bs, seq_lens, req_pool_indices, spec_info):
+        method = TritonAttnBackend._update_target_verify_buffers
+        if self.window_full_pool_layers:
+            method = inspect.unwrap(method)
+        return method(self, bs, seq_lens, req_pool_indices, spec_info)
+
     def init_forward_metadata_in_graph(self, forward_batch):
         if (
             self._graph_metadata_enabled
@@ -174,6 +189,8 @@ class SparkDSparkFlashMLAAttnBackend(TritonAttnBackend):
                 forward_mode=forward_batch.forward_mode,
                 spec_info=forward_batch.spec_info,
             )
+            if self.window_full_pool_layers:
+                self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
             return
         return super().init_forward_metadata_in_graph(forward_batch)
 

@@ -11,6 +11,7 @@ from queue import Empty, Queue
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -58,6 +59,16 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
+
+
+def _windowed_draft_storage_config(extra_config, *, windowed_draft):
+    if not windowed_draft:
+        return extra_config
+    config = dict(extra_config or {})
+    tag = config.get("extra_backend_tag")
+    prefix = str(tag) + "_" if tag is not None else ""
+    config["extra_backend_tag"] = prefix + "dspark_ring_v1"
+    return config
 
 
 def _session_refresh_age_config() -> float:
@@ -274,6 +285,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.tp_rank = tp_rank
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
+        )
+        extra_config = _windowed_draft_storage_config(
+            extra_config,
+            windowed_draft=bool(params.mtp_draft_device_pools)
+            and envs.SGLANG_DSPARK_SWA_KV_POOL.get(),
         )
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,

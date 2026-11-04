@@ -417,10 +417,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     def swa_reprefill_tail_tokens(self) -> int:
-        # Only the unified_kv compress-only HiCache layout needs to hold back a
-        # trailing sliding window for re-prefill; every other cache keeps SWA
-        # content-stable and overrides this where relevant.
-        return 0
+        return getattr(self, "dspark_draft_swa_reprefill_tail_tokens", 0)
 
     def supports_mamba(self) -> bool:
         return False

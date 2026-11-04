@@ -150,6 +150,7 @@ class TargetHiddenKvInjector:
         event.record(torch.cuda.current_stream(device))
         return event
 
+    @torch.inference_mode()
     def _inject_ring_context(
         self,
         *,

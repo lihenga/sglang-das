@@ -85,9 +85,10 @@ def build_draft_swa_memory_pool_config(
 
 
 def create_dspark_swa_ring_mapping(size_full: int, page_size: int, device: str):
-    """All -1: an unfilled loc translates to skip, never to pool slot 0."""
+    """Reserve slot zero for graph padding; unfilled live locations stay -1."""
     n = size_full + page_size
     mapping = torch.full((n + 1,), -1, dtype=torch.int64, device=device)
+    mapping[0] = 0
     mapping[-1] = -1
     return mapping
 
@@ -128,6 +129,26 @@ def dspark_pd_skipped_draft_layers(draft_model_path: str) -> Optional[set]:
         and layer_types[target_idx] == "sliding_attention"
     }
     return skipped or None
+
+
+def dspark_draft_pd_buf_infos(pool):
+    if not is_dspark_swa_ring_pool(pool):
+        return pool.get_contiguous_buf_infos()
+    if not pool.is_mla():
+        raise ValueError("DSPARK ring draft transfer requires MLA sub-pools")
+    mapping = pool.layers_mapping
+    if set(mapping) != set(range(len(mapping))):
+        raise ValueError("DSPARK ring draft layer ids must be contiguous")
+    parts = (
+        pool.full_kv_pool.get_contiguous_buf_infos(),
+        pool.swa_kv_pool.get_contiguous_buf_infos(),
+    )
+    if any(len(part) != 3 or len({len(x) for x in part}) != 1 for part in parts):
+        raise ValueError("DSPARK ring draft buffer metadata is inconsistent")
+    return tuple(
+        [parts[int(mapping[i][1])][field][mapping[i][0]] for i in range(len(mapping))]
+        for field in range(3)
+    )
 
 
 def apply_dspark_swa_pool_geometry(

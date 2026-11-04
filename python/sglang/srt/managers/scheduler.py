@@ -587,6 +587,10 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if self.draft_worker is not None:
+            self.tree_cache.dspark_draft_swa_reprefill_tail_tokens = (
+                self.draft_worker.hicache_draft_plan.swa_reprefill_tail_tokens
+            )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 

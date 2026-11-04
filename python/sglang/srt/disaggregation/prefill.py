@@ -90,7 +90,11 @@ from sglang.srt.speculative.dspark_components.dspark_disaggregation import (
     resolve_hidden_bootstrap_plan,
 )
 from sglang.srt.speculative.dspark_components.dspark_swa_pool import (
+    dspark_draft_pd_buf_infos,
+    dspark_draft_swa_ring_pages,
     dspark_draft_swa_state_buf_infos,
+    is_dspark_swa_ring_pool,
+    resolve_dspark_swa_ring_tokens,
     dspark_draft_swa_window_start,
     dspark_pd_skip_swa_window,
     dspark_pd_skipped_draft_layers,
@@ -425,12 +429,17 @@ class PrefillBootstrapQueue:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                dspark_draft_pd_buf_infos(self.draft_token_to_kv_pool)
             )
             kept_draft_layers = list(range(len(draft_kv_data_ptrs)))
             skip_layers = dspark_pd_skipped_draft_layers(
                 self.scheduler.server_args.speculative_draft_model_path
             )
+            if is_dspark_swa_ring_pool(self.draft_token_to_kv_pool):
+                if skip_layers != set(self.draft_token_to_kv_pool.swa_attention_layer_ids):
+                    raise ValueError(
+                        "P ring draft requires matching skipped SWA layers for PD transfer"
+                    )
             if skip_layers:
                 # The decode peer runs the windowed draft pool: the sliding
                 # layers ship only their last window, as the DSPARK_DRAFT_SWA
@@ -2646,6 +2655,15 @@ class SchedulerDisaggregationPrefillMixin:
                 # Last-window pages of the full-length draft pool, in position
                 # order; decode lists the matching ring pages for its req slot.
                 bootstrap_queue = self.disagg_prefill_bootstrap_queue
+                if is_dspark_swa_ring_pool(bootstrap_queue.draft_token_to_kv_pool):
+                    window = bootstrap_queue._dspark_skip_swa_window
+                    return dspark_draft_swa_ring_pages(
+                        int(req.req_pool_idx),
+                        seq_len,
+                        window,
+                        resolve_dspark_swa_ring_tokens(window, page_size),
+                        page_size,
+                    )
                 window_start = dspark_draft_swa_window_start(
                     seq_len, bootstrap_queue._dspark_skip_swa_window, page_size
                 )
