@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["VERIFY_STRIDE"])
 def _store_committed_mla_bytes(
     cache,
     locs,
@@ -17,11 +17,13 @@ def _store_committed_mla_bytes(
     ROPE_ROW: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
-    VERIFY_STRIDE: tl.constexpr,
+    VERIFY_STRIDE,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    committed = row % VERIFY_STRIDE < tl.load(commit_lens + row // VERIFY_STRIDE)
+    group = tl.program_id(1)
+    offset = tl.program_id(0)
+    row = group * VERIFY_STRIDE + offset
+    committed = offset < tl.load(commit_lens + group)
     # Rejected rows may contain invalid locations. Do not load their location,
     # their projected values, or form a cache write for them. loc -1 is the
     # windowed-out sentinel (DSPARK ring draft pool): skip it too.
@@ -61,7 +63,7 @@ def store_committed_mla_fp8(cache, loc_2d, commit_lens, nope, rope):
     nope_bytes = nope.to(torch.float8_e4m3fn).contiguous().view(torch.uint8)
     rope_bytes = rope.to(torch.float8_e4m3fn).contiguous().view(torch.uint8)
     cache_bytes = cache.view(torch.uint8)
-    _store_committed_mla_bytes[(rows,)](
+    _store_committed_mla_bytes[(loc_2d.shape[1], loc_2d.shape[0])](
         cache_bytes,
         loc_2d,
         commit_lens,
