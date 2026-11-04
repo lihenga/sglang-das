@@ -593,6 +593,7 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                context.model_id,
             )
         } else {
             // Handle non-streaming error response
@@ -894,6 +895,7 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        context.model_id,
                     )
                 } else {
                     // Non-streaming response
@@ -1134,6 +1136,7 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        model_id: Option<&str>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1156,6 +1159,12 @@ impl PDRouter {
         // stream cleanly to None and record a spurious success.
         let mut tracked =
             BreakerTrackedStream::new(stream, Arc::clone(&decode), decode.url().to_string());
+        if status.is_success() {
+            tracked = tracked.with_metrics(
+                metrics_labels::BACKEND_PD,
+                model_id.unwrap_or_else(|| decode.model_id()),
+            );
+        }
         if !(status.is_success() || status.is_client_error()) {
             tracked.mark_errored();
         }
@@ -2039,6 +2048,7 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1

@@ -34,7 +34,48 @@ use bytes::Bytes;
 use futures_util::Stream;
 use tracing::error;
 
-use crate::core::Worker;
+use crate::{core::Worker, observability::metrics::Metrics};
+
+/// Only retain the prefix needed to recognize the engine's error envelope.
+#[derive(Default)]
+struct ErrorEventScanner {
+    line_start: Vec<u8>,
+    saw_error: bool,
+}
+
+impl ErrorEventScanner {
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.saw_error {
+            return;
+        }
+        // shortcut: inspect at most 32 bytes per line for the engine's first-key
+        // error envelope; use a streaming parser if other SSE formats are needed.
+        const LINE_PROBE: usize = 32;
+        for (i, segment) in chunk.split(|&b| b == b'\n').enumerate() {
+            if i > 0 {
+                self.saw_error |= Self::is_error_line(&self.line_start);
+                self.line_start.clear();
+            }
+            let room = LINE_PROBE - self.line_start.len();
+            self.line_start
+                .extend_from_slice(&segment[..segment.len().min(room)]);
+        }
+    }
+
+    fn is_error_line(line: &[u8]) -> bool {
+        line.strip_prefix(b"data:")
+            .map(|p| p.trim_ascii_start())
+            .and_then(|p| p.strip_prefix(b"{"))
+            .map(|p| p.trim_ascii_start())
+            .is_some_and(|p| p.starts_with(b"\"error\""))
+    }
+}
+
+struct StreamMetrics {
+    backend_type: &'static str,
+    model: String,
+    scanner: ErrorEventScanner,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Terminal {
@@ -65,6 +106,7 @@ pub struct BreakerTrackedStream<E = reqwest::Error> {
     worker: Arc<dyn Worker>,
     log_url: String,
     terminal: Terminal,
+    metrics: Option<StreamMetrics>,
 }
 
 impl<E> BreakerTrackedStream<E> {
@@ -77,6 +119,29 @@ impl<E> BreakerTrackedStream<E> {
             worker,
             log_url,
             terminal: Terminal::Active,
+            metrics: None,
+        }
+    }
+
+    /// Enable observation only after the caller has received 2xx headers.
+    pub fn with_metrics(mut self, backend_type: &'static str, model: &str) -> Self {
+        self.metrics = Some(StreamMetrics {
+            backend_type,
+            model: model.to_owned(),
+            scanner: ErrorEventScanner::default(),
+        });
+        self
+    }
+
+    fn stream_outcome(&self) -> &'static str {
+        if self.terminal == Terminal::Errored {
+            "upstream_error"
+        } else if self.metrics.as_ref().is_some_and(|m| m.scanner.saw_error) {
+            "stream_error_event"
+        } else if self.terminal == Terminal::Active {
+            "client_disconnect"
+        } else {
+            "ok"
         }
     }
 
@@ -110,7 +175,12 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
+            Poll::Ready(Some(Ok(b))) => {
+                if let Some(metrics) = self.metrics.as_mut() {
+                    metrics.scanner.feed(&b);
+                }
+                Poll::Ready(Some(Ok(b)))
+            }
             Poll::Ready(Some(Err(e))) => {
                 error!("Upstream stream error from worker {}: {}", self.log_url, e);
                 self.terminal = Terminal::Errored;
@@ -138,6 +208,14 @@ impl<E> Drop for BreakerTrackedStream<E> {
             // is unhealthy.
             Terminal::Active => {}
         }
+        if let Some(metrics) = &self.metrics {
+            Metrics::record_http_stream_outcome(
+                metrics.backend_type,
+                &metrics.model,
+                self.worker.url(),
+                self.stream_outcome(),
+            );
+        }
     }
 }
 
@@ -148,8 +226,25 @@ mod tests {
     use bytes::Bytes;
     use futures_util::StreamExt;
 
-    use super::BreakerTrackedStream;
+    use super::{BreakerTrackedStream, ErrorEventScanner};
     use crate::core::{BasicWorkerBuilder, Worker};
+
+    fn drop_and_render_metrics<E>(tracked: BreakerTrackedStream<E>) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || drop(tracked));
+        handle.render()
+    }
+
+    fn assert_outcome(metrics: &str, outcome: &str) {
+        let lines: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("smg_router_stream_outcome_total{"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{metrics}");
+        assert!(lines[0].contains(&format!("outcome=\"{outcome}\"")));
+        assert!(lines[0].ends_with(" 1"), "{metrics}");
+    }
 
     /// Lightweight error type for tests — keeps the wrapper generic so we
     /// don't need to fabricate `reqwest::Error` instances.
@@ -172,11 +267,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_while_active_records_nothing() {
+    async fn drop_while_active_records_disconnect_without_breaker_outcome() {
         let w = worker();
         let inner = futures_util::stream::pending::<Result<Bytes, TestErr>>();
-        let tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into());
-        drop(tracked);
+        let tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("regular", "test-model");
+        assert_outcome(&drop_and_render_metrics(tracked), "client_disconnect");
         assert_eq!(breaker_counters(&w), (0, 0));
     }
 
@@ -187,9 +283,10 @@ mod tests {
             Ok::<_, TestErr>(Bytes::from_static(b"a")),
             Ok(Bytes::from_static(b"b")),
         ]);
-        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into());
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("regular", "test-model");
         while tracked.next().await.is_some() {}
-        drop(tracked);
+        assert_outcome(&drop_and_render_metrics(tracked), "ok");
         assert_eq!(breaker_counters(&w), (1, 0));
     }
 
@@ -198,9 +295,10 @@ mod tests {
         let w = worker();
         let inner =
             futures_util::stream::iter(vec![Ok(Bytes::from_static(b"a")), Err(TestErr("boom"))]);
-        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into());
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("regular", "test-model");
         while tracked.next().await.is_some() {}
-        drop(tracked);
+        assert_outcome(&drop_and_render_metrics(tracked), "upstream_error");
         assert_eq!(breaker_counters(&w), (0, 1));
     }
 
@@ -221,9 +319,10 @@ mod tests {
     async fn mark_completed_then_drop_records_success() {
         let w = worker();
         let inner = futures_util::stream::pending::<Result<Bytes, TestErr>>();
-        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into());
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("pd", "test-model");
         tracked.mark_completed();
-        drop(tracked);
+        assert_outcome(&drop_and_render_metrics(tracked), "ok");
         assert_eq!(breaker_counters(&w), (1, 0));
     }
 
@@ -267,5 +366,71 @@ mod tests {
         assert!(matches!(tracked.next().await, Some(Err(_))));
         drop(tracked);
         assert_eq!(breaker_counters(&w), (0, 1));
+    }
+
+    #[test]
+    fn scanner_handles_chunk_boundaries_without_matching_content() {
+        let mut scanner = ErrorEventScanner::default();
+        scanner.feed(b"data: {\"choices\":[{\"content\":\"data: {\\\"error\\\"\"}]}\n\n");
+        assert!(!scanner.saw_error);
+        scanner.feed(b"data:{ \"err");
+        scanner.feed(b"or\":{\"code\":503}}\n\n");
+        assert!(scanner.saw_error);
+
+        let mut scanner = ErrorEventScanner::default();
+        scanner.feed(&vec![b'x'; 1024 * 1024]);
+        assert_eq!(scanner.line_start.len(), 32);
+        assert!(!scanner.saw_error);
+    }
+
+    #[tokio::test]
+    async fn in_band_error_preserves_bytes_and_breaker_behavior() {
+        let w = worker();
+        let chunks = vec![
+            Bytes::from_static(b"data: {\"err"),
+            Bytes::from_static(b"or\":{\"code\":503}}\n\ndata: [DONE]\n\n"),
+        ];
+        let inner = futures_util::stream::iter(
+            chunks
+                .iter()
+                .cloned()
+                .map(Ok::<_, TestErr>)
+                .collect::<Vec<_>>(),
+        );
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("pd", "requested-model");
+        let mut received = Vec::new();
+        while let Some(chunk) = tracked.next().await {
+            received.push(chunk.unwrap());
+        }
+        assert_eq!(received, chunks);
+        let metrics = drop_and_render_metrics(tracked);
+        assert_outcome(&metrics, "stream_error_event");
+        assert!(metrics.contains("backend_type=\"pd\""));
+        assert!(metrics.contains("model=\"requested-model\""));
+        assert!(metrics.contains("worker_url=\"http://test-worker\""));
+        assert_eq!(breaker_counters(&w), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn transport_error_outranks_in_band_error() {
+        let w = worker();
+        let inner = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: {\"error\":{\"code\":503}}\n\n")),
+            Err(TestErr("reset")),
+        ]);
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("regular", "test-model");
+        while tracked.next().await.is_some() {}
+        assert_outcome(&drop_and_render_metrics(tracked), "upstream_error");
+        assert_eq!(breaker_counters(&w), (0, 1));
+    }
+
+    #[test]
+    fn streams_without_metrics_do_not_create_series() {
+        let w = worker();
+        let inner = futures_util::stream::pending::<Result<Bytes, TestErr>>();
+        let tracked = BreakerTrackedStream::new(inner, w, "u".into());
+        assert!(!drop_and_render_metrics(tracked).contains("smg_router_stream_outcome_total"));
     }
 }
