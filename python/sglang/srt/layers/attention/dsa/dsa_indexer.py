@@ -79,6 +79,13 @@ _use_fast_hadamard_transform = get_bool_env_var("SGLANG_USE_FAST_HADAMARD_TRANSF
 if _is_hcu:
     from lightop import attention as lightop_attention
     from lightop import kvcache as lightop_kvcache
+    from lightop import op as lightop_native
+    from lightop import quant as lightop_quant
+
+    _mqa_quant_gate = (
+        getattr(lightop_quant, "per_token_dynamic_quant_int8", None)
+        if getattr(lightop_native, "per_token_quant_int8_out_supports_gate", False) else None
+    )
 
     from sglang.kernels.ops.attention.dsa.triton_kernel import (
         fused_get_logits_head_gate_triton,
@@ -1171,6 +1178,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_bf16.shape[-1], dtype=torch.float32, device=q.device
             )
             self._hcu_int8_query_smooth_scale = smooth_scale
+
+        if (
+            _mqa_quant_gate is not None
+            and q_flat.shape[-1] == 128
+            and q_flat.shape[0] >= 32
+            and weights.dtype == torch.float32
+            and weights.is_contiguous()
+            and weights.numel() == q_flat.shape[0]
+            and q_flat.data_ptr() % 16 == 0
+            and smooth_scale.data_ptr() % 32 == 0
+        ):
+            q_int8, q_scales, adjusted_weights = _mqa_quant_gate(
+                q_flat, smooth_scale, weights=weights
+            )
+            return q_int8.view_as(q_bf16), adjusted_weights
 
         q_int8, q_scales = per_token_dynamic_quant_int8(q_flat, smooth_scale)
         q_int8 = q_int8.view_as(q_bf16)
