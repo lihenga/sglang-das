@@ -54,6 +54,38 @@ maturin build --release --out dist --features vendored-openssl
 pip install dist/sglang_router-*.whl
 ```
 
+## HTTP streaming outcome metrics
+
+The native `sglang-router` wheel exports
+`smg_router_stream_outcome_total{router_type,backend_type,model,worker_url,outcome}`
+on its configured Prometheus endpoint. This counter observes HTTP regular and
+HTTP PD streams whose upstream response status is 2xx; PD labels identify the
+decode worker. Requests without an explicit model use the worker's model ID.
+
+| `outcome` | Meaning |
+| --- | --- |
+| `ok` | Upstream reached EOF, or the existing PD loop recognized `[DONE]`. |
+| `stream_error_event` | An engine SSE line starts with `data:` and a JSON object whose first key is `error`. |
+| `upstream_error` | The byte stream yielded a transport error; this takes precedence over an in-band error. |
+| `client_disconnect` | The response stream was dropped before upstream completion or error. |
+
+This is observation only: bytes, circuit-breaker rules, retries, cancellation,
+and timeouts retain their existing behavior. Non-2xx responses remain in
+`smg_http_responses_total` and upstream status metrics. The new counter does not
+cover gRPC or external OpenAI response-processing paths. `ok` is an upstream
+completion observation, not proof that the client received every byte. A PD
+failure is attributed to the decode stream and does not identify the failing
+prefill as its root cause. No `expired` or `aborted` classifications are added.
+Series appear only after an observed stream is dropped.
+
+```promql
+sum by (outcome) (rate(smg_router_stream_outcome_total[5m]))
+```
+
+Build and install this directory's wheel to use the metric with the existing
+`python -m sglang_router.launch_router` entry point. Updating only the `sglang`
+Engine wheel or building `experimental/sgl-router` does not update this package.
+
 ## Testing
 
 ```bash
