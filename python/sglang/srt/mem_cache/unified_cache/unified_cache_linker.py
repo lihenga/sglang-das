@@ -102,9 +102,7 @@ class UnifiedCacheLinker(ABC):
         """Prepare a normal load while it can still degrade to a cache miss."""
         return False
 
-    def submit_host_prefetch(
-        self, rid: str, transfers: list[PoolTransfer]
-    ) -> bool:
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a request-scoped host prefetch without allocating device pages."""
         return False
 
@@ -226,7 +224,7 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Waiting-queue prefetches retain the original hit until admission can
-        # rematch it. The backend owns the private session and readiness state.
+        # rematch it. The backend tracks promotion readiness without a session.
         self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] | None = (
             {} if self._waiting_queue_prefetch_enabled else None
         )
@@ -331,7 +329,11 @@ class UnifiedCacheLinkerWrapper:
                             name=transfer.name,
                             host_indices=transfer.host_indices,
                             device_indices=transfer.device_indices,
-                            keys=(list(transfer.keys) if transfer.keys is not None else None),
+                            keys=(
+                                list(transfer.keys)
+                                if transfer.keys is not None
+                                else None
+                            ),
                             hit_policy=transfer.hit_policy,
                             nodes_to_load=transfer.nodes_to_load,
                             indices_from_pool=transfer.indices_from_pool,
@@ -466,9 +468,9 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         if prefetched_hit is not None:
-            expected_len = prefetched_hit.device_hit_len + len(
-                prefetched_hit.tail_hashes
-            ) * page
+            expected_len = (
+                prefetched_hit.device_hit_len + len(prefetched_hit.tail_hashes) * page
+            )
             current_prefix = key[:expected_len]
             same_prefix = (
                 current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
@@ -643,9 +645,9 @@ class UnifiedCacheLinkerWrapper:
     ) -> None:
         """Clean up after the ranks agreed a load cannot proceed.
 
-        Frees this rank's transfers, then, on the prefetched path, cancels the
-        prefetch (rolling a claimed session back) even if freeing raised.
-        Raises the pending build or claim error, which stays the primary one;
+        Frees this rank's transfers, cancels request prefetch bookkeeping and
+        releases any admission session even if freeing raised.
+        Raises the pending build error, which stays the primary one;
         a cleanup error is logged then, and raised otherwise. Freeing stops at
         the first component that raises, so a failed cleanup does not promise
         that every slot was released.
@@ -697,123 +699,30 @@ class UnifiedCacheLinkerWrapper:
         if hit is None:
             return empty_indices, req.last_node
 
-        prepared_for_load = False
-        prefetched = (
-            self.host_prefetch_hits.pop(req.rid, None) is not None
-            if self._waiting_queue_prefetch_enabled
-            else False
-        )
-        if prefetched:
-            status = self.cache_linker.get_host_prefetch_status(req.rid)
-            locally_complete = status in {"dfs_prefetched", "no_prefetch_needed"}
-            ready = torch.tensor(int(locally_complete), dtype=torch.int)
-            cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
-            if int(ready.item()) == 0:
-                self.cache_linker.cancel_host_prefetch(req.rid)
-                self.hit_markers[req.rid] = hit
-                return self.load_back(req)
-
-            # Every rank must reach the reduction below, so any local failure,
-            # including an exception, becomes a local False.
-            try:
-                if status == "no_prefetch_needed":
-                    # Its session was released while queued; re-check that
-                    # the keys survived so eviction falls back to the normal
-                    # path instead of failing the later load.
-                    locally_valid = self.cache_linker.revalidate_no_prefetch_needed(
-                        req.rid
-                    )
-                else:
-                    locally_valid = (
-                        status == "dfs_prefetched"
-                        and self.cache_linker.revalidate_host_prefetch(req.rid)
-                    )
-            except BaseException:
-                locally_valid = False
-            valid = torch.tensor(int(locally_valid), dtype=torch.int)
-            cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
-            if int(valid.item()) == 0:
-                self.cache_linker.cancel_host_prefetch(req.rid)
-                self.hit_markers[req.rid] = hit
-                return self.load_back(req)
-
+        # Queue-time promotion holds no get sessions. Every admitted request
+        # acquires its session here, selecting the latest COMPLETE replica and
+        # a fresh read lease. No prefetch refresh/revalidate/claim round trip.
+        if self._waiting_queue_prefetch_enabled:
+            self.host_prefetch_hits.pop(req.rid, None)
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
-
-        if prefetched:
-            # Build before claiming so that the claim reduction also carries
-            # the construction verdict: one reduction instead of two.
-            component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=status == "no_prefetch_needed"
+        component_transfers, constructed, build_error = self._build_load_transfers(
+            req, tail_hashes, prepare_session=self._waiting_queue_prefetch_enabled
+        )
+        all_constructed = torch.tensor(int(constructed), dtype=torch.int)
+        cache._all_reduce_attn_groups(all_constructed, torch.distributed.ReduceOp.MIN)
+        if int(all_constructed.item()) == 0:
+            self._abort_disagreed_load(
+                req,
+                component_transfers,
+                prefix_len,
+                cancel_prefetch=self._waiting_queue_prefetch_enabled,
+                pending=build_error,
+                release_session=constructed and self._waiting_queue_prefetch_enabled,
             )
-            prepared_locally = status == "no_prefetch_needed" and constructed
-            claim_error: BaseException | None = None
-            try:
-                if status == "no_prefetch_needed":
-                    self.cache_linker.cancel_host_prefetch(req.rid)
-                    claimed = True
-                else:
-                    claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
-            except BaseException as error:
-                # Still join the reduction below, then re-raise after cleanup.
-                # Reporting "not constructed" sends every rank to the miss exit
-                # rather than to a normal-path retry this rank would not join.
-                claimed, constructed, claim_error = False, False, error
-            verdict = torch.tensor([int(claimed), int(constructed)], dtype=torch.int)
-            cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
-            claimed_all, constructed_all = (int(value) for value in verdict)
-            if not (claimed_all and constructed_all):
-                # Free the device slots, then cancel (which also rolls a
-                # locally claimed session back); a build or claim error is
-                # raised on its own rank only after both were attempted.
-                if build_error is not None and claim_error is not None:
-                    logger.error(
-                        "Claiming the prefetch of rid=%s also failed",
-                        req.rid,
-                        exc_info=claim_error,
-                    )
-                self._abort_disagreed_load(
-                    req,
-                    component_transfers,
-                    prefix_len,
-                    cancel_prefetch=True,
-                    pending=build_error if build_error is not None else claim_error,
-                    release_session=prepared_locally,
-                )
-                if not constructed_all:
-                    # Building failed somewhere: a miss, as on the normal path.
-                    return empty_indices, req.last_node
-                # Every rank built but a claim failed: retry the normal path,
-                # which builds again and agrees on its own construction.
-                self.hit_markers[req.rid] = hit
-                return self.load_back(req)
-            prepared_for_load = True
-        else:
-            # Ordinary LOAD construction must agree across ranks even when
-            # waiting-queue prefetch is disabled.
-            component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=self._waiting_queue_prefetch_enabled
-            )
-            all_constructed = torch.tensor(int(constructed), dtype=torch.int)
-            cache._all_reduce_attn_groups(
-                all_constructed, torch.distributed.ReduceOp.MIN
-            )
-            if int(all_constructed.item()) == 0:
-                # Each rank frees what it built; a component frees its own
-                # slots when it fails after allocating.
-                self._abort_disagreed_load(
-                    req,
-                    component_transfers,
-                    prefix_len,
-                    cancel_prefetch=False,
-                    pending=build_error,
-                    release_session=constructed and self._waiting_queue_prefetch_enabled,
-                )
-                return empty_indices, req.last_node
-            # With prefetch enabled, session start/refresh already checked
-            # the master on every rank.
-            prepared_for_load = self._waiting_queue_prefetch_enabled
+            return empty_indices, req.last_node
+        prepared_for_load = self._waiting_queue_prefetch_enabled
 
         # Keys can be evicted remotely (master memory-watermark eviction)
         # between the match-time lookup and this load-back; a stale hit would

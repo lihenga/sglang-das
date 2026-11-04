@@ -34,16 +34,17 @@ class _Store:
         self.status = status
         self.error = error
         self.arena_queries = 0
+        self.disable_dfs_prefetch = lambda: True
         for name in (
             "batch_get_session_start_with_sources",
-            "batch_get_session_prefetch",
+            "batch_prefetch_to_memory",
             "batch_get_session_refresh",
         ):
             if name not in missing:
                 setattr(self, name, lambda *args, **kwargs: None)
-        if "dfs_prefetch_arena_available" not in missing:
-            self.dfs_prefetch_arena_available = self._arena_available
-        self.dfs_prefetch_arena_status = lambda: self.status
+        if "dfs_prefetch_to_memory_available" not in missing:
+            self.dfs_prefetch_to_memory_available = self._arena_available
+        self.dfs_prefetch_to_memory_status = lambda: self.status
 
     def _arena_available(self):
         self.arena_queries += 1
@@ -96,17 +97,17 @@ class TestLocalCapability(CustomTestCase):
         self.assertEqual(store.arena_queries, 0)
 
     def test_missing_api_is_unavailable(self):
-        store = _Store(missing=("dfs_prefetch_arena_available",))
+        store = _Store(missing=("dfs_prefetch_to_memory_available",))
         ok, reason = _linker(store)._local_host_prefetch_capability(True)
         self.assertFalse(ok)
-        self.assertIn("dfs_prefetch_arena_available", reason)
+        self.assertIn("dfs_prefetch_to_memory_available", reason)
 
     def test_unconfigured_arena_reports_status(self):
         store = _Store(available=False, status="not configured")
         ok, reason = _linker(store)._local_host_prefetch_capability(True)
         self.assertFalse(ok)
-        self.assertIn("not configured", reason)
-        self.assertIn("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", reason)
+        self.assertIn("DFS promotion unavailable", reason)
+        self.assertNotIn("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", reason)
 
     def test_arena_query_error_is_unavailable(self):
         store = _Store(error=RuntimeError("boom"))
@@ -131,7 +132,7 @@ class TestResolveHostPrefetch(CustomTestCase):
         with self.assertLogs(_LINKER_LOGGER, level="WARNING") as logs:
             enabled = linker._resolve_host_prefetch_enabled(_params(), requested=True)
         self.assertFalse(enabled)
-        self.assertIn("not configured", logs.output[0])
+        self.assertIn("DFS promotion unavailable", logs.output[0])
 
     def test_any_unavailable_rank_disables_all(self):
         cp, tp = object(), object()
@@ -225,24 +226,30 @@ class TestDisableHostPrefetch(CustomTestCase):
                 class SetupReached(Exception):
                     pass
 
-                with mock.patch(
-                    f"{module}.resolve_hybrid_device_pool_group",
-                    return_value=pool_group,
-                ), mock.patch(
-                    f"{module}.HybridCacheController.parse_storage_backend_extra_config",
-                    return_value=({},),
-                ), mock.patch(
-                    f"{module}.get_memory",
-                    return_value=types.SimpleNamespace(
-                        hicache_storage_backend_extra_config=None
+                with (
+                    mock.patch(
+                        f"{module}.resolve_hybrid_device_pool_group",
+                        return_value=pool_group,
                     ),
-                ), mock.patch(
-                    f"{module}.get_model",
-                    return_value=types.SimpleNamespace(model_path="dummy"),
-                ), mock.patch(
-                    "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
-                    side_effect=SetupReached,
-                ) as setup:
+                    mock.patch(
+                        f"{module}.HybridCacheController.parse_storage_backend_extra_config",
+                        return_value=({},),
+                    ),
+                    mock.patch(
+                        f"{module}.get_memory",
+                        return_value=types.SimpleNamespace(
+                            hicache_storage_backend_extra_config=None
+                        ),
+                    ),
+                    mock.patch(
+                        f"{module}.get_model",
+                        return_value=types.SimpleNamespace(model_path="dummy"),
+                    ),
+                    mock.patch(
+                        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
+                        side_effect=SetupReached,
+                    ) as setup,
+                ):
                     with self.assertRaises(SetupReached):
                         MooncakeDirectLinker(args, params, components=set())
                 self.assertIs(setup.call_args.kwargs["enable_dfs_prefetch"], False)
