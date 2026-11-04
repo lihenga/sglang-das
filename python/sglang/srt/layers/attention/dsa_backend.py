@@ -66,6 +66,7 @@ from sglang.srt.layers.attention.dsa.forward_batch_utils import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
+    cal_padded_tokens,
     dsa_cp_round_robin_split_data,
     dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
@@ -97,6 +98,7 @@ from sglang.srt.utils import (
 )
 
 _is_hcu = is_hcu()
+_DSA_FUSED_CP_METADATA = get_bool_env_var("SGLANG_DSA_FUSED_CP_METADATA")
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
 # per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
@@ -963,8 +965,61 @@ class DeepseekSparseAttnBackend(
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
 
+    def _init_fused_target_cp_metadata(self, forward_batch: ForwardBatch):
+        if (not _is_hcu or not _DSA_FUSED_CP_METADATA
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or effective_forward_mode(forward_batch) != ForwardMode.EXTEND
+            or self.hisparse_coordinator is not None
+            or not can_dsa_prefill_cp_round_robin_split(forward_batch)
+            or is_cp_v2_active(forward_batch)
+            or forward_batch.seq_lens_cpu is None
+            or forward_batch.seq_lens_cpu.device.type != "cpu"
+            or forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.extend_prefix_lens_cpu is None
+            or forward_batch.extend_seq_lens is None):
+            return False
+        self.set_dsa_prefill_impl(forward_batch)
+        if (self.use_mha or self.dsa_prefill_impl != "flashmla_sparse"
+            or self.get_topk_transform_method(ForwardMode.EXTEND) != TopkTransformMethod.RAGGED):
+            return False
+        has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        if has_prefix and forward_batch.seq_lens_sum > self.token_to_kv_pool.size + self.token_to_kv_pool.page_size:
+            return False
+        from lightop.fused_metadata import dsa_cp_prefill_metadata_plan, fused_dsa_cp_prefill_metadata
+        seq_cpu = forward_batch.seq_lens_cpu
+        try:
+            plan = dsa_cp_prefill_metadata_plan(
+                seq_cpu.tolist(), forward_batch.extend_seq_lens_cpu,
+                get_parallel().attn_cp_size, get_parallel().attn_cp_rank,
+                self.dsa_index_topk, cal_padded_tokens(forward_batch),
+                self.real_page_size, has_prefix)
+        except ValueError:
+            return False
+        tensors = (forward_batch.seq_lens, forward_batch.req_pool_indices, forward_batch.extend_seq_lens)
+        if (forward_batch.batch_size != plan["batch"]
+            or any(x.ndim != 1 or x.numel() != plan["batch"] or not x.is_contiguous() or x.device != tensors[0].device for x in tensors)
+            or tensors[0].dtype not in (torch.int32, torch.int64)
+            or tensors[1].dtype not in (torch.int32, torch.int64)
+            or tensors[2].dtype != torch.int32
+            or self.req_to_token_pool.req_to_token.dtype != torch.int32
+            or self.req_to_token_pool.req_to_token.stride(1) != 1):
+            return False
+        outputs = fused_dsa_cp_prefill_metadata(
+            tensors[0], self.req_to_token_pool.req_to_token, tensors[1], tensors[2], plan)
+        forward_batch.using_mha_one_shot_fp8_dequant = False
+        self.forward_metadata = DSAMetadata(
+            page_size=self.real_page_size, max_seq_len_q=plan["max_q"],
+            max_seq_len_k=plan["width"], seq_lens_sum=forward_batch.seq_lens_sum,
+            dsa_extend_seq_lens_list=plan["counts"],
+            indexer_seq_lens_cpu=seq_cpu[plan["selected"]],
+            topk_v2_plan=self._build_topk_v2_plan(outputs["dsa_seqlens_expanded"]),
+            **outputs)
+        return True
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        if self._init_fused_target_cp_metadata(forward_batch):
+            return
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
         forward_mode = effective_forward_mode(forward_batch)
