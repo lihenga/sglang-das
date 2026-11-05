@@ -1916,9 +1916,9 @@ class DeepEPMoE(FusedMoE):
             (num_groups, m, n1), device=hidden_states.device, dtype=torch.bfloat16
         )
 
-        from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
+        from deepgemm import m_grouped_fp8_gemm_nt_masked
 
-        m_grouped_fp8_gemm_nt_masked_ll(
+        m_grouped_fp8_gemm_nt_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scales),
             gateup_output,
@@ -1946,7 +1946,7 @@ class DeepEPMoE(FusedMoE):
         if enable_overlap:
             down_gemm_overlap_args.start_event.record()
 
-        m_grouped_fp8_gemm_nt_masked_ll(
+        m_grouped_fp8_gemm_nt_masked(
             (q_a2_all, q_a2_scale),
             (w2_weight, w2_scales),
             down_output,
