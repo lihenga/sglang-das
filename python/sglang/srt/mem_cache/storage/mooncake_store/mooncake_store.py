@@ -28,6 +28,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage.mooncake_store.compat import (
+    setup_store,
+    supports_feature,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -454,15 +458,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         try:
             self.store = MooncakeDistributedStore()
-            if enable_dfs_prefetch is True and not callable(
-                getattr(self.store, "disable_dfs_prefetch", None)
-            ):
-                raise RuntimeError(
-                    "Waiting-queue DFS prefetch requires Mooncake with "
-                    "disable_dfs_prefetch to release its arena if startup "
-                    "agreement disables prefetch. Rebuild/install the updated "
-                    "Mooncake package."
-                )
 
             self.config = self._load_config(storage_config)
             extra_config = (
@@ -597,48 +592,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
 
-                while True:
-                    try:
-                        ret_code = self.store.setup(
-                            client_hostname,
-                            self.config.metadata_server,
-                            per_rank_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                            self.config.protocol,
-                            device_name,
-                            self.config.master_server_address,
-                            transfer_engine,
-                            **setup_kwargs,
-                        )
-                        break
-                    except TypeError as e:
-                        unsupported_kwargs = [
-                            key for key in list(setup_kwargs) if key in str(e)
-                        ]
-                        if not unsupported_kwargs:
-                            raise
-                        if "enable_dfs_prefetch" in unsupported_kwargs:
-                            raise RuntimeError(
-                                "The installed Mooncake package cannot disable "
-                                "DFS prefetch per client. Rebuild/install the "
-                                "updated Mooncake package to honor the disabled "
-                                "SGLang prefetch flag."
-                            ) from e
-                        if "tenant_id" in unsupported_kwargs:
-                            raise RuntimeError(
-                                "The installed Mooncake version does not support "
-                                "tenant_id in MooncakeDistributedStore.setup(). "
-                                "Please upgrade Mooncake to use non-default "
-                                "Mooncake tenants with SGLang."
-                            ) from e
-                        logger.warning(
-                            "The installed Mooncake version does not support the "
-                            f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
-                            f"Retrying without {', '.join(unsupported_kwargs)}. "
-                            "Please upgrade Mooncake to enable SSD offload support."
-                        )
-                        for key in unsupported_kwargs:
-                            setup_kwargs.pop(key, None)
+                ret_code = setup_store(
+                    self.store,
+                    (
+                        client_hostname,
+                        self.config.metadata_server,
+                        per_rank_global_segment_size,
+                        DEFAULT_LOCAL_BUFFER_SIZE,
+                        self.config.protocol,
+                        device_name,
+                        self.config.master_server_address,
+                        transfer_engine,
+                    ),
+                    setup_kwargs,
+                )
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
@@ -677,7 +644,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 os.environ.get("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR")
                 == "distributed_storage_backend"
             )
-            if distributed_dfs:
+            if distributed_dfs and not supports_feature(self.store, "dfs_health"):
+                logger.warning(
+                    "Mooncake package lacks DFS health/policy APIs; preserving its "
+                    "legacy DFS behavior without SGLang health-based failover."
+                )
+            elif distributed_dfs:
                 from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
                     MooncakeDfsHealthManager,
                 )
