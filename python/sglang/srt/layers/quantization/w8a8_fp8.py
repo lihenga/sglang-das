@@ -336,7 +336,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
             # DeepEP + DeepGEMM MoE path (used by GLM-5.3-Flash FP8 d.sh, p.sh):
             # forward_groupgemm_w8a8_fp8_masked / forward_groupgemm_w8a8_fp8_contiguous
             # read layer.w13_weight_deepgemm / layer.w2_weight_deepgemm, produced by
-            # pack_int8_weight_enk_to_w6_low_latency. The compressed_tensors W8A8-FP8
+            # marlin_fp8_contiguous_weight. The compressed_tensors W8A8-FP8
             # scheme does this in _prepare_dsv4_channel_fp8_deepgemm_weights, but the
             # --quantization w8a8_fp8 route reaches this method instead, so publish
             # the same aliases here.
@@ -351,13 +351,13 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale.data, requires_grad=False
             )
 
-            from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+            from deepgemm import marlin_fp8_contiguous_weight
 
             w13 = layer.w13_weight
             w2 = layer.w2_weight
             with torch.no_grad():
-                w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
-                w2_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+                w13_deepgemm = marlin_fp8_contiguous_weight(w13).detach()
+                w2_deepgemm = marlin_fp8_contiguous_weight(w2).detach()
 
             # Save shapes so DeepEPMoE.forward_groupgemm_w8a8_fp8_contiguous can infer
             # the N dimension via _dsv4_w13_weight_shape.
