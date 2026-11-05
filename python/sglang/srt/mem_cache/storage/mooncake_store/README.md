@@ -554,3 +554,62 @@ python3 [path of test_mooncake_store.py]
 ```
 
 If all tests pass, the message "✅ All tests passed" will be printed at the end.
+
+## 等待队列 DFS 预取效果监控
+
+本节只针对 `--mooncake-enable-waiting-queue-dfs-prefetch`：等待队列中的请求经后台队列提前读取 DFS，请求加载时再消费准备好的数据。非 overlap 模式可在 forward 期间接收新请求；overlap 模式沿用正常调度循环收请求，保留后台预取。
+
+**SGLang 导出队列与任务指标，Mooncake master 导出实际读取和成功消费指标。** Prometheus 抓取两个服务入口即可，不需要配置或抓取每个 Mooncake 客户端端口。
+
+### SGLang：队列与任务
+
+启动 SGLang 时加 `--enable-metrics`，从业务端口 `/metrics` 抓取：
+
+| 指标 | 口径 |
+| --- | --- |
+| `sglang:waiting_queue_prefetch_scheduler_events_total{event}` | forward_received、enqueued、submitted、skipped；forward 生成请求按子请求计数，健康检查及延迟处理消息不计 |
+| `sglang:waiting_queue_prefetch_events_total{event}` | host 预取 submitted、请求 claimed、就绪未领取即取消 discarded_ready |
+| `sglang:waiting_queue_prefetch_duration_seconds{result}` | host 排队、session 准备和 DFS 读取总耗时；结果为 dfs_prefetched、no_prefetch_needed、failed、cancelled |
+| `sglang:waiting_queue_prefetch_ready_lead_seconds` | DFS 预取就绪到请求领取的时间余量 |
+
+事件和任务数按 rank 记录。看请求数量时固定 TP0/PP0/CP0 并保留 DP 副本，避免重复计数；`no_prefetch_needed` 不是 L4 预取成功，`claimed` 也不保证最终 DMA 成功。提前量不能直接当成节省的 TTFT。
+
+### Mooncake master：实际 L4 读取与成功消费
+
+SGLang 已自动注册服务地址；配套更新 master 和 SGLang 使用的 Mooncake 包后，每约 5 秒通过现有后台 RPC 上报累计快照。该链路不依赖客户端 HTTP 或 `MC_STORE_CLIENT_METRIC`，也不增加逐请求 RPC。master 按 `service_endpoint`（SGLang 业务 IP:端口）汇总，支持 UUID/sequence 去重与断报恢复。
+
+| master 指标 | 标签及口径 |
+| --- | --- |
+| `mooncake_master_service_l4_read_operations_total` | service_endpoint、mode=prefetch/on_demand、result=success/failure；实际 DFS BatchGet 批次 |
+| `mooncake_master_service_l4_read_bytes_total` | 同上；成功读取的物理字节，部分失败批次的成功字节计入 failure |
+| `mooncake_master_service_l4_read_duration_seconds` | 同上；实际读取耗时直方图，包含 bucket、sum、count |
+| `mooncake_master_service_l4_restore_ranges_total` | service_endpoint、mode=prefetched/on_demand；成功消费的数据段数，不是 chunk 或请求数 |
+| `mooncake_master_service_l4_restore_bytes_total` | 同上；完成 scatter 后的成功消费有效字节 |
+| `mooncake_master_service_reporting_clients` | service_endpoint；30 秒内仍有有效上报的客户端数量，0 表示断报，历史 Counter 保留 |
+
+客户端原有 `mooncake_l4_*` 指标保留排障使用；SGLang 开启 `--enable-metrics` 时仍可自动开启客户端 HTTP，但无需给 Prometheus 配置这些客户端端口。本次扩展了服务上报快照，应配套升级 master 和客户端 Mooncake 包。
+
+### 抓取与看板
+
+```yaml
+scrape_configs:
+  - job_name: sglang
+    static_configs:
+      - targets: ["<sglang-host>:<business-port>"]
+  - job_name: mooncake-master
+    static_configs:
+      - targets: ["<master-host>:<master-metrics-port>"]
+```
+
+核心预取覆盖率，分子与分母均为成功消费字节；将服务地址替换为实际值：
+
+```promql
+100 * (
+  sum(rate(mooncake_master_service_l4_restore_bytes_total{service_endpoint="<sglang-ip:port>",mode="prefetched"}[5m]))
+  or 0 * sum(rate(mooncake_master_service_l4_restore_bytes_total{service_endpoint="<sglang-ip:port>"}[5m]))
+) / sum(rate(mooncake_master_service_l4_restore_bytes_total{service_endpoint="<sglang-ip:port>"}[5m]))
+```
+
+没有 L4 消费时比例没有有效值，不能解释为 0% 命中。客户端停止上报时要结合 reporting_clients 判定，不能将历史窗口没有增量当成服务闲置。物理读取可能含整对象、对齐和重复读取，不与有效消费字节混用。
+
+后台上报与 Prometheus 抓取存在延迟；窗口速率反映收到的上报，首次补报累计数据也可能产生脉冲。原有 `prefetched_tokens_total` 包含普通请求加载，不用来计算本机制覆盖率。压测时比较相同负载下开关预取的覆盖率、实时回源量、TTFT 与吞吐；SGLang 任务计数与 master 字节不直接相除。
