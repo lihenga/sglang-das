@@ -38,6 +38,7 @@ class _Store:
             "batch_get_session_start_with_sources",
             "batch_get_session_prefetch",
             "batch_get_session_refresh",
+            "disable_dfs_prefetch",
         ):
             if name not in missing:
                 setattr(self, name, lambda *args, **kwargs: None)
@@ -199,6 +200,12 @@ class TestDisableHostPrefetch(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "requests have started"):
             linker.disable_waiting_queue_prefetch()
         self.assertTrue(linker.waiting_queue_prefetch_enabled())
+
+    def test_community_and_l3_without_prefetch_api_can_disable(self):
+        linker = _linker(types.SimpleNamespace())
+        linker.host_prefetch_enabled = True
+        linker.disable_waiting_queue_prefetch()
+        self.assertFalse(linker.waiting_queue_prefetch_enabled())
 
     def test_unsupported_local_config_disables_arena_at_setup(self):
         module = "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker"

@@ -486,6 +486,59 @@ In such cases, you should manually configure an appropriate L2 cache size based 
 
 Additional troubleshooting information can be found [here](https://kvcache-ai.github.io/Mooncake/troubleshooting/troubleshooting.html).
 
+## Community, HYGON L3, and L4 package compatibility
+
+The Store integration negotiates optional APIs instead of comparing wheel
+version strings. The target baselines are community `v0.3.13.post1`, HYGON
+`v0.3.13.post1_dev`, and the DAS `v0.3.13.post1_l4` branch. Install the package
+variant appropriate for your Linux device and driver.
+
+| Optional feature | Community / HYGON L3 | L4 with the corresponding APIs |
+| --- | --- | --- |
+| Basic Store and session range reads | Existing API path | Existing API path |
+| Native strided ReadLayout | Selected automatically when present for layer-wise loads | Selected automatically when ReadPlan is not selected |
+| Waiting-queue DFS prefetch | Disabled with a startup warning when requested | Negotiated across ranks; requires an available arena |
+| `SGLANG_MOONCAKE_READ_PLAN=1` | Uses native ReadLayout when available, otherwise session ranges; address reuse disabled | Native ReadPlan |
+| DFS health and access policy | Original package behavior; no SGLang health-based failover | Native probes and coordinated policy |
+| Client HTTP metrics | Automatic port zero disables the optional endpoint with a warning; an explicit nonzero `MOONCAKE_CLIENT_METRICS_PORT_BASE` is retained | Automatic ports enabled when declared by the package |
+
+The same SGLang code and configuration can use either package. Optional API
+selection first respects local capability declarations, then checks callable
+methods for older packages without a query. Layer-wise loads automatically use
+native ReadLayout when available, so Mooncake expands strided addresses in C++.
+An existing ReadPlan request selects ReadPlan on a supporting L4 package and
+falls back on L3; page-wise loads keep their aggregated read path. No package
+version-string comparison or per-package SGLang patch is required.
+
+An older SGLang caller can keep its existing setup, batch-put, session, and range
+calls with the L4 wheel. It uses the L4 implementation behind those interfaces;
+caller-driven features such as ReadPlan and waiting-queue prefetch still require
+SGLang code that calls their APIs. Python API compatibility alone does not carry
+over native hardware fixes: the installed L4 build must also retain the needed
+L3 transport fixes.
+
+Disabling prefetch omits the L4-only setup argument on packages that predate
+prefetch arenas. Packages with a prefetch arena must support either the setup
+gate or a successful startup-only `disable_dfs_prefetch()` call. The adapter
+does not change process-wide environment variables. Unsupported non-default
+tenants or SSD placement options fail explicitly rather than silently changing
+where data is stored.
+
+For standalone mode, the Python wheel and external `mooncake_client` must be
+from matching packages. A local method's existence does not establish remote
+RPC support. Mooncake Client and Master must have matching RPC protocols.
+Fallbacks preserve the older package's feature limits: for example, a
+community memory-only session path does not acquire L4 DFS-only reads.
+
+Run dependency-free negotiation and startup tests from the repository root:
+
+```bash
+python3 test/manual/mooncake/test_package_compatibility.py
+```
+
+These tests isolate native dependencies; they do not replace model, GPU, or
+cluster I/O tests for each package combination.
+
 ## Test Mooncake Store
 
 This test is intended for developers to quickly verify that the MooncakeStore class interfaces are functioning correctly.
