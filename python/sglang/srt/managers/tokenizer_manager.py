@@ -186,6 +186,30 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+_DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
+    "SGLANG_DAS_PREFETCH_TRACE", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _trace_disagg_prefill_dispatch(event: str, obj: Any) -> None:
+    if not _DAS_PREFETCH_TRACE_ENABLED:
+        return
+    requests = getattr(obj, "batch", None)
+    if requests is None:
+        requests = (obj,)
+    for req in requests:
+        if not isinstance(req, TokenizedGenerateReqInput):
+            continue
+        logger.info(
+            "DAS_PREFETCH_TRACE phase=%s rid=%s bootstrap_room=%s rank=tokenizer "
+            "wall_ns=%d monotonic_ns=%d",
+            event,
+            req.rid if req.rid is not None else "-",
+            req.bootstrap_room if req.bootstrap_room is not None else "-",
+            time.time_ns(),
+            time.monotonic_ns(),
+        )
+
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
     """Do not silently turn a failed EPD request into local vision work."""
@@ -603,12 +627,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         sock_send(self.send_to_scheduler, obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         await async_sock_send(self.send_to_scheduler, obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     def init_running_status(self):
         # Request states
@@ -713,11 +745,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # list.  Pre-populated with static --encoder-urls so the legacy
             # CLI flag still works (alongside dynamic registrations).
             self.encoder_urls: List[str] = list(get_disagg().encoder_urls)
-            self.encoder_bootstrap_server = EncoderBootstrapServer(
-                host=get_serving().host,
-                port=get_disagg().encoder_bootstrap_port,
-                urls=self.encoder_urls,
-            )
+            # The router owns the shared registry in multi-worker mode.
+            if get_serving().tokenizer_worker_num == 1:
+                self.encoder_bootstrap_server = EncoderBootstrapServer(
+                    host=get_serving().host,
+                    port=get_disagg().encoder_bootstrap_port,
+                    urls=self.encoder_urls,
+                )
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
@@ -1690,13 +1724,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         # Batch tokenize all texts using unified method
+        tokenization_timing = {}
         input_ids_list, token_type_ids_list = await self._tokenize_texts(
-            texts, is_cross_encoder_request
+            texts, is_cross_encoder_request, tokenization_timing=tokenization_timing
         )
 
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
+            req.tokenize_queue_entry_ts = tokenization_timing.get("queue_entry", 0.0)
+            req.tokenize_exec_start_ts = tokenization_timing.get("exec_start", 0.0)
+            req.tokenize_exec_finish_ts = tokenization_timing.get("exec_finish", 0.0)
             self._validate_one_request(obj[i], input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
@@ -3730,15 +3768,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        rids = set()
+        for rid, _, _ in items:
+            if rid in self.rid_to_state or rid in rids:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            rids.add(rid)
+
+        new_states = {}
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-            self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            new_states[rid] = state
+
             timing_obj = (
                 sub_obj if getattr(sub_obj, "tokenize_queue_entry_ts", 0.0) else obj
             )
@@ -3752,6 +3796,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.set_tokenize_exec_finish_time(
                     timing_obj.tokenize_exec_finish_ts
                 )
+
+        self.rid_to_state.update(new_states)
 
     def _release_req_states_on_failure(self, rids: Iterable[str]):
         """Release rid_to_state entries created for a failed handler.

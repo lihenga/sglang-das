@@ -141,16 +141,16 @@ class AsyncDynamicbatchTokenizer:
         can_batch = all(kw == first_kw for kw in kwargs_list[1:])
         kwargs = first_kw if can_batch else None
 
-        def run_with_timing(fn):
+        def run_with_timing(fn, request_timings):
             exec_start = time.perf_counter()
-            for timing in timings:
+            for timing in request_timings:
                 if timing is not None:
                     timing["exec_start"] = exec_start
             try:
                 return fn()
             finally:
                 exec_finish = time.perf_counter()
-                for timing in timings:
+                for timing in request_timings:
                     if timing is not None:
                         timing["exec_finish"] = exec_finish
 
@@ -160,7 +160,7 @@ class AsyncDynamicbatchTokenizer:
             if can_batch and len(prompts) > 1:
                 encode_fn = partial(self.tokenizer, prompts, **kwargs)
                 results = await asyncio.get_running_loop().run_in_executor(
-                    self._executor, run_with_timing, encode_fn
+                    self._executor, run_with_timing, encode_fn, timings
                 )
 
                 for i, fut in enumerate(result_futures):
@@ -176,11 +176,14 @@ class AsyncDynamicbatchTokenizer:
                         f"Consider using consistent tokenization parameters across requests."
                     )
 
-                encode_fn = lambda prompts=prompts, kwargs=kwargs_list: [
-                    self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs_list)
-                ]
+                def encode_fn():
+                    return [
+                        run_with_timing(partial(self.tokenizer, p, **kw), [timing])
+                        for p, kw, timing in zip(prompts, kwargs_list, timings)
+                    ]
+
                 results = await asyncio.get_running_loop().run_in_executor(
-                    self._executor, run_with_timing, encode_fn
+                    self._executor, encode_fn
                 )
 
                 for fut, res in zip(result_futures, results):

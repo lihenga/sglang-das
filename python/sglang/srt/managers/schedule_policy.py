@@ -7,6 +7,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip
@@ -40,6 +41,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -588,6 +590,10 @@ class PrefillAdder:
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
+        )
+        self.dsa_prefill_cp_in_seq_split = (
+            is_dsa_enable_prefill_cp()
+            and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
         )
         self.max_running_requests = max_running_requests
         self.prefill_max_requests = prefill_max_requests
@@ -1205,6 +1211,12 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # TODO support cp with multiple requests
+        # Enabling context parallelism currently presents precision issues;
+        # therefore, the prefill-batch setting is temporarily set to 1.
+        if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
+            return AddReqResult.OTHER
+
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 

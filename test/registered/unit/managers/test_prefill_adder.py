@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci, register_hcu_ci
@@ -143,6 +145,45 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_real_requests_respect_cp_batch_limit_after_constructor(self):
+        for enabled, mode, limit_one in (
+            (False, "in-seq-split", False),
+            (True, "round-robin-split", False),
+            (True, "in-seq-split", True),
+        ):
+            with (
+                self.subTest(enabled=enabled, mode=mode),
+                patch.object(
+                    schedule_policy,
+                    "is_dsa_enable_prefill_cp",
+                    return_value=enabled,
+                ),
+                get_context().override_server_args(dsa_prefill_cp_mode=mode),
+            ):
+                self.mock_tree_cache.supports_mamba.return_value = False
+                adder = self._create_delayer_adder(
+                    available_tokens=100_000, delayer=None
+                )
+                requests = [
+                    Req(
+                        rid=f"cp-request-{i}",
+                        origin_input_text="",
+                        origin_input_ids=array("q", range(50)),
+                        sampling_params=SamplingParams(max_new_tokens=8),
+                    )
+                    for i in range(2)
+                ]
+                for req in requests:
+                    req.init_next_round_input()
+                self.assertEqual(
+                    adder.add_one_req(requests[0], False, None), AddReqResult.CONTINUE
+                )
+                self.assertEqual(
+                    adder.add_one_req(requests[1], False, None),
+                    AddReqResult.OTHER if limit_one else AddReqResult.CONTINUE,
+                )
+                self.assertEqual(len(adder.can_run_list), 1 if limit_one else 2)
 
     def test_storage_prefetch_fulfillment_resolves_at_admission(self):
         adder = self.create_adder(self.create_running_batch())

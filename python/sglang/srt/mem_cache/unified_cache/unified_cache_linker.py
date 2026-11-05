@@ -20,6 +20,7 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -84,9 +85,10 @@ class LayerWiseLoadCounter:
         self.futures[index][layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
+        failure = RuntimeError(f"{type(error).__name__}: {error}")
         for future in self.futures.get(index, ()):
             if not future.done():
-                future.set_exception(error)
+                future.set_exception(failure)
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
@@ -107,7 +109,7 @@ class LayerWiseLoadCounter:
             return True
         # Wait before dropping the entry: the load thread still completes the
         # layers the forward never waited on through it.
-        landed = all(future.exception() is None for future in futures)
+        landed = all([future.exception() is None for future in futures])
         del self.futures[index]
         return landed
 
@@ -115,6 +117,10 @@ class LayerWiseLoadCounter:
         self.producer_index = -1
         self.consumer_index = -1
         self.futures.clear()
+
+
+class ExternalLinkerLoadError(RuntimeError):
+    """A recoverable external-cache load failure for the current batch."""
 
 
 class UnifiedCacheLinker(ABC):
@@ -144,9 +150,59 @@ class UnifiedCacheLinker(ABC):
         not here.
         """
 
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        """Whether waiting-queue host prefetch is enabled on every rank."""
+        return False
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        """Return a rank-local DFS policy candidate, if the backend has one."""
+        return None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        """Apply a cross-rank DFS policy, if the backend supports it."""
+
+    def disable_waiting_queue_prefetch(self) -> None:
+        """Turn waiting-queue host prefetch off before any job is submitted."""
+
+    def prepare_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Prepare a normal load while it can still degrade to a cache miss."""
+        return False
+
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Queue a request-scoped host prefetch without allocating device pages."""
+        return False
+
+    def get_host_prefetch_status(self, rid: str) -> str | None:
+        """Return the backend host-prefetch state, or ``None`` if absent."""
+        return None
+
+    def revalidate_host_prefetch(self, rid: str) -> bool:
+        """Refresh the prepared session without copying into device memory."""
+        return False
+
+    def revalidate_no_prefetch_needed(self, rid: str) -> bool:
+        """Check that a prefetch finished without DFS reads is still loadable."""
+        return False
+
+    def claim_ready_host_prefetch(self, rid: str) -> bool:
+        """Transfer a READY speculative session to the normal load path."""
+        return False
+
+    def cancel_host_prefetch(self, rid: str) -> None:
+        """Cancel or retire a request-scoped host prefetch."""
+
+    def abort_prepared_load(self, rid: str) -> None:
+        """Release a session claimed by the normal load path."""
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
+
+    def wait_for_pending_loads(self) -> None:
+        """Wait for loads already issued to the backend worker to finish.
+
+        Loads still waiting for ``start_layer_wise_loading`` are not included.
+        """
 
     @abstractmethod
     def cancel_queued_load(self, rid: str) -> bool:
@@ -186,6 +242,17 @@ class ExternalCacheHitMarker(NamedTuple):
 
     tail_hashes: list[str]
     device_hit_len: int
+    prefix_key: RadixKey | None = None
+
+
+class PreparedHostPrefetch(NamedTuple):
+    """Immutable request-local work for the scheduler's background prefetch round."""
+
+    rid: str
+    locally_eligible: bool
+    transfers: tuple[PoolTransfer, ...]
+    cache_linker: UnifiedCacheLinker
+    cancelled: threading.Event
 
 
 class _PendingOffload(NamedTuple):
@@ -204,9 +271,23 @@ class UnifiedCacheLinkerWrapper:
     ):
         self.cache = cache
         self.cache_linker = cache_linker
+        self._waiting_queue_prefetch_enabled = (
+            cache_linker.waiting_queue_prefetch_enabled()
+        )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
-        # Loaded tails remain request-owned until the forward confirms the load.
+        # Waiting-queue prefetches retain the original hit until admission can
+        # rematch it. The backend owns the private session and readiness state.
+        self.host_prefetch_hits: dict[str, ExternalCacheHitMarker] | None = (
+            {} if self._waiting_queue_prefetch_enabled else None
+        )
+        # Submission work is prepared and committed only by the scheduler
+        # thread. The background worker receives a snapshot and never touches
+        # this dict or the cache tree.
+        self.pending_host_prefetch_submissions: (
+            dict[str, tuple[PreparedHostPrefetch, ExternalCacheHitMarker]] | None
+        ) = {} if self._waiting_queue_prefetch_enabled else None
+        # Tails remain request-owned until the post-forward verdict.
         self.inflight_load_rids: list[str] = []
         self.private_load_indices: dict[str, torch.Tensor] = {}
         self.inflight_load_index = -1
@@ -223,17 +304,197 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        return self._waiting_queue_prefetch_enabled
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        linker = getattr(self, "cache_linker", None)
+        getter = getattr(linker, "get_local_dfs_health_policy", None)
+        return getter() if callable(getter) else None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        linker = getattr(self, "cache_linker", None)
+        apply_policy = getattr(linker, "apply_dfs_health_policy", None)
+        if callable(apply_policy):
+            apply_policy(allow_read, allow_write)
+
+    def disable_waiting_queue_prefetch(self) -> None:
+        self._waiting_queue_prefetch_enabled = False
+        self.cache_linker.disable_waiting_queue_prefetch()
+
+    def get_host_prefetch_admission_state(self, rid: str) -> str:
+        if not self._waiting_queue_prefetch_enabled:
+            return "not_tracked"
+        if rid in self.pending_host_prefetch_submissions:
+            return "pending"
+        tracked = rid in self.host_prefetch_hits
+        status = self.cache_linker.get_host_prefetch_status(rid)
+        if status in {"queued", "preparing", "reading"}:
+            return "pending"
+        if tracked and status == "dfs_prefetched":
+            return "dfs_prefetched"
+        if tracked and status == "no_prefetch_needed":
+            return "no_prefetch_needed"
+        if not tracked and status is None:
+            return "not_tracked"
+        return "terminal"
+
+    def cancel_waiting_queue_prefetch(self, rid: str) -> None:
+        self.hit_markers.pop(rid, None)
+        if not self._waiting_queue_prefetch_enabled:
+            return
+        tracked = self.host_prefetch_hits.pop(rid, None) is not None
+        pending = self.pending_host_prefetch_submissions.pop(rid, None)
+        if pending is not None:
+            pending[0].cancelled.set()
+        if tracked or pending is not None:
+            self.cache_linker.cancel_host_prefetch(rid)
+
+    def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
+        """Build a request-local snapshot without issuing any collectives."""
+        hit = self.hit_markers.get(req.rid)
+        transfers = []
+        locally_eligible = hit is not None
+        if hit is not None:
+            try:
+                for component in self.cache._components_tuple:
+                    transfer = component.build_external_linker_transfer(
+                        LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+                    )
+                    if transfer is None:
+                        locally_eligible = False
+                        break
+                    # LOOKUP transfers are CPU metadata only. Copy their
+                    # mutable key lists so the worker owns its snapshot.
+                    transfers.append(
+                        PoolTransfer(
+                            name=transfer.name,
+                            host_indices=transfer.host_indices,
+                            device_indices=transfer.device_indices,
+                            keys=(
+                                list(transfer.keys)
+                                if transfer.keys is not None
+                                else None
+                            ),
+                            hit_policy=transfer.hit_policy,
+                            nodes_to_load=transfer.nodes_to_load,
+                            indices_from_pool=transfer.indices_from_pool,
+                        )
+                    )
+            except Exception:
+                locally_eligible = False
+
+        job = PreparedHostPrefetch(
+            rid=req.rid,
+            locally_eligible=locally_eligible,
+            transfers=tuple(transfers),
+            cache_linker=self.cache_linker,
+            cancelled=threading.Event(),
+        )
+        if hit is not None:
+            self.pending_host_prefetch_submissions[req.rid] = (job, hit)
+        return job
+
+    def complete_host_prefetch_submission(
+        self, job: PreparedHostPrefetch, submitted: bool
+    ) -> bool:
+        """Commit a background result if this is still the live request."""
+        pending = self.pending_host_prefetch_submissions.get(job.rid)
+        if pending is None or pending[0] is not job:
+            if submitted:
+                job.cache_linker.cancel_host_prefetch(job.rid)
+            return False
+
+        del self.pending_host_prefetch_submissions[job.rid]
+        hit = pending[1]
+        if submitted and not job.cancelled.is_set():
+            self.host_prefetch_hits[job.rid] = hit
+            return True
+        if submitted:
+            job.cache_linker.cancel_host_prefetch(job.rid)
+        return False
+
+    def prefetch_to_host(self, req: Req) -> bool:
+        if not self._waiting_queue_prefetch_enabled:
+            return False
+        hit = self.hit_markers.get(req.rid)
+        transfers = []
+        locally_eligible = hit is not None
+        if hit is not None:
+            try:
+                for component in self.cache._components_tuple:
+                    transfer = component.build_external_linker_transfer(
+                        LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+                    )
+                    if transfer is None:
+                        locally_eligible = False
+                        break
+                    transfers.append(transfer)
+            except Exception:
+                locally_eligible = False
+
+        eligible = torch.tensor(int(locally_eligible), dtype=torch.int)
+        self.cache._all_reduce_attn_groups(eligible, torch.distributed.ReduceOp.MIN)
+        if int(eligible.item()) == 0:
+            return False
+
+        try:
+            submitted = self.cache_linker.submit_host_prefetch(req.rid, transfers)
+        except BaseException:
+            submitted = False
+
+        globally_submitted = torch.tensor(int(submitted), dtype=torch.int)
+        self.cache._all_reduce_attn_groups(
+            globally_submitted, torch.distributed.ReduceOp.MIN
+        )
+        if int(globally_submitted.item()) == 0:
+            self.cache_linker.cancel_host_prefetch(req.rid)
+            return False
+
+        self.host_prefetch_hits[req.rid] = hit
+        return True
+
+    def has_pending_operations(self) -> bool:
+        return bool(self.inflight_load_rids or self.pending_offloads)
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
+        self.hit_markers.pop(req.rid, None)
+        prefetched_hit = (
+            self.host_prefetch_hits.get(req.rid)
+            if self._waiting_queue_prefetch_enabled
+            else None
+        )
+
+        known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
+        if known_hit_len is not None:
+            # The absolute boundary also survives later local L1 rematches.
+            key = key[:known_hit_len]
+        elif cache.pp_size > 1:
+            # Every PP stage must derive the same absolute boundary before it
+            # builds its extend batch.  In particular, a downstream stage
+            # cannot stop at its local L1 hit while PP0 extends that hit from
+            # L3: the hidden states sent by PP0 would then have a different
+            # token count from the downstream batch.  Direct-linker lookups
+            # are metadata-only, and PP-aware backends (for example Mooncake)
+            # validate every PP shard, so probing from each stage's local L1
+            # frontier produces the common restorable boundary without an
+            # additional scheduler-side PP control message.
+            req.external_cache_hit_length = device_hit_len
+
         if device_hit_len >= len(key):
+            if prefetched_hit is not None:
+                self.cancel_waiting_queue_prefetch(req.rid)
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
+            if prefetched_hit is not None:
+                self.cancel_waiting_queue_prefetch(req.rid)
             return result
 
         lookup_transfers = []
@@ -242,16 +503,63 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
             if transfer is None:
+                if prefetched_hit is not None:
+                    self.cancel_waiting_queue_prefetch(req.rid)
                 return result
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
+        if prefetched_hit is not None:
+            expected_len = (
+                prefetched_hit.device_hit_len + len(prefetched_hit.tail_hashes) * page
+            )
+            current_prefix = key[:expected_len]
+            same_prefix = (
+                current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
+                and current_prefix.cache_salt == prefetched_hit.prefix_key.cache_salt
+                and current_prefix.is_bigram == prefetched_hit.prefix_key.is_bigram
+                and current_prefix.raw_token_ids()
+                == prefetched_hit.prefix_key.raw_token_ids()
+            )
+            reusable = (
+                device_hit_len == prefetched_hit.device_hit_len
+                and list(tail_hashes[: len(prefetched_hit.tail_hashes)])
+                == prefetched_hit.tail_hashes
+                and same_prefix
+            )
+            if reusable:
+                hit_pages = len(prefetched_hit.tail_hashes)
+                hit_tokens = hit_pages * page
+                swa_transfer = by_pool.get(PoolName.SWA)
+                self.hit_markers[req.rid] = prefetched_hit
+                return result._replace(
+                    last_host_node=result.best_match_node,
+                    host_hit_length=hit_tokens,
+                    swa_host_hit_length=max(
+                        result.swa_host_hit_length,
+                        min(len(swa_transfer.keys), hit_pages) * page
+                        if swa_transfer is not None
+                        else 0,
+                    ),
+                    mamba_host_hit_length=max(
+                        result.mamba_host_hit_length,
+                        1 if PoolName.MAMBA in by_pool else 0,
+                    ),
+                )
+
+            self.cancel_waiting_queue_prefetch(req.rid)
+
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+        if known_hit_len is None:
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
+            if cache.pp_size > 1:
+                req.external_cache_hit_length = device_hit_len + hit_pages * page
+        else:
+            hit_pages = len(tail_hashes)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -268,6 +576,7 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
+            prefix_key=key[: device_hit_len + hit_tokens],
         )
         return result._replace(
             last_host_node=result.best_match_node,
@@ -321,6 +630,110 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> request-private device slots ----
 
+    def _build_load_transfers(
+        self, req: Req, tail_hashes, *, prepare_session: bool = False
+    ) -> tuple[list[tuple[TreeComponent, PoolTransfer]], bool, BaseException | None]:
+        """Build LOAD transfers and optionally prepare their session locally.
+
+        Building allocates device slots and can fail on one rank alone, so the
+        caller must agree on the returned flag with the other ranks before any
+        later collective, and on failure ABORT the transfers returned here (a
+        component frees slots it could not hand over). A component returning
+        None (not enough room) is an expected miss. An unexpected error may
+        have left the tree or an allocator partly changed, so it is returned
+        rather than raised: this rank still joins that agreement, and the
+        caller re-raises it after cleanup instead of serving on.
+        """
+
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
+        try:
+            for component in self.cache._components_tuple:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
+                )
+                if transfer is None:
+                    return component_transfers, False, None
+                component_transfers.append((component, transfer))
+        except BaseException as error:
+            return component_transfers, False, error
+        if prepare_session:
+            try:
+                prepared = self.cache_linker.prepare_load(
+                    req.rid, [transfer for _, transfer in component_transfers]
+                )
+            except BaseException:
+                logger.warning(
+                    "External cache session preparation failed", exc_info=True
+                )
+                prepared = False
+            if not prepared:
+                logger.warning(
+                    "External cache session preparation failed for rid=%s, "
+                    "degrading request to cache miss",
+                    req.rid,
+                )
+                return component_transfers, False, None
+        return component_transfers, True, None
+
+    def _abort_disagreed_load(
+        self,
+        req: Req,
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]],
+        prefix_len: int,
+        *,
+        cancel_prefetch: bool,
+        pending: BaseException | None,
+        release_session: bool = False,
+    ) -> None:
+        """Clean up after the ranks agreed a load cannot proceed.
+
+        Frees this rank's transfers, then, on the prefetched path, cancels the
+        prefetch (rolling a claimed session back) even if freeing raised.
+        Raises the pending build or claim error, which stays the primary one;
+        a cleanup error is logged then, and raised otherwise. Freeing stops at
+        the first component that raises, so a failed cleanup does not promise
+        that every slot was released.
+        """
+        cleanup_error: BaseException | None = None
+        try:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+            )
+        except BaseException as error:
+            cleanup_error = error
+        if cancel_prefetch:
+            try:
+                self.cache_linker.cancel_host_prefetch(req.rid)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                else:
+                    logger.error(
+                        "Cancelling the prefetch of rid=%s also failed",
+                        req.rid,
+                        exc_info=error,
+                    )
+        if release_session:
+            try:
+                self.cache_linker.abort_prepared_load(req.rid)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                else:
+                    logger.error(
+                        "Releasing the failed load session also failed", exc_info=error
+                    )
+        if pending is not None:
+            if cleanup_error is not None:
+                logger.error(
+                    "Cleaning up the failed load of rid=%s also failed",
+                    req.rid,
+                    exc_info=cleanup_error,
+                )
+            raise pending
+        if cleanup_error is not None:
+            raise cleanup_error
+
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         """Return private loaded slots without publishing them to the tree.
 
@@ -333,25 +746,143 @@ class UnifiedCacheLinkerWrapper:
         if hit is None:
             return empty_indices, req.last_node
 
-        tail_hashes = hit.tail_hashes
-        prefix_len = hit.device_hit_len + len(tail_hashes) * cache.page_size
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in cache._components_tuple:
+        prepared_for_load = False
+        prefetched = (
+            self.host_prefetch_hits.pop(req.rid, None) is not None
+            if self._waiting_queue_prefetch_enabled
+            else False
+        )
+        if prefetched:
+            status = self.cache_linker.get_host_prefetch_status(req.rid)
+            locally_complete = status in {"dfs_prefetched", "no_prefetch_needed"}
+            ready = torch.tensor(int(locally_complete), dtype=torch.int)
+            cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
+            if int(ready.item()) == 0:
+                self.cache_linker.cancel_host_prefetch(req.rid)
+                self.hit_markers[req.rid] = hit
+                return self.load_back(req)
+
+            # Every rank must reach the reduction below, so any local failure,
+            # including an exception, becomes a local False.
             try:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOAD, None, tail_hashes
-                )
+                if status == "no_prefetch_needed":
+                    # Its session was released while queued; re-check that
+                    # the keys survived so eviction falls back to the normal
+                    # path instead of failing the later load.
+                    locally_valid = self.cache_linker.revalidate_no_prefetch_needed(
+                        req.rid
+                    )
+                else:
+                    locally_valid = (
+                        status == "dfs_prefetched"
+                        and self.cache_linker.revalidate_host_prefetch(req.rid)
+                    )
             except BaseException:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+                locally_valid = False
+            valid = torch.tensor(int(locally_valid), dtype=torch.int)
+            cache._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
+            if int(valid.item()) == 0:
+                self.cache_linker.cancel_host_prefetch(req.rid)
+                self.hit_markers[req.rid] = hit
+                return self.load_back(req)
+
+        device_hit_len = hit.device_hit_len
+        tail_hashes = hit.tail_hashes
+        prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
+
+        if prefetched:
+            # Build before claiming so that the claim reduction also carries
+            # the construction verdict: one reduction instead of two.
+            component_transfers, constructed, build_error = self._build_load_transfers(
+                req, tail_hashes, prepare_session=status == "no_prefetch_needed"
+            )
+            prepared_locally = status == "no_prefetch_needed" and constructed
+            claim_error: BaseException | None = None
+            try:
+                if status == "no_prefetch_needed":
+                    self.cache_linker.cancel_host_prefetch(req.rid)
+                    claimed = True
+                else:
+                    claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
+            except BaseException as error:
+                # Still join the reduction below, then re-raise after cleanup.
+                # Reporting "not constructed" sends every rank to the miss exit
+                # rather than to a normal-path retry this rank would not join.
+                claimed, constructed, claim_error = False, False, error
+            verdict = torch.tensor([int(claimed), int(constructed)], dtype=torch.int)
+            cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+            claimed_all, constructed_all = (int(value) for value in verdict)
+            if not (claimed_all and constructed_all):
+                # Free the device slots, then cancel (which also rolls a
+                # locally claimed session back); a build or claim error is
+                # raised on its own rank only after both were attempted.
+                if build_error is not None and claim_error is not None:
+                    logger.error(
+                        "Claiming the prefetch of rid=%s also failed",
+                        req.rid,
+                        exc_info=claim_error,
+                    )
+                self._abort_disagreed_load(
+                    req,
+                    component_transfers,
+                    prefix_len,
+                    cancel_prefetch=True,
+                    pending=build_error if build_error is not None else claim_error,
+                    release_session=prepared_locally,
                 )
-                raise
-            if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+                if not constructed_all:
+                    # Building failed somewhere: a miss, as on the normal path.
+                    return empty_indices, req.last_node
+                # Every rank built but a claim failed: retry the normal path,
+                # which builds again and agrees on its own construction.
+                self.hit_markers[req.rid] = hit
+                return self.load_back(req)
+            prepared_for_load = True
+        else:
+            # Ordinary LOAD construction must agree across ranks even when
+            # waiting-queue prefetch is disabled. Session preparation is only
+            # available after that capability has been enabled for the linker.
+            prepare_session = self._waiting_queue_prefetch_enabled
+            component_transfers, constructed, build_error = self._build_load_transfers(
+                req, tail_hashes, prepare_session=prepare_session
+            )
+            all_constructed = torch.tensor(int(constructed), dtype=torch.int)
+            cache._all_reduce_attn_groups(
+                all_constructed, torch.distributed.ReduceOp.MIN
+            )
+            if int(all_constructed.item()) == 0:
+                # Each rank frees what it built; a component frees its own
+                # slots when it fails after allocating.
+                self._abort_disagreed_load(
+                    req,
+                    component_transfers,
+                    prefix_len,
+                    cancel_prefetch=False,
+                    pending=build_error,
+                    release_session=prepare_session and constructed,
                 )
                 return empty_indices, req.last_node
-            component_transfers.append((component, transfer))
+            if prepare_session:
+                # Session start/refresh already checked the master on every rank.
+                prepared_for_load = True
+
+        # Keys can be evicted remotely (master memory-watermark eviction)
+        # between the match-time lookup and this load-back; a stale hit would
+        # then fail the async layer-wise session fatally. Re-check existence
+        # here so the request degrades to a plain cache miss instead.
+        revalidate = getattr(self.cache_linker, "revalidate_load", None)
+        if (
+            not prepared_for_load
+            and revalidate is not None
+            and not revalidate([transfer for _, transfer in component_transfers])
+        ):
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+            return empty_indices, req.last_node
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
@@ -361,11 +892,13 @@ class UnifiedCacheLinkerWrapper:
                 req.rid, [transfer for _, transfer in component_transfers]
             )
         except BaseException:
+            self.cache_linker.abort_prepared_load(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
             raise
         if not queued:
+            self.cache_linker.abort_prepared_load(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
@@ -509,11 +1042,20 @@ class UnifiedCacheLinkerWrapper:
         )
         return rids
 
+    def wait_for_pending_loads(self) -> None:
+        self.cache_linker.wait_for_pending_loads()
+
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        if self.pending_host_prefetch_submissions is not None:
+            for job, _hit in self.pending_host_prefetch_submissions.values():
+                job.cancelled.set()
+            self.pending_host_prefetch_submissions.clear()
         self.cache_linker.reset()
         self.hit_markers.clear()
+        if self.host_prefetch_hits is not None:
+            self.host_prefetch_hits.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -530,7 +1072,10 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
-        self.hit_markers.pop(rid, None)
+        if self._waiting_queue_prefetch_enabled:
+            self.cancel_waiting_queue_prefetch(rid)
+        else:
+            self.hit_markers.pop(rid, None)
         # Started loads finish before the scheduler releases request-owned slots.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
             self.inflight_load_rids.remove(rid)

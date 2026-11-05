@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    PreparedHostPrefetch,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
@@ -117,6 +118,10 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+_DFS_POLICY_RETRY_INITIAL_S = 1.0
+_DFS_POLICY_RETRY_MAX_S = 30.0
+_DFS_POLICY_WARNING_INTERVAL_S = 30.0
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -241,6 +246,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self._dfs_policy_failed_target: tuple[bool, bool] | None = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -339,6 +349,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        self.tree_core.enable_external_cache_linker = True
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
@@ -420,6 +431,17 @@ class UnifiedRadixCache(BasePrefixCache):
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 get_memory().hicache_storage_backend_extra_config
             )
+
+            if storage_backend == "mooncake":
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    inject_dfs_health_config,
+                )
+
+                # Carry the same resolved CLI/env/default values through the
+                # HiCache backend factory to MooncakeStore.
+                storage_extra_config = inject_dfs_health_config(
+                    storage_extra_config, server_args=server_args
+                )
 
         attach_hybrid_pool_to_unified_cache(
             self,
@@ -536,6 +558,116 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result
+
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        """Rank-consistent switch resolved when the linker was built."""
+        return self.linker is not None and self.linker.waiting_queue_prefetch_enabled()
+
+    def disable_waiting_queue_prefetch(self) -> None:
+        if self.linker is not None:
+            self.linker.disable_waiting_queue_prefetch()
+
+    def prefetch_external_linker_to_host(self, req) -> bool:
+        if self.linker is None:
+            return False
+        return self.linker.prefetch_to_host(req)
+
+    def prepare_external_linker_prefetch(self, req) -> Optional[PreparedHostPrefetch]:
+        if self.linker is None:
+            return None
+        return self.linker.prepare_host_prefetch(req)
+
+    def complete_external_linker_prefetch(
+        self, job: PreparedHostPrefetch, submitted: bool
+    ) -> bool:
+        if self.linker is None:
+            if submitted:
+                job.cache_linker.cancel_host_prefetch(job.rid)
+            return False
+        return self.linker.complete_host_prefetch_submission(job, submitted)
+
+    def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
+        """Return one rank-wide admission state for a queued DFS prefetch."""
+        return self.get_waiting_queue_prefetch_admission_states([rid])[rid]
+
+    def get_waiting_queue_prefetch_admission_states(
+        self, rids: Sequence[str]
+    ) -> dict[str, str]:
+        """Resolve variable local request lists in one fixed-shape collective round.
+
+        The request-id union and state matrix make this safe when ranks have
+        different waiting-queue lengths, including an empty queue on some
+        ranks. This method remains scheduler-thread only.
+        """
+        groups = []
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                groups.append(group)
+        if not groups and self.tp_world_size > 1:
+            groups.append(self.tp_group)
+
+        all_rids = list(dict.fromkeys(rids))
+        has_rids = torch.tensor([int(bool(all_rids))], dtype=torch.int)
+        self._all_reduce_attn_groups(has_rids, torch.distributed.ReduceOp.MAX)
+        if int(has_rids.item()) == 0:
+            return {}
+
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(gathered, all_rids, group=group)
+            all_rids = sorted({rid for rank_rids in gathered for rid in rank_rids})
+
+        if not all_rids:
+            return {}
+
+        state_names = (
+            "not_tracked",
+            "pending",
+            "dfs_prefetched",
+            "no_prefetch_needed",
+            "terminal",
+        )
+        local_states = [
+            "not_tracked"
+            if self.linker is None
+            else self.linker.get_host_prefetch_admission_state(rid)
+            for rid in all_rids
+        ]
+        counts = torch.tensor(
+            [
+                [int(local_state == state) for state in state_names]
+                for local_state in local_states
+            ],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
+
+        def state_from_counts(row) -> str:
+            not_tracked, pending, dfs_prefetched, no_prefetch_needed, terminal = (
+                int(value) for value in row
+            )
+            # PENDING wins: an in-flight native read owns its private session
+            # and must finish before any rank can fall back to normal load.
+            if pending:
+                return "pending"
+            completed = dfs_prefetched + no_prefetch_needed
+            if terminal or (not_tracked and completed):
+                return "terminal"
+            if dfs_prefetched:
+                return "dfs_prefetched"
+            if no_prefetch_needed:
+                return "no_prefetch_needed"
+            if not_tracked:
+                return "not_tracked"
+            return "terminal"
+
+        return {
+            rid: state_from_counts(counts[index]) for index, rid in enumerate(all_rids)
+        }
+
+    def cancel_waiting_queue_prefetch(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.cancel_waiting_queue_prefetch(rid)
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -2975,6 +3107,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._sync_dfs_health_policy()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
@@ -3305,6 +3438,101 @@ class UnifiedRadixCache(BasePrefixCache):
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
         return self.tree_core.root_node_handle(extra_key)
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across all attention ranks."""
+        owner = self.linker
+        if owner is None and self.cache_controller is not None:
+            owner = self.cache_controller.storage_backend
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if local_policy is None:
+            return
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+        # Attention groups are local to one PP stage. Reduce their already
+        # conservative result once more across corresponding PP ranks so every
+        # stage enables DFS only when every stage can use it.
+        pp_group = getattr(self, "pp_group", None)
+        if getattr(self, "pp_size", 1) > 1 and pp_group is not None:
+            torch.distributed.all_reduce(
+                effective, op=torch.distributed.ReduceOp.MIN, group=pp_group
+            )
+        effective_values = effective.tolist()
+        allow_write = bool(effective_values[1])
+        target = (bool(effective_values[0]) and allow_write, allow_write)
+
+        # Every rank must participate in the collective above on every step.
+        # Only the rank-local storage RPC is throttled after a failure.
+        now = time.monotonic()
+        failed_target = getattr(self, "_dfs_policy_failed_target", None)
+        next_retry_at = getattr(self, "_dfs_policy_next_retry_at", 0.0)
+        if failed_target == target and now < next_retry_at:
+            return
+
+        try:
+            apply_policy(*target)
+        except Exception as exc:
+            failures = (
+                getattr(self, "_dfs_policy_consecutive_failures", 0) + 1
+                if failed_target == target
+                else 1
+            )
+            retry_delay = min(
+                _DFS_POLICY_RETRY_INITIAL_S * (2 ** min(failures - 1, 30)),
+                _DFS_POLICY_RETRY_MAX_S,
+            )
+            self._dfs_policy_failed_target = target
+            self._dfs_policy_consecutive_failures = failures
+            self._dfs_policy_next_retry_at = now + retry_delay
+
+            last_warning_at = getattr(
+                self, "_dfs_policy_last_warning_at", float("-inf")
+            )
+            if now - last_warning_at >= _DFS_POLICY_WARNING_INTERVAL_S:
+                suppressed = getattr(self, "_dfs_policy_suppressed_warnings", 0)
+                logger.warning(
+                    "Mooncake DFS policy application failed; retaining the "
+                    "previous policy: target_read=%s target_write=%s "
+                    "failures=%d retry_in_s=%.1f suppressed=%d error=%r",
+                    target[0],
+                    target[1],
+                    failures,
+                    retry_delay,
+                    suppressed,
+                    exc,
+                )
+                self._dfs_policy_last_warning_at = now
+                self._dfs_policy_suppressed_warnings = 0
+            else:
+                self._dfs_policy_suppressed_warnings = (
+                    getattr(self, "_dfs_policy_suppressed_warnings", 0) + 1
+                )
+            return
+
+        failures = getattr(self, "_dfs_policy_consecutive_failures", 0)
+        if failures:
+            logger.info(
+                "Mooncake DFS policy application recovered: "
+                "target_read=%s target_write=%s failures=%d",
+                target[0],
+                target[1],
+                failures,
+            )
+        self._dfs_policy_failed_target = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
+
+    def drain_linker_loads(self, *, wait_for_completion: bool = False) -> list[str]:
+        """Confirm private loads before their requests can publish KV or output."""
+        if self.linker is None:
+            return []
+        return self.linker.finish_loads()
 
     def dfs_weight_order(self, node_handles: Sequence[NodeId]) -> list[int]:
         return self.tree_core.dfs_weight_order(node_handles)

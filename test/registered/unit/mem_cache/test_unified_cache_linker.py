@@ -88,6 +88,7 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "_all_reduce_attn_groups": lambda _tensor, _op: None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)

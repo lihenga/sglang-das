@@ -50,8 +50,6 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
-    get_dsa_index_topk,
-    is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -94,7 +92,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -107,6 +104,12 @@ from sglang.srt.utils import (
 
 _is_hcu = is_hcu()
 logger = logging.getLogger(__name__)
+
+# SGLANG_HCU_MLA_QCAT=1: flashmla_kv takes q_nope / q_rope that forward_mla_rocm already
+# wrote side by side into one [T, H, 576] buffer as q_all (a view) instead of concatenating.
+_hcu_qcat = None
+if _is_hcu and get_bool_env_var("SGLANG_HCU_MLA_QCAT"):
+    import hcu_ops as _hcu_qcat
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
 # per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
@@ -2324,7 +2327,11 @@ class DeepseekSparseAttnBackend(
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = None
+                if _hcu_qcat is not None:
+                    q_all = _hcu_qcat.adjacent_q_all(q_nope, q_rope)
+                if q_all is None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2500,7 +2507,11 @@ class DeepseekSparseAttnBackend(
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = None
+                if _hcu_qcat is not None:
+                    q_all = _hcu_qcat.adjacent_q_all(q_nope, q_rope)
+                if q_all is None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,

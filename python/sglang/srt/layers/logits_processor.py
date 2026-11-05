@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -69,6 +70,39 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
+_RELAYOUT_LM_HEAD = os.environ.get("SGLANG_HCU_LM_HEAD_NN", "1") == "1"
+# SGLANG_HCU_SKINNY_LM_HEAD=1: decode-sized bf16 lm_head GEMMs on the relaid NN weight run
+# hcu_ops' skinny NN GEMM (~1.11-1.33 vs 1.58-1.59 ms for GLM-5.3's 154880-row head at
+# M <= 64 on BW1100); it returns None (-> torch.matmul) for M > 64, untuned shapes or the NT
+# layout.
+_hcu_lm_head = None
+if os.environ.get("SGLANG_HCU_SKINNY_LM_HEAD", "0") == "1":
+    import hcu_ops as _hcu_lm_head
+
+
+def _maybe_relayout_lm_head_weight(lm_head) -> None:
+    """Store the LM-head weight as a [K, V]-contiguous buffer viewed as [V, K].
+
+    rocBLAS picks very slow kernels for the NT layout of the huge
+    bf16 LM-head GEMM on HCU; with this layout ``weight.T`` is contiguous and
+    the GEMM runs as NN. Done once, outside of CUDA graph capture.
+    """
+    global _RELAYOUT_LM_HEAD
+    if not _RELAYOUT_LM_HEAD:
+        return
+    w = lm_head.weight
+    if w.dim() != 2 or not w.is_cuda or not w.is_contiguous() or w.shape[0] == 1:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        # A captured graph may now reference the current storage; never move it.
+        _RELAYOUT_LM_HEAD = False
+        logger.warning("LM-head relayout skipped: first call was under graph capture.")
+        return
+    w.data = w.data.t().contiguous().t()
+    logger.info("LM-head weight relaid out for NN GEMM: shape=%s", tuple(w.shape))
+    torch.cuda.empty_cache()
+
+
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
     "UnquantizedLinearMethod",
@@ -99,60 +133,6 @@ def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
     return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
 
 
-def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
-    if (
-        quant_method is None
-        or not hasattr(lm_head, "weight")
-        or not callable(getattr(quant_method, "apply", None))
-    ):
-        return False
-
-    method_name = type(quant_method).__name__
-    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
-        return False
-
-    # A shared target lm_head can retain the draft's stale ModelOpt method; use it
-    # only when the runtime tensor layout matches that method.
-    if method_name == "ModelOptFp4LinearMethod":
-        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale",
-                "weight_global_scale",
-                "workspace",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        ):
-            return True
-        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale_interleaved",
-                "alpha",
-                "input_scale_inv",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        )
-    if method_name == "ModelOptNvFp4A16LinearMethod":
-        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale",
-                "weight_global_scale",
-                "workspace",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        )
-    if method_name == "ModelOptFp8LinearMethod":
-        return (
-            lm_head.weight.dtype == torch.float8_e4m3fn
-            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
-        )
-
-    return True
 
 
 # FlashInfer autotune skips the unprofiled LM-head all-gather; its
@@ -938,9 +918,19 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                _maybe_relayout_lm_head_weight(lm_head)
+                logits = None
+                if (
+                    _hcu_lm_head is not None
+                    and hidden_states.dtype == lm_head.weight.dtype
+                ):
+                    logits = _hcu_lm_head.try_skinny_nn_bf16(
+                        hidden_states, lm_head.weight.T
+                    )
+                if logits is None:
+                    logits = torch.matmul(
+                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

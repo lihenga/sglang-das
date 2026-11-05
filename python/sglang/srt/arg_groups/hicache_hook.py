@@ -24,6 +24,8 @@ def handle_hicache(server_args: Any):
     """
     cfg = resolving_view(server_args)
     if cfg.enable_unified_cache_external_linker:
+        if cfg.disable_radix_cache:
+            raise ValueError("--enable-unified-cache-external-linker and --disable-radix-cache are mutually exclusive.")
         if cfg.enable_hierarchical_cache:
             raise ValueError(
                 "--enable-unified-cache-external-linker and "

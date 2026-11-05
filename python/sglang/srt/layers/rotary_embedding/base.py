@@ -31,6 +31,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# SGLANG_HCU_FUSED_ROPE=1: hcu_ops.rope_inplace tiles heads over the grid, so all
+# query heads and the key go in one launch instead of nq * rot_dim / 512 launches.
+_hcu_rope = None
+if get_bool_env_var("SGLANG_HCU_FUSED_ROPE"):
+    from hcu_ops import rope_inplace as _hcu_rope
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -424,6 +430,14 @@ class RotaryEmbedding(BaseFusedOp):
                 self.cos_sin_cache = self.cos_sin_cache.to(
                     query.device, dtype=query.dtype
                 )
+                if (
+                    _hcu_rope is not None and query.dtype in (torch.bfloat16, torch.float16)
+                    and self.cos_sin_cache.dtype == query.dtype
+                    and query.dim() in (2, 3) and query.stride(-1) == 1
+                    and (key is None or (key.dim() in (2, 3) and key.stride(-1) == 1))
+                ):
+                    _hcu_rope(positions, query, key, self.head_size, self.cos_sin_cache, self.is_neox_style)
+                    return query, key
                 self.fallback_rotary_embedding(
                     positions,
                     query,

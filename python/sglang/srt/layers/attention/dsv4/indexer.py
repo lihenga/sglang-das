@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import os
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -41,12 +44,14 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -76,6 +81,106 @@ if TYPE_CHECKING:
 _is_hcu = is_hcu()
 _is_aiter_fp8_paged_mqa_logits_supported = is_gfx942_supported() or is_gfx95_supported()
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
+
+_FRACTION_ENV = "SGLANG_DSV4_PAGED_MQA_LOGITS_FREE_MEM_FRACTION"
+_budget_cache = {}
+
+
+@dataclass(frozen=True)
+class PagedMQAChunkPlan:
+    rows_per_chunk: int
+    budget_bytes: int
+    output_width: int
+    use_prefill: bool
+
+
+def explicit_mqa_fraction():
+    """Absence disables this V4 path; the DSA environment is independent."""
+    raw = os.environ.get(_FRACTION_ENV)
+    if raw is None:
+        return None
+    try:
+        fraction = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_FRACTION_ENV} must be a finite number in (0, 1], got {raw!r}") from exc
+    if not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError(f"{_FRACTION_ENV} must be in (0, 1], got {raw!r}")
+    return fraction
+
+
+def _budget_bytes(device, fraction, mem_fraction_static):
+    device_index = torch.device(device).index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (device_index, fraction, mem_fraction_static)
+    if key in _budget_cache:
+        return _budget_cache[key]
+    total = int(torch.cuda.get_device_properties(device_index).total_memory)
+    total_guard = int(total * 0.3)
+    static_guard = total_guard
+    if mem_fraction_static is not None:
+        static_guard = min(
+            total_guard, int(int(total * max(0.0, 1.0 - mem_fraction_static)) * fraction)
+        )
+    free, device_total = torch.cuda.mem_get_info(device_index)
+    try:
+        stats = torch.cuda.memory_stats(device_index)
+        reusable = max(
+            0,
+            int(stats["reserved_bytes.all.current"])
+            - int(stats["active_bytes.all.current"])
+            - int(stats["inactive_split_bytes.all.current"]),
+        )
+        free = min(int(device_total), int(free) + reusable)
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        pass
+    budget = max(1, min(int(free * fraction), static_guard))
+    _budget_cache[key] = budget
+    return budget
+
+
+def make_paged_mqa_chunk_plan(q, max_seq_len, *, use_prefill, mem_fraction_static):
+    fraction = explicit_mqa_fraction()
+    if fraction is None:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Paged MQA row chunk planning requires eager execution")
+    if q.shape[0] < 1 or max_seq_len < 1:
+        return None
+    # The ordinary paged kernel allocates a physical width rounded to page size.
+    width = max_seq_len if use_prefill else (max_seq_len + 63) // 64 * 64
+    budget = _budget_bytes(q.device, fraction, mem_fraction_static)
+    rows = min(q.shape[0], max(1, budget // (4 * width)))
+    return PagedMQAChunkPlan(rows, budget, width, use_prefill)
+
+
+def run_int8_paged_mqa_chunks(
+    fn, q, kv_cache, weights, seq_lens, block_table, max_seq_len,
+    *, rows_per_chunk, use_prefill, consume_logits, label="",
+):
+    """Consume each FP32 logits chunk immediately; the callback must not retain it.
+
+    Prefix-prefill reads only the first page-table row: use it exclusively for a
+    proven single-request batch with no metadata row padding. Mixed or unknown
+    ownership must use the ordinary paged kernel's per-query page table.
+    """
+    if rows_per_chunk <= 0:
+        raise ValueError("rows_per_chunk must be positive")
+    rows = q.shape[0]
+    if any(t.shape[0] != rows for t in (weights, seq_lens, block_table)):
+        raise ValueError("INT8 paged MQA inputs must have the same Q row count")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Paged MQA row chunks require eager execution")
+    for start in range(0, rows, rows_per_chunk):
+        end = min(start + rows_per_chunk, rows)
+        logits = fn(
+            q[start:end], kv_cache, weights[start:end], seq_lens[start:end],
+            block_table[start:end], None, max_seq_len, False, use_prefill,
+        )
+        consume_logits(logits, start, end)
+        # Release before the next RHS allocation, avoiding two live chunks.
+        del logits
 
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1006,7 +1111,21 @@ class C4IndexerBackendMixin:
                     rows = slice(start, min(start + _SM120_INDEXER_M_CHUNK, num_rows))
                     run_paged_indexer(rows, deep_gemm_metadata[chunk_idx])
             else:
-                run_paged_indexer(all_rows, deep_gemm_metadata)
+                chunk_plan = None
+                if (envs.SGLANG_DSV4_PAGED_MQA_LOGITS_FREE_MEM_FRACTION.is_set()
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and not get_is_capture_mode() and not use_fp4_indexer
+                    and isinstance(q, torch.Tensor)):
+                    chunk_plan = make_paged_mqa_chunk_plan(
+                        q, indexer_metadata.max_c4_seq_len, use_prefill=False,
+                        mem_fraction_static=get_schedule().mem_fraction_static,
+                    )
+                if chunk_plan is None:
+                    run_paged_indexer(all_rows, deep_gemm_metadata)
+                else:
+                    chunk_rows = chunk_plan.rows_per_chunk
+                    for start in range(0, query_rows, chunk_rows):
+                        run_paged_indexer(slice(start, min(start + chunk_rows, query_rows)), deep_gemm_metadata)
 
         if hisparse_coordinator is not None:
             if hisparse_decode:
