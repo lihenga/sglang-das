@@ -59,6 +59,7 @@ impl ErrorEventScanner {
             let room = LINE_PROBE - self.line_start.len();
             self.line_start
                 .extend_from_slice(&segment[..segment.len().min(room)]);
+            self.saw_error |= Self::is_error_line(&self.line_start);
         }
     }
 
@@ -381,6 +382,15 @@ mod tests {
         scanner.feed(&vec![b'x'; 1024 * 1024]);
         assert_eq!(scanner.line_start.len(), 32);
         assert!(!scanner.saw_error);
+    }
+
+    #[test]
+    fn scanner_recognizes_error_before_line_terminator() {
+        let mut scanner = ErrorEventScanner::default();
+        scanner.feed(b"data: {\"err");
+        assert!(!scanner.saw_error);
+        scanner.feed(b"or\":{\"code\":503}}");
+        assert!(scanner.saw_error);
     }
 
     #[tokio::test]
