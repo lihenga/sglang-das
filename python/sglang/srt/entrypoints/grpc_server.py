@@ -37,7 +37,7 @@ async def _start_sidecar_server(host: str, port: int, app):
     return runner
 
 
-def _add_metrics_routes(app):
+def _add_metrics_routes(app, server_args=None):
     """Add Prometheus /metrics endpoint to the aiohttp app."""
     from prometheus_client import (
         CollectorRegistry,
@@ -48,10 +48,17 @@ def _add_metrics_routes(app):
         generate_latest,
     )
 
+    from sglang.srt.observability.mooncake_client_metrics import (
+        SNAPSHOT_PATH,
+        MooncakeClientCollector,
+        receive_snapshot,
+    )
+
     async def metrics_handler(request):
         try:
             registry = CollectorRegistry()
             multiprocess.MultiProcessCollector(registry)
+            registry.register(MooncakeClientCollector())
             data = generate_latest(registry)
             return web.Response(
                 body=data,
@@ -62,6 +69,32 @@ def _add_metrics_routes(app):
             return web.Response(status=500, text="Failed to generate metrics")
 
     app.router.add_get("/metrics", metrics_handler)
+
+    async def snapshot_handler(request):
+        import asyncio
+
+        from sglang.srt.utils.auth import AuthLevel, decide_request_auth
+
+        decision = decide_request_auth(
+            method="POST",
+            path=SNAPSHOT_PATH,
+            authorization_header=request.headers.get("Authorization"),
+            api_key=getattr(server_args, "api_key", None),
+            admin_api_key=getattr(server_args, "admin_api_key", None),
+            auth_level=AuthLevel.NORMAL,
+        )
+        if not decision.allowed:
+            return web.Response(status=decision.error_status_code)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a snapshot object")
+            await asyncio.to_thread(receive_snapshot, payload)
+        except (ValueError, TypeError):
+            return web.Response(status=400)
+        return web.Response(status=204)
+
+    app.router.add_post(SNAPSHOT_PATH, snapshot_handler)
 
 
 def _check_communicator_results(results, action):
@@ -165,7 +198,9 @@ async def serve_grpc(server_args, model_info=None):
             "version mismatch — see the chained exception above for details."
         ) from e
 
-    sidecar_app = web.Application()
+    from sglang.srt.observability.mooncake_client_metrics import MAX_SNAPSHOT_BYTES
+
+    sidecar_app = web.Application(client_max_size=MAX_SNAPSHOT_BYTES)
     sidecar_runner = None
     sidecar_port = (
         server_args.smg_http_sidecar_port
@@ -183,7 +218,7 @@ async def serve_grpc(server_args, model_info=None):
 
             set_prometheus_multiproc_dir()
             enable_func_timer()
-            _add_metrics_routes(sidecar_app)
+            _add_metrics_routes(sidecar_app, server_args)
         except Exception as e:
             logger.error(
                 "Failed to set up metrics: %s. Continuing without metrics.",

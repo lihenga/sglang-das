@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import uuid
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
@@ -108,43 +109,26 @@ def _normalize_tenant_id(value) -> str:
 
 def _get_service_endpoint(server_args) -> str:
     """Use existing serving/network settings for both direct and HiCache stores."""
-    host = server_args.host or "0.0.0.0"
+    host = (
+        NetworkAddress.parse(server_args.dist_init_addr).host
+        if server_args.nnodes > 1
+        else server_args.host or "0.0.0.0"
+    )
     address = ipaddress.ip_address(NetworkAddress.resolve_host(host))
     if address.is_unspecified:
-        if server_args.nnodes > 1:
-            # All nodes already share the leader address. Never substitute a
-            # worker's local IP in a multi-node service.
-            host = NetworkAddress.parse(server_args.dist_init_addr).host
-            address = ipaddress.ip_address(NetworkAddress.resolve_host(host))
-        else:
-            address = ipaddress.ip_address(get_local_ip_auto())
+        address = ipaddress.ip_address(get_local_ip_auto())
     port = int(server_args.port)
     if address.is_unspecified or not 1 <= port <= 65535:
         raise ValueError("Cannot resolve a concrete SGLang service IP:business-port")
     return NetworkAddress(str(address), port).to_host_port_str()
 
 
-def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
-    """Let the server bind an OS-assigned port unless a fixed base is configured."""
-    base_port = envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.get()
-    if base_port == 0:
-        return 0
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        global_rank = torch.distributed.get_rank()
-        if dp_rank is not None:
-            global_rank += dp_rank * torch.distributed.get_world_size()
-        return base_port + global_rank
-    return base_port
-
-
-def _get_mooncake_client_http_setup_kwargs(
-    enable_client_http_server: bool, dp_rank: Optional[int] = None
-) -> dict[str, Any]:
+def _get_mooncake_client_http_setup_kwargs(enable_client_http_server: bool) -> dict[str, Any]:
     if not enable_client_http_server:
         return {}
     return {
         "enable_client_http_server": True,
-        "client_http_port": _get_mooncake_client_http_port(dp_rank),
+        "client_http_port": 0,
     }
 
 
@@ -449,6 +433,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ):
         MooncakeBaseStore.__init__(self)
         self._dfs_health_manager = None
+        self._client_metrics_reporter = None
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -577,7 +562,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
                 setup_kwargs = _get_mooncake_client_http_setup_kwargs(
                     enable_client_http_server,
-                    getattr(storage_config, "dp_rank", None),
                 )
                 if enable_dfs_prefetch is False:
                     # Override the arena environment for this client only.
@@ -635,6 +619,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     logger.info(
                         "Mooncake Master service metrics endpoint: %s", service_endpoint
                     )
+                if enable_client_http_server and not self.config.standalone_storage:
+                    from sglang.srt.observability.mooncake_client_metrics import (
+                        start_client_metrics_reporter,
+                    )
+
+                    rank = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0
+                    )
+                    self._client_metrics_reporter = start_client_metrics_reporter(
+                        self.store, get_server_args(), service_endpoint, rank
+                    )
+                    if self._client_metrics_reporter is not None:
+                        weakref.finalize(self, self._client_metrics_reporter.close)
             logger.info("Mooncake store setup successfully.")
 
             distributed_dfs = (
@@ -1548,6 +1547,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
+        if self._client_metrics_reporter is not None:
+            self._client_metrics_reporter.close()
+            self._client_metrics_reporter = None
         if self._dfs_health_manager is not None:
             self._dfs_health_manager.close()
             self._dfs_health_manager = None
