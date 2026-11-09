@@ -802,8 +802,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         for index_k_cache in self.index_key_cache.buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         if self.use_int8_index_k_cache:
-            kv_size_bytes += get_tensor_size_bytes(self.index_k_dequant_workspace)
-            kv_size_bytes += get_tensor_size_bytes(self.index_k_page_claims)
+            kv_size_bytes += self._get_index_k_workspace_size_bytes()
         return kv_size_bytes
 
     def get_contiguous_buf_infos(self):

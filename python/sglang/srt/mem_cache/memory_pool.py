@@ -82,7 +82,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -4665,12 +4665,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
             logger.info(
                 "DSA index-K cache mode=%s, persistent bytes/token/layer=%d, "
-                "workspace_count=1, workspace_bytes=%d, page_claim_bytes=%d, "
+                "workspace_count=%d, workspace_bytes=%d, page_claim_bytes=%d, "
                 "persistent_bytes=%d",
                 self.index_k_cache_mode.value,
                 index_k_cache_bytes_per_token(self.index_k_cache_mode),
-                self.index_k_dequant_workspace.nbytes,
-                self.index_k_page_claims.nbytes,
+                int(self._index_k_dequant_workspace is not None),
+                getattr(self._index_k_dequant_workspace, "nbytes", 0),
+                getattr(self._index_k_page_claims, "nbytes", 0),
                 persistent_bytes,
             )
 
@@ -4687,8 +4688,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _initialize_int8_index_k_workspace(self) -> None:
         self.index_k_int8_aliases = None
         self.index_k_int8_remote_aliases = None
-        self.index_k_dequant_workspace = None
-        self.index_k_page_claims = None
+        self._index_k_dequant_workspace = None
+        self._index_k_page_claims = None
         if not self.use_int8_index_k_cache:
             return
 
@@ -4702,13 +4703,25 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 remote_buffer
             )
 
+        if not (
+            envs.SGLANG_DSA_PREFILL_LAZY_INDEX_K_WORKSPACE.get()
+            and get_disagg().disaggregation_mode == "prefill"
+        ):
+            self._ensure_index_k_dequant_workspace()
+
+    def _ensure_index_k_dequant_workspace(self) -> None:
+        if (
+            not self.use_int8_index_k_cache
+            or self._index_k_dequant_workspace is not None
+        ):
+            return
         num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
             else nullcontext()
         ):
-            self.index_k_dequant_workspace = torch.empty(
+            workspace = torch.empty(
                 (
                     num_pages,
                     self.page_size,
@@ -4718,9 +4731,27 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 dtype=torch.bfloat16,
                 device=self.device,
             )
-            self.index_k_page_claims = torch.empty(
+            page_claims = torch.empty(
                 (num_pages,), dtype=torch.int32, device=self.device
             )
+        self._index_k_dequant_workspace = workspace
+        self._index_k_page_claims = page_claims
+
+    @property
+    def index_k_dequant_workspace(self):
+        self._ensure_index_k_dequant_workspace()
+        return self._index_k_dequant_workspace
+
+    @property
+    def index_k_page_claims(self):
+        self._ensure_index_k_dequant_workspace()
+        return self._index_k_page_claims
+
+    def _get_index_k_workspace_size_bytes(self):
+        return sum(
+            getattr(buffer, "nbytes", 0)
+            for buffer in (self._index_k_dequant_workspace, self._index_k_page_claims)
+        )
 
     def _create_index_k_buffer(self):
         num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
@@ -4763,8 +4794,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _clear_index_k_buffers(self) -> None:
         self.index_k_int8_aliases = None
         self.index_k_int8_remote_aliases = None
-        self.index_k_dequant_workspace = None
-        self.index_k_page_claims = None
+        self._index_k_dequant_workspace = None
+        self._index_k_page_claims = None
         if self.index_key_cache is not None:
             self.index_key_cache.clear()
         if getattr(self, "index_k_buffer", None) is not None:
@@ -5023,8 +5054,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in index_cache:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         if self.use_int8_index_k_cache:
-            kv_size_bytes += get_tensor_size_bytes(self.index_k_dequant_workspace)
-            kv_size_bytes += get_tensor_size_bytes(self.index_k_page_claims)
+            kv_size_bytes += self._get_index_k_workspace_size_bytes()
         return kv_size_bytes
 
 

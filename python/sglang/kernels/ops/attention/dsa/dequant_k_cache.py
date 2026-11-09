@@ -184,7 +184,7 @@ def _lightop_prefill_gather(device_index):
     return op
 
 
-def _try_lightop_prefill_gather(cache, ids, group_size):
+def _try_lightop_prefill_gather(cache, ids, group_size, workspace_rows=None):
     if not (
         group_size == 128
         and cache.is_cuda
@@ -203,15 +203,62 @@ def _try_lightop_prefill_gather(cache, ids, group_size):
     op = _lightop_prefill_gather(cache.device.index)
     if op is None:
         return None
-    output = torch.empty((ids.numel(), 1, 576), device=cache.device, dtype=torch.bfloat16)
+    rows = ids.numel() if workspace_rows is None else workspace_rows
+    if type(rows) is not int or rows < ids.numel():
+        raise ValueError("workspace_rows must cover all logical KV rows")
+    output = torch.empty((rows, 1, 576), device=cache.device, dtype=torch.bfloat16)
+    if rows != ids.numel():
+        output = output[: ids.numel()]
     op.prefill_gather_and_upconvert_fp8_kv_cache(cache, ids, output)
     return output
+
+
+def try_dequantize_k_cache_physical(cache, ids, indices, group_size=128):
+    if not (
+        group_size == 128
+        and cache.is_cuda
+        and cache.dtype == torch.float8_e4m3fn
+        and cache.ndim in (3, 4)
+        and cache.shape[-2:] == (1, 656)
+        and cache.is_contiguous()
+        and cache.data_ptr() % 16 == 0
+        and ids.device == cache.device
+        and indices.device == cache.device
+        and ids.dtype == indices.dtype == torch.int32
+        and ids.ndim == 1
+        and ids.is_contiguous()
+        and indices.ndim == 2
+        and indices.shape[1] == 2048
+        and indices.is_contiguous()
+        and 1 <= indices.shape[0] <= 5120
+    ):
+        return None
+    logical_rows = ids.numel()
+    physical_rows = cache.numel() // 656
+    if (
+        logical_rows <= 262144
+        or logical_rows < 786432
+        or not 262144 <= physical_rows <= 1114432
+        or logical_rows < 2 * physical_rows
+        or logical_rows >= 2147483647
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    if _lightop_prefill_gather(cache.device.index) is None:
+        return None
+    try:
+        from lightop.kvcache import prefill_gather_physical_kv
+    except ImportError:
+        return None
+    return prefill_gather_physical_kv(cache, ids, indices)
 
 
 def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
+    *,
+    workspace_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """
     De-quantize the k-cache with paged layout
@@ -222,7 +269,7 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     lightop_output = _try_lightop_prefill_gather(
-        quant_k_cache, page_table_1_flattened, group_size
+        quant_k_cache, page_table_1_flattened, group_size, workspace_rows
     )
     if lightop_output is not None:
         return lightop_output

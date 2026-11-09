@@ -1638,6 +1638,95 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
 
+    def _try_sampled_mqa_topk(
+        self,
+        forward_batch,
+        layer_id,
+        q,
+        k,
+        weights,
+        scales,
+        ks,
+        ke,
+        metadata,
+        result,
+        budget,
+    ):
+        from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+            DSAIndexerMetadata,
+        )
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+
+        if os.getenv("SGLANG_DSA_MQA_SAMPLED_TOPK", "0") != "1":
+            return None
+        if (
+            type(metadata) is not DSAIndexerMetadata
+            or not metadata.topk_backend.is_lightop()
+            or metadata.topk_transform_method != TopkTransformMethod.RAGGED
+            or metadata.force_unfused_topk
+            or not envs.SGLANG_DSA_FUSE_TOPK.get()
+            or self.index_topk != 2048
+            or self.num_init_tokens
+            or self.num_local_tokens
+            or get_is_capture_mode()
+            or budget <= 16384
+            or any(
+                getattr(layer, "set_lora", False)
+                for layer in (self.weights_proj, self.wq_b, self.wk)
+            )
+        ):
+            return None
+        from lightop.attention.mqa import mqa_logits_topk_sampled_int8
+
+        rows, heads, width = q.shape
+        if (
+            heads != 32
+            or width != 128
+            or q.dtype != torch.int8
+            or not q.is_contiguous()
+            or k.dtype != torch.int8
+            or not k.is_contiguous()
+            or not 262144 < k.shape[0] <= 1179648
+        ):
+            return None
+        offsets = metadata.attn_metadata.topk_indices_offset
+        if offsets is None or offsets.shape[0] < rows:
+            return None
+        offsets = offsets[:rows]
+        candidate_kwargs = {}
+        if os.getenv("SGLANG_DSA_MQA_DIRECT_EMIT", "0") == "1":
+            candidate_kwargs["direct_candidate_emit"] = True
+        fallback_rows = 64
+        fixed_bytes = 4 * k.shape[0] * fallback_rows + 2 * 1024 * 1024
+        max_rows = min(16384, (budget - fixed_bytes) // 196608)
+        if max_rows < 64:
+            return None
+        parts = (rows + max_rows - 1) // max_rows
+        chunk_rows = (rows + parts - 1) // parts
+        full_chunks, tail_rows = divmod(rows, chunk_rows)
+        tiles = full_chunks * ((chunk_rows + 63) // 64) + (tail_rows + 63) // 64
+        if tiles > (rows + 63) // 64:
+            chunk_rows = max_rows // 64 * 64
+        for begin in range(0, rows, chunk_rows):
+            end = min(begin + chunk_rows, rows)
+            with self._with_real_sm_count():
+                selected = mqa_logits_topk_sampled_int8(
+                    q[begin:end],
+                    k,
+                    weights[begin:end],
+                    scales,
+                    ks[begin:end],
+                    ke[begin:end],
+                    offsets[begin:end],
+                    fallback_workspace_rows=fallback_rows,
+                    sort_topk=False,
+                    min_sample_k=131072,
+                    **candidate_kwargs,
+                )
+            result[begin:end].copy_(selected)
+            del selected
+        return result
+
     def _get_topk_ragged(
         self,
         enable_dual_stream: bool,
@@ -1744,6 +1833,27 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )
+
+        if (
+            _is_hcu
+            and use_int8_mqa
+            and os.getenv("SGLANG_DSA_MQA_SAMPLED_TOPK", "0") == "1"
+        ):
+            sampled_result = self._try_sampled_mqa_topk(
+                forward_batch,
+                layer_id,
+                q_fp8[:q_offset],
+                k_quant,
+                weights[:q_offset],
+                k_scale,
+                ks,
+                ke,
+                metadata,
+                topk_result,
+                logits_budget_bytes,
+            )
+            if sampled_result is not None:
+                return sampled_result
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0

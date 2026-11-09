@@ -1546,6 +1546,8 @@ class Envs:
     # Set to false to use the Triton kernel with a runtime page-table stride.
     SGLANG_DSA_HCU_LIGHTOP_INT8_INDEX_K_DEQUANT = EnvBool(True)
     SGLANG_DSA_COMPACT_INDEX_K_CACHE_PD = EnvBool(False)
+    SGLANG_DSA_PREFILL_LAZY_INDEX_K_WORKSPACE = EnvBool(False)
+    SGLANG_DSA_PREFILL_KV_WORKSPACE_ROUND = EnvBool(False)
     # HCU Q/K preparation; independent of the CUDA DSA indexer fusion switch.
     # Disable to run normalization (preserving input dtype) before separate RoPE.
     SGLANG_DSA_HCU_FUSE_LN_ROPE = EnvBool(True)

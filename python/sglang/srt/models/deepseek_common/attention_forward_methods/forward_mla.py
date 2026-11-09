@@ -87,8 +87,11 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 _ENABLE_DSA_HCU_MAIN_KV_CP_OVERLAP = envs.SGLANG_DSA_HCU_MAIN_KV_CP_OVERLAP.get()
-_ENABLE_DSA_ROPE_PACKED_Q_OUTPUT = get_bool_env_var("SGLANG_DSA_ROPE_PACKED_Q_OUTPUT", "false")
+_ENABLE_DSA_ROPE_PACKED_Q_OUTPUT = get_bool_env_var(
+    "SGLANG_DSA_ROPE_PACKED_Q_OUTPUT", "false"
+)
 _MAIN_KV_CP_STREAMS = {}
+_MAIN_KV_CP_HANDOFF = {}
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -136,8 +139,16 @@ def should_defer_dsa_cp_kv_gather(
 
 
 def _try_overlap_spark_cp_bmm(
-    self, forward_batch, positions, q_nope, q_pe, k_nope, k_pe,
-    latent_cache, q_nope_out, q_pe_output=None,
+    self,
+    forward_batch,
+    positions,
+    q_nope,
+    q_pe,
+    k_nope,
+    k_pe,
+    latent_cache,
+    q_nope_out,
+    q_pe_output=None,
 ):
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -177,7 +188,15 @@ def _try_overlap_spark_cp_bmm(
         and q_nope_out.shape == (128, q_nope.shape[0], 512)
         and all(
             value.device == q_nope.device and value.dtype == torch.bfloat16
-            for value in (q_nope, q_pe, k_nope, k_pe, latent_cache, self.w_kc, q_nope_out)
+            for value in (
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                latent_cache,
+                self.w_kc,
+                q_nope_out,
+            )
         )
     ):
         return None
@@ -188,22 +207,37 @@ def _try_overlap_spark_cp_bmm(
     stream = _MAIN_KV_CP_STREAMS.get(q_nope.device)
     if stream is None:
         return None
+    handoff = _MAIN_KV_CP_HANDOFF.get(q_nope.device)
+    if handoff is not None and handoff[0] != current_stream:
+        return None
     if q_pe_output is None:
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
     else:
-        from sglang.srt.layers.rotary_embedding.native_bf16_rope import run_native_bf16_rope_to
-        q_pe, k_pe = run_native_bf16_rope_to(self.rotary_emb, positions, q_pe, k_pe, q_pe_output)
-    stream.wait_stream(current_stream)
-    for value in (latent_cache, k_nope, k_pe):
-        value.record_stream(stream)
-    with torch.cuda.stream(stream):
-        k_nope, k_pe = materialize_full_kv_cp(
-            self, forward_batch, latent_cache, k_nope, k_pe
+        from sglang.srt.layers.rotary_embedding.native_bf16_rope import (
+            run_native_bf16_rope_to,
         )
-    torch.bmm(q_nope.transpose(0, 1), self.w_kc, out=q_nope_out)
-    current_stream.wait_stream(stream)
-    k_nope.record_stream(current_stream)
-    k_pe.record_stream(current_stream)
+
+        q_pe, k_pe = run_native_bf16_rope_to(
+            self.rotary_emb, positions, q_pe, k_pe, q_pe_output
+        )
+    stream.wait_stream(current_stream)
+    _MAIN_KV_CP_HANDOFF.pop(q_nope.device, None)
+    handoff = None
+    cp_inputs = (latent_cache, k_nope, k_pe)
+    try:
+        with torch.cuda.stream(stream):
+            k_nope, k_pe = materialize_full_kv_cp(
+                self, forward_batch, latent_cache, k_nope, k_pe
+            )
+        torch.bmm(q_nope.transpose(0, 1), self.w_kc, out=q_nope_out)
+        current_stream.wait_stream(stream)
+    except BaseException:
+        for value in cp_inputs:
+            value.record_stream(stream)
+        raise
+    for value in cp_inputs:
+        value.record_stream(current_stream)
+    _MAIN_KV_CP_HANDOFF[q_nope.device] = (current_stream, k_nope, k_pe)
     return q_pe, k_nope, k_pe
 
 
@@ -657,16 +691,28 @@ class DeepseekMLAForwardMixin:
                 )
                 if direct_q:
                     packed_q = q_nope.new_empty((q_nope.shape[0], 128, 576))
-                    if (_ENABLE_DSA_ROPE_PACKED_Q_OUTPUT and 3584 <= q_nope.shape[0] <= 5120
-                            and not get_is_capture_mode() and not torch.cuda.is_current_stream_capturing()
-                            and not is_graph_dsa_split_op_surface(forward_batch)
-                            and not is_in_breakable_cuda_graph() and not is_in_tc_piecewise_cuda_graph()
-                            and get_tc_piecewise_forward_context() is None):
+                    if (
+                        _ENABLE_DSA_ROPE_PACKED_Q_OUTPUT
+                        and 3584 <= q_nope.shape[0] <= 5120
+                        and not get_is_capture_mode()
+                        and not torch.cuda.is_current_stream_capturing()
+                        and not is_graph_dsa_split_op_surface(forward_batch)
+                        and not is_in_breakable_cuda_graph()
+                        and not is_in_tc_piecewise_cuda_graph()
+                        and get_tc_piecewise_forward_context() is None
+                    ):
                         packed_rope_output = packed_q[..., 512:]
                     q_nope_out = packed_q[..., :512].transpose(0, 1)
                     overlapped = _try_overlap_spark_cp_bmm(
-                        self, forward_batch, positions, q_nope, q_pe, k_nope,
-                        k_pe, latent_cache, q_nope_out,
+                        self,
+                        forward_batch,
+                        positions,
+                        q_nope,
+                        q_pe,
+                        k_nope,
+                        k_pe,
+                        latent_cache,
+                        q_nope_out,
                         packed_rope_output,
                     )
                     if overlapped is None:
@@ -698,13 +744,25 @@ class DeepseekMLAForwardMixin:
             from sglang.srt.models.sparkv1_mla_preprocess import maybe_defer_spark_mla
 
             deferred = maybe_defer_spark_mla(
-                self, forward_batch, positions, q_nope_out, q_pe, k_nope, k_pe,
-                fusion_plan=fusion_plan, llama_4_scaling=llama_4_scaling,
+                self,
+                forward_batch,
+                positions,
+                q_nope_out,
+                q_pe,
+                k_nope,
+                k_pe,
+                fusion_plan=fusion_plan,
+                llama_4_scaling=llama_4_scaling,
             )
             if not deferred:
                 if packed_rope_output is not None:
-                    from sglang.srt.layers.rotary_embedding.native_bf16_rope import run_native_bf16_rope_to
-                    q_pe, k_pe = run_native_bf16_rope_to(self.rotary_emb, positions, q_pe, k_pe, packed_rope_output)
+                    from sglang.srt.layers.rotary_embedding.native_bf16_rope import (
+                        run_native_bf16_rope_to,
+                    )
+
+                    q_pe, k_pe = run_native_bf16_rope_to(
+                        self.rotary_emb, positions, q_pe, k_pe, packed_rope_output
+                    )
                 else:
                     q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -793,8 +851,12 @@ class DeepseekMLAForwardMixin:
 
         if packed_q is not None:
             suffix = packed_q[..., 512:]
-            if not (packed_rope_output is not None and q_pe.shape == suffix.shape
-                    and q_pe.stride() == suffix.stride() and q_pe.data_ptr() == suffix.data_ptr()):
+            if not (
+                packed_rope_output is not None
+                and q_pe.shape == suffix.shape
+                and q_pe.stride() == suffix.stride()
+                and q_pe.data_ptr() == suffix.data_ptr()
+            ):
                 suffix.copy_(q_pe)
             q_nope_out = packed_q
             q_pe = None
