@@ -116,6 +116,41 @@ class TestWaitingQueuePrefetchMetrics(CustomTestCase):
         self.assertFalse(self.linker.submit_host_prefetch("other", self.transfers))
         self.assertEqual(self.sample("events_total", event="submitted"), 1)
 
+    def test_completed_load_exports_l4_metrics_per_request_without_double_counting(
+        self,
+    ):
+        self.linker.pending_load_tokens = {"a": 16, "b": 32, "failed": 64}
+        self.linker.pending_load_started = {"a": 10.0, "b": 11.0, "failed": 12.0}
+        self.linker.storage = Mock()
+        with patch("time.perf_counter", return_value=15.0):
+            self.linker._finish_prefetch_metrics(["a", "b"], True)
+            self.linker._finish_prefetch_metrics(["a", "b"], True)
+            self.linker._finish_prefetch_metrics(["failed"], False)
+        labels = {"tp_rank": "0", "source": "mooncake"}
+        sample = self.registry.get_sample_value
+        self.assertEqual(sample("sglang:l4_prefetched_tokens_total", labels), 48)
+        self.assertEqual(sample("sglang:prefetched_tokens_total", {"tp_rank": "0"}), 48)
+        self.assertEqual(
+            sample("sglang:l4_prefetched_tokens_per_request_count", labels), 2
+        )
+        self.assertEqual(
+            sample(
+                "sglang:l4_prefetch_duration_seconds_sum",
+                {**labels, "result": "success"},
+            ),
+            9,
+        )
+        self.assertEqual(
+            sample(
+                "sglang:l4_prefetch_duration_seconds_count",
+                {**labels, "result": "failure"},
+            ),
+            1,
+        )
+        self.linker.storage.store.record_prefetched_tokens.assert_called_once_with(48)
+        self.assertEqual(self.linker.pending_load_tokens, {})
+        self.assertEqual(self.linker.pending_load_started, {})
+
 
 if __name__ == "__main__":
     unittest.main()
