@@ -1228,7 +1228,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     return
                 counter_index, pending, ready_event = task
                 success = False
-                started = time.perf_counter()
                 try:
                     ready_event.synchronize()
                     if self.host_prefetch_enabled:
