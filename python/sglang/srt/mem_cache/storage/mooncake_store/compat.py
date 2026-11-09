@@ -147,8 +147,8 @@ def setup_store(store, args, kwargs):
         kwargs.pop("client_http_port")
         logger.warning(
             "Mooncake package does not declare automatic client HTTP ports; "
-            "disabling its optional client HTTP metrics endpoint. Set "
-            "MOONCAKE_CLIENT_METRICS_PORT_BASE to a nonzero base port to enable it."
+            "disabling its optional client HTTP metrics endpoint. "
+            "Rebuild/install a package with automatic client HTTP port support."
         )
 
     def omit(unsupported):

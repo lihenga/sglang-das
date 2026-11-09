@@ -1190,12 +1190,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self._abort_prepared_load_now(rid)
 
     def cancel_queued_load(self, rid: str) -> bool:
+        cancelled = self.pending_loads.pop(rid, None) is not None
+        if not cancelled:
+            # A dispatched load still needs its token/time record at completion.
+            return False
         getattr(self, "pending_load_tokens", {}).pop(rid, None)
         getattr(self, "pending_load_started", {}).pop(rid, None)
-        cancelled = self.pending_loads.pop(rid, None) is not None
-        if cancelled and self.host_prefetch_enabled:
+        if self.host_prefetch_enabled:
             self.abort_prepared_load(rid)
-        return cancelled
+        return True
 
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()

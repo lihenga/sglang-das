@@ -222,7 +222,6 @@ class TestMooncakeServiceMetrics(unittest.TestCase):
             patch("torch.distributed.is_initialized", return_value=True),
             patch("torch.distributed.get_rank") as get_rank,
         ):
-            envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.clear()
             # Four independent TP=2 services all repeat rank 0 and rank 1.
             # Every server must bind port zero itself, without rank offsets.
             for _ in range(4):
@@ -233,17 +232,17 @@ class TestMooncakeServiceMetrics(unittest.TestCase):
                         {"enable_client_http_server": True, "client_http_port": 0},
                     )
 
-    def test_explicit_http_port_base_preserves_rank_offsets(self):
+    def test_old_http_port_base_no_longer_controls_client_ports(self):
         with (
-            envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.override(15000),
+            patch.dict(os.environ, {"MOONCAKE_CLIENT_METRICS_PORT_BASE": "15000"}),
             patch("torch.distributed.is_available", return_value=True),
             patch("torch.distributed.is_initialized", return_value=True),
             patch("torch.distributed.get_rank", return_value=1),
             patch("torch.distributed.get_world_size", return_value=2),
         ):
             self.assertEqual(
-                _get_mooncake_client_http_setup_kwargs(True, dp_rank=1),
-                {"enable_client_http_server": True, "client_http_port": 15003},
+                _get_mooncake_client_http_setup_kwargs(True),
+                {"enable_client_http_server": True, "client_http_port": 0},
             )
             self.assertEqual(_get_mooncake_client_http_setup_kwargs(False), {})
 
@@ -251,6 +250,17 @@ class TestMooncakeServiceMetrics(unittest.TestCase):
         self.assertEqual(
             _get_service_endpoint(
                 SimpleNamespace(host="10.0.0.20", port=30000, nnodes=1)
+            ),
+            "10.0.0.20:30000",
+        )
+
+    def test_remote_worker_uses_leader_even_with_explicit_bind_host(self):
+        self.assertEqual(
+            _get_service_endpoint(
+                SimpleNamespace(
+                    host="10.0.0.21", port=30000, nnodes=2,
+                    dist_init_addr="10.0.0.20:29500",
+                )
             ),
             "10.0.0.20:30000",
         )
