@@ -422,6 +422,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.pending_load_tokens: dict[str, int] = {}
+        self.pending_load_started: dict[str, float] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -706,6 +707,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if pending_load_tokens is None:
             pending_load_tokens = self.pending_load_tokens = {}
         pending_load_tokens[rid] = len(logical_pages) * self.page_size
+        pending_load_started = getattr(self, "pending_load_started", None)
+        if pending_load_started is None:
+            pending_load_started = self.pending_load_started = {}
+        pending_load_started[rid] = time.perf_counter()
         return True
 
     def prepare_load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -1186,6 +1191,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def cancel_queued_load(self, rid: str) -> bool:
         getattr(self, "pending_load_tokens", {}).pop(rid, None)
+        getattr(self, "pending_load_started", {}).pop(rid, None)
         cancelled = self.pending_loads.pop(rid, None) is not None
         if cancelled and self.host_prefetch_enabled:
             self.abort_prepared_load(rid)
@@ -1427,10 +1433,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
         pending_load_tokens = getattr(self, "pending_load_tokens", {})
-        tokens = sum(pending_load_tokens.pop(rid, 0) for rid in rids)
+        pending_load_started = getattr(self, "pending_load_started", {})
+        completed_at = time.perf_counter()
+        tokens = 0
+        for rid in rids:
+            request_tokens = pending_load_tokens.pop(rid, 0)
+            started = pending_load_started.pop(rid, completed_at)
+            if request_tokens <= 0:
+                continue
+            self._log_l4_prefetch_metric(
+                request_tokens, completed_at - started, success
+            )
+            tokens += request_tokens
         if not success or tokens <= 0:
             return
-        self._log_prefetched_tokens(tokens)
         recorder = getattr(
             getattr(self.storage, "store", None), "record_prefetched_tokens", None
         )
@@ -1443,12 +1459,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     exc_info=True,
                 )
 
-    def _log_prefetched_tokens(self, tokens: int) -> None:
+    def _log_l4_prefetch_metric(
+        self, tokens: int, duration: float, success: bool
+    ) -> None:
         collector = getattr(self, "storage_metrics_collector", None)
         if collector is None or tokens <= 0:
             return
         try:
-            collector.log_prefetched_tokens(tokens)
+            collector.log_l4_prefetch("mooncake", tokens, duration, success)
         except BaseException:
             logger.warning(
                 "Failed to record SGLang direct-storage prefetch metrics.",
@@ -1672,6 +1690,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.abort_prepared_load(rid)
         self.pending_loads.clear()
         getattr(self, "pending_load_tokens", {}).clear()
+        getattr(self, "pending_load_started", {}).clear()
         self.load_queue.join()
         self.offload_queue.join()
         if self.host_prefetch_threads:

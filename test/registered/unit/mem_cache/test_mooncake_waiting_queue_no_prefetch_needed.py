@@ -9,7 +9,7 @@ import threading
 import time
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -324,14 +324,7 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
         )
         cache_linker = MagicMock()
         cache_linker.waiting_queue_prefetch_enabled.return_value = False
-        with patch(
-            "sglang.srt.mem_cache.storage.mooncake_store."
-            "mooncake_direct_linker.MooncakeDirectLinker",
-            return_value=cache_linker,
-        ):
-            wrapper = UnifiedCacheLinkerWrapper(
-                cache, types.SimpleNamespace(), types.SimpleNamespace()
-            )
+        wrapper = UnifiedCacheLinkerWrapper(cache, cache_linker)
 
         self.assertIsNone(wrapper.host_prefetch_hits)
         self.assertIsNone(wrapper.pending_host_prefetch_submissions)
