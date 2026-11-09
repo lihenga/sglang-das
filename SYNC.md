@@ -1,5 +1,70 @@
 # sglang-model → sglang-das 代码同步记录
 
+## 同步范围（2026-11-06）
+
+本批次以上一批的源上界 `d3db5682d1560c4d707feb4d17a92edac1b3c91f` 为游标，按拓扑顺序审查至新源上界 `d0146097effd7f95308bad5184081f42d0b5dd1f`（`sglang-model` 分支 `reference`/`sglang_glm_dev`）的7个候选提交，目标分支仍为 `main_glm53_flash_feature_cleanup`，同步前基线为 `eb437264d345f892c0e4cf2bca4f14d5509dc119`。
+
+后续补迁移 ReplaySSM 延迟提交后，5 个源提交全部或部分迁移，2 个跳过。
+
+## 本批次内容
+
+- 融合 DeepEP normal dispatch/combine 与 INT8 MoE 核心的 ep_scatter/ep_gather，默认关闭，按部署条件门控。
+- KDA Triton kernel 新增 aiter decode/verify 后端切换（`SGLANG_KDA_USE_AITER_DECODE`/`SGLANG_KDA_USE_AITER_VERIFY`）。
+- `CommonKVManager._connect` 修复：监听 `EVENT_CLOSED`（不仅 `EVENT_DISCONNECTED`），首次连接失败的 ZMQ PUSH socket 不再被永久缓存复用，带有最小重连间隔。
+
+## 本批次测试对比（2026-11-08 至 2026-11-09）
+
+同步后代码为 `ee93d2a19`。D-only 性能测试使用 W8A8 INT8，输入 87,040 token，共享前缀 84,992 token，输出 1,024 token，并发 128，固定接受长度 4。每侧三轮，每轮 384/384 请求成功。精度使用 E/P/D、自然接受长度，AIME25 和 HumanEval 各运行一次，采样参数为 seed 42、temperature 1、top_p 0.95、输出上限 64,000 token。DeepEP 融合和本次新增的可选 KDA AITER 路由保持默认关闭。
+
+| 指标 | 同步前 → 同步后 |
+| --- | --- |
+| 三轮平均输出吞吐（token/s） | 6243.91 → 6290.30（+0.74%） |
+| 三轮平均 TPOT（ms） | 18.81 → 18.93（+0.64%） |
+| AIME25 | 26/30 → 27/30 |
+| HumanEval pass@1 | 164/164 → 163/164 |
+
+两侧各 16 份 rank trace 均可解析。按各 rank 单次平均耗时取中位数，DeepEP dispatch 为 122.73 → 113.88 µs，HCU KDA 为 153.44 → 153.46 µs。该对比只有每侧一次 profile，DeepEP dispatch 的差值无法归因于默认关闭的融合。两项数据集各只跑一次，单题变化不足以确认稳定的精度变化。
+
+## 运行行为变化
+
+| 项目 | 本次行为 / 保留项 |
+| --- | --- |
+| `SGLANG_DEEPEP_DISPATCH_SCATTER_FUSED` | 默认关闭；开启后需 a2a=DeepEP、非TBO、非internode（≤8 ranks）、非MNNVL、`SGLANG_GROUPGEMM=1`、INT8 deepgemm MoE 路径，任一不满足则警告并回退到现有 ep_scatter。 |
+| `SGLANG_DEEPEP_COMBINE_GATHER_FUSED` | 默认关闭；另需 topk ≤ 64（ROCm warp size）且 NVL buffer 的 fused-combine 行容量不小于 `chunked_prefill_size / attn_cp_size` 的每-rank批量，不满足则警告并回退到现有 ep_gather。 |
+| `SGLANG_KDA_USE_AITER_DECODE` / `SGLANG_KDA_USE_AITER_VERIFY` | 默认关闭；开启后 `TritonKDAKernel.decode`/`target_verify` 走 aiter `sglang_fused_sigmoid_gating_delta_rule_update`，需安装 `aiter` 包。 |
+| `SGLANG_DISAGGREGATION_ZMQ_SOCKET_RECONNECT_BACKOFF_MS` | 默认 1000ms；`CommonKVManager` 缓存的 PUSH socket 首次连接失败后，在这段时间内 `_connect` 抛 `zmq.Again`而不返回旧 socket，超时后重建。 |
+
+## ReplaySSM 延迟提交对比（2026-11-09）
+
+D-only 使用同一 `sglang-das` 版本，输入 87,040 token，输出 1,024 token，并发 128，固定接受长度 4。开关各测一轮，均为 384/384 请求成功。两组都设置 `SGLANG_KDA_USE_TILELANG_VERIFY=1`、`SGLANG_KDA_USE_AITER_VERIFY=0`，开启 ReplaySSM spec，使用 `--disable-radix-cache` 和 `--mamba-radix-cache-strategy no_buffer`。唯一切换项为 `SGLANG_KDA_REPLAYSSM_DEFER_COMMIT`，默认关闭。
+
+| 指标 | 延迟提交关闭 → 开启 |
+| --- | --- |
+| 输出吞吐（token/s） | 6386.46 → 6458.44（+1.13%） |
+| 平均 TPOT（ms） | 18.27 → 18.09（-0.99%） |
+
+两组各 16 份 rank trace 均显示每 rank 340 次 TileLang verify，独立 commit 从 10 次降至 0 次，新增 10 次 pending 记录。按各算子 GPU 总时间的 rank 中位数相加，verify 与 commit 或 pending 合计 51.38 → 41.67 ms。DCU 上 FP32 和 FP16 checkpoint 对齐测试均通过。端到端结果来自单轮计时。
+
+### 延迟提交精度对照
+
+使用 E/P/D Router 和自然接受长度，沿用上面的 Decode 开关约束。每侧各跑一次，采样参数为 seed 42、temperature 1、top_p 0.95，输出上限 64,000 token。AIME25 为 26/30 → 25/30，HumanEval pass@1 为 162/164 → 163/164，顺序为关闭到开启。AIME25 两组各三题触及输出上限，其中两题相同；完整但错误的答案由一题增至两题。HumanEval 两组同一道词排序题使用了方向相反的选择逻辑，关闭组另有一题触及输出上限。 单轮每项相差一题，无法确认稳定的精度变化。
+
+## 逐提交账本
+
+| 源完整 SHA | 原主题 | 结论 | 目标提交 | 依据与适配说明 |
+| --- | --- | --- | --- | --- |
+| `7c5d4a7bf94c076a99078c2f4fd206c205889f45` | perf(moe): fuse ep_scatter into the DeepEP dispatch | 迁移 | 18798158c | 目标 `DeepEPMoE`/`DeepEPDispatcher`/`MaybeTboDeepEPDispatcher` 与源结构几乎一致，直接移植 `enable_dispatch_scatter`/`take_dispatch_scatter`/`fusion_unsupported_reason` 和 `_ep_moe_workspace_base`。 |
+| `f6b08b48ea8b4f96216976d79fed6c0ecb98e4d9` | perf(moe): fuse ep_gather into the DeepEP combine | 迁移 | 18798158c | 与上一条合并迁移；`DeepEPBuffer.normal_nvl_bytes`/`combine_gather_capacity`、`set_combine_gather`、`_MAX_GATHER_TOPK` 等均直接移植。 |
+| `f2b71915a43fac3202b70746ada30ed6ffb2436f` | Update sglang_fused_sigmoid_gating_delta_rule_update kernel. | 迁移 | 55c8f0732 | 开关只作用于目标 `TritonKDAKernel`，独立的 `HcuKDAKernel` 路径不受影响，按源逻辑添加 aiter 分支和日志；`beta_scale` 在目标 `kda_backend.py` 已是带默认值的 `**kwargs` 传递参数，无需调整调用方。 |
+| `e03e6c397bcd883e446092815ed585f341349873` | fix: recover stale ZMQ sockets with bounded reconnect backoff | 部分迁移 | 79e11787a | 源的 lease 式 `ZMQSocketCache`（`disaggregation/common/utils.py`）在目标不存在；目标 `CommonKVManager` 用 `_socket_cache`/`_monitor_cache` 字典 + `_connect` 方法。移植源的核心修复思路（监听 `EVENT_CLOSED`、有界重连间隔）到该方法，新建 `_socket_unreachable_since` 字典替代源的 `_SocketEntry.unreachable_since`。源的容量公式、`_SocketEntry`/`_quarantine`/`retired` 生命周期、`_is_stale_locked` 等基于共享缓存池的机制不适用于目标每-manager 独立字典结构，全部省略。源测试的容量/陀离区场景不适用，改为新写 `test_common_kv_manager_connect.py` 针对目标 `_connect` 的场景。 |
+| `e27af720aa50318de4b3e8b2329f522f77da9859` | fix(hicache): preserve HiMamba lock ownership during eviction | 跳过 | — | 源修复的 `HiMambaRadixCache`（`mamba_lock_ref`/`full_lock_ref` 双树、`mamba_lru_list`、`ongoing_write_through: dict[int, (node, params)]`）在目标不存在。目标已重构为组件化的 `UnifiedRadixCache`/`MambaComponent`（`unified_cache/components/mamba_component.py`），用 `component_data[ComponentType.MAMBA].lock_ref`/`skip_lock_node_ids` 机制表达等价语义，没有源那个需要 `mamba_lock_ref_acquired` 标记的 Full-only 预锁问题。`registry.py` 对 hybrid-ssm + hierarchical-cache 无条件走 `UnifiedRadixCache`，没有源的 `HiMambaRadixCache` 分派分支。未尝试将源的修复改写到组件架构上，因为无法验证等价性；若未来重新引入类似的 `HiMambaRadixCache` 双树架构应重新审查本条。 |
+| `0d5f5bcbd20a9b399b0e33b1c4d4d057ef9c5678` | fix(hicache): harden locked leaf eviction lifecycle | 跳过 | — | 与上一条同因：本提交在源 `HiMambaRadixCache`/`MambaRadixCache` 双树上进一步强化锁生命周期（`req.lock_ref_params`、`DecodePreallocQueue` 释放路径、`StreamingSession` 会话恢复），依赖上一条的 `mamba_lock_ref_acquired`/`mamba_full_lock_protected` 机制。目标 `req.swa_uuid_for_lock`/`skip_lock_node_ids` 已是通用的跨组件锁归属表达方式，`DecodePreallocQueue._match_prefix_and_lock` 和 `MambaRadixCache`/`RadixCache`/`SWARadixCache`/`UnifiedRadixCache` 各自维护自己的 `inc_lock_ref`/`dec_lock_ref` 配对，没有源那种跳过的风险点。未找到可独立移植的残留问题；若上一条被重新引入应重新审查。 |
+| `d0146097effd7f95308bad5184081f42d0b5dd1f` | perf(kda): fold ReplaySSM commit into the next TileLang verify | 适配迁移 | 55f564108 | 将 `sglang-model` 的延迟提交接入 `sglang-das` 的 HCU KDA 路径。按物理槽位记录 pending，下一轮 TileLang verify 折入状态，普通 Decode、Extend 和状态拷贝前物化。开启后 verify 无法走 TileLang 时显式报错。 |
+
+本批次源上界 `d0146097effd7f95308bad5184081f42d0b5dd1f` 作为后续同步的新游标。
+
+---
+
 ## 同步范围（2026-10-29）
 
 本批次审查 sglang-model 自 2026-09-15 起、截至 `d3db5682d1560c4d707feb4d17a92edac1b3c91f` 的26个候选提交。目标分支为 `mx_int8/main_glm53_flash_feature_cleanup`，迁移前基线为 `975bec73b6e167e8512fcb1e743332eaf84f9301`。同步采用线性追加提交，保留目标分支已有功能与差异化实现。

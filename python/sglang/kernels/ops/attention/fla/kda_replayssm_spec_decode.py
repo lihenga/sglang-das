@@ -343,6 +343,7 @@ def commit_kda_replayssm_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
     use_hcu_kda: bool = False,
+    pending: torch.Tensor | None = None,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
 
@@ -358,7 +359,13 @@ def commit_kda_replayssm_after_verify(
 
     L = spec_state.replayssm_rawv.shape[-2]
     num_k_heads = spec_state.replayssm_rawk.shape[2]
-    if use_hcu_kda:
+    if pending is not None:
+        if mamba_track_indices is not None:
+            raise RuntimeError("Deferred KDA ReplaySSM requires Mamba tracking to be disabled")
+        set_kda_replayssm_pending(
+            pending, state_batch_indices.contiguous(), accept_lens.contiguous()
+        )
+    elif use_hcu_kda:
         from sglang.kernels.ops.attention.fla.hcu.kda_replayssm_spec_decode import (
             commit_kda_replayssm_spec_all_layers as commit_hcu_kda,
         )
@@ -403,3 +410,36 @@ def commit_kda_replayssm_after_verify(
             fused_conv_window_scatter_with_mask(
                 conv_states, interm_conv, mamba_track_indices, mamba_steps_to_track
             )
+@triton.jit
+def _kda_replayssm_set_pending_kernel(
+    pending,
+    ssm_state_indices,
+    accept_lens,
+    batch,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < batch
+    slot = tl.load(ssm_state_indices + offs, mask=mask, other=-1).to(tl.int64)
+    n = tl.load(accept_lens + offs, mask=mask, other=0)
+    tl.store(pending + slot, n.to(tl.int32), mask=mask & (slot >= 0))
+
+
+def set_kda_replayssm_pending(
+    pending: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+) -> None:
+    """Park this step's accept lengths; the next verify folds them."""
+    batch = ssm_state_indices.shape[0]
+    if batch == 0:
+        return
+    if not (ssm_state_indices.is_contiguous() and accept_lens.is_contiguous()):
+        raise ValueError("KDA ReplaySSM pending scatter expects contiguous inputs")
+    _kda_replayssm_set_pending_kernel[(1,)](
+        pending,
+        ssm_state_indices,
+        accept_lens,
+        batch,
+        BLOCK=triton.next_power_of_2(batch),
+    )

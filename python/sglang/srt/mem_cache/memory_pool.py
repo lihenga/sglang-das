@@ -543,6 +543,17 @@ class MambaPool:
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
         )
+        self.replayssm_pending = None
+        self._replayssm_pending_resets = []
+        if (
+            enable_linear_replayssm_spec
+            and envs.SGLANG_KDA_REPLAYSSM_DEFER_COMMIT.get()
+        ):
+            if not self.use_hcu_kda_replayssm:
+                raise ValueError("Deferred KDA ReplaySSM requires the HCU KDA backend")
+            self.replayssm_pending = torch.zeros(
+                size + 1, dtype=torch.int32, device=device
+            )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
         # for disagg with nvlink
@@ -984,6 +995,34 @@ class MambaPool:
     def _should_fuse_slot_ops(self) -> bool:
         return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
 
+    def reset_replayssm_pending(self):
+        """Clear recycled slots on the forward stream before reading their rings."""
+        resets = self._replayssm_pending_resets
+        if resets:
+            self._replayssm_pending_resets = []
+            stream = torch.cuda.current_stream()
+            for slots in resets:
+                slots.record_stream(stream)
+            self.replayssm_pending[torch.cat(resets)] = 0
+
+    def flush_replayssm_pending(self, slots: torch.Tensor):
+        from sglang.kernels.ops.attention.fla.hcu.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_spec_all_layers,
+        )
+
+        state = self.mamba_cache
+        safe_slots = slots.clamp_min(0)
+        commit_kda_replayssm_spec_all_layers(
+            checkpoint_state=state.temporal,
+            rawv_cache=state.replayssm_rawv,
+            rawk_cache=state.replayssm_rawk,
+            g_cache=state.replayssm_g,
+            beta_cache=state.replayssm_beta,
+            ssm_state_indices=slots,
+            accept_lens=self.replayssm_pending[safe_slots],
+        )
+        self.replayssm_pending[safe_slots] = 0
+
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         if self._should_fuse_slot_ops():
@@ -1025,6 +1064,11 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        pending = getattr(self, "replayssm_pending", None)
+        if pending is not None:
+            self.reset_replayssm_pending()
+            self.flush_replayssm_pending(src_indices)
+            pending[dst_indices] = 0
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1059,6 +1103,9 @@ class MambaPool:
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
+        if getattr(self, "replayssm_pending", None) is not None:
+            self.reset_replayssm_pending()
+            self.flush_replayssm_pending(indices)
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
             for conv in self.mamba_cache.conv
@@ -1077,6 +1124,9 @@ class MambaPool:
         else:
             conv_cpu, temporal_cpu = mamba_cache_cpu
         current_platform.synchronize()
+        pending = getattr(self, "replayssm_pending", None)
+        if pending is not None:
+            pending[indices] = 0
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
@@ -1369,6 +1419,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mid is not None, (
                     f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 )
+                if getattr(self.mamba_pool, "replayssm_pending", None) is not None:
+                    self.mamba_pool._replayssm_pending_resets.append(mid.reshape(-1))
                 req.kv.mamba_pool_idx = mid[0]
                 req.kv.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty

@@ -1070,6 +1070,7 @@ def commit_mamba_states_after_verify(
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             use_hcu_kda=mamba_pool.use_hcu_kda,
+            pending=getattr(mamba_pool, "replayssm_pending", None),
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,  # incl. bonus token
             last_correct_step_indices=last_correct_step_indices,

@@ -137,9 +137,12 @@ class HcuKDAKernel(LinearAttnKernelBase):
                 replayssm_rawk=kwargs.get("replayssm_rawk"),
                 replayssm_g=kwargs.get("replayssm_g"),
                 replayssm_beta=kwargs.get("replayssm_beta"),
+                replayssm_pending=kwargs.get("replayssm_pending"),
             )
             if out is not None:
                 return out
+        if kwargs.get("replayssm_pending") is not None:
+            raise RuntimeError("Deferred KDA ReplaySSM requires the TileLang verify kernel for this batch")
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,

@@ -1794,6 +1794,24 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            pool = self.req_to_token_pool
+            mamba_pool = getattr(pool, "mamba_pool", None)
+            if (
+                not self.is_draft_worker
+                and getattr(mamba_pool, "replayssm_pending", None) is not None
+            ):
+                mamba_pool.reset_replayssm_pending()
+                mode = forward_batch.forward_mode
+                if (
+                    (mode.is_decode() or mode.is_extend_without_speculative())
+                    and forward_batch.req_pool_indices.numel()
+                ):
+                    mamba_pool.flush_replayssm_pending(
+                        pool.translate_mamba_indices(
+                            pool.get_mamba_indices(forward_batch.req_pool_indices)
+                        )
+                    )
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(

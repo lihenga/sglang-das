@@ -380,6 +380,20 @@ def handle_linear_attn_backend(server_args: Any):
     # GDN sizes the window to the draft maximum; KDA (kda_backend) keeps a
     # --linear-replayssm-cache-len window and folds via its own fused
     # verify ring-write + commit_kda_replayssm_after_verify.
+    if envs.SGLANG_KDA_REPLAYSSM_DEFER_COMMIT.get():
+        if (
+            not cfg.enable_linear_replayssm_spec
+            or not envs.SGLANG_KDA_USE_TILELANG_VERIFY.get()
+            or envs.SGLANG_KDA_USE_AITER_VERIFY.get()
+            or not cfg.disable_radix_cache
+            or mamba_extra_buffer_of(resolved_view(server_args))
+        ):
+            raise ValueError(
+                "Deferred KDA ReplaySSM requires --enable-linear-replayssm-spec, "
+                "SGLANG_KDA_USE_TILELANG_VERIFY=1, --disable-radix-cache and "
+                "--mamba-radix-cache-strategy no_buffer, with AITER verify off."
+            )
+
     if cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(

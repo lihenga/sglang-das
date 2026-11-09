@@ -613,6 +613,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 PR=pool_slots,
                 W=window_len,
                 pool_dtype=str(spec_cache.temporal.dtype).removeprefix("torch."),
+                defer=getattr(mamba_pool, "replayssm_pending", None) is not None,
                 h0_stride=spec_cache.temporal[0].stride(0),
                 rv_slot=spec_cache.replayssm_rawv[0].stride(0),
                 rk_slot=spec_cache.replayssm_rawk[0].stride(0),
@@ -1436,6 +1437,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             commit_kda_replayssm_after_verify(
                 spec_state=mamba_caches,
                 use_hcu_kda=mamba_pool.use_hcu_kda,
+                pending=getattr(mamba_pool, "replayssm_pending", None),
                 state_batch_indices=state_indices_tensor,
                 accept_lens=last_correct_step_indices + 1,
                 last_correct_step_indices=last_correct_step_indices,

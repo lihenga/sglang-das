@@ -91,6 +91,21 @@ _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 
+# MNNVL transport and an internode group both refuse the fused scatter/gather arguments in
+# DeepEP, so the MoE core asks before it opts in (see fusion_unsupported_reason).
+_normal_mnnvl = get_bool_env_var("DEEP_EP_NORMAL_MNVL")
+# Mirrors NUM_MAX_NVL_PEERS in DeepEP's csrc/config.hpp: above it the group is internode.
+_MAX_NVL_PEERS = 8
+# Mirrors NUM_MAX_LOCAL_EXPERTS_FOR_SCATTER: notify_dispatch seeds the scatter's counters out of
+# shared memory, and beyond this DeepEP would trap on the device instead of falling back here.
+_MAX_SCATTER_LOCAL_EXPERTS = 128
+# The intranode kernels broadcast per-token indices by lane shuffle, which wraps at kWarpSize;
+# this ROCm fork's is 64 (csrc/kernels/configs.cuh), and both fused paths assert against it.
+_MAX_GATHER_TOPK = 64
+# The fused combine reduces bf16, so DeepEP's slot stride (hidden * x.element_size()) is this
+# many bytes per column. Only used to mirror that sizing before the buffer exists.
+_COMBINE_DTYPE_BYTES = 2
+
 use_groupgemm = get_bool_env_var("SGLANG_GROUPGEMM", default="true")
 
 logger = logging.getLogger(__name__)
@@ -124,6 +139,45 @@ def _deepep_precompile_tp_barrier() -> None:
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         get_tp_group().barrier()
+
+
+def _scatter_tensors(x, topk_ids):
+    """The expert-major destination dispatch_scatter receives into: the MoE core's pooled INT8
+    workspace (grown by DeepEP) plus an empty output_index it sizes."""
+    if not isinstance(x, tuple):
+        raise RuntimeError("dispatch-scatter requires quantized (x, scale) input")
+    q, scale = x
+    if q.dtype != torch.int8:
+        raise RuntimeError("dispatch-scatter requires INT8-quantized dispatch input")
+    if scale.dtype != torch.float32:
+        # The pooled scale workspace below is fp32, and DeepEP asserts that the destination's
+        # scale type matches the input's, so state the assumption where the buffer is made.
+        raise RuntimeError("dispatch-scatter requires fp32 dispatch scales")
+
+    from sglang.srt.layers.moe.ep_moe.layer import _ep_moe_workspace_base
+
+    topk = int(topk_ids.shape[1])
+    scatter_x = _ep_moe_workspace_base(
+        "w8a8_int8_contiguous_input",
+        int(q.shape[1]),
+        device=q.device,
+        dtype=q.dtype,
+    )
+    scatter_scale = _ep_moe_workspace_base(
+        "w8a8_int8_contiguous_input_scale",
+        int(scale.shape[-1]),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    # Pooled like the two above: DeepEP resizes it to the step's rows, so a fresh tensor here
+    # would hand it a new block every step and make its ordering guard fire every step.
+    output_index = _ep_moe_workspace_base(
+        "w8a8_int8_scatter_output_index",
+        topk,
+        device=q.device,
+        dtype=torch.int32,
+    )
+    return scatter_x, scatter_scale, output_index
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -220,6 +274,37 @@ class DeepEPBuffer:
         return state
 
     @classmethod
+    def normal_nvl_bytes(
+        cls, group_size: int, hidden_size: int, param_bytes: int
+    ) -> int:
+        """NVL buffer bytes the normal path asks for. A pure function of the deployment, so a
+        caller can have the answer before any buffer is created."""
+        hidden_bytes = hidden_size * param_bytes
+        num_nvl_bytes = 0
+        for config in (
+            DeepEPConfig.get_instance().normal_dispatch_config
+            or Buffer.get_dispatch_config(group_size),
+            DeepEPConfig.get_instance().normal_combine_config
+            or Buffer.get_combine_config(group_size),
+        ):
+            num_nvl_bytes = max(
+                config.get_nvl_buffer_size_hint(hidden_bytes, group_size), num_nvl_bytes
+            )
+        return num_nvl_bytes
+
+    @classmethod
+    def combine_gather_capacity(
+        cls, group_size: int, hidden_size: int, param_bytes: int
+    ) -> int:
+        """Rows per step the fused combine can stage: it takes one slot per (source rank, own
+        token) in the NVL buffer. Worth gating on at startup, where every rank computes the same
+        answer -- DeepEP's own check runs per step on per-rank counts, so it can fire on one rank
+        while its peers are already writing into that rank's buffer."""
+        return cls.normal_nvl_bytes(group_size, hidden_size, param_bytes) // (
+            group_size * hidden_size * _COMBINE_DTYPE_BYTES
+        )
+
+    @classmethod
     def get_deepep_buffer(
         cls,
         group: dist.ProcessGroup,
@@ -239,6 +324,7 @@ class DeepEPBuffer:
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
+            num_nvl_bytes = cls.normal_nvl_bytes(group.size(), hidden_size, param_bytes)
             hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
@@ -246,10 +332,6 @@ class DeepEPBuffer:
                 DeepEPConfig.get_instance().normal_combine_config
                 or Buffer.get_combine_config(group.size()),
             ):
-                num_nvl_bytes = max(
-                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
-                    num_nvl_bytes,
-                )
                 num_rdma_bytes = max(
                     config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                     num_rdma_bytes,
@@ -319,6 +401,15 @@ class DeepEPBuffer:
         is_cu12 = get_cuda_version()[0] == 12
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
+
+        if deepep_mode.enable_normal() and num_nvl_bytes > 0:
+            # The fused combine stages one slot per (source rank, token) in this buffer, so its
+            # row capacity bounds what a step may receive; DeepEP raises above it.
+            logger.info(
+                "DeepEP normal NVL buffer %.0f MiB: fused-combine capacity %d rows/step",
+                num_nvl_bytes / 2**20,
+                cls.combine_gather_capacity(group.size(), hidden_size, param_bytes),
+            )
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
@@ -424,10 +515,33 @@ class _DeepEPDispatcherImplBase:
 
         self.quant_config: Optional[dict] = None
 
+        # Set by a consumer that reads the fused dispatch-scatter output; see
+        # _dispatch_core.
+        self.dispatch_scatter = False
+
+        # (x, scale, output_index) the fused dispatch wrote, for the MoE core to pick up.
+        # Lives here, i.e. one per MoE layer, and is consumed once.
+        self.dispatch_scatter_handoff = None
+        # (output_index, topk_ids, topk_weights) the MoE core leaves for its next combine,
+        # likewise one per layer and consumed once.
+        self.combine_gather: Optional[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
+
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
         self.set_deepep_dispatcher_dtype()
+
+    def enable_dispatch_scatter(self) -> None:
+        self.dispatch_scatter = True
+
+    def take_dispatch_scatter(self):
+        handoff, self.dispatch_scatter_handoff = self.dispatch_scatter_handoff, None
+        return handoff
+
+    def set_combine_gather(self, handoff) -> None:
+        self.combine_gather = handoff
 
     def dispatch_a(
         self,
@@ -631,6 +745,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # `handle` as a member variable works.
         _deepep_precompile_tp_barrier()
         if use_groupgemm:
+            dispatch_fn, extra_kwargs = buffer.dispatch, {}
+            if self.dispatch_scatter:
+                # Its own entry point, not dispatch() with extra arguments: a build without the
+                # fusion has no dispatch_scatter, which the MoE core's gate checks for.
+                scatter_x, scatter_scale, output_index = _scatter_tensors(x, topk_ids)
+                self.dispatch_scatter_handoff = (scatter_x, scatter_scale, output_index)
+                dispatch_fn = buffer.dispatch_scatter
+                extra_kwargs = dict(
+                    scatter_x=scatter_x,
+                    scatter_x_scales=scatter_scale,
+                    scatter_output_index=output_index,
+                )
             (
                 recv_x,
                 recv_topk_ids,
@@ -638,7 +764,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 num_recv_tokens_per_expert,
                 self.handle,
                 event,
-            ) = buffer.dispatch(
+            ) = dispatch_fn(
                 x,
                 topk_idx=topk_ids,
                 topk_weights=topk_weights,
@@ -666,6 +792,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     else 1
                 ),
                 config=DeepEPConfig.get_instance().normal_dispatch_config,
+                **extra_kwargs,
             )
         else:
             (
@@ -754,13 +881,24 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
-        combined_x, _, event = buffer.combine(
+        combine_fn, gather_kwargs = buffer.combine, {}
+        if self.combine_gather is not None:
+            # x is the expanded down output; combine reduces it in flight. The handoff is per
+            # dispatcher, i.e. per MoE layer, consumed once, and has its own entry point.
+            _gi, _gt, _gw = self.combine_gather
+            self.combine_gather = None
+            combine_fn = buffer.combine_gather
+            gather_kwargs = dict(
+                gather_index=_gi, gather_topk_ids=_gt, gather_weights=_gw
+            )
+        combined_x, _, event = combine_fn(
             x,
             self.handle,
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
             config=DeepEPConfig.get_instance().normal_combine_config,
+            **gather_kwargs,
         )
         return combined_x, event
 
@@ -1199,6 +1337,72 @@ class DeepEPDispatcher(BaseDispatcher):
             self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
+
+    def fusion_unsupported_reason(self, topk: int) -> Optional[str]:
+        """Why this dispatcher cannot run the fused scatter/gather, or None if it can. The
+        caller warns once and keeps the standalone pass; it does not refuse to start."""
+        if not self.deepep_mode.enable_normal():
+            return "this dispatcher has no normal path (--deepep-mode low_latency)"
+        if not hasattr(Buffer, "dispatch_scatter"):
+            # The fused entry points are separate methods precisely so that this is a
+            # question one can ask: an older DeepEP simply does not have them.
+            return "this DeepEP build has no Buffer.dispatch_scatter"
+        if not hasattr(Buffer, "combine_gather"):
+            return "this DeepEP build has no Buffer.combine_gather"
+        if self._normal_dispatcher.group.size() > _MAX_NVL_PEERS:
+            return (
+                f"DeepEP is internode here ({self._normal_dispatcher.group.size()} ranks)"
+            )
+        if _normal_mnnvl:
+            return "the MNNVL transport is selected (DEEP_EP_NORMAL_MNVL)"
+        if not use_groupgemm:
+            return "SGLANG_GROUPGEMM is disabled; the fused scatter feeds the grouped-GEMM path"
+        if _use_fp8_w8a8_moe or _use_marlin_w16a16_moe:
+            return (
+                "SGLANG_USE_FP8_W8A8_MOE or SGLANG_USE_MARLIN_W16A16_MOE pick a dispatch "
+                "input dtype the fused scatter cannot receive"
+            )
+        if self._normal_dispatcher.num_local_experts > _MAX_SCATTER_LOCAL_EXPERTS:
+            return (
+                f"{self._normal_dispatcher.num_local_experts} local experts exceed the "
+                f"scatter's limit ({_MAX_SCATTER_LOCAL_EXPERTS})"
+            )
+        if topk > _MAX_GATHER_TOPK:
+            return f"topk {topk} exceeds the combine's warp-size limit ({_MAX_GATHER_TOPK})"
+        # Derived, not read off the buffer: that is built on the first forward, long after this
+        # gate runs, so a cached value would always be missing and the check would never fire.
+        capacity = DeepEPBuffer.combine_gather_capacity(
+            self._normal_dispatcher.group.size(),
+            self._normal_dispatcher.hidden_size,
+            self._normal_dispatcher.params_bytes,
+        )
+        # One slot per (source rank, own token), so the demand is the per-rank batch itself.
+        # Unsplit prefill has no static bound; there DeepEP's per-step raise is all that is left.
+        args = get_global_server_args()
+        chunked = args.chunked_prefill_size or 0
+        tokens = -(-chunked // max(args.attn_cp_size, 1)) if chunked > 0 else 0
+        if tokens > 0 and capacity < tokens:
+            return (
+                f"fused-combine capacity {capacity} rows/step < per-rank batch {tokens} "
+                f"(chunked_prefill_size {args.chunked_prefill_size} / CP "
+                f"{args.attn_cp_size}); raise the DeepEP config's num_sms or "
+                f"num_max_nvl_chunked_recv_tokens, or receives will raise mid-run"
+            )
+        return None
+
+    def enable_dispatch_scatter(self):
+        # Pure opt-in: every mismatch is a fusion_unsupported_reason for the layer to warn
+        # about, never a raise here (the standalone ep_scatter runs on those branches).
+        self._normal_dispatcher.enable_dispatch_scatter()
+
+    def take_dispatch_scatter(self):
+        if self.deepep_mode.enable_normal():
+            return self._normal_dispatcher.take_dispatch_scatter()
+        return None
+
+    def set_combine_gather(self, handoff):
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_combine_gather(handoff)
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict

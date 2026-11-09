@@ -29,6 +29,15 @@ The kernel supports any ``2 <= S <= 8`` (odd and even). A whole ``(S, *)``
 row lives in one 32-lane warp via an explicit ``warp_row`` layout, so layout
 inference does not require ``S`` to be even (auto inference would need
 ``S * head_dim`` to divide the 256-thread block).
+
+Deferred commit (``defer=True``): instead of a separate post-sampling
+ReplaySSM commit kernel re-reading the fp32 state, the previous step's
+accepted prefix is folded here. ``pend[slot]`` holds how many ring rows of
+the *previous* verify were accepted; the kernel replays them onto the loaded
+state, writes the committed state back to ``h0[slot]``, and only then
+overwrites the ring with this step's inputs. Invariant maintained by the
+caller: committed state == ``h0[slot]`` replayed with
+``ring[slot][:pend[slot]]``.
 """
 
 import functools
@@ -73,11 +82,12 @@ def make_kernel_pooled(N, S, HV, K, V, P, PR, W,
                        a_stride=None, b_stride=None, q_stride=None,
                        k_stride=None, v_stride=None, h0_stride=None,
                        rv_slot=None, rk_slot=None, rg_slot=None, rb_slot=None,
-                       pool_dtype="float32"):
+                       pool_dtype="float32", defer=False):
     """Build the pooled prim_func.
 
     ``h0`` is ``(P, HV, V, K)``; rings are ``(PR, HV, W, *)``; ``idx`` is
-    ``(N,)`` mapping each sequence to its pool slot.
+    ``(N,)`` mapping each sequence to its pool slot. ``pend`` is ``(PR,)``
+    and only read when ``defer`` is set (see module docstring).
 
     All activations (a/b/q/k/v), the state pool and the rings take a
     compile-time outer stride (token stride for activations, per-slot pitch
@@ -86,6 +96,9 @@ def make_kernel_pooled(N, S, HV, K, V, P, PR, W,
     """
     assert 2 <= S <= 8, "S must be in 2..8"
     assert W >= S
+    # The fold reuses this step's (S, *) staging buffers for the previous
+    # step's ring rows, so the ring must hold exactly one verify window.
+    assert not defer or W == S, "deferred commit requires W == S"
     scale = float(K ** -0.5)
     a_stride = HV * K if a_stride is None else a_stride
     b_stride = HV if b_stride is None else b_stride
@@ -130,6 +143,7 @@ def make_kernel_pooled(N, S, HV, K, V, P, PR, W,
         ring_k: T.StridedTensor[(PR, HV, W, K), (rk_slot, W * K, K, 1), "bfloat16"],
         ring_g: T.StridedTensor[(PR, HV, W, K), (rg_slot, W * K, K, 1), "float32"],
         ring_beta: T.StridedTensor[(PR, HV, W), (rb_slot, W, 1), "float32"],
+        pend: T.Tensor((PR,), "int32"),
     ):
         with T.Kernel(N * HV, threads=256) as (bnh,):
             i_n = bnh // HV
@@ -204,6 +218,64 @@ def make_kernel_pooled(N, S, HV, K, V, P, PR, W,
                     h_fr[i, j] = h_fr[i, j] * gate
             A_v = T.cast(A_log[i_hv], "float32")
 
+            # ---- deferred commit: fold the previous verify's accepted rows ----
+            # Matches kda_replayssm_exact_fold_kernel (rsqrt k-norm, stored
+            # gate). The (S, *) staging buffers are borrowed for the old ring
+            # rows; the barrier after the fold orders every old-ring read and
+            # every fold-step read of the shared buffers before they are
+            # refilled and the ring is overwritten below.
+            if defer:
+                n_pend = T.if_then_else(slot >= 0, T.min(pend[safe], S), 0)
+                T.copy(ring_k[safe, i_hv, 0 : S, 0 : K], k_fr)
+                T.copy(ring_g[safe, i_hv, 0 : S, 0 : K], gv_fr)
+                T.copy(ring_v[safe, i_hv, 0 : S, 0 : V], v_fr)
+                for i, j in T.Parallel(S, K):
+                    xf_fr[i, j] = T.cast(k_fr[i, j], "float32")
+                    sq_fr[i, j] = xf_fr[i, j] * xf_fr[i, j]
+                T.reduce_sum(sq_fr, row_fr, dim=1, clear=True)
+                for i in T.Parallel(S):
+                    den_fr[i] = T.rsqrt(row_fr[i] + 1e-6)
+                for i, j in T.Parallel(S, K):
+                    kh_[i, j] = xf_fr[i, j] * den_fr[i]
+                    eg[i, j] = T.exp(gv_fr[i, j])
+                for i, j in T.Parallel(S, V):
+                    vs[i, j] = T.cast(v_fr[i, j], "float32")
+                for i in T.Parallel(S):
+                    bt[i] = ring_beta[safe, i_hv, i]
+                T.sync_threads()
+
+                # Static trip count + uniform guard: a data-dependent extent
+                # makes tilelang wrap every shared access in bounds checks.
+                for s in T.Serial(0, S):
+                    if s < n_pend:
+                        for i, j in T.Parallel(V, K):
+                            h_fr[i, j] = h_fr[i, j] * eg[s, j]
+                        for i, j in T.Parallel(V, K):
+                            tmp_fr[i, j] = h_fr[i, j] * kh_[s, j]
+                        T.reduce_sum(tmp_fr, a1_fr, dim=1, clear=True)
+                        for i in T.Parallel(V):
+                            u_fr[i] = (vs[s, i] - a1_fr[i]) * bt[s]
+                        for i, j in T.Parallel(V, K):
+                            h_fr[i, j] = h_fr[i, j] + kh_[s, j] * u_fr[i]
+                if n_pend > 0:
+                    if pool_dtype == "float16":
+                        for i, j in T.Parallel(V, K):
+                            h0[safe, i_hv, i, j] = T.cast(h_fr[i, j], "float16")
+                    else:
+                        T.copy(h_fr, h0[safe, i_hv, 0 : V, 0 : K])
+                if pool_dtype == "float16":
+                    # Keep the in-register state bit-identical to the fp16
+                    # checkpoint just stored: the eager path reads h0 back next
+                    # step, so continuing the recurrence from the un-rounded
+                    # fp32 value would make deferred commit diverge from eager
+                    # by one fp16 rounding per step. The store above already
+                    # performed this rounding, so this is a re-use, not extra
+                    # precision loss.
+                    for i, j in T.Parallel(V, K):
+                        h_fr[i, j] = T.cast(
+                            T.cast(h_fr[i, j], "float16"), "float32"
+                        )
+                T.sync_threads()
             # ---- gate prep: g = -5 * sigmoid(exp(A_log) * (a + dt_bias)) ----
             T.copy(a_raw[tok0 : tok0 + S, c0 : c0 + K], a_fr)
             T.copy(k_raw[tok0 : tok0 + S, c0 : c0 + K], k_fr)
@@ -277,7 +349,8 @@ def _is_capturing():
 _compiled_keys = set()  # keys successfully compiled by _compiled/precompile
 
 
-def _compiled_capture_safe(N, S, HV, K, V, P, PR, W, strides, pool_dtype):
+def _compiled_capture_safe(N, S, HV, K, V, P, PR, W, strides, pool_dtype,
+                           defer=False):
     """Compile (or fetch) the kernel; never JIT inside a graph capture.
 
     Compiling runs host-side codegen and CUDA module loads, which are
@@ -287,7 +360,7 @@ def _compiled_capture_safe(N, S, HV, K, V, P, PR, W, strides, pool_dtype):
     (same policy as the upstream kernelhub integration). Outside capture
     this is a plain cached compile.
     """
-    key = (N, S, HV, K, V, P, PR, W, strides, pool_dtype)
+    key = (N, S, HV, K, V, P, PR, W, strides, pool_dtype, defer)
     if key not in _compiled_keys and _is_capturing():
         logger.warning(
             "[KDA-TileLang] cache miss during CUDA-graph capture (N=%d); "
@@ -299,21 +372,23 @@ def _compiled_capture_safe(N, S, HV, K, V, P, PR, W, strides, pool_dtype):
 
 
 @functools.lru_cache(maxsize=256)
-def _compiled(N, S, HV, K, V, P, PR, W, strides, pool_dtype="float32"):
+def _compiled(N, S, HV, K, V, P, PR, W, strides, pool_dtype="float32",
+              defer=False):
     logger.info(
         "[KDA-TileLang] compiling target_verify kernel: N=%d S=%d HV=%d "
-        "K=%d V=%d pool=%d/%d window=%d pool=%s strides=%s",
-        N, S, HV, K, V, P, PR, W, pool_dtype, strides,
+        "K=%d V=%d pool=%d/%d window=%d pool=%s defer=%s strides=%s",
+        N, S, HV, K, V, P, PR, W, pool_dtype, defer, strides,
     )
     kw = dict(zip(_STRIDE_KEYS, strides))
     kern = tilelang.jit(make_kernel_pooled, pass_configs=_pass_configs())(
-        N, S, HV, K, V, P, PR, W, pool_dtype=pool_dtype, **kw
+        N, S, HV, K, V, P, PR, W, pool_dtype=pool_dtype, defer=defer, **kw
     )
-    _compiled_keys.add((N, S, HV, K, V, P, PR, W, strides, pool_dtype))
+    _compiled_keys.add((N, S, HV, K, V, P, PR, W, strides, pool_dtype, defer))
     return kern
 
 
-def precompile(n_list, S, HV, K, V, P, PR, W, pool_dtype="float32", **strides):
+def precompile(n_list, S, HV, K, V, P, PR, W, pool_dtype="float32",
+               defer=False, **strides):
     """Warm the kernel cache ahead of CUDA-graph capture.
 
     Call this from model warmup with every capture batch size in ``n_list``
@@ -323,13 +398,13 @@ def precompile(n_list, S, HV, K, V, P, PR, W, pool_dtype="float32", **strides):
     ``strides`` are the keyword stride/pitch arguments of
     ``make_kernel_pooled`` (a_stride, b_stride, ..., rb_slot) or empty for
     the contiguous layout. ``pool_dtype`` is the state-pool storage dtype
-    ("float32" or "float16").
+    ("float32" or "float16"). ``defer`` selects the deferred-commit variant.
     Compilation errors propagate to the caller, who should treat the
     TileLang path as unavailable (the per-call helper stays fail-open).
     """
     strides = _normalize_strides(strides)
     for n in n_list:
-        _compiled(n, S, HV, K, V, P, PR, W, strides, pool_dtype)
+        _compiled(n, S, HV, K, V, P, PR, W, strides, pool_dtype, defer)
 
 
 _STRIDE_KEYS = ("a_stride", "b_stride", "q_stride", "k_stride", "v_stride",
@@ -382,6 +457,7 @@ def tilelang_target_verify_or_none(
     replayssm_rawk,
     replayssm_g,
     replayssm_beta,
+    replayssm_pending=None,
     **_ignored,
 ) -> Optional[torch.Tensor]:
     """Run the TileLang target_verify kernel, or return ``None`` to fall back.
@@ -410,6 +486,7 @@ def tilelang_target_verify_or_none(
             cache_replayssm_inputs=cache_replayssm_inputs,
             replayssm_rawv=replayssm_rawv, replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g, replayssm_beta=replayssm_beta,
+            replayssm_pending=replayssm_pending,
         )
     except Exception as e:  # noqa: BLE001 - deliberate fail-open to Triton
         if isinstance(e, torch.cuda.OutOfMemoryError):
@@ -451,6 +528,7 @@ def _tilelang_target_verify(
     replayssm_rawk,
     replayssm_g,
     replayssm_beta,
+    replayssm_pending=None,
 ) -> Optional[torch.Tensor]:
     # --- semantic gate: exactly the kernel variant we implement ---
     if not cache_replayssm_inputs:
@@ -528,6 +606,11 @@ def _tilelang_target_verify(
     if W < S:
         _fb("ring window W < S:", W, S)
         return None
+    defer = replayssm_pending is not None
+    if defer and (W != S or tuple(replayssm_pending.shape) != (PR,)
+                  or replayssm_pending.dtype != torch.int32):
+        _fb("deferred commit needs W == S and an int32 (PR,) pending table")
+        return None
     # Ring / pool layouts: the kernel bakes per-slot pitches at compile
     # time, so only the inner dims need to be dense (the per-layer views
     # the Triton kernel gets are sliced along dim 0 and thus strided in
@@ -575,12 +658,19 @@ def _tilelang_target_verify(
         v2d.stride(0), h0_stride, ring_strides["rv_slot"],
         ring_strides["rk_slot"], ring_strides["rg_slot"],
         ring_strides["rb_slot"],
-    ), pool_dtype)
+    ), pool_dtype, defer)
     if kern is None:
         return None
 
     o = torch.empty(Tn, HV, V, dtype=torch.bfloat16, device=q.device)
+    pend = replayssm_pending if defer else _dummy_pending(PR, q.device)
 
     kern(A32, dtb, a2d, b2d, q2d, k2d, v2d, o, h0, idx,
-         replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
+         replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta, pend)
     return o.view(q.shape[0], Tn, HV, V)
+
+
+@functools.lru_cache(maxsize=8)
+def _dummy_pending(PR, device):
+    # Never read by the non-deferred kernel; only satisfies the signature.
+    return torch.zeros(PR, dtype=torch.int32, device=device)

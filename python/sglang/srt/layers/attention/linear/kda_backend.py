@@ -1737,6 +1737,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             if replayssm_on:
                 replayssm_kwargs = dict(
                     cache_replayssm_inputs=True,
+                    replayssm_pending=getattr(mamba_pool, "replayssm_pending", None),
                     replayssm_rawv=mamba_cache_params.replayssm_rawv,
                     replayssm_rawk=mamba_cache_params.replayssm_rawk,
                     replayssm_g=mamba_cache_params.replayssm_g,

@@ -48,6 +48,7 @@ from sglang.srt.layers.moe import (  # should_use_flashinfer_trtllm_moe, # æ‰¾ä¸
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    is_tbo_enabled,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
@@ -491,6 +492,32 @@ _w8a8_int8_ep_workspace_tokens = get_int_env_var(
     "SGLANG_REUSE_W8A8_INT8_EP_MOE_WORKSPACE", 32768
 )
 _w8a8_int8_ep_workspace: Dict[Any, torch.Tensor] = {}
+_dispatch_scatter_warned = False
+_combine_gather_warned = False
+
+
+def _ep_moe_workspace_base(
+    name: str, cols: int, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """The pooled buffer itself, for a callee that sizes it: DeepEP grows it from the counts it
+    syncs to the host, the same figure _ep_moe_workspace_empty gets after the call."""
+    if _w8a8_int8_ep_workspace_tokens <= 0:
+        return torch.empty((0, cols), device=device, dtype=dtype)
+
+    key = (str(device), dtype, name)
+    buf = _w8a8_int8_ep_workspace.get(key)
+    if (
+        buf is None
+        or buf.device != device
+        or buf.dtype != dtype
+        or buf.shape[1:] != (cols,)
+    ):
+        buf = torch.empty(
+            (_w8a8_int8_ep_workspace_tokens, cols), device=device, dtype=dtype
+        )
+        _w8a8_int8_ep_workspace[key] = buf
+
+    return buf
 
 
 def _ep_moe_workspace_empty(
@@ -744,6 +771,78 @@ class DeepEPMoE(FusedMoE):
             self.use_w8a8_marlin = False
 
         self.deepep_mode = get_deepep_mode()
+
+        scatter_fused = envs.SGLANG_DEEPEP_DISPATCH_SCATTER_FUSED.get()
+        _combine_gather_fused = envs.SGLANG_DEEPEP_COMBINE_GATHER_FUSED.get()
+        # Declared for the whole constructor: separate misses below share the flags, and
+        # leaving them inside the first one would make the others write a local instead.
+        global _dispatch_scatter_warned, _combine_gather_warned
+        # One place decides whether either fusion applies: our own facts here, the deployment
+        # facts from the dispatcher. Any miss warns once and keeps the standalone pass.
+        unsupported = None
+        if scatter_fused or _combine_gather_fused:
+            if not get_moe_a2a_backend().is_deepep():
+                unsupported = "the a2a backend is not DeepEP"
+            elif is_tbo_enabled():
+                unsupported = "two-batch overlap is on"
+            elif not hasattr(self.dispatcher, "fusion_unsupported_reason"):
+                unsupported = "this dispatcher does not support the fused paths"
+            else:
+                unsupported = self.dispatcher.fusion_unsupported_reason(self.top_k)
+        fusions_apply = unsupported is None
+        if scatter_fused and not fusions_apply:
+            scatter_fused = False
+            if not _dispatch_scatter_warned:
+                _dispatch_scatter_warned = True
+                logger.warning(
+                    "SGLANG_DEEPEP_DISPATCH_SCATTER_FUSED is not applied (%s); the "
+                    "standalone ep_scatter runs instead",
+                    unsupported,
+                )
+
+        # Branch mismatches degrade like every other miss above rather than raise: the standalone
+        # ep_scatter runs there, so it is a downgrade to warn about, not a startup failure.
+        if scatter_fused and not (
+            self.deepep_mode.is_normal() or self.use_int8_w8a8_deepgemm_asm
+        ):
+            scatter_fused = False
+            if not _dispatch_scatter_warned:
+                _dispatch_scatter_warned = True
+                logger.warning(
+                    "SGLANG_DEEPEP_DISPATCH_SCATTER_FUSED is not applied (requires the int8 "
+                    "contiguous GEMM branch: --deepep-mode normal and/or "
+                    "SGLANG_INT8_DEEPGEMM_ASM=1; other branches consume per-row m_indices, "
+                    "which the fused scatter cannot fill); the standalone ep_scatter runs instead"
+                )
+
+        if scatter_fused and not self.use_int8_w8a8_deepgemm:
+            scatter_fused = False
+            if not _dispatch_scatter_warned:
+                _dispatch_scatter_warned = True
+                logger.warning(
+                    "SGLANG_DEEPEP_DISPATCH_SCATTER_FUSED is not applied (requires the INT8 "
+                    "deepgemm MoE path: w8a8-int8 quant + SGLANG_USE_DEEPGEMM_MOE=1 on DCU); "
+                    "the standalone ep_scatter runs instead"
+                )
+
+        if scatter_fused and hasattr(self.dispatcher, "enable_dispatch_scatter"):
+            # Opt in: dispatch then writes the expert-major layout and leaves the
+            # token-ordered receive buffer unwritten, so only this consumer reads it.
+            self.dispatcher.enable_dispatch_scatter()
+
+        # Only the INT8 contiguous forward parks the handoff, so without it the switch would
+        # do nothing and say nothing -- hence the warning.
+        self.combine_gather_fused = (
+            _combine_gather_fused and fusions_apply and self.use_int8_w8a8_deepgemm
+        )
+        if _combine_gather_fused and not self.combine_gather_fused:
+            if not _combine_gather_warned:
+                _combine_gather_warned = True
+                logger.warning(
+                    "SGLANG_DEEPEP_COMBINE_GATHER_FUSED is not applied (%s); the standalone "
+                    "ep_gather runs instead",
+                    unsupported or "not the INT8 deepgemm MoE path",
+                )
 
         if quant_config is not None and quant_config.get_name() == "slimquant_w4a8":
             self.dispatcher.set_quant_config({"int8_dispatch": True})
@@ -2301,6 +2400,13 @@ class DeepEPMoE(FusedMoE):
             topk_weights,
             num_recv_tokens_per_expert,
         ) = dispatch_output
+        # The fused dispatch wrote the expert-major layout and left it on the dispatcher;
+        # None means this step took the plain receive and ep_scatter runs below.
+        _scatter = (
+            self.dispatcher.take_dispatch_scatter()
+            if hasattr(self.dispatcher, "take_dispatch_scatter")
+            else None
+        )
 
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
@@ -2309,10 +2415,23 @@ class DeepEPMoE(FusedMoE):
                 "DeepEP W8A8 INT8 dispatch must return activation scales."
             )
         if num_recv_tokens_per_expert is None:
+            if _scatter is not None:
+                # The fused receive never writes hidden_states, so returning it here would hand
+                # back uninitialized memory; the fused path always carries the counts.
+                raise RuntimeError(
+                    "dispatch-scatter requires num_recv_tokens_per_expert from the dispatch"
+                )
             return hidden_states.bfloat16()
 
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
+            if self.combine_gather_fused:
+                # Ranks that received rows take the gather combine, and every rank must
+                # take the same combine: take it with nothing to gather.
+                empty_index = torch.empty_like(topk_ids, dtype=torch.int32)
+                self.dispatcher.set_combine_gather(
+                    (empty_index, topk_ids, topk_weights)
+                )
             return hidden_states.bfloat16()
 
         M, K = hidden_states.size()
@@ -2326,20 +2445,40 @@ class DeepEPMoE(FusedMoE):
 
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
-        input_tensor = [
-            _ep_moe_workspace_empty(
-                "w8a8_int8_contiguous_input",
-                (all_tokens, K),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            ),
-            _ep_moe_workspace_empty(
-                "w8a8_int8_contiguous_input_scale",
-                (all_tokens, hidden_states_scale.shape[-1]),
-                device=hidden_states.device,
-                dtype=torch.float32,
-            ),
-        ]
+        # The fused dispatch already received into the INT8 workspace: it grew the buffers to
+        # at least this step's rows and filled that prefix.
+        if _scatter is not None:
+            if _scatter[0].shape[0] < all_tokens or _scatter[1].shape[0] < all_tokens:
+                raise RuntimeError(
+                    f"dispatch-scatter buffer {_scatter[0].shape[0]}/"
+                    f"{_scatter[1].shape[0]} rows < {all_tokens}"
+                )
+            if _scatter[2].shape[0] < topk_ids.shape[0]:
+                # Sized by DeepEP like the buffers above; a shorter index array is read out of
+                # bounds by ep_gather or the fused combine (silent zeros).
+                raise RuntimeError(
+                    f"dispatch-scatter output_index {_scatter[2].shape[0]} rows < "
+                    f"{topk_ids.shape[0]} received tokens"
+                )
+            input_tensor = [
+                _scatter[0].narrow(0, 0, all_tokens),
+                _scatter[1].narrow(0, 0, all_tokens),
+            ]
+        else:
+            input_tensor = [
+                _ep_moe_workspace_empty(
+                    "w8a8_int8_contiguous_input",
+                    (all_tokens, K),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                ),
+                _ep_moe_workspace_empty(
+                    "w8a8_int8_contiguous_input_scale",
+                    (all_tokens, hidden_states_scale.shape[-1]),
+                    device=hidden_states.device,
+                    dtype=torch.float32,
+                ),
+            ]
         if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
@@ -2352,19 +2491,33 @@ class DeepEPMoE(FusedMoE):
                 device="cpu",
             ).cuda(non_blocking=True)
 
+        # Build before ep_scatter overwrites the counts with prefix sums; the fused
+        # scatter cannot fill per-row m_indices, so the GEMMs take this table.
+        gemm_indices, gemm_config = None, None
+        if _scatter is not None:
+            counts = num_recv_tokens_per_expert_gpu
+            offsets = torch.cumsum(counts, 0, dtype=torch.int32) - counts
+            gemm_indices = torch.cat((counts, offsets))
+            gemm_config = {"MODE": 2001}
+
         counts_are_aligned = all(
             count % 256 == 0 for count in num_recv_tokens_per_expert
         )
-        m_indices, output_index = _ep_scatter_with_optional_lightop(
-            hidden_states,
-            hidden_states_scale,
-            topk_ids,
-            num_recv_tokens_per_expert_gpu,
-            input_tensor[0],
-            input_tensor[1],
-            all_tokens,
-            counts_are_aligned=counts_are_aligned,
-        )
+        if _scatter is not None:
+            output_index = _scatter[2]
+            # gemm_indices is set above, so no GEMM below reads the per-row m_indices.
+            m_indices = None
+        else:
+            m_indices, output_index = _ep_scatter_with_optional_lightop(
+                hidden_states,
+                hidden_states_scale,
+                topk_ids,
+                num_recv_tokens_per_expert_gpu,
+                input_tensor[0],
+                input_tensor[1],
+                all_tokens,
+                counts_are_aligned=counts_are_aligned,
+            )
 
         # Keep this as a flat storage so both output views stay contiguous.
         bf16_workspace_tokens = max(all_tokens, _w8a8_int8_ep_workspace_tokens)
@@ -2380,12 +2533,17 @@ class DeepEPMoE(FusedMoE):
         if not counts_are_aligned:
             gateup_output.zero_()
 
+        gemm_kwargs = {} if gemm_config is None else {"config": gemm_config}
+        # The fused scatter fills no m_indices, so the GEMMs take the group table instead;
+        # the two gfx936 branches below cannot and are rejected at init in that case.
+        gemm_rows = m_indices if gemm_indices is None else gemm_indices
         if self.deepep_mode.is_normal() or self.use_int8_w8a8_deepgemm_asm:
             m_grouped_i8_gemm_nt_contiguous(
                 input_tensor,
                 w13_weight_int8,
                 gateup_output,
-                m_indices,
+                gemm_rows,
+                **gemm_kwargs,
                 shuffle_unique=0,
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
@@ -2402,7 +2560,8 @@ class DeepEPMoE(FusedMoE):
                 input_tensor,
                 w13_weight_int8,
                 gateup_output,
-                m_indices,
+                gemm_rows,
+                **gemm_kwargs,
             )
         del input_tensor
 
@@ -2428,7 +2587,8 @@ class DeepEPMoE(FusedMoE):
                 (q_a2_all, q_a2_scale),
                 w2_weight_int8,
                 down_output,
-                m_indices,
+                gemm_rows,
+                **gemm_kwargs,
                 shuffle_unique=0,
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
@@ -2445,8 +2605,15 @@ class DeepEPMoE(FusedMoE):
                 (q_a2_all, q_a2_scale),
                 w2_weight_int8,
                 down_output,
-                m_indices,
+                gemm_rows,
+                **gemm_kwargs,
             )
+
+        if self.combine_gather_fused:
+            # Skip ep_gather: combine reduces the expanded rows itself. output_index
+            # comes from either scatter path; k with topk_ids[k] < 0 is skipped.
+            self.dispatcher.set_combine_gather((output_index, topk_ids, topk_weights))
+            return down_output
 
         gather_out = torch.empty(
             hidden_states_shape,

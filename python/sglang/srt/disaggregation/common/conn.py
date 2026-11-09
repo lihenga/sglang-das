@@ -20,6 +20,7 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -28,6 +29,7 @@ import numpy.typing as npt
 import requests
 import torch.distributed as dist
 import zmq
+from zmq.utils.monitor import recv_monitor_message
 from aiohttp import web
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -235,6 +237,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._socket_unreachable_since: Dict[str, float] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
@@ -877,22 +880,45 @@ class CommonKVManager(BaseKVManager):
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
                 monitor = self._monitor_cache.get(endpoint)
-                disconnected = False
+                stale = False
                 if monitor is not None:
                     try:
-                        monitor.recv_multipart(zmq.NOBLOCK)
-                        disconnected = True
+                        while monitor.poll(timeout=0):
+                            event = recv_monitor_message(monitor, flags=zmq.NOBLOCK)
+                            if event["event"] == zmq.EVENT_DISCONNECTED:
+                                stale = True
+                            elif event["event"] == zmq.EVENT_CLOSED:
+                                if endpoint not in self._socket_unreachable_since:
+                                    self._socket_unreachable_since[endpoint] = (
+                                        time.monotonic()
+                                    )
                     except zmq.Again:
                         pass
                     except zmq.ZMQError:
-                        disconnected = True
-                if not disconnected:
+                        stale = True
+                unreachable_since = self._socket_unreachable_since.get(endpoint)
+                if not stale and unreachable_since is not None:
+                    backoff = (
+                        max(
+                            0,
+                            envs.SGLANG_DISAGGREGATION_ZMQ_SOCKET_RECONNECT_BACKOFF_MS.get(),
+                        )
+                        / 1000.0
+                    )
+                    if time.monotonic() - unreachable_since < backoff:
+                        # RECONNECT_IVL=-1 makes this socket permanently unusable;
+                        # returning it during backoff would silently queue a send
+                        # that can never arrive.
+                        raise zmq.Again()
+                    stale = True
+                if not stale:
                     return sock
                 sock.close(linger=0)
                 if monitor is not None:
                     monitor.close()
                 self._socket_cache.pop(endpoint, None)
                 self._monitor_cache.pop(endpoint, None)
+                self._socket_unreachable_since.pop(endpoint, None)
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
@@ -904,11 +930,14 @@ class CommonKVManager(BaseKVManager):
             sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
             sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
             sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+            monitor = sock.get_monitor_socket(
+                events=zmq.EVENT_DISCONNECTED | zmq.EVENT_CLOSED,
+                addr=f"inproc://sglang-disagg-socket-monitor-{uuid.uuid4().hex}",
+            )
             sock.connect(endpoint)
             self._socket_cache[endpoint] = sock
-            self._monitor_cache[endpoint] = sock.get_monitor_socket(
-                zmq.EVENT_DISCONNECTED
-            )
+            self._monitor_cache[endpoint] = monitor
+            self._socket_unreachable_since.pop(endpoint, None)
             self._socket_send_locks.setdefault(endpoint, threading.Lock())
             return sock
 
@@ -920,7 +949,17 @@ class CommonKVManager(BaseKVManager):
         with self._socket_lock:
             send_lock = self._socket_send_locks.setdefault(endpoint, threading.Lock())
         with send_lock:
-            sock = self._connect(endpoint, is_ipv6=is_ipv6)
+            try:
+                sock = self._connect(endpoint, is_ipv6=is_ipv6)
+            except zmq.Again:
+                # Do not let an expected reconnect delay terminate a transfer
+                # worker. The endpoint lock serializes retirement and retries.
+                backoff = max(
+                    0,
+                    envs.SGLANG_DISAGGREGATION_ZMQ_SOCKET_RECONNECT_BACKOFF_MS.get(),
+                ) / 1000.0
+                time.sleep(backoff)
+                sock = self._connect(endpoint, is_ipv6=is_ipv6)
             sock.send_multipart(parts)
 
     def _disconnect_manager_endpoint(self, endpoint: str):
@@ -933,6 +972,7 @@ class CommonKVManager(BaseKVManager):
             with self._socket_lock:
                 sock = self._socket_cache.pop(endpoint, None)
                 monitor = self._monitor_cache.pop(endpoint, None)
+                self._socket_unreachable_since.pop(endpoint, None)
                 if sock is not None:
                     sock.close(linger=0)
                 if monitor is not None:

@@ -257,6 +257,9 @@ class DsparkFoldedSampling(IntEnum):
 class Envs:
     # Optional HCU KDA speculative verification kernel (default off).
     SGLANG_KDA_USE_TILELANG_VERIFY = EnvBool(False)
+    SGLANG_KDA_REPLAYSSM_DEFER_COMMIT = EnvBool(False)
+    SGLANG_KDA_USE_AITER_DECODE = EnvBool(False)
+    SGLANG_KDA_USE_AITER_VERIFY = EnvBool(False)
 
     SGLANG_ENABLE_HEALTH_CHECK_IPC_DRAIN_ALL = EnvBool(False)
     SGLANG_UVICORN_WORKER_STARTUP_TIMEOUT = EnvInt(300)
@@ -686,6 +689,8 @@ class Envs:
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
+    # Delay before rebuilding a socket whose initial connection failed.
+    SGLANG_DISAGGREGATION_ZMQ_SOCKET_RECONNECT_BACKOFF_MS = EnvInt(1000)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
@@ -1194,6 +1199,8 @@ class Envs:
     # Deprecated in favor of '--deepep-dispatcher-output-dtype bf16' but still
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
+    SGLANG_DEEPEP_DISPATCH_SCATTER_FUSED = EnvBool(False)
+    SGLANG_DEEPEP_COMBINE_GATHER_FUSED = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)

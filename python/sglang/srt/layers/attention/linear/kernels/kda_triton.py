@@ -1,11 +1,20 @@
+import logging
 from typing import Optional
 
 import torch
+
+from sglang.srt.environ import envs
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
+
+_USE_AITER_DECODE = envs.SGLANG_KDA_USE_AITER_DECODE.get()
+_USE_AITER_VERIFY = envs.SGLANG_KDA_USE_AITER_VERIFY.get()
+_LOGGER = logging.getLogger(__name__)
+_LOGGED_DECODE_BACKEND = False
+_LOGGED_VERIFY_BACKEND = False
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -18,6 +27,9 @@ if not is_cpu():
         fused_sigmoid_gating_delta_rule_update,
     )
     from sglang.kernels.ops.attention.fla.kda import chunk_kda
+
+    if _USE_AITER_DECODE or _USE_AITER_VERIFY:
+        from aiter import sglang_fused_sigmoid_gating_delta_rule_update as _aiter_kda
 
 
 class TritonKDAKernel(LinearAttnKernelBase):
@@ -137,6 +149,36 @@ class TritonKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
+        global _LOGGED_DECODE_BACKEND
+        if not _LOGGED_DECODE_BACKEND:
+            _LOGGER.info(
+                "KDA decode backend=%s state_dtype=%s",
+                "aiter" if _USE_AITER_DECODE else "triton",
+                ssm_states.dtype,
+            )
+            _LOGGED_DECODE_BACKEND = True
+
+        if _USE_AITER_DECODE:
+            return _aiter_kda(
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                scale=None,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=query_start_loc,
+                is_kda=True,
+                lower_bound=lower_bound,
+                beta_scale=kwargs.get("beta_scale", 1.0),
+            )
+
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -181,6 +223,47 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_beta: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        global _LOGGED_VERIFY_BACKEND
+        beta_scale = kwargs.get("beta_scale", 1.0)
+        if _USE_AITER_VERIFY:
+            if not _LOGGED_VERIFY_BACKEND:
+                _LOGGER.info(
+                    "KDA verify backend=aiter state_dtype=%s replay_ssm=%s",
+                    ssm_states.dtype,
+                    cache_ring,
+                )
+                _LOGGED_VERIFY_BACKEND = True
+
+            return _aiter_kda(
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                scale=None,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=query_start_loc,
+                is_kda=True,
+                lower_bound=lower_bound,
+                beta_scale=beta_scale,
+                disable_state_update=True,
+                intermediate_states_buffer=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=cache_steps,
+                retrieve_parent_token=retrieve_parent_token,
+                cache_replayssm_inputs=cache_ring,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
+            )
+
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
         # mirroring the GDN triton verify path. Reads the committed state, writes
         # per-draft-token intermediate states to the scratch buffer, does NOT mutate

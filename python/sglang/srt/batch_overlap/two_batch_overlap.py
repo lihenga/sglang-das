@@ -1205,6 +1205,29 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         for inner in self._inners:
             inner.set_quant_config(quant_config)
 
+    def enable_dispatch_scatter(self):
+        for inner in self._inners:
+            inner.enable_dispatch_scatter()
+
+    def set_combine_gather(self, handoff):
+        for inner in self._inners:
+            inner.set_combine_gather(handoff)
+
+    def take_dispatch_scatter(self):
+        # The MoE core refuses the fusions under TBO, so at most one inner can hold a handoff;
+        # take from every inner anyway, so a relaxed gate cannot leave a stale one behind.
+        held = [
+            h
+            for h in (inner.take_dispatch_scatter() for inner in self._inners)
+            if h is not None
+        ]
+        assert len(held) <= 1, "dispatch_scatter handoff held by more than one TBO inner"
+        return held[0] if held else None
+
+    def fusion_unsupported_reason(self, topk: int):
+        # Every inner is the same class on the same group, so one answer covers them all.
+        return self._inners[0].fusion_unsupported_reason(topk)
+
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ):

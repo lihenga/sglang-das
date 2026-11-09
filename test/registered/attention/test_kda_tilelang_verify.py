@@ -431,6 +431,113 @@ class TestKDATileLangTargetVerify(unittest.TestCase):
             "ring tail was written past S",
         )
 
+    def test_deferred_commit_matches_eager(self):
+        self._check_deferred_commit_matches_eager(torch.float32)
+
+    def test_deferred_commit_fp16_matches_eager(self):
+        # fp16 SSM: the deferred kernel must round its in-register state to the
+        # fp16 checkpoint before continuing, otherwise the recurrence diverges
+        # from the eager path that reads the rounded checkpoint back next step.
+        self._check_deferred_commit_matches_eager(torch.float16)
+
+    def _check_deferred_commit_matches_eager(self, state_dtype):
+        # Multi-step: verify(defer) + parked accept lengths must produce the
+        # same outputs and (after a final flush) the same checkpoint as
+        # verify + eager ReplaySSM commit. Covers a changing batch, -1
+        # padding rows and a final explicit flush.
+        from sglang.kernels.ops.attention.fla.hcu.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_spec_all_layers,
+        )
+        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            set_kda_replayssm_pending,
+        )
+
+        S, steps, n_live = 6, 6, 12
+        HV, K, V, N, P = self.HV, self.K, self.V, self.N, self.P
+        dev = get_device()
+        state0, _, _, _ = self._inputs(S, 7)
+        state0 = state0.to(state_dtype)
+        gen = torch.Generator().manual_seed(7)
+        live = torch.randperm(P - 1, generator=gen)[:n_live].to(torch.int32) + 1
+
+        def world():
+            return dict(
+                st=state0.clone(),
+                rawv=torch.zeros(P, HV, S, V, dtype=torch.bfloat16, device=dev),
+                rawk=torch.zeros(P, HV, S, K, dtype=torch.bfloat16, device=dev),
+                g=torch.zeros(P, HV, S, K, dtype=torch.float32, device=dev),
+                beta=torch.zeros(P, HV, S, dtype=torch.float32, device=dev),
+                pend=torch.zeros(P, dtype=torch.int32, device=dev),
+            )
+
+        def rings(w):
+            return dict(
+                replayssm_rawv=w["rawv"], replayssm_rawk=w["rawk"],
+                replayssm_g=w["g"], replayssm_beta=w["beta"],
+            )
+
+        def all_layer(w):
+            return dict(
+                checkpoint_state=w["st"].unsqueeze(0),
+                rawv_cache=w["rawv"].unsqueeze(0),
+                rawk_cache=w["rawk"].unsqueeze(0),
+                g_cache=w["g"].unsqueeze(0),
+                beta_cache=w["beta"].unsqueeze(0),
+            )
+
+        ref, dfr = world(), world()
+        for step in range(steps):
+            _, _, common, _ = self._inputs(S, 100 + step)
+            pick = torch.randperm(n_live, generator=gen)[: N - 1]
+            idx = torch.cat([live[pick], torch.tensor([-1], dtype=torch.int32)])
+            idx = idx.to(dev)
+            common = dict(common, initial_state_indices=idx)
+            acc = torch.randint(1, S + 1, (N,), generator=gen, dtype=torch.int32)
+            acc = acc.to(dev)
+
+            with envs.SGLANG_KDA_USE_TILELANG_VERIFY.override(True):
+                o_ref = tilelang_target_verify_or_none(
+                    initial_state_source=ref["st"], **rings(ref), **common
+                )
+                o_dfr = tilelang_target_verify_or_none(
+                    initial_state_source=dfr["st"], **rings(dfr),
+                    replayssm_pending=dfr["pend"], **common,
+                )
+            self.assertIsNotNone(o_ref)
+            self.assertIsNotNone(o_dfr)
+            real = (N - 1) * S
+            o_ref_v = o_ref.reshape(-1, HV, V)[:real].float()
+            o_dfr_v = o_dfr.reshape(-1, HV, V)[:real].float()
+            scale = o_ref_v.abs().max().item()
+            err = (o_dfr_v - o_ref_v).abs().max().item()
+            self.assertLess(err, 0.02 + 0.02 * scale, f"step {step} o err {err}")
+
+            commit_kda_replayssm_spec_all_layers(
+                **all_layer(ref), ssm_state_indices=idx, accept_lens=acc
+            )
+            set_kda_replayssm_pending(dfr["pend"], idx, acc)
+
+        commit_kda_replayssm_spec_all_layers(
+            **all_layer(dfr),
+            ssm_state_indices=torch.arange(P, device=dev),
+            accept_lens=dfr["pend"],
+        )
+        dfr["pend"].zero_()
+        torch.cuda.synchronize()
+        self.assertEqual(int(dfr["pend"].abs().sum()), 0)
+        if state_dtype == torch.float16:
+            # Defer and eager both store fp16 checkpoints; allow one fp16 ulp
+            # of fold-arithmetic difference between the two kernels.
+            self.assertTrue(
+                torch.allclose(dfr["st"], ref["st"], rtol=1e-2, atol=1e-3),
+                "fp16 checkpoint mismatch: "
+                f"max={(dfr['st'] - ref['st']).abs().max().item()}",
+            )
+        else:
+            scale = ref["st"].abs().max().item()
+            err = (dfr["st"] - ref["st"]).abs().max().item()
+            self.assertLess(err, 1e-4 * scale, f"checkpoint err {err}")
+
 
 if __name__ == "__main__":
     unittest.main()
