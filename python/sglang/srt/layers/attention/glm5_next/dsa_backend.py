@@ -2236,6 +2236,25 @@ class NativeSparseAttnBackend(
                             page_table_1_flattened
                         )
                     )
+                    if (
+                        page_table_1_flattened.numel()
+                        > forward_batch.get_max_chunk_capacity()
+                        and metadata.indexer_seq_lens_cpu.numel() > 1
+                    ):
+                        return self._forward_flashmla_sparse_by_request(
+                            q_all,
+                            kv_cache,
+                            topk_indices,
+                            page_table_1_flattened,
+                            metadata.indexer_seq_lens_cpu.tolist(),
+                            self._get_topk_transform_lens(
+                                forward_batch, metadata, q_all.shape[0]
+                            ),
+                            layer.scaling,
+                            layer.v_head_dim,
+                            layer.layer_id,
+                            use_hcu_fp8_no_rope_512_prefill,
+                        )
                     kv_cache = dequantize_k_cache_paged(
                         kv_cache,
                         page_table_1_flattened,
@@ -2517,6 +2536,51 @@ class NativeSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_flashmla_sparse_by_request(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        page_table_1_flattened: torch.Tensor,
+        kv_lens: List[int],
+        q_lens: List[int],
+        sm_scale: float,
+        v_head_dim: int,
+        layer_id: int,
+        use_hcu_fp8_no_rope_512: bool,
+    ) -> torch.Tensor:
+        # New-token limits do not bound cached history. Materializing all
+        # requests' histories at once can OOM even on a small extend batch.
+        assert len(q_lens) == len(kv_lens)
+        assert sum(kv_lens) == page_table_1_flattened.numel()
+        assert sum(q_lens) <= q_all.shape[0]
+        output = q_all.new_zeros((*q_all.shape[:2], v_head_dim))
+        q_start = kv_start = 0
+        for q_len, kv_len in zip(q_lens, kv_lens):
+            q_end, kv_end = q_start + q_len, kv_start + kv_len
+            if q_len:
+                request_kv = dequantize_k_cache_paged(
+                    kv_cache,
+                    page_table_1_flattened[kv_start:kv_end],
+                    target_dim_rope=(0 if use_hcu_fp8_no_rope_512 else None),
+                )
+                indices = topk_indices[q_start:q_end]
+                # Fused and unfused RAGGED top-k both use batch-global offsets.
+                indices = torch.where(indices >= 0, indices - kv_start, indices)
+                output[q_start:q_end] = self._forward_flashmla_sparse(
+                    q_all=q_all[q_start:q_end],
+                    kv_cache=request_kv,
+                    page_table_1=indices,
+                    sm_scale=sm_scale,
+                    v_head_dim=v_head_dim,
+                    layer_id=layer_id,
+                    use_hcu_fp8_no_rope_512=use_hcu_fp8_no_rope_512,
+                )
+                # Release before allocating the next history on this stream.
+                del request_kv
+            q_start, kv_start = q_end, kv_end
+        return output
 
     def _forward_flashmla_sparse(
         self,
