@@ -500,7 +500,7 @@ variant appropriate for your Linux device and driver.
 | Waiting-queue DFS prefetch | Disabled with a startup warning when requested | Negotiated across ranks; requires an available arena |
 | `SGLANG_MOONCAKE_READ_PLAN=1` | Uses native ReadLayout when available, otherwise session ranges; address reuse disabled | Native ReadPlan |
 | DFS health and access policy | Original package behavior; no SGLang health-based failover | Native probes and coordinated policy |
-| Client HTTP metrics | Automatic port zero disables the optional endpoint with a warning; an explicit nonzero `MOONCAKE_CLIENT_METRICS_PORT_BASE` is retained | Automatic ports enabled when declared by the package |
+| Client HTTP metrics | Automatic port zero disables the optional endpoint with a warning; upgrade for automatic ports | Automatic ports enabled when declared by the package |
 
 The same SGLang code and configuration can use either package. Optional API
 selection first respects local capability declarations, then checks callable
@@ -554,6 +554,21 @@ python3 [path of test_mooncake_store.py]
 ```
 
 If all tests pass, the message "✅ All tests passed" will be printed at the end.
+
+## 内嵌 client 指标统一采集
+
+配套升级 SGLang 与 Mooncake 后，启动 SGLang 加 `--enable-metrics`，Prometheus 只需抓取 SGLang 业务端口的 `/metrics`，即可采集同机和跨机器 worker 内嵌 client 的指标。无需配置各 client 的端口，`MOONCAKE_CLIENT_METRICS_PORT_BASE` 已移除，即使环境中遗留该变量也不再用于端口分配。可选 client HTTP 监听使用端口 0，由系统从临时端口范围分配可用端口。
+
+worker 每约 5 秒通过原生 `get_client_metrics()` 获取与 client HTTP 相同的完整快照，并主动上报 SGLang；抓取时读取最近快照，不会逐个连接 client HTTP。该链路不依赖 Master 的服务快照，不修改其协议。需使用包含 `get_client_metrics` 的 Mooncake 包；旧包会告警且无法提供本节功能。`MC_STORE_CLIENT_METRIC=0` 会关闭这些原始 client 指标。
+
+导出的 client 指标保留原标签，并增加 `mooncake_client`（client 生命周期 ID）、`mooncake_host`、`mooncake_pid` 和 `mooncake_rank`，避免不同 worker 同名序列冲突。Python Prometheus exporter 会按标准将 counter 名称规范为 `_total` 后缀，例如原始 `mooncake_transfer_read_bytes` 在此入口为 `mooncake_transfer_read_bytes_total`；histogram 的 bucket/sum/count 保留。
+
+- `sglang:mooncake_client_up`：30 秒内收到有效 client 指标快照为 1；指标关闭或断报为 0。首次上报前不会出现该 client。
+- `sglang:mooncake_client_last_report_timestamp_seconds`：SGLang 最近接收该 client 快照的时间。断报 30 秒后停止导出它的原始指标，300 秒后移除其状态。
+
+上报失败会在后续周期重试，乱序快照按 sequence 丢弃；SGLang 重启后可通过后续累计快照恢复。异常退出前未成功上报的数据不保证保留。跨机器 worker 使用 `dist_init_addr` 的主节点地址与 SGLang 业务端口，因此须能访问该入口。上报沿用现有 API key 和 TLS 配置；legacy gRPC 模式使用其 HTTP sidecar。多 tokenizer HTTP 进程通过现有 Prometheus 目录共享接收快照，无需跨机器共享文件系统。
+
+本节只统一内嵌 client 指标；独立 daemon 及 Master 自身指标仍由各自入口导出。多 rank 的物理 I/O 可以按需汇总，同一逻辑请求产生的 token/请求计数应根据实际并行方式过滤，不能机械地将所有 rank 相加。
 
 ## 等待队列 DFS 预取效果监控
 
