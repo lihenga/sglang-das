@@ -1396,6 +1396,7 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
     """
 
     device_pool: MHATokenToKVPool
+    mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
 
     def __init__(
         self,
@@ -1407,6 +1408,9 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        *,
+        mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
+        pool_label: str = "kv",
     ):
         if layout != "layout_hcu":
             raise ValueError(
@@ -1417,6 +1421,30 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
             raise ValueError(
                 "layout_hcu HiCache does not support layer-sharded KV pools"
             )
+        self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
+        for draft_pool in self.mtp_draft_device_pools:
+            if draft_pool.layer_num != 1 or draft_pool.layer_shard_enabled:
+                raise ValueError(
+                    "layout_hcu packed MTP requires one unsharded KV layer "
+                    "per draft pool"
+                )
+            for name in (
+                "head_num",
+                "head_dim",
+                "v_head_dim",
+                "page_size",
+                "store_dtype",
+                "device",
+            ):
+                if getattr(draft_pool, name) != getattr(device_pool, name):
+                    raise ValueError(
+                        f"layout_hcu packed MTP requires matching target/draft {name}"
+                    )
+            if draft_pool.size < device_pool.size:
+                raise ValueError(
+                    "layout_hcu packed MTP draft capacity must cover target KV indices"
+                )
+        self.target_layer_num = device_pool.layer_num
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -1426,6 +1454,7 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            pool_label=pool_label,
         )
         k_by_layer = self.k_buffer.transpose(0, 1)
         v_by_layer = self.v_buffer.transpose(0, 1)
@@ -1442,10 +1471,25 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
             device=self.device_pool.device,
         )
 
+        if self.mtp_draft_device_pools:
+            device_pools = (self.device_pool, *self.mtp_draft_device_pools)
+            self.packed_device_k_data_ptrs = torch.cat(
+                [pool.k_data_ptrs for pool in device_pools]
+            )
+            self.packed_device_v_data_ptrs = torch.cat(
+                [pool.v_data_ptrs for pool in device_pools]
+            )
+            self.packed_device_k_buffers = [
+                buffer for pool in device_pools for buffer in pool.k_buffer
+            ]
+            self.packed_device_v_buffers = [
+                buffer for pool in device_pools for buffer in pool.v_buffer
+            ]
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
-        self.layer_num = self.device_pool.layer_num
+        self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
     def get_ksize_per_token(self):
@@ -1487,8 +1531,20 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
         return self.kv_buffer[1]
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
+        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
+            return
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        device_layer_id = 0 if is_draft else layer_id
+
         if io_backend == "kernel":
             from sgl_kernel.kvcacheio import (
                 transfer_kv_per_layer_kernel_pf_lf_H2D_hcu,
@@ -1496,42 +1552,65 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
 
             transfer_kv_per_layer_kernel_pf_lf_H2D_hcu(
                 src_k=self.k_buffer,
-                dst_k=device_pool.k_buffer[layer_id],
+                dst_k=device_pool.k_buffer[device_layer_id],
                 src_v=self.v_buffer,
-                dst_v=device_pool.v_buffer[layer_id],
+                dst_v=device_pool.v_buffer[device_layer_id],
                 src_indices=host_indices,
                 dst_indices=device_indices,
                 item_size=self.token_stride_size,
                 src_layout_dim=self.token_stride_size * self.layer_num,
                 page_size=self.page_size,
-                layer_id=layer_id,
+                layer_id=host_layer_id,
             )
         elif io_backend == "direct":
             from sgl_kernel.kvcacheio import transfer_kv_all_direct_pf_lf_H2D_hcu
 
+            # The direct operator shares one layer index between host and device.
+            # Single-layer views map a packed host tail to draft device layer zero.
             transfer_kv_all_direct_pf_lf_H2D_hcu(
-                src_ptrs_k=self.k_buffer,
-                src_ptrs_v=self.v_buffer,
-                dst_ptrs_k=device_pool.k_buffer,
-                dst_ptrs_v=device_pool.v_buffer,
+                src_ptrs_k=self.k_buffer[:, host_layer_id : host_layer_id + 1],
+                src_ptrs_v=self.v_buffer[:, host_layer_id : host_layer_id + 1],
+                dst_ptrs_k=[device_pool.k_buffer[device_layer_id]],
+                dst_ptrs_v=[device_pool.v_buffer[device_layer_id]],
                 src_indices=host_indices,
                 dst_indices=device_indices,
-                start_layer_id=layer_id,
+                start_layer_id=0,
                 page_size=self.page_size,
             )
         else:
             raise ValueError(f"Unsupported layout_hcu IO backend: {io_backend}")
 
+    def _resolve_device_transfer_buffers(self, device_pool):
+        if self.mtp_draft_device_pools:
+            return (
+                self.packed_device_k_data_ptrs,
+                self.packed_device_v_data_ptrs,
+                self.packed_device_k_buffers,
+                self.packed_device_v_buffers,
+            )
+        return (
+            device_pool.k_data_ptrs,
+            device_pool.v_data_ptrs,
+            device_pool.k_buffer,
+            device_pool.v_buffer,
+        )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        (
+            device_k_data_ptrs,
+            device_v_data_ptrs,
+            device_k_buffers,
+            device_v_buffers,
+        ) = self._resolve_device_transfer_buffers(device_pool)
         if io_backend == "kernel":
             from sgl_kernel.kvcacheio import transfer_kv_all_kernel_lf_pf_D2H_hcu
 
             transfer_kv_all_kernel_lf_pf_D2H_hcu(
-                src_k=device_pool.k_data_ptrs,
+                src_k=device_k_data_ptrs,
                 dst_k=self.k_buffer,
-                src_v=device_pool.v_data_ptrs,
+                src_v=device_v_data_ptrs,
                 dst_v=self.v_buffer,
                 src_indices=device_indices,
                 dst_indices=host_indices,
@@ -1545,8 +1624,8 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
             from sgl_kernel.kvcacheio import transfer_kv_all_direct_lf_pf_D2H_hcu
 
             transfer_kv_all_direct_lf_pf_D2H_hcu(
-                src_ptrs_k=device_pool.k_buffer,
-                src_ptrs_v=device_pool.v_buffer,
+                src_ptrs_k=device_k_buffers,
+                src_ptrs_v=device_v_buffers,
                 dst_ptrs_k=self.k_buffer,
                 dst_ptrs_v=self.v_buffer,
                 src_indices=device_indices,
