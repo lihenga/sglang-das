@@ -213,7 +213,7 @@ class MooncakeClientMetricsReporter:
                             "metrics": metrics,
                             "sequence": sequence,
                         },
-                        timeout=(2, 2),
+                        timeout=(2, 5),
                         verify=self._verify,
                         allow_redirects=False,
                     )
