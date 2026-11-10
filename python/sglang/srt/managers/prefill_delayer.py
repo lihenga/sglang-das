@@ -197,7 +197,7 @@ class PrefillDelayer:
         self._metrics_collector = metrics_collector
 
         self._curr_state: Optional[_State] = None
-        self.skip_first_delayer = True
+        self.skip_first_delayer = self._prefill_max_requests is None
 
         assert (
             not get_schedule().disable_overlap_schedule
@@ -405,9 +405,14 @@ class PrefillDelayer:
                 < global_max_prefill_bs_max
             )
 
-            if slot_condition or queue_condition or idle_coalesce_condition:
-                # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
-                # the first merge_batch causes the decoding to fail to reach the maximum batch size.
+            should_delay = slot_condition or queue_condition or idle_coalesce_condition
+            if self._prefill_max_requests is not None:
+                # Use the batch cap as the queue target on every participating rank.
+                should_delay = (
+                    (global_waiting_queue_len < self._prefill_max_requests).any().item()
+                )
+
+            if should_delay:
                 if self.skip_first_delayer and not idle_coalesce_condition:
                     self.skip_first_delayer = False
                     pass
