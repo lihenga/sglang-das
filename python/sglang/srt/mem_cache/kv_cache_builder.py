@@ -235,6 +235,8 @@ def build_kv_cache(
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
+    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
@@ -375,6 +377,12 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        sidecar_draft_device_pools=(
+            hicache_draft_plan.device_pools
+            if hicache_draft_plan is not None
+            and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
+            else ()
+        ),
     )
 
     tree_cache = create_tree_cache(

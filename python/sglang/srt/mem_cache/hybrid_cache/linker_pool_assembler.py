@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 
 class DevicePoolEntry:
@@ -679,6 +680,117 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
+def _mha_device_pool_entry(
+    name: PoolName,
+    pool: Any,
+    layer_mapping: dict[int, int],
+    page_size: int,
+    indices_from_pool: PoolName,
+) -> DevicePoolEntry:
+    if pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
+        raise ValueError("The direct external linker does not support scaled draft KV.")
+    return DevicePoolEntry(
+        name=name,
+        indices_from_pool=indices_from_pool,
+        device_pool=pool,
+        # This branch's MooncakeStore uses separate DRAFT_k / DRAFT_v keys.
+        # Keep offsets relative to each object for range reads and ReadPlan.
+        components=[pool.k_buffer, pool.v_buffer],
+        layer_mapping=layer_mapping,
+        page_size=page_size,
+        rows_are_pages=False,
+        packed=False,
+    )
+
+
+def _build_mamba_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    """Assemble MLA pages and TP-sharded Mamba state slots for direct I/O.
+
+    Based on shequ-code/main's implementation (introduced in eb91a41f38),
+    adapted to this branch's HybridReqToTokenPool state ownership.
+    """
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+    )
+
+    full = kvcache.full_kv_pool
+    if (
+        type(kvcache) is not HybridLinearKVPool
+        or type(full) is not MLATokenToKVPool
+        or get_parallel().attn_dcp_size > 1
+        or params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL + MAMBA models only with a "
+            "plain MLA pool, without DCP or packed draft KV."
+        )
+    if get_memory().enable_unified_memory:
+        raise ValueError(
+            "The Mamba direct external linker does not support unified memory."
+        )
+    req_pool = params.req_to_token_pool
+    if (
+        req_pool.mamba_ckpt_pool is not None
+        or req_pool.short_conv_pool.enabled
+        or req_pool.ngram_pool.enabled
+    ):
+        raise ValueError(
+            "The direct external linker does not support int8 Mamba checkpoints "
+            "or Mamba side states yet."
+        )
+    state_pool = req_pool.mamba_pool
+    state = state_pool.mamba_cache
+    start = kvcache.start_layer
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full,
+            components=[full.kv_buffer],
+            layer_mapping={
+                gid - start: lid
+                for gid, lid in kvcache.full_attention_layer_id_mapping.items()
+            },
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        DevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=state_pool,
+            components=[
+                [tensor[layer] for layer in range(state_pool.num_mamba_layers)]
+                for tensor in (state.temporal, *state.conv)
+                if tensor.numel() > 0
+            ],
+            layer_mapping={gid - start: lid for gid, lid in req_pool.mamba_map.items()},
+            page_size=1,
+            rows_are_pages=True,
+        ),
+    ]
+    for draft in getattr(params, "sidecar_draft_device_pools", ()):
+        if draft.page_size != page_size:
+            raise ValueError("Draft KV page size must match the tree page size.")
+        entries.append(
+            _mha_device_pool_entry(
+                PoolName.DRAFT,
+                draft,
+                {layer: layer for layer in range(draft.layer_num)},
+                page_size,
+                PoolName.KV,
+            )
+        )
+    # Mamba state is TP-sharded even when the MLA KV is replicated.
+    return DevicePoolGroup(
+        entries,
+        max(layer for entry in entries for layer in entry.layer_mapping) + 1,
+        page_size,
+    )
+
+
 def resolve_hybrid_device_pool_group(
     *,
     kvcache: Any,
@@ -691,8 +803,16 @@ def resolve_hybrid_device_pool_group(
         _select_strategy,
     )
 
-    return _select_strategy(kvcache, components).build_direct_linker_pool_group(
+    group = _select_strategy(kvcache, components).build_direct_linker_pool_group(
         kvcache=kvcache,
         params=params,
         page_size=page_size,
     )
+    if (
+        getattr(params, "sidecar_draft_device_pools", ())
+        and PoolName.DRAFT not in group.entry_map
+    ):
+        raise ValueError(
+            "The direct external linker does not support this model's draft KV."
+        )
+    return group

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -649,9 +650,80 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value,
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        if not keys:
+            return None
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[keys[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
+        if phase == LinkerTransferPhase.LOAD:
+            # Unlike upstream's request-private load path, this tree inserts the
+            # checkpoint before DMA. Give the request a separate mutable state;
+            # both destinations must be loaded before their layer executes.
+            count = 1 if self.cache.pp_size > 1 else 2
+            allocator = self.cache.req_to_token_pool.mamba_allocator
+            slots = allocator.alloc(count)
+            if slots is None:
+                self.cache.evict(EvictParams(num_tokens=0, mamba_num=count))
+                slots = allocator.alloc(count)
+            if slots is None:
+                return None
+            transfer.device_indices = slots
+            transfer.keys *= count
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        allocator = self.cache.req_to_token_pool.mamba_allocator
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            allocator.free(transfer.device_indices)
+            return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            if req.mamba_pool_idx is not None:
+                allocator.free(req.mamba_pool_idx.unsqueeze(0))
+            req.mamba_pool_idx = transfer.device_indices[-1]
+            req.mamba_cow_src_index = None
+            req.mamba_needs_clear = False
+            pool = self.cache.req_to_token_pool.mamba_pool
+            for name in (
+                "replayssm_write_pos",
+                "replayssm_cache_base",
+                "replayssm_is_flush",
+            ):
+                cursor = getattr(pool, name, None)
+                if cursor is not None:
+                    cursor[transfer.device_indices] = 0
+            return transfer
+        assert phase == ExternalLinkerLoadPhase.COMMIT
+        assert insert_result is not None
+        if insert_result.mamba_exist:
+            # The wrapper freed the redundant tree slot; still load the
+            # request's private slot instead of dropping the entire transfer.
+            transfer.device_indices = transfer.device_indices[1:]
+            transfer.keys = transfer.keys[1:]
+        return transfer
 
     # ---- HiCache Hooks ----
 
