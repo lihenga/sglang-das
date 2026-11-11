@@ -100,6 +100,9 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.mooncake_client_metrics import (
+    SNAPSHOT_PATH as MOONCAKE_CLIENT_METRICS_PATH,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     configured_tp_size,
@@ -3181,7 +3184,7 @@ def kill_itself_when_parent_died():
 
 
 class UvicornAccessLogFilter(logging.Filter):
-    """Filter uvicorn access logs by request path.
+    """Suppress successful client metric reports and configured path prefixes.
 
     Notes:
     - Uvicorn access records usually provide `request_line` like: "GET /metrics HTTP/1.1".
@@ -3196,6 +3199,9 @@ class UvicornAccessLogFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         path = None
+        status_code = getattr(record, "status_code", None)
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            _, _, path, _, status_code = record.args
 
         request_line = getattr(record, "request_line", None)
         if request_line:
@@ -3232,6 +3238,8 @@ class UvicornAccessLogFilter(logging.Filter):
                 # If parsing fails, fall back to the raw value.
                 pass
         path = path.split("?", 1)[0]
+        if path == MOONCAKE_CLIENT_METRICS_PATH and str(status_code) == "204":
+            return False
         return not any(
             path.startswith(prefix) for prefix in self.excluded_path_prefixes
         )
@@ -3257,24 +3265,19 @@ def _configure_uvicorn_access_log_filter(
 ):
     """Configure uvicorn access log path filter into uvicorn LOGGING_CONFIG.
 
-    This optionally filters uvicorn access logs (e.g., suppress noisy /metrics polling).
+    Successful Mooncake client metric reports are always quiet. Other path
+    prefixes are excluded only when configured (e.g., /metrics polling).
 
     Args:
         uvicorn_logging_config: The dict-like LOGGING_CONFIG from uvicorn.
         server_args: Parsed server args object that may contain:
             - uvicorn_access_log_exclude_prefixes (list[str] | tuple[str] | None)
     """
-    # Optionally filter uvicorn access logs (e.g., suppress noisy /metrics polling).
-    if server_args is None:
-        return
-
     filter_name = "sglang_uvicorn_access_path_filter"
 
-    excluded_prefixes = getattr(
-        server_args, "uvicorn_access_log_exclude_prefixes", None
+    excluded_prefixes = (
+        getattr(server_args, "uvicorn_access_log_exclude_prefixes", None) or []
     )
-    if not excluded_prefixes:
-        return
 
     # Normalize: accept list/tuple; treat a single string as one prefix (not an iterable of chars).
     if isinstance(excluded_prefixes, str):
@@ -3283,9 +3286,6 @@ def _configure_uvicorn_access_log_filter(
     # De-duplicate while keeping order; drop empty prefixes.
     excluded_prefixes = [p for p in excluded_prefixes if p]
     excluded_prefixes = list(dict.fromkeys(excluded_prefixes))
-    if not excluded_prefixes:
-        return
-
     uvicorn_logging_config.setdefault("filters", {})
     uvicorn_logging_config["filters"][filter_name] = {
         "()": "sglang.srt.utils.common.UvicornAccessLogFilter",
