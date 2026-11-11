@@ -42,6 +42,14 @@ from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 logger = logging.getLogger(__name__)
 
 
+def _spark_dense_draft_sync_counts(counts, logprob_counts, dp_size):
+    if len(counts) != dp_size or len(logprob_counts) != dp_size:
+        raise ValueError("Spark draft global Dense TP requires one count per DP")
+    if any(type(n) is not int or n < 0 for n in [*counts, *logprob_counts]):
+        raise ValueError("Spark draft DP counts must be nonnegative integers")
+    return [max(n, 1) for n in counts], [max(n, 1) for n in logprob_counts]
+
+
 def _one_hot_token0(probs: torch.Tensor) -> torch.Tensor:
     degenerate = torch.isnan(probs[:, :1])
     one_hot = torch.zeros_like(probs)
@@ -471,6 +479,17 @@ class DraftBlockProposer:
                 global_num_tokens_for_logprob=[1],
                 can_run_dp_cuda_graph=False,
             )
+            from sglang.srt.utils.common import require_mlp_tp_gather
+
+            if require_mlp_tp_gather(self.draft_model_runner.server_args):
+                metadata.global_num_tokens = batch.global_num_tokens
+                metadata.global_num_tokens_for_logprob = (
+                    batch.global_num_tokens_for_logprob
+                )
+                if metadata.global_num_tokens is None:
+                    raise ValueError(
+                        "Spark idle global Dense TP requires DP token counts"
+                    )
             self._fill_num_token_non_padded(forward)
             self._fill_dp_moe_sync_metadata(forward, metadata)
             self._detach_eager_count_metadata(forward)
@@ -690,10 +709,19 @@ class DraftBlockProposer:
         from sglang.srt.layers.node_local_lm_head import populate_lm_head_dp_metadata
 
         populate_lm_head_dp_metadata(forward_batch, batch)
+        counts = batch.global_num_tokens
+        logprob_counts = batch.global_num_tokens_for_logprob
+        if getattr(self, "_attention_tp_group", None) is not None:
+            from sglang.srt.utils.common import require_mlp_tp_gather
+
+            if require_mlp_tp_gather(self.draft_model_runner.server_args):
+                counts, logprob_counts = _spark_dense_draft_sync_counts(
+                    counts, logprob_counts, get_parallel().attn_dp_size
+                )
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
-            batch.global_num_tokens,
-            batch.global_num_tokens_for_logprob,
+            counts,
+            logprob_counts,
         )
         device = self.draft_model_runner.device
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens

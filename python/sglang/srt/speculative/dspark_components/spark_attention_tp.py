@@ -73,3 +73,53 @@ def broadcast_attention_tp(tensor, group):
     if group is not None:
         group.broadcast(tensor, src=0)
     return tensor
+
+
+def log_spark_model_memory(model, label):
+    if os.getenv("SGLANG_1M_MEMORY_AUDIT", "0") != "1":
+        return
+    import json
+    import logging
+    import torch
+
+    rows = []
+    seen = set()
+    for kind, named in (
+        ("parameter", model.named_parameters()),
+        ("buffer", model.named_buffers()),
+    ):
+        for name, tensor in named:
+            if tensor.device.type != "cuda":
+                continue
+            storage = tensor.untyped_storage()
+            key = (storage.data_ptr(), storage.nbytes())
+            rows.append(
+                dict(
+                    name=name,
+                    kind=kind,
+                    shape=list(tensor.shape),
+                    dtype=str(tensor.dtype),
+                    bytes=tensor.numel() * tensor.element_size(),
+                    storage_bytes=storage.nbytes(),
+                    duplicate_storage=key in seen,
+                )
+            )
+            seen.add(key)
+    rows.sort(key=lambda x: x["bytes"], reverse=True)
+    torch.cuda.synchronize()
+    logging.getLogger(__name__).info(
+        "1M model memory audit %s %s",
+        label,
+        json.dumps(
+            dict(
+                allocated=torch.cuda.memory_allocated(),
+                reserved=torch.cuda.memory_reserved(),
+                max_allocated=torch.cuda.max_memory_allocated(),
+                max_reserved=torch.cuda.max_memory_reserved(),
+                unique_model_storage_bytes=sum(k[1] for k in seen),
+                largest=rows[:35],
+                rotary=[r for r in rows if "cos_sin" in r["name"]],
+            ),
+            separators=(",", ":"),
+        ),
+    )

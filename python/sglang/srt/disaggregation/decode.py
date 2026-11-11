@@ -803,7 +803,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
-    def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
+    def _decode_radix_prefix_limit(
+        self, origin_input_len: int, fill_len: int, uses_swa_tail_prealloc: bool
+    ) -> Optional[int]:
+        draft_window = self._dspark_swa_decode_prefix_window()
+        if not uses_swa_tail_prealloc and draft_window <= 0:
+            return None
+        page_size = self.token_to_kv_pool_allocator.page_size
+        limit = origin_input_len
+        if uses_swa_tail_prealloc:
+            limit = min(limit, max(0, fill_len - self._swa_tail_len(fill_len)))
+        if draft_window > 0:
+            limit = min(
+                limit,
+                dspark_swa_decode_prefix_cap(origin_input_len, draft_window, page_size),
+            )
+        limit = page_align_floor(limit, page_size)
+        return self._dsv4_safe_prefix_len(limit)
+
+    def _match_prefix_and_lock(
+        self, req: Req, *, max_prefix_len: Optional[int] = None
+    ) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
@@ -824,6 +844,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         req.origin_input_ids,
                         req.extra_key,
                         is_bigram=is_eagle,
+                        limit=max_prefix_len,
                         cache_salt=getattr(req, "cache_salt", None),
                     ),
                     cow_mamba=self.tree_cache.supports_mamba(),
@@ -853,6 +874,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 req.origin_input_ids,
                 cow_mamba=self.tree_cache.supports_mamba(),
                 include_req=True,
+                max_prefix_len=max_prefix_len,
             )
         # Always lock to match aggregated scheduling behavior. SWA locks only
         # span the sliding window and return a boundary uuid; store it so the
@@ -1399,7 +1421,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
-                prefix_match = self._match_prefix_and_lock(decode_req.req)
+                fill_len = self._pre_alloc_fill_len(decode_req.req)
+                prefix_limit = self._decode_radix_prefix_limit(
+                    origin_input_len, fill_len, uses_swa_tail_prealloc
+                )
+                prefix_match = self._match_prefix_and_lock(
+                    decode_req.req, max_prefix_len=prefix_limit
+                )
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -2254,9 +2282,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
         return (
-            len(self.scheduler.running_batch.reqs)
-            + len(self.transfer_queue.queue)
-            + len(self.scheduler.waiting_queue)
+            sum(not req.finished() for req in self.scheduler.running_batch.reqs)
+            + sum(not entry.req.finished() for entry in self.transfer_queue.queue)
+            + sum(not req.finished() for req in self.scheduler.waiting_queue)
             + extra_reserved_reqs
         )
 
@@ -2383,8 +2411,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
-            allocatable_tokens -= self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
+            allocatable_tokens -= self.num_reserved_decode_tokens * sum(
+                not req.finished() for req in self.scheduler.last_batch.reqs
             )
 
         if count_retracted:
@@ -2451,10 +2479,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
-            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
+            prebuilt_n = sum(
+                not req.finished() for req in self.scheduler.last_batch.reqs
             )
-            prebuilt_n = len(self.scheduler.last_batch.reqs)
+            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * prebuilt_n
             prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
             swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
 

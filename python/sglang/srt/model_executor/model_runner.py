@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -1213,6 +1214,15 @@ class ModelRunner:
             self.model_config,
             logger,
         )
+
+        if os.getenv("SGLANG_1M_MEMORY_AUDIT", "0") == "1":
+            from sglang.srt.speculative.dspark_components.spark_attention_tp import (
+                log_spark_model_memory,
+            )
+
+            log_spark_model_memory(
+                self.model, "draft" if self.is_draft_worker else "target"
+            )
 
         if self.startup_weight_load is None:
             dist_barrier_after_load(

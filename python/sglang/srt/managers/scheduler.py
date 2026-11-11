@@ -5648,6 +5648,48 @@ class Scheduler(
             target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=draft_graph_memory_usage,
         )
+        if os.getenv("SGLANG_1M_MEMORY_AUDIT", "0") == "1":
+            ret["cuda_allocator"] = {
+                "allocated_bytes": torch.cuda.memory_allocated(),
+                "reserved_bytes": torch.cuda.memory_reserved(),
+                "max_allocated_bytes": torch.cuda.max_memory_allocated(),
+                "max_reserved_bytes": torch.cuda.max_memory_reserved(),
+                "device": torch.cuda.current_device(),
+                "node_rank": self.server_args.node_rank,
+                "tp_rank": self.ps.tp_rank,
+                "dp_rank": self.ps.attn_dp_rank,
+            }
+            queue = self.disagg_decode_prealloc_queue
+            last_batch = self.last_batch
+            if queue is not None:
+                ret["decode_admission"] = {
+                    "dp_rank": self.ps.attn_dp_rank,
+                    "allocator_available": self.token_to_kv_pool_allocator.available_size(),
+                    "full_evictable": queue._radix_full_evictable(),
+                    "budget_now": queue._allocatable_token_budgets(),
+                    "active_reserved_reqs": queue._active_req_count(),
+                    "last_batch_mode": (
+                        str(last_batch.forward_mode) if last_batch else None
+                    ),
+                    "last_batch_reqs": [
+                        {
+                            "rid": req.rid,
+                            "finished": req.finished(),
+                            "input_len": len(req.origin_input_ids),
+                        }
+                        for req in (last_batch.reqs if last_batch else [])
+                    ],
+                    "pending": [
+                        {
+                            "rid": entry.req.rid,
+                            "input_len": len(entry.req.origin_input_ids),
+                            "cache_protected_len": getattr(
+                                entry.req, "cache_protected_len", 0
+                            ),
+                        }
+                        for entry in queue.queue[:4]
+                    ],
+                }
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
@@ -6222,6 +6264,14 @@ class Scheduler(
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
         freeze_gc("Scheduler")
+        if envs.SGLANG_CUDA_CACHE_TRIM_ON_FREEZE_GC.get() and self.device == "cuda":
+            before_bytes = torch.cuda.memory_reserved()
+            torch.cuda.empty_cache()
+            logger.info(
+                "Allocator trim after GC: reserved %.1f -> %.1f MiB",
+                before_bytes / (1 << 20),
+                torch.cuda.memory_reserved() / (1 << 20),
+            )
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 

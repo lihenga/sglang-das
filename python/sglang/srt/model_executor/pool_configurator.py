@@ -439,6 +439,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             * indexer_ratio
         )
         workspace_bytes = index_k_workspace_bytes_per_token(cache_mode)
+        if (
+            not allocate_all_layers
+            and not kvc.is_draft_worker
+            and cache_mode.value == "int8_scaled"
+            and envs.SGLANG_DSA_DECODE_LAZY_INDEX_K_WORKSPACE.get()
+            and get_disagg().disaggregation_mode == "decode"
+        ):
+            workspace_bytes = 0
         return math.ceil(persistent_bytes + workspace_bytes)
 
     def calculate_pool_sizes(

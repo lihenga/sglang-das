@@ -4704,8 +4704,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
         if not (
-            envs.SGLANG_DSA_PREFILL_LAZY_INDEX_K_WORKSPACE.get()
-            and get_disagg().disaggregation_mode == "prefill"
+            (
+                envs.SGLANG_DSA_PREFILL_LAZY_INDEX_K_WORKSPACE.get()
+                and get_disagg().disaggregation_mode == "prefill"
+            )
+            or (
+                envs.SGLANG_DSA_DECODE_LAZY_INDEX_K_WORKSPACE.get()
+                and get_disagg().disaggregation_mode == "decode"
+            )
         ):
             self._ensure_index_k_dequant_workspace()
 
