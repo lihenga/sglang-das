@@ -1,3 +1,4 @@
+import logging
 import os
 import tempfile
 import time
@@ -50,6 +51,56 @@ def payload(index=1, sequence=1, metrics=METRICS):
 
 
 class TestMooncakeClientMetrics(unittest.TestCase):
+    def test_successful_report_access_logs_are_silent_without_configuration(self):
+        from sglang.srt.utils.common import (
+            UvicornAccessLogFilter,
+            _configure_uvicorn_access_log_filter,
+        )
+
+        config = {"handlers": {"access": {}}, "loggers": {"uvicorn.access": {}}}
+        _configure_uvicorn_access_log_filter(config)
+        name = "sglang_uvicorn_access_path_filter"
+        self.assertIn(name, config["handlers"]["access"]["filters"])
+        self.assertIn(name, config["loggers"]["uvicorn.access"]["filters"])
+        options = dict(config["filters"][name])
+        options.pop("()")
+        access_filter = UvicornAccessLogFilter(**options)
+        for path, status, visible in (
+            (SNAPSHOT_PATH, 204, False),
+            (SNAPSHOT_PATH + "?worker=1", 204, False),
+            (SNAPSHOT_PATH, 400, True),
+            (SNAPSHOT_PATH, 401, True),
+            (SNAPSHOT_PATH, 500, True),
+            (SNAPSHOT_PATH + "/other", 204, True),
+            ("/generate", 204, True),
+            ("/metrics", 200, True),
+        ):
+            with self.subTest(path=path, status=status):
+                record = logging.LogRecord(
+                    "uvicorn.access",
+                    logging.INFO,
+                    __file__,
+                    0,
+                    '%s - "%s %s HTTP/%s" %d',
+                    ("127.0.0.1:1234", "POST", path, "1.1", status),
+                    None,
+                )
+                self.assertEqual(access_filter.filter(record), visible)
+
+    def test_configured_access_log_prefixes_still_apply(self):
+        from sglang.srt.utils.common import UvicornAccessLogFilter
+
+        record = logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            __file__,
+            0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:1234", "GET", "/metrics", "1.1", 200),
+            None,
+        )
+        self.assertFalse(UvicornAccessLogFilter(["/metrics"]).filter(record))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
