@@ -36,30 +36,50 @@ use tracing::error;
 
 use crate::{core::Worker, observability::metrics::Metrics};
 
-/// Only retain the prefix needed to recognize the engine's error envelope.
+/// Retain a small probe for normal events and a bounded error line for logging.
 #[derive(Default)]
 struct ErrorEventScanner {
     line_start: Vec<u8>,
     saw_error: bool,
+    error_logged: bool,
 }
 
 impl ErrorEventScanner {
-    fn feed(&mut self, chunk: &[u8]) {
-        if self.saw_error {
-            return;
+    fn feed(&mut self, chunk: &[u8]) -> Option<String> {
+        if self.error_logged {
+            return None;
         }
         // shortcut: inspect at most 32 bytes per line for the engine's first-key
         // error envelope; use a streaming parser if other SSE formats are needed.
         const LINE_PROBE: usize = 32;
-        for (i, segment) in chunk.split(|&b| b == b'\n').enumerate() {
-            if i > 0 {
-                self.saw_error |= Self::is_error_line(&self.line_start);
+        const ERROR_LOG_LIMIT: usize = 4096;
+        for segment in chunk.split_inclusive(|&b| b == b'\n') {
+            let probe_len = segment
+                .len()
+                .min(LINE_PROBE.saturating_sub(self.line_start.len()));
+            self.line_start.extend_from_slice(&segment[..probe_len]);
+            self.saw_error |= Self::is_error_line(&self.line_start);
+            if self.saw_error {
+                let rest = &segment[probe_len..];
+                let room = ERROR_LOG_LIMIT - self.line_start.len();
+                self.line_start
+                    .extend_from_slice(&rest[..rest.len().min(room)]);
+                if segment.ends_with(b"\n") || self.line_start.len() == ERROR_LOG_LIMIT {
+                    return self.take_error();
+                }
+            } else if segment.ends_with(b"\n") {
                 self.line_start.clear();
             }
-            let room = LINE_PROBE - self.line_start.len();
-            self.line_start
-                .extend_from_slice(&segment[..segment.len().min(room)]);
-            self.saw_error |= Self::is_error_line(&self.line_start);
+        }
+        None
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        if self.saw_error && !self.error_logged {
+            self.error_logged = true;
+            Some(String::from_utf8_lossy(&self.line_start).into_owned())
+        } else {
+            None
         }
     }
 
@@ -76,6 +96,7 @@ struct StreamMetrics {
     backend_type: &'static str,
     model: String,
     scanner: ErrorEventScanner,
+    error_event: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +151,7 @@ impl<E> BreakerTrackedStream<E> {
             backend_type,
             model: model.to_owned(),
             scanner: ErrorEventScanner::default(),
+            error_event: false,
         });
         self
     }
@@ -137,12 +159,23 @@ impl<E> BreakerTrackedStream<E> {
     fn stream_outcome(&self) -> &'static str {
         if self.terminal == Terminal::Errored {
             "upstream_error"
-        } else if self.metrics.as_ref().is_some_and(|m| m.scanner.saw_error) {
+        } else if self
+            .metrics
+            .as_ref()
+            .is_some_and(|m| m.error_event || m.scanner.saw_error)
+        {
             "stream_error_event"
         } else if self.terminal == Terminal::Active {
             "client_disconnect"
         } else {
             "ok"
+        }
+    }
+
+    /// Record an application error recognized by the caller's SSE parser.
+    pub fn mark_error_event(&mut self) {
+        if let Some(metrics) = self.metrics.as_mut() {
+            metrics.error_event = true;
         }
     }
 
@@ -178,7 +211,9 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(b))) => {
                 if let Some(metrics) = self.metrics.as_mut() {
-                    metrics.scanner.feed(&b);
+                    if let Some(event) = metrics.scanner.feed(&b) {
+                        error!(worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
+                    }
                 }
                 Poll::Ready(Some(Ok(b)))
             }
@@ -200,6 +235,11 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
 
 impl<E> Drop for BreakerTrackedStream<E> {
     fn drop(&mut self) {
+        if let Some(metrics) = self.metrics.as_mut() {
+            if let Some(event) = metrics.scanner.take_error() {
+                error!(worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
+            }
+        }
         match self.terminal {
             Terminal::Completed => self.worker.circuit_breaker().record_success(),
             Terminal::Errored => self.worker.circuit_breaker().record_failure(),
@@ -372,25 +412,41 @@ mod tests {
     #[test]
     fn scanner_handles_chunk_boundaries_without_matching_content() {
         let mut scanner = ErrorEventScanner::default();
-        scanner.feed(b"data: {\"choices\":[{\"content\":\"data: {\\\"error\\\"\"}]}\n\n");
+        assert!(scanner
+            .feed(b"data: {\"choices\":[{\"content\":\"data: {\\\"error\\\"\"}]}\n\n")
+            .is_none());
         assert!(!scanner.saw_error);
-        scanner.feed(b"data:{ \"err");
-        scanner.feed(b"or\":{\"code\":503}}\n\n");
+        assert!(scanner.feed(b"data:{ \"err").is_none());
+        assert_eq!(
+            scanner
+                .feed(b"or\":{\"message\":\"KV handshake failed\",\"code\":503}}\n\n")
+                .unwrap(),
+            "data:{ \"error\":{\"message\":\"KV handshake failed\",\"code\":503}}\n"
+        );
         assert!(scanner.saw_error);
+        assert!(scanner.take_error().is_none());
 
         let mut scanner = ErrorEventScanner::default();
-        scanner.feed(&vec![b'x'; 1024 * 1024]);
+        assert!(scanner.feed(&vec![b'x'; 1024 * 1024]).is_none());
         assert_eq!(scanner.line_start.len(), 32);
         assert!(!scanner.saw_error);
+
+        let mut scanner = ErrorEventScanner::default();
+        let mut large_error = b"data: {\"error\":\"".to_vec();
+        large_error.extend(vec![b'x'; 8192]);
+        assert_eq!(scanner.feed(&large_error).unwrap().len(), 4096);
+        assert!(scanner.feed(b"trailing error bytes\n").is_none());
     }
 
     #[test]
     fn scanner_recognizes_error_before_line_terminator() {
         let mut scanner = ErrorEventScanner::default();
-        scanner.feed(b"data: {\"err");
+        assert!(scanner.feed(b"data: {\"err").is_none());
         assert!(!scanner.saw_error);
-        scanner.feed(b"or\":{\"code\":503}}");
+        assert!(scanner.feed(b"or\":{\"code\":503}}").is_none());
         assert!(scanner.saw_error);
+        assert!(scanner.take_error().unwrap().contains("503"));
+        assert!(scanner.take_error().is_none());
     }
 
     #[tokio::test]
