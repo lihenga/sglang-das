@@ -272,6 +272,48 @@ async fn complete_json_error_is_detected_without_waiting_for_eof() {
 }
 
 #[tokio::test]
+async fn decode_json_error_cancels_prefill_without_waiting_for_body_end() {
+    for stream in [false, true] {
+        let (prefill, started, closed) = pending_peer().await;
+        let decode = serve(Router::new().route(
+            "/generate",
+            post(move || {
+                let started = started.clone();
+                async move {
+                    started.notified().await;
+                    let chunks = tokio_stream::iter([
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"{\"error\":{\"message\":\"KV handshake",
+                        )),
+                        Ok(bytes::Bytes::from_static(b" failed\",\"code\":503}}")),
+                    ])
+                    .chain(futures_util::stream::pending());
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        Body::from_stream(chunks),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let (response, metrics) =
+            observe_metrics(dispatch(&prefill.url, &decode.url, stream)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let worker_metrics: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("smg_worker_errors_total{"))
+            .collect();
+        assert_eq!(worker_metrics.len(), 1, "{metrics}");
+        assert!(worker_metrics[0].contains("worker_type=\"decode\""));
+        assert!(worker_metrics[0].ends_with(" 1"));
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn fragmented_prefill_sse_error_cancels_decode_before_eof() {
     let (decode, started, closed) = pending_peer().await;
     let prefill = serve(Router::new().route(
@@ -425,9 +467,11 @@ async fn selection_failure_does_not_record_worker_errors() {
 
 #[test]
 fn streaming_error_closes_response_and_records_metrics_once() {
-    for error_event in [
-        "data: {\"error\":{\"message\":\"KV handshake failed\",\"code\":503}}\n\n",
-        "data: {\"text\":\"\",\"meta_info\":{\"finish_reason\":{\"type\":\"abort\",\"message\":\"KV handshake failed\",\"status_code\":503}}}\n\n",
+    for (error_event, worker_failed) in [
+        ("data: {\"error\":{\"message\":\"KV handshake failed\",\"code\":503}}\n\n", true),
+        ("data: {\"text\":\"\",\"meta_info\":{\"finish_reason\":{\"type\":\"abort\",\"message\":\"KV handshake failed\",\"status_code\":503}}}\n\n", true),
+        ("data: {\"error\":{\"message\":\"invalid request\",\"code\":400}}\n\n", false),
+        ("data: {\"text\":\"\",\"meta_info\":{\"finish_reason\":{\"type\":\"abort\",\"message\":\"user abort\"}}}\n\n", false),
     ] {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -444,10 +488,11 @@ fn streaming_error_closes_response_and_records_metrics_once() {
             ];
             let stream = tokio_stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>))
                 .chain(futures_util::stream::pending());
+            let prefill = worker("http://prefill", WorkerType::Prefill { bootstrap_port: None });
+            let decode = worker("http://decode", WorkerType::Decode);
             let response = router.create_streaming_response(
                 stream, StatusCode::OK, None, false, None,
-                worker("http://prefill", WorkerType::Prefill { bootstrap_port: None }),
-                worker("http://decode", WorkerType::Decode), Some("test-model"),
+                prefill.clone(), decode.clone(), Some("test-model"),
             );
             let body = tokio::time::timeout(Duration::from_secs(1),
                 axum::body::to_bytes(response.into_body(), usize::MAX))
@@ -458,10 +503,16 @@ fn streaming_error_closes_response_and_records_metrics_once() {
             assert_eq!(stream_metrics.len(), 1, "{metrics}");
             assert!(stream_metrics[0].contains("outcome=\"stream_error_event\""));
             assert!(stream_metrics[0].ends_with(" 1"));
+            assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+            assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+            assert_eq!(decode.circuit_breaker().total_successes(), u64::from(!worker_failed));
+            assert_eq!(decode.circuit_breaker().total_failures(), u64::from(worker_failed));
             let worker_metrics: Vec<_> = metrics.lines().filter(|line| line.starts_with("smg_worker_errors_total{")).collect();
-            assert_eq!(worker_metrics.len(), 1, "{metrics}");
-            assert!(worker_metrics[0].contains("worker_type=\"decode\""));
-            assert!(worker_metrics[0].ends_with(" 1"));
+            assert_eq!(worker_metrics.len(), usize::from(worker_failed), "{metrics}");
+            if worker_failed {
+                assert!(worker_metrics[0].contains("worker_type=\"decode\""));
+                assert!(worker_metrics[0].ends_with(" 1"));
+            }
         }));
     }
 }
