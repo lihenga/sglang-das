@@ -594,23 +594,22 @@ impl PDRouter {
                 }
             } else {
                 let headers = header_utils::preserve_response_headers(response.headers());
-                match response.bytes().await {
-                    Ok(body) => {
-                        if let Err(response) = Self::check_json_worker_error(&body, "decode") {
-                            return Err(response);
-                        }
-                        decode.record_outcome(true);
-                        Ok(DecodeResponse::Buffered(status, headers, body))
-                    }
-                    Err(e) => {
+                let mut stream = response.bytes_stream();
+                let mut body = bytes::BytesMut::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| {
                         error!(decode_url = decode.url(), error = ?e, "Failed to read decode body");
-                        Err(error::create_error(
+                        error::create_error(
                             Self::worker_transport_status(&e),
                             "decode_read_failed",
                             format!("{e:#}"),
-                        ))
-                    }
+                        )
+                    })?;
+                    body.extend_from_slice(&chunk);
+                    Self::check_json_worker_error(&body, "decode")?;
                 }
+                decode.record_outcome(true);
+                Ok(DecodeResponse::Buffered(status, headers, body.freeze()))
             }
         };
         let decode_fut = async {
@@ -904,7 +903,7 @@ impl PDRouter {
                                                         error_type_from_status(response.status()),
                                                     );
                                                 }
-                                                tracked.mark_error_event();
+                                                tracked.mark_error_event(response.status().is_server_error());
                                                 stream_error = true;
                                                 break;
                                             }
