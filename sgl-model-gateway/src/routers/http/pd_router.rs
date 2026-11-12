@@ -29,6 +29,7 @@ use crate::{
     core::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
     observability::{
         events::{self, Event},
+        logging::rate_limited_log,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
@@ -202,7 +203,7 @@ impl PDRouter {
     }
 
     fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
+        rate_limited_log!(ERROR, "Failed to select PD pair error={}", error);
         error::service_unavailable(
             "server_selection_failed",
             format!("No available servers: {}", error),
@@ -576,7 +577,7 @@ impl PDRouter {
             let response = match decode_request.send().await {
                 Ok(response) => response,
                 Err(e) => {
-                    error!(decode_url = %decode.url(), error = ?e, "Decode request failed");
+                    rate_limited_log!(ERROR, decode_url = %decode.url(), error = ?e, "Decode request failed");
                     return Err(error::create_error(
                         Self::worker_transport_status(&e),
                         "decode_server_error",
@@ -587,7 +588,7 @@ impl PDRouter {
             let status = response.status();
             if !status.is_success() {
                 // Return the failure before committing downstream stream headers.
-                warn!(decode_url = decode.url(), %status, "Decode returned an HTTP error");
+                rate_limited_log!(WARN, decode_url = decode.url(), %status, "Decode returned an HTTP error");
                 return Err(error::create_error(
                     status,
                     "decode_server_error",
@@ -622,7 +623,7 @@ impl PDRouter {
                 let mut body = bytes::BytesMut::new();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk.map_err(|e| {
-                        error!(decode_url = decode.url(), error = ?e, "Failed to read decode body");
+                        rate_limited_log!(ERROR, decode_url = decode.url(), error = ?e, "Failed to read decode body");
                         error::create_error(
                             Self::worker_transport_status(&e),
                             "decode_read_failed",
@@ -655,7 +656,7 @@ impl PDRouter {
         let ((_, prefill_body), decode_response) = match tokio::try_join!(prefill_fut, decode_fut) {
             Ok(responses) => responses,
             Err(response) => {
-                warn!(
+                rate_limited_log!(WARN,
                     prefill_url = prefill.url(),
                     decode_url = decode.url(),
                     status = %response.status(),
@@ -980,7 +981,7 @@ impl PDRouter {
                         }
                     }
                     _ = tx.closed() => {
-                        tracing::info!(
+                        rate_limited_log!(INFO,
                             "Client disconnected, cancelling upstream PD stream from {}",
                             decode_for_log.url()
                         );
@@ -1056,7 +1057,7 @@ impl PDRouter {
         let prefill_response = match prefill_result {
             Ok(response) => response,
             Err(e) => {
-                error!(prefill_url, error = ?e, "Prefill request failed; cancelling paired decode");
+                rate_limited_log!(ERROR, prefill_url, error = ?e, "Prefill request failed; cancelling paired decode");
 
                 // Return error immediately - don't wait for decode to timeout
                 return Err(error::create_error(
@@ -1071,7 +1072,7 @@ impl PDRouter {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !prefill_status.is_success() {
-            warn!(prefill_url, status = %prefill_status, "Prefill returned an HTTP error");
+            rate_limited_log!(WARN, prefill_url, status = %prefill_status, "Prefill returned an HTTP error");
             return Err(error::create_error(
                 prefill_status,
                 "prefill_server_error",
@@ -1089,7 +1090,7 @@ impl PDRouter {
         let mut event_start = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
-                error!(prefill_url, error = ?e, "Failed to read prefill body");
+                rate_limited_log!(ERROR, prefill_url, error = ?e, "Failed to read prefill body");
                 error::create_error(
                     Self::worker_transport_status(&e),
                     "prefill_read_failed",
@@ -1187,7 +1188,7 @@ impl PDRouter {
             while !message.is_char_boundary(log_end) {
                 log_end -= 1;
             }
-            warn!(side, %status, error = &message[..log_end], "PD worker returned an error payload");
+            rate_limited_log!(WARN, side, %status, error = &message[..log_end], "PD worker returned an error payload");
             return Err(error::create_error(
                 status,
                 format!("{side}_response_error"),
@@ -1238,7 +1239,7 @@ impl PDRouter {
                 if is_sse {
                     output_ready |= Self::decode_event_ready(&prefix[event_start..])?;
                     if !output_ready {
-                        warn!("Decode stream ended before any output");
+                        rate_limited_log!(WARN, "Decode stream ended before any output");
                         return Err(error::bad_gateway(
                             "decode_stream_empty",
                             "Decode stream ended before any output",
@@ -1248,7 +1249,7 @@ impl PDRouter {
                 return Ok(tokio_stream::iter(chunks.into_iter().map(Ok)).boxed());
             };
             let chunk = chunk.map_err(|e| {
-                error!(error = ?e, "Decode stream failed before forwarding");
+                rate_limited_log!(ERROR, error = ?e, "Decode stream failed before forwarding");
                 error::create_error(
                     Self::worker_transport_status(&e),
                     "decode_read_failed",
@@ -1294,7 +1295,7 @@ impl PDRouter {
             return Ok(false);
         }
         let payload: Value = serde_json::from_str(&data).map_err(|e| {
-            warn!(error = %e, "Decode returned an invalid SSE event");
+            rate_limited_log!(WARN, error = %e, "Decode returned an invalid SSE event");
             error::bad_gateway("decode_stream_invalid", e.to_string())
         })?;
         Self::check_worker_payload(&payload, "decode")?;
