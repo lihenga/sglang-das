@@ -1,7 +1,11 @@
 //! Logging infrastructure with non-blocking file I/O.
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
+use parking_lot::Mutex;
 use tracing::Level;
 use tracing_appender::{
     non_blocking::WorkerGuard,
@@ -18,6 +22,48 @@ use crate::config::TraceConfig;
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const TIME_FORMAT_MS: &str = "%Y-%m-%d %H:%M:%S%.3f";
 const DEFAULT_LOG_TARGET: &str = "smg";
+
+pub(crate) struct LogRateLimiter {
+    state: Mutex<(Option<Instant>, u64)>,
+}
+
+impl LogRateLimiter {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: Mutex::new((None, 0)),
+        }
+    }
+
+    pub(crate) fn check(&self) -> Option<u64> {
+        self.check_at(Instant::now())
+    }
+
+    fn check_at(&self, now: Instant) -> Option<u64> {
+        let mut state = self.state.lock();
+        if state
+            .0
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(30))
+        {
+            state.1 = state.1.saturating_add(1);
+            return None;
+        }
+        state.0 = Some(now);
+        Some(std::mem::take(&mut state.1))
+    }
+}
+
+// One process-wide limiter per call site; never throttle the surrounding error handling.
+macro_rules! rate_limited_log {
+    ($level:ident, $($fields:tt)*) => {{
+        static LIMITER: $crate::observability::logging::LogRateLimiter =
+            $crate::observability::logging::LogRateLimiter::new();
+        if let Some(suppressed_logs) = LIMITER.check() {
+            tracing::event!(tracing::Level::$level, suppressed_logs, $($fields)*);
+        }
+    }};
+}
+
+pub(crate) use rate_limited_log;
 
 fn get_time_format() -> &'static str {
     match std::env::var("SGLANG_LOG_MS") {
@@ -180,5 +226,89 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     LogGuard {
         _file_guard: file_guard,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Barrier},
+    };
+
+    use super::*;
+
+    #[test]
+    fn limiter_emits_first_event_and_counts_suppressed_events_per_window() {
+        let limiter = LogRateLimiter::new();
+        let now = Instant::now();
+        assert_eq!(limiter.check_at(now), Some(0));
+        assert_eq!(limiter.check_at(now), None);
+        assert_eq!(limiter.check_at(now + Duration::from_secs(29)), None);
+        assert_eq!(limiter.check_at(now + Duration::from_secs(30)), Some(2));
+        assert_eq!(limiter.check_at(now + Duration::from_secs(59)), None);
+        assert_eq!(limiter.check_at(now + Duration::from_secs(60)), Some(1));
+    }
+
+    #[test]
+    fn concurrent_failures_share_the_same_budget() {
+        let limiter = Arc::new(LogRateLimiter::new());
+        let barrier = Arc::new(Barrier::new(16));
+        let now = Instant::now();
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let limiter = limiter.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    limiter.check_at(now)
+                })
+            })
+            .collect();
+        let emitted = threads
+            .into_iter()
+            .filter_map(|thread| thread.join().unwrap())
+            .count();
+        assert_eq!(emitted, 1);
+        assert_eq!(limiter.check_at(now + Duration::from_secs(30)), Some(15));
+    }
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn macro_limits_each_call_site_across_different_requests_and_preserves_level() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for request in 0..20 {
+                rate_limited_log!(WARN, request, "limited warning");
+                rate_limited_log!(ERROR, request, "limited error");
+            }
+        });
+        let bytes = output.lock();
+        let logs = String::from_utf8_lossy(&bytes);
+        assert_eq!(logs.lines().count(), 2, "{logs}");
+        assert!(logs.contains("WARN"));
+        assert!(logs.contains("ERROR"));
+        assert!(logs.contains("limited warning"));
+        assert!(logs.contains("limited error"));
+        assert_eq!(logs.matches("suppressed_logs=0").count(), 2, "{logs}");
     }
 }

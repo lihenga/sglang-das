@@ -30,11 +30,12 @@ use std::{
     task::{Context, Poll},
 };
 
+use crate::{
+    core::Worker,
+    observability::{logging::rate_limited_log, metrics::Metrics},
+};
 use bytes::Bytes;
 use futures_util::Stream;
-use tracing::error;
-
-use crate::{core::Worker, observability::metrics::Metrics};
 
 /// Retain a small probe for normal events and a bounded error line for logging.
 #[derive(Default)]
@@ -217,13 +218,18 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
             Poll::Ready(Some(Ok(b))) => {
                 if let Some(metrics) = self.metrics.as_mut() {
                     if let Some(event) = metrics.scanner.feed(&b) {
-                        error!(worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
+                        rate_limited_log!(ERROR, worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
                     }
                 }
                 Poll::Ready(Some(Ok(b)))
             }
             Poll::Ready(Some(Err(e))) => {
-                error!("Upstream stream error from worker {}: {}", self.log_url, e);
+                rate_limited_log!(
+                    ERROR,
+                    "Upstream stream error from worker {}: {}",
+                    self.log_url,
+                    e
+                );
                 self.terminal = Terminal::Errored;
                 Poll::Ready(Some(Err(e)))
             }
@@ -242,7 +248,7 @@ impl<E> Drop for BreakerTrackedStream<E> {
     fn drop(&mut self) {
         if let Some(metrics) = self.metrics.as_mut() {
             if let Some(event) = metrics.scanner.take_error() {
-                error!(worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
+                rate_limited_log!(ERROR, worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
             }
         }
         match self.terminal {
@@ -526,6 +532,36 @@ mod tests {
         assert!(tracked.next().await.unwrap().is_err());
         assert_outcome(&drop_and_render_metrics(tracked), "upstream_error");
         assert_eq!(breaker_counters(&w), (0, 1));
+    }
+
+    #[test]
+    fn repeated_failures_still_record_every_stream_and_breaker_outcome() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let w = worker();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                for _ in 0..20 {
+                    let inner = futures_util::stream::iter(vec![Err(TestErr("reset"))]);
+                    let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+                        .with_metrics("pd", "test-model");
+                    assert!(tracked.next().await.unwrap().is_err());
+                }
+            })
+        });
+        let metrics = handle.render();
+        let outcomes: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("smg_router_stream_outcome_total{"))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "{metrics}");
+        assert!(outcomes[0].contains("outcome=\"upstream_error\""));
+        assert!(outcomes[0].ends_with(" 20"));
+        assert_eq!(breaker_counters(&w), (0, 20));
     }
 
     #[test]

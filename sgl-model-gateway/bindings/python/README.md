@@ -83,6 +83,11 @@ prefill as its root cause. No `expired` or `aborted` classifications are added.
 Series appear when an observed stream ends or an early decode error is detected.
 Error events are logged with their worker URL; each logged SSE line is capped
 at 4 KiB. Worker error counters only record the side that actually failed.
+Stream failure and PD cancellation logs are limited to one event per call site
+per router process every 30 seconds. The first event is logged immediately;
+the next emitted event includes `suppressed_logs`, the number skipped since the
+previous event. This limit is shared across requests and workers at that call
+site. It does not sample metrics, breaker outcomes, or request cancellation.
 
 ```promql
 sum by (outcome) (rate(smg_router_stream_outcome_total[5m]))
