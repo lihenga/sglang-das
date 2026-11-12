@@ -606,7 +606,7 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record one final outcome of a committed 2xx HTTP stream.
+    /// Record one final outcome of an upstream 2xx HTTP stream.
     pub fn record_http_stream_outcome(
         backend_type: &'static str,
         model_id: &str,
