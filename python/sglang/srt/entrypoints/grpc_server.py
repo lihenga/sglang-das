@@ -76,7 +76,7 @@ def _add_metrics_routes(app, server_args=None):
         from sglang.srt.utils.auth import AuthLevel, decide_request_auth
 
         decision = decide_request_auth(
-            method="POST",
+            method=request.method,
             path=SNAPSHOT_PATH,
             authorization_header=request.headers.get("Authorization"),
             api_key=getattr(server_args, "api_key", None),
@@ -85,6 +85,8 @@ def _add_metrics_routes(app, server_args=None):
         )
         if not decision.allowed:
             return web.Response(status=decision.error_status_code)
+        if request.method in ("GET", "HEAD"):
+            return web.Response(status=204)
         try:
             payload = await request.json()
             if not isinstance(payload, dict):
@@ -95,6 +97,7 @@ def _add_metrics_routes(app, server_args=None):
         return web.Response(status=204)
 
     app.router.add_post(SNAPSHOT_PATH, snapshot_handler)
+    app.router.add_get(SNAPSHOT_PATH, snapshot_handler)
 
 
 def _check_communicator_results(results, action):
