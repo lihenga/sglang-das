@@ -105,6 +105,8 @@ enum Terminal {
     Active,
     /// Stream returned `None` or the caller marked it complete.
     Completed,
+    /// Caller recognized a server-side application error in the stream.
+    ApplicationError,
     /// Stream yielded an `Err` item.
     Errored,
 }
@@ -172,10 +174,13 @@ impl<E> BreakerTrackedStream<E> {
         }
     }
 
-    /// Record an application error recognized by the caller's SSE parser.
-    pub fn mark_error_event(&mut self) {
+    /// Keep application errors separate from transport errors in stream metrics.
+    pub fn mark_error_event(&mut self, worker_failed: bool) {
         if let Some(metrics) = self.metrics.as_mut() {
             metrics.error_event = true;
+        }
+        if worker_failed && self.terminal != Terminal::Errored {
+            self.terminal = Terminal::ApplicationError;
         }
     }
 
@@ -242,7 +247,9 @@ impl<E> Drop for BreakerTrackedStream<E> {
         }
         match self.terminal {
             Terminal::Completed => self.worker.circuit_breaker().record_success(),
-            Terminal::Errored => self.worker.circuit_breaker().record_failure(),
+            Terminal::Errored | Terminal::ApplicationError => {
+                self.worker.circuit_breaker().record_failure()
+            }
             // Client disconnected before we knew the worker's verdict.
             // Leaving the breaker untouched is the correct default — we
             // got a 200 header and some bytes; nothing said the worker
@@ -488,6 +495,35 @@ mod tests {
         let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
             .with_metrics("regular", "test-model");
         while tracked.next().await.is_some() {}
+        assert_outcome(&drop_and_render_metrics(tracked), "upstream_error");
+        assert_eq!(breaker_counters(&w), (0, 1));
+    }
+
+    #[test]
+    fn application_error_keeps_stream_classification_and_breaker_outcome() {
+        for worker_failed in [false, true] {
+            let w = worker();
+            let inner = futures_util::stream::pending::<Result<Bytes, TestErr>>();
+            let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+                .with_metrics("pd", "test-model");
+            tracked.mark_error_event(worker_failed);
+            tracked.mark_completed();
+            assert_outcome(&drop_and_render_metrics(tracked), "stream_error_event");
+            assert_eq!(
+                breaker_counters(&w),
+                (u64::from(!worker_failed), u64::from(worker_failed))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_error_outranks_recognized_application_error() {
+        let w = worker();
+        let inner = futures_util::stream::iter(vec![Err(TestErr("reset"))]);
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("pd", "test-model");
+        tracked.mark_error_event(true);
+        assert!(tracked.next().await.unwrap().is_err());
         assert_outcome(&drop_and_render_metrics(tracked), "upstream_error");
         assert_eq!(breaker_counters(&w), (0, 1));
     }
