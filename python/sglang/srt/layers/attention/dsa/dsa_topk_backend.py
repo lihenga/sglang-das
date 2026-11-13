@@ -170,6 +170,9 @@ class DSATopKBackend(Enum):
                     if batch_idx_list is not None
                     else attn_metadata.page_table_1
                 )
+                extra_args = {}
+                if self.is_lightop() and envs.SGLANG_DSA_HCU_PAGED_TOPK_COMPACT.get():
+                    extra_args["parallel_candidates"] = True
                 result = fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
@@ -177,6 +180,7 @@ class DSATopKBackend(Enum):
                     cu_seqlens_q=cu_seqlens_q_topk,
                     topk=topk,
                     row_starts=row_starts,
+                    **extra_args,
                 )
                 if self.is_lightop():
                     attn_metadata.lightop_kv_reuse.page_indices = result

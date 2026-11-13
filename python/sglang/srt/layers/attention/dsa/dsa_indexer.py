@@ -229,7 +229,19 @@ def _hcu_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: Optional[torch.Tensor],
     max_seq_len: int,
+    *,
+    group_size: int = 1,
 ) -> torch.Tensor:
+    if group_size == 3:
+        return lightop_attention.paged_mqa_logits_persisten(
+            q.unsqueeze(1),
+            kv_cache,
+            weights,
+            seqlens,
+            block_tables,
+            max_seq_len,
+            group_size=3, clean_logits=False,
+        )
     return lightop_attention.paged_mqa_logits(
         q.unsqueeze(1),
         kv_cache,
@@ -1443,6 +1455,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 ),
             )
             if sparse_route is None:
+                use_grouped_mqa = (
+                    envs.SGLANG_DSA_HCU_TARGET_VERIFY_GROUPED_MQA.get()
+                    and use_int8_index_cache
+                    and self.hcu_arch_name == "gfx936"
+                    and self.sm_count == 80
+                    and (self.n_heads, self.head_dim) == (32, 128)
+                    and forward_mode.is_target_verify()
+                    and forward_batch.batch_size == 2
+                    and paged_row_count == 18
+                    and metadata.get_dsa_extend_len_cpu() in ([9, 9], [1] * 18)
+                    and paged_schedule_metadata is None
+                    and hasattr(lightop_attention, "paged_mqa_logits_persisten")
+                )
                 logits = _hcu_paged_mqa_logits(
                     paged_q,
                     kv_cache,
@@ -1451,6 +1476,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     paged_block_tables,
                     paged_schedule_metadata,
                     max_seq_len,
+                    group_size=3 if use_grouped_mqa else 1,
                 )
             elif sparse_route.group_size == 1:
                 from lightop.gemmopt import page_mqa_logits_sparse_mask
