@@ -3503,7 +3503,7 @@ class DeepseekSparseAttnBackend(
                 is_fp8_kvcache=True,
             )
 
-        if needs_repad:
+        if needs_repad and num_valid != num_total:
             full_o = o.new_zeros((num_total, *o.shape[1:]))
             full_o[:num_valid] = o
             o = full_o

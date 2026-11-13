@@ -4,6 +4,7 @@ Normalization has a separate opt-in native-rounding adapter. RoPE/cache-store
 and shared-expert physical weight remapping remain independent.
 """
 import logging
+import os
 import inspect
 from typing import Callable
 
@@ -366,6 +367,7 @@ def install_mla_clamp_smooth(config):
     from lightop import op
     import tokenflow.models.sparkv1.layers.attention as attention
     from sglang.srt.layers.cp.utils import is_cp_v2_active
+    from sglang.srt.runtime_context import get_parallel
 
     cls = attention.SparkV1AttentionMLA
     original = cls.forward_absorb_prepare
@@ -428,9 +430,18 @@ def install_mla_clamp_smooth(config):
 
     def forward(self, *args, **kwargs):
         batch = kwargs.get('forward_batch', args[2] if len(args) > 2 else None)
-        if (batch is None or getattr(self, 'cp_size', None) != 8
-                or not batch.forward_mode.is_extend_without_speculative()
-                or is_cp_v2_active(batch) or not enabled(config)):
+        prefill = (batch is not None and getattr(self, 'cp_size', None) == 8
+                   and batch.forward_mode.is_extend_without_speculative()
+                   and not is_cp_v2_active(batch))
+        decode = (batch is not None
+                  and os.getenv('SGLANG_DSA_HCU_FUSE_MLA_CLAMP_SMOOTH', '0') == '1'
+                  and get_parallel().attn_cp_size == 1
+                  and get_parallel().attn_tp_size == 1
+                  and not get_parallel().dcp_enabled
+                  and (batch.forward_mode.is_decode_or_idle()
+                       or batch.forward_mode.is_target_verify()
+                       or batch.forward_mode.is_draft_extend_v2()))
+        if not (prefill or decode) or not enabled(config):
             return original(self, *args, **kwargs)
         token = scope.set((self, {}))
         try:

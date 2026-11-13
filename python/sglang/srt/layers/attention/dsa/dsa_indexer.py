@@ -756,7 +756,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Keep K's original FP32 LayerNorm and BF16 Hadamard accumulation.
         key = norm.forward_native(key.view(tokens, 1, 128))
         key_rope = key[..., :self.rope_head_dim]
-        _, rotated_key = self._apply_indexer_rope(positions, key_rope, key_rope)
+        if (envs.SGLANG_DSA_HCU_FUSE_INDEXER_K_ROPE.get()
+                and positions.dtype == torch.int64):
+            rotated_key = torch.empty(key_rope.shape, dtype=key_rope.dtype,
+                                      device=key_rope.device)
+            op.rotary_embedding_deepseek_fuse(
+                positions, key_rope, None, 64, rope.cos_sin_cache,
+                rope.is_neox_style, round_bf16_products=True,
+                query_out=rotated_key,
+            )
+        else:
+            _, rotated_key = self._apply_indexer_rope(
+                positions, key_rope, key_rope
+            )
         self._update_rope_guarded(key_rope, rotated_key)
         key = rotate_activation(key)
         if not getattr(self, "_lightop_preprocess_logged", False):
