@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import requests
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
@@ -65,15 +66,17 @@ class TestMooncakeClientMetrics(unittest.TestCase):
         options = dict(config["filters"][name])
         options.pop("()")
         access_filter = UvicornAccessLogFilter(**options)
-        for path, status, visible in (
-            (SNAPSHOT_PATH, 204, False),
-            (SNAPSHOT_PATH + "?worker=1", 204, False),
-            (SNAPSHOT_PATH, 400, True),
-            (SNAPSHOT_PATH, 401, True),
-            (SNAPSHOT_PATH, 500, True),
-            (SNAPSHOT_PATH + "/other", 204, True),
-            ("/generate", 204, True),
-            ("/metrics", 200, True),
+        for method, path, status, visible in (
+            ("POST", SNAPSHOT_PATH, 204, False),
+            ("POST", SNAPSHOT_PATH + "?worker=1", 204, False),
+            ("POST", SNAPSHOT_PATH, 400, True),
+            ("POST", SNAPSHOT_PATH, 401, True),
+            ("POST", SNAPSHOT_PATH, 500, True),
+            ("POST", SNAPSHOT_PATH + "/other", 204, True),
+            ("POST", "/generate", 204, True),
+            ("POST", "/metrics", 200, True),
+            ("GET", SNAPSHOT_PATH, 204, False),
+            ("GET", SNAPSHOT_PATH, 401, True),
         ):
             with self.subTest(path=path, status=status):
                 record = logging.LogRecord(
@@ -82,7 +85,7 @@ class TestMooncakeClientMetrics(unittest.TestCase):
                     __file__,
                     0,
                     '%s - "%s %s HTTP/%s" %d',
-                    ("127.0.0.1:1234", "POST", path, "1.1", status),
+                    ("127.0.0.1:1234", method, path, "1.1", status),
                     None,
                 )
                 self.assertEqual(access_filter.filter(record), visible)
@@ -192,6 +195,10 @@ class TestMooncakeClientMetrics(unittest.TestCase):
         app = FastAPI()
         add_prometheus_middleware(app)
         with TestClient(app) as client:
+            self.assertEqual(client.get(SNAPSHOT_PATH).status_code, 204)
+            self.assertEqual(
+                list(Path(self.directory.name).glob("mooncake_clients/*.json")), []
+            )
             self.assertEqual(
                 client.post(SNAPSHOT_PATH, json=payload()).status_code, 204
             )
@@ -216,9 +223,10 @@ class TestMooncakeClientMetrics(unittest.TestCase):
                 store, "http://127.0.0.1:1234", args, 7
             )
         reporter._stopped.wait = Mock(side_effect=[False, True])
-        reporter._stopped.is_set = Mock(side_effect=[False, False, True])
+        reporter._stopped.is_set = Mock(side_effect=[False, False, False, True])
         session = Mock()
         session.headers = {}
+        session.get.return_value = SimpleNamespace(status_code=204)
         session.post.side_effect = [
             OSError("not ready"),
             SimpleNamespace(status_code=204),
@@ -239,6 +247,168 @@ class TestMooncakeClientMetrics(unittest.TestCase):
         reporter.close()
         reporter._thread.join.assert_called_once()
 
+    def make_reporter(self):
+        store = Mock()
+        store.get_client_metrics.return_value = METRICS
+        args = SimpleNamespace(api_key="test-key", ssl_verify=lambda: "ca.pem")
+        with patch("threading.Thread"):
+            reporter = MooncakeClientMetricsReporter(
+                store, "https://127.0.0.1:1234", args, 7
+            )
+        reporter._stopped.wait = Mock(return_value=False)
+        session = Mock()
+        session.headers = {}
+        session.get.return_value = SimpleNamespace(status_code=204)
+        return reporter, store, session
+
+    def run_reports(self, reporter, session, results):
+        results = iter(results)
+
+        def post(*args, **kwargs):
+            result, last = next(results)
+            if last:
+                reporter._stopped.set()
+            if isinstance(result, Exception):
+                raise result
+            return SimpleNamespace(status_code=result)
+
+        session.post.side_effect = post
+        with patch("requests.Session") as create_session:
+            create_session.return_value.__enter__.return_value = session
+            reporter._run()
+
+    def test_reporter_waits_for_receiver_without_collecting_or_posting(self):
+        reporter, store, session = self.make_reporter()
+
+        def get(*args, **kwargs):
+            store.get_client_metrics.assert_not_called()
+            session.post.assert_not_called()
+            if session.get.call_count <= 2:
+                raise requests.ConnectionError("connection refused")
+            if session.get.call_count == 3:
+                raise requests.Timeout("lost readiness response")
+            return SimpleNamespace(status_code=204)
+
+        session.get.side_effect = get
+        with patch("sglang.srt.observability.mooncake_client_metrics.logger") as log:
+            self.run_reports(reporter, session, [(204, True)])
+        self.assertEqual(session.get.call_count, 4)
+        self.assertEqual(session.post.call_count, 1)
+        store.get_client_metrics.assert_called_once()
+        self.assertEqual(
+            [call.args[0] for call in reporter._stopped.wait.call_args_list],
+            [1, 1, 1, 5],
+        )
+        self.assertEqual(session.get.call_args.kwargs["verify"], "ca.pem")
+        self.assertFalse(session.get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(session.headers["Authorization"], "Bearer test-key")
+        log.warning.assert_not_called()
+        log.info.assert_called_once()
+
+    def test_reporter_can_stop_while_waiting_for_receiver(self):
+        reporter, store, session = self.make_reporter()
+        session.get.side_effect = requests.ConnectionError("connection refused")
+        reporter._stopped.wait.side_effect = lambda _: reporter._stopped.set() or True
+        with patch("requests.Session") as create_session:
+            create_session.return_value.__enter__.return_value = session
+            reporter._run()
+        store.get_client_metrics.assert_not_called()
+        session.post.assert_not_called()
+        reporter.close()
+        reporter._thread.join.assert_called_once()
+
+    def test_startup_wait_warns_after_grace_and_keeps_retrying(self):
+        reporter, store, session = self.make_reporter()
+        session.get.side_effect = [
+            *[requests.ConnectionError("connection refused") for _ in range(7)],
+            SimpleNamespace(status_code=204),
+        ]
+        with (
+            patch(
+                "sglang.srt.observability.mooncake_client_metrics.time.monotonic",
+                side_effect=[0, 0, 299, 300, 301, 359, 360, 361],
+            ),
+            patch("sglang.srt.observability.mooncake_client_metrics.logger") as log,
+        ):
+            self.assertTrue(reporter._wait_for_receiver(session))
+        self.assertEqual(log.warning.call_count, 2)
+        self.assertEqual(session.get.call_count, 8)
+        store.get_client_metrics.assert_not_called()
+        session.post.assert_not_called()
+
+    def test_auth_route_and_tls_errors_are_not_hidden_by_startup_grace(self):
+        for result in (
+            SimpleNamespace(status_code=401),
+            SimpleNamespace(status_code=404),
+            requests.exceptions.SSLError("bad certificate"),
+        ):
+            with self.subTest(result=result):
+                reporter, _, session = self.make_reporter()
+                session.get.side_effect = [
+                    result,
+                    result,
+                    SimpleNamespace(status_code=204),
+                ]
+                with (
+                    patch(
+                        "sglang.srt.observability.mooncake_client_metrics.time.monotonic",
+                        side_effect=[0, 0, 1],
+                    ),
+                    patch(
+                        "sglang.srt.observability.mooncake_client_metrics.logger"
+                    ) as log,
+                ):
+                    self.assertTrue(reporter._wait_for_receiver(session))
+                log.warning.assert_called_once()
+                self.assertEqual(
+                    [call.args[0] for call in reporter._stopped.wait.call_args_list],
+                    [5, 5],
+                )
+
+    def test_runtime_refusals_do_not_return_to_startup_wait(self):
+        reporter, _, session = self.make_reporter()
+        with patch("sglang.srt.observability.mooncake_client_metrics.logger") as log:
+            self.run_reports(
+                reporter,
+                session,
+                [
+                    (204, False),
+                    (requests.ConnectionError("connection refused"), False),
+                    (requests.ConnectionError("connection refused"), False),
+                    (204, True),
+                ],
+            )
+        session.get.assert_called_once()
+        self.assertEqual(session.post.call_count, 4)
+        log.warning.assert_called_once()
+        self.assertEqual(log.info.call_count, 2)
+        self.assertEqual(log.info.call_args.args[1], 2)
+        self.assertTrue(
+            all(call.args == (5,) for call in reporter._stopped.wait.call_args_list)
+        )
+
+    def test_runtime_warning_frequency_and_success_reset_are_preserved(self):
+        for outcomes, expected in (
+            ([requests.ConnectionError("refused")] * 24, 3),
+            ([requests.ConnectionError("refused")] * 12 + [204, 500], 3),
+        ):
+            with self.subTest(expected=expected, attempts=len(outcomes)):
+                reporter, _, session = self.make_reporter()
+                with patch(
+                    "sglang.srt.observability.mooncake_client_metrics.logger"
+                ) as log:
+                    self.run_reports(
+                        reporter,
+                        session,
+                        [
+                            (result, i == len(outcomes) - 1)
+                            for i, result in enumerate(outcomes)
+                        ],
+                    )
+                self.assertEqual(log.warning.call_count, expected)
+                session.get.assert_called_once()
+                self.assertEqual(session.post.call_count, len(outcomes))
+
     def test_http_snapshot_route_uses_existing_api_key_auth(self):
         from fastapi import FastAPI
         from starlette.testclient import TestClient
@@ -250,6 +420,13 @@ class TestMooncakeClientMetrics(unittest.TestCase):
         add_prometheus_middleware(app)
         add_api_key_middleware(app, api_key="test-key", admin_api_key=None)
         with TestClient(app) as client:
+            self.assertEqual(client.get(SNAPSHOT_PATH).status_code, 401)
+            self.assertEqual(
+                client.get(
+                    SNAPSHOT_PATH, headers={"Authorization": "Bearer test-key"}
+                ).status_code,
+                204,
+            )
             self.assertEqual(
                 client.post(SNAPSHOT_PATH, json=payload()).status_code, 401
             )
@@ -298,6 +475,15 @@ class TestMooncakeClientMetrics(unittest.TestCase):
             app = web.Application(client_max_size=MAX_SNAPSHOT_BYTES)
             _add_metrics_routes(app, SimpleNamespace(api_key="key", admin_api_key=None))
             async with TestClient(TestServer(app)) as client:
+                response = await client.get(SNAPSHOT_PATH)
+                self.assertEqual(response.status, 401)
+                response = await client.get(
+                    SNAPSHOT_PATH, headers={"Authorization": "Bearer key"}
+                )
+                self.assertEqual(response.status, 204)
+                self.assertEqual(
+                    list(Path(self.directory.name).glob("mooncake_clients/*.json")), []
+                )
                 response = await client.post(SNAPSHOT_PATH, json=payload())
                 self.assertEqual(response.status, 401)
                 response = await client.post(

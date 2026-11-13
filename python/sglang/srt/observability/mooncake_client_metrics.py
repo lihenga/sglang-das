@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_PATH = "/internal/mooncake_client_metrics"
 REPORT_INTERVAL = 5
 REPORT_TIMEOUT = 30
+RECEIVER_CHECK_INTERVAL = 1
+RECEIVER_STARTUP_GRACE = 300
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 CLIENT_LABELS = ("mooncake_client", "mooncake_host", "mooncake_pid", "mooncake_rank")
 
@@ -156,6 +158,8 @@ def add_snapshot_route(app):
     from starlette.responses import Response
 
     async def receive(request: Request):
+        if request.method in ("GET", "HEAD"):
+            return Response(status_code=204)
         body = bytearray()
         async for chunk in request.stream():
             body.extend(chunk)
@@ -170,7 +174,7 @@ def add_snapshot_route(app):
             return Response(status_code=400)
         return Response(status_code=204)
 
-    app.add_route(SNAPSHOT_PATH, receive, methods=["POST"])
+    app.add_route(SNAPSHOT_PATH, receive, methods=["GET", "POST"])
 
 
 class MooncakeClientMetricsReporter:
@@ -192,6 +196,41 @@ class MooncakeClientMetricsReporter:
         )
         self._thread.start()
 
+    def _wait_for_receiver(self, session):
+        import requests
+
+        deadline = time.monotonic() + RECEIVER_STARTUP_GRACE
+        next_warning = 0.0
+        while not self._stopped.is_set():
+            try:
+                response = session.get(
+                    self._url,
+                    timeout=(2, 5),
+                    verify=self._verify,
+                    allow_redirects=False,
+                )
+                if response.status_code == 204:
+                    return True
+                raise RuntimeError(f"HTTP {response.status_code}")
+            except Exception as error:
+                # A receiver cannot listen until scheduler initialization finishes.
+                starting = isinstance(
+                    error, (requests.ConnectionError, requests.Timeout)
+                ) and not isinstance(error, requests.exceptions.SSLError)
+                now = time.monotonic()
+                if (not starting or now >= deadline) and now >= next_warning:
+                    logger.warning(
+                        "Waiting for SGLang HTTP metrics receiver %s: %s",
+                        self._url,
+                        error,
+                    )
+                    next_warning = now + 12 * REPORT_INTERVAL
+                if self._stopped.wait(
+                    RECEIVER_CHECK_INTERVAL if starting else REPORT_INTERVAL
+                ):
+                    return False
+        return False
+
     def _run(self):
         import requests
 
@@ -199,6 +238,8 @@ class MooncakeClientMetricsReporter:
             session.trust_env = False
             if self._api_key:
                 session.headers["Authorization"] = f"Bearer {self._api_key}"
+            if not self._wait_for_receiver(session):
+                return
             failures = 0
             sequence = 0
             while not self._stopped.is_set():
@@ -219,6 +260,13 @@ class MooncakeClientMetricsReporter:
                     )
                     if response.status_code != 204:
                         raise RuntimeError(f"HTTP {response.status_code}")
+                    if failures:
+                        logger.info(
+                            "Mooncake client metrics reporting recovered after %d failures",
+                            failures,
+                        )
+                    elif sequence == 1:
+                        logger.info("Mooncake client metrics reporting started")
                     failures = 0
                 except Exception as error:
                     failures += 1
