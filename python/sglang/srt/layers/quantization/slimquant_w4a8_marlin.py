@@ -757,6 +757,23 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                 layer.w2_weight_scale.data, requires_grad=False
             )
 
+        if (self.use_deepep and not _use_lightop_w4a8_marlin_moe
+                and os.getenv("SGLANG_SPARK_W4A8_LL_COMBINED_PHASES", "0") == "1"
+                and tuple(layer.w13_weight.shape) == (16, 2048, 3072)
+                and tuple(layer.w2_weight.shape) == (16, 6144, 512)):
+            inners = getattr(layer.dispatcher, "_inners", ())
+            if len(inners) != 1:
+                raise RuntimeError("Combined W4A8 phases require one dispatcher")
+            impl = inners[0]._low_latency_dispatcher
+            if (impl.group.size() != 16 or impl.num_experts != 256
+                    or impl.num_local_experts != 16 or impl.hidden_size != 6144
+                    or impl.router_topk != 14
+                    or impl.num_max_dispatch_tokens_per_rank != 32
+                    or impl.overlap_args is not None):
+                raise RuntimeError("Unsupported combined W4A8 phase configuration")
+            impl.return_recv_hook = False
+            logger.info("Enabled combined DeepEP phases for target W4A8 EP16")
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
