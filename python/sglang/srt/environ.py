@@ -505,6 +505,7 @@ class Envs:
     # Window the draft KV pool: sliding draft layers (SWA 512) get a per-req
     # ring sub-pool instead of full-length storage, freeing ~2 GiB/card that
     # is credited back to the target KV budget. Rollback: unset (= full pool).
+    SGLANG_HCU_DSPARK_SWA_RING_GPU_REFRESH = EnvBool(False)
     SGLANG_DSPARK_SWA_KV_POOL = EnvBool(False)
     # Ring slots per request for the windowed draft pool, 0 = derive from the
     # draft SWA window (2x window, page-aligned).

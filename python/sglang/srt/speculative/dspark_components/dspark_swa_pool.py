@@ -241,6 +241,29 @@ def fill_dspark_swa_ring_for_draft_forward(
     ring = draft_model_runner.dspark_swa_ring
     req_to_token = draft_model_runner.req_to_token_pool.req_to_token
     bs = req_pool_indices.shape[0]
+    if (
+        envs.SGLANG_HCU_DSPARK_SWA_RING_GPU_REFRESH.get()
+        and req_pool_indices.is_cuda and prefix_lens.is_cuda
+        and mapping.is_contiguous() and mapping.dtype == torch.int64
+        and req_to_token.dtype == torch.int32
+        and req_pool_indices.dtype in (torch.int32, torch.int64)
+        and prefix_lens.dtype in (torch.int32, torch.int64)
+        and 0 < bs <= 2 and block_size == 8
+        and (draft_positions is None or (
+            draft_positions.dtype == torch.int64
+            and draft_positions.numel() == bs * block_size
+            and draft_cache_locs.dtype in (torch.int32, torch.int64)
+        ))
+    ):
+        from lightop.kvcache import fill_swa_ring_mapping
+        fill_swa_ring_mapping(
+            mapping, req_pool_indices, prefix_lens, req_to_token,
+            draft_positions, draft_cache_locs, window, ring, block_size,
+        )
+        if not getattr(pool, "_gpu_ring_refresh_logged", False):
+            logger.info("DSPARK Ring SWA GPU mapping refresh enabled")
+            pool._gpu_ring_refresh_logged = True
+        return
     if draft_positions is None:
         cols = torch.arange(block_size, device=req_to_token.device, dtype=torch.int64)
         pos_2d = prefix_lens[:bs].to(torch.int64).view(-1, 1) + cols
