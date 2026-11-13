@@ -3478,12 +3478,16 @@ class DeepseekSparseAttnBackend(
                 compact_indices,
                 **gather_kwargs,
             )
+            mla_options = {}
+            if envs.SGLANG_DSA_HCU_D_MLA_PACKED_RESCALE.get() and forward_mode.is_target_verify():
+                mla_options["packed_rescale"] = True
             o, _, _ = flash_mla_sparse_fwd(
                 q=q_input[:, 0],
                 kv=gathered_kv.view(-1, 1, self._lightop_decode_head_dim),
                 indices=compact_indices.unsqueeze(1),
                 sm_scale=sm_scale,
                 d_v=v_head_dim,
+                **mla_options,
             )
             o = o.unsqueeze(1)
         else:

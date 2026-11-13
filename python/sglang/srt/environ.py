@@ -1529,6 +1529,7 @@ class Envs:
     SGLANG_DSA_HCU_TARGET_VERIFY_GROUPED_MQA = EnvBool(False)
     SGLANG_DSA_HCU_PAGED_TOPK_COMPACT = EnvBool(False)
     SGLANG_DSA_HCU_FUSE_INDEXER_K_ROPE = EnvBool(False)
+    SGLANG_DSA_HCU_D_MLA_PACKED_RESCALE = EnvBool(False)
     # Opt-in BF16 VanillaMarkov projection/add; sampling behavior is unchanged.
     SGLANG_DSPARK_LIGHTOP_MARKOV = EnvBool(False)
     # Paired gfx938 LightOp sparse Page-MQA and mask-aware paged TopK.
