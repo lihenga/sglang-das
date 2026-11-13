@@ -30,36 +30,57 @@ use std::{
     task::{Context, Poll},
 };
 
+use crate::{
+    core::Worker,
+    observability::{logging::rate_limited_log, metrics::Metrics},
+};
 use bytes::Bytes;
 use futures_util::Stream;
-use tracing::error;
 
-use crate::{core::Worker, observability::metrics::Metrics};
-
-/// Only retain the prefix needed to recognize the engine's error envelope.
+/// Retain a small probe for normal events and a bounded error line for logging.
 #[derive(Default)]
 struct ErrorEventScanner {
     line_start: Vec<u8>,
     saw_error: bool,
+    error_logged: bool,
 }
 
 impl ErrorEventScanner {
-    fn feed(&mut self, chunk: &[u8]) {
-        if self.saw_error {
-            return;
+    fn feed(&mut self, chunk: &[u8]) -> Option<String> {
+        if self.error_logged {
+            return None;
         }
         // shortcut: inspect at most 32 bytes per line for the engine's first-key
         // error envelope; use a streaming parser if other SSE formats are needed.
         const LINE_PROBE: usize = 32;
-        for (i, segment) in chunk.split(|&b| b == b'\n').enumerate() {
-            if i > 0 {
-                self.saw_error |= Self::is_error_line(&self.line_start);
+        const ERROR_LOG_LIMIT: usize = 4096;
+        for segment in chunk.split_inclusive(|&b| b == b'\n') {
+            let probe_len = segment
+                .len()
+                .min(LINE_PROBE.saturating_sub(self.line_start.len()));
+            self.line_start.extend_from_slice(&segment[..probe_len]);
+            self.saw_error |= Self::is_error_line(&self.line_start);
+            if self.saw_error {
+                let rest = &segment[probe_len..];
+                let room = ERROR_LOG_LIMIT - self.line_start.len();
+                self.line_start
+                    .extend_from_slice(&rest[..rest.len().min(room)]);
+                if segment.ends_with(b"\n") || self.line_start.len() == ERROR_LOG_LIMIT {
+                    return self.take_error();
+                }
+            } else if segment.ends_with(b"\n") {
                 self.line_start.clear();
             }
-            let room = LINE_PROBE - self.line_start.len();
-            self.line_start
-                .extend_from_slice(&segment[..segment.len().min(room)]);
-            self.saw_error |= Self::is_error_line(&self.line_start);
+        }
+        None
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        if self.saw_error && !self.error_logged {
+            self.error_logged = true;
+            Some(String::from_utf8_lossy(&self.line_start).into_owned())
+        } else {
+            None
         }
     }
 
@@ -76,6 +97,7 @@ struct StreamMetrics {
     backend_type: &'static str,
     model: String,
     scanner: ErrorEventScanner,
+    error_event: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +106,8 @@ enum Terminal {
     Active,
     /// Stream returned `None` or the caller marked it complete.
     Completed,
+    /// Caller recognized a server-side application error in the stream.
+    ApplicationError,
     /// Stream yielded an `Err` item.
     Errored,
 }
@@ -130,6 +154,7 @@ impl<E> BreakerTrackedStream<E> {
             backend_type,
             model: model.to_owned(),
             scanner: ErrorEventScanner::default(),
+            error_event: false,
         });
         self
     }
@@ -137,12 +162,26 @@ impl<E> BreakerTrackedStream<E> {
     fn stream_outcome(&self) -> &'static str {
         if self.terminal == Terminal::Errored {
             "upstream_error"
-        } else if self.metrics.as_ref().is_some_and(|m| m.scanner.saw_error) {
+        } else if self
+            .metrics
+            .as_ref()
+            .is_some_and(|m| m.error_event || m.scanner.saw_error)
+        {
             "stream_error_event"
         } else if self.terminal == Terminal::Active {
             "client_disconnect"
         } else {
             "ok"
+        }
+    }
+
+    /// Keep application errors separate from transport errors in stream metrics.
+    pub fn mark_error_event(&mut self, worker_failed: bool) {
+        if let Some(metrics) = self.metrics.as_mut() {
+            metrics.error_event = true;
+        }
+        if worker_failed && self.terminal != Terminal::Errored {
+            self.terminal = Terminal::ApplicationError;
         }
     }
 
@@ -178,12 +217,19 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(b))) => {
                 if let Some(metrics) = self.metrics.as_mut() {
-                    metrics.scanner.feed(&b);
+                    if let Some(event) = metrics.scanner.feed(&b) {
+                        rate_limited_log!(ERROR, worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
+                    }
                 }
                 Poll::Ready(Some(Ok(b)))
             }
             Poll::Ready(Some(Err(e))) => {
-                error!("Upstream stream error from worker {}: {}", self.log_url, e);
+                rate_limited_log!(
+                    ERROR,
+                    "Upstream stream error from worker {}: {}",
+                    self.log_url,
+                    e
+                );
                 self.terminal = Terminal::Errored;
                 Poll::Ready(Some(Err(e)))
             }
@@ -200,9 +246,16 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
 
 impl<E> Drop for BreakerTrackedStream<E> {
     fn drop(&mut self) {
+        if let Some(metrics) = self.metrics.as_mut() {
+            if let Some(event) = metrics.scanner.take_error() {
+                rate_limited_log!(ERROR, worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
+            }
+        }
         match self.terminal {
             Terminal::Completed => self.worker.circuit_breaker().record_success(),
-            Terminal::Errored => self.worker.circuit_breaker().record_failure(),
+            Terminal::Errored | Terminal::ApplicationError => {
+                self.worker.circuit_breaker().record_failure()
+            }
             // Client disconnected before we knew the worker's verdict.
             // Leaving the breaker untouched is the correct default — we
             // got a 200 header and some bytes; nothing said the worker
@@ -372,25 +425,41 @@ mod tests {
     #[test]
     fn scanner_handles_chunk_boundaries_without_matching_content() {
         let mut scanner = ErrorEventScanner::default();
-        scanner.feed(b"data: {\"choices\":[{\"content\":\"data: {\\\"error\\\"\"}]}\n\n");
+        assert!(scanner
+            .feed(b"data: {\"choices\":[{\"content\":\"data: {\\\"error\\\"\"}]}\n\n")
+            .is_none());
         assert!(!scanner.saw_error);
-        scanner.feed(b"data:{ \"err");
-        scanner.feed(b"or\":{\"code\":503}}\n\n");
+        assert!(scanner.feed(b"data:{ \"err").is_none());
+        assert_eq!(
+            scanner
+                .feed(b"or\":{\"message\":\"KV handshake failed\",\"code\":503}}\n\n")
+                .unwrap(),
+            "data:{ \"error\":{\"message\":\"KV handshake failed\",\"code\":503}}\n"
+        );
         assert!(scanner.saw_error);
+        assert!(scanner.take_error().is_none());
 
         let mut scanner = ErrorEventScanner::default();
-        scanner.feed(&vec![b'x'; 1024 * 1024]);
+        assert!(scanner.feed(&vec![b'x'; 1024 * 1024]).is_none());
         assert_eq!(scanner.line_start.len(), 32);
         assert!(!scanner.saw_error);
+
+        let mut scanner = ErrorEventScanner::default();
+        let mut large_error = b"data: {\"error\":\"".to_vec();
+        large_error.extend(vec![b'x'; 8192]);
+        assert_eq!(scanner.feed(&large_error).unwrap().len(), 4096);
+        assert!(scanner.feed(b"trailing error bytes\n").is_none());
     }
 
     #[test]
     fn scanner_recognizes_error_before_line_terminator() {
         let mut scanner = ErrorEventScanner::default();
-        scanner.feed(b"data: {\"err");
+        assert!(scanner.feed(b"data: {\"err").is_none());
         assert!(!scanner.saw_error);
-        scanner.feed(b"or\":{\"code\":503}}");
+        assert!(scanner.feed(b"or\":{\"code\":503}}").is_none());
         assert!(scanner.saw_error);
+        assert!(scanner.take_error().unwrap().contains("503"));
+        assert!(scanner.take_error().is_none());
     }
 
     #[tokio::test]
@@ -434,6 +503,65 @@ mod tests {
         while tracked.next().await.is_some() {}
         assert_outcome(&drop_and_render_metrics(tracked), "upstream_error");
         assert_eq!(breaker_counters(&w), (0, 1));
+    }
+
+    #[test]
+    fn application_error_keeps_stream_classification_and_breaker_outcome() {
+        for worker_failed in [false, true] {
+            let w = worker();
+            let inner = futures_util::stream::pending::<Result<Bytes, TestErr>>();
+            let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+                .with_metrics("pd", "test-model");
+            tracked.mark_error_event(worker_failed);
+            tracked.mark_completed();
+            assert_outcome(&drop_and_render_metrics(tracked), "stream_error_event");
+            assert_eq!(
+                breaker_counters(&w),
+                (u64::from(!worker_failed), u64::from(worker_failed))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_error_outranks_recognized_application_error() {
+        let w = worker();
+        let inner = futures_util::stream::iter(vec![Err(TestErr("reset"))]);
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("pd", "test-model");
+        tracked.mark_error_event(true);
+        assert!(tracked.next().await.unwrap().is_err());
+        assert_outcome(&drop_and_render_metrics(tracked), "upstream_error");
+        assert_eq!(breaker_counters(&w), (0, 1));
+    }
+
+    #[test]
+    fn repeated_failures_still_record_every_stream_and_breaker_outcome() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let w = worker();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                for _ in 0..20 {
+                    let inner = futures_util::stream::iter(vec![Err(TestErr("reset"))]);
+                    let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+                        .with_metrics("pd", "test-model");
+                    assert!(tracked.next().await.unwrap().is_err());
+                }
+            })
+        });
+        let metrics = handle.render();
+        let outcomes: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("smg_router_stream_outcome_total{"))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "{metrics}");
+        assert!(outcomes[0].contains("outcome=\"upstream_error\""));
+        assert!(outcomes[0].ends_with(" 20"));
+        assert_eq!(breaker_counters(&w), (0, 20));
     }
 
     #[test]

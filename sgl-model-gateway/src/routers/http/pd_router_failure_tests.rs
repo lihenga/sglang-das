@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use axum::{routing::post, Json, Router};
 use tokio::{
@@ -90,6 +93,17 @@ async fn dispatch(p: &str, d: &str, stream: bool) -> Response {
     )
     .await
     .expect("failed pair must not wait for the other worker")
+}
+
+async fn observe_metrics<F: Future>(future: F) -> (F::Output, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    tokio::pin!(future);
+    let output = std::future::poll_fn(|cx| {
+        metrics::with_local_recorder(&recorder, || future.as_mut().poll(cx))
+    })
+    .await;
+    (output, handle.render())
 }
 
 #[tokio::test]
@@ -258,6 +272,48 @@ async fn complete_json_error_is_detected_without_waiting_for_eof() {
 }
 
 #[tokio::test]
+async fn decode_json_error_cancels_prefill_without_waiting_for_body_end() {
+    for stream in [false, true] {
+        let (prefill, started, closed) = pending_peer().await;
+        let decode = serve(Router::new().route(
+            "/generate",
+            post(move || {
+                let started = started.clone();
+                async move {
+                    started.notified().await;
+                    let chunks = tokio_stream::iter([
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"{\"error\":{\"message\":\"KV handshake",
+                        )),
+                        Ok(bytes::Bytes::from_static(b" failed\",\"code\":503}}")),
+                    ])
+                    .chain(futures_util::stream::pending());
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        Body::from_stream(chunks),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let (response, metrics) =
+            observe_metrics(dispatch(&prefill.url, &decode.url, stream)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let worker_metrics: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("smg_worker_errors_total{"))
+            .collect();
+        assert_eq!(worker_metrics.len(), 1, "{metrics}");
+        assert!(worker_metrics[0].contains("worker_type=\"decode\""));
+        assert!(worker_metrics[0].ends_with(" 1"));
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn fragmented_prefill_sse_error_cancels_decode_before_eof() {
     let (decode, started, closed) = pending_peer().await;
     let prefill = serve(Router::new().route(
@@ -294,7 +350,63 @@ async fn fragmented_prefill_sse_error_cancels_decode_before_eof() {
 }
 
 #[tokio::test]
-async fn decode_error_after_role_event_cancels_prefill_before_first_token() {
+async fn decode_error_after_role_or_token_cancels_prefill_and_records_metrics_once() {
+    for first_event in [
+        b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n".as_slice(),
+        b"data: {\"text\":\"first token\"}\n\n".as_slice(),
+    ] {
+        let (prefill, started, closed) = pending_peer().await;
+        let decode = serve(Router::new().route(
+            "/generate",
+            post(move || {
+                let started = started.clone();
+                async move {
+                    started.notified().await;
+                    let chunks = tokio_stream::iter([
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(first_event)),
+                        Ok(bytes::Bytes::from_static(
+                            b"data: {\"error\":{\"message\":\"KV handshake failed\",\"code\":503}}\n\n",
+                        )),
+                    ])
+                    .chain(futures_util::stream::pending());
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(chunks),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let (response, metrics) = observe_metrics(dispatch(&prefill.url, &decode.url, true)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("KV handshake failed"));
+        let stream_metrics: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("smg_router_stream_outcome_total{"))
+            .collect();
+        assert_eq!(stream_metrics.len(), 1, "{metrics}");
+        assert!(stream_metrics[0].contains("outcome=\"stream_error_event\""));
+        assert!(stream_metrics[0].contains(&format!("worker_url=\"{}\"", decode.url)));
+        assert!(stream_metrics[0].ends_with(" 1"));
+        let worker_metrics: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("smg_worker_errors_total{"))
+            .collect();
+        assert_eq!(worker_metrics.len(), 1, "{metrics}");
+        assert!(worker_metrics[0].contains("worker_type=\"decode\""));
+        assert!(worker_metrics[0].ends_with(" 1"));
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn decode_disconnect_after_token_does_not_wait_for_prefill() {
     let (prefill, started, closed) = pending_peer().await;
     let decode = serve(Router::new().route(
         "/generate",
@@ -302,15 +414,13 @@ async fn decode_error_after_role_event_cancels_prefill_before_first_token() {
             let started = started.clone();
             async move {
                 started.notified().await;
-                let chunks = tokio_stream::iter([
-                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(
-                        b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
-                    )),
-                    Ok(bytes::Bytes::from_static(
-                        b"data: {\"error\":{\"message\":\"KV handshake failed\",\"code\":503}}\n\n",
-                    )),
-                ])
-                .chain(futures_util::stream::pending());
+                let chunks = tokio_stream::once(Ok(bytes::Bytes::from_static(
+                    b"data: {\"text\":\"token\"}\n\n",
+                )))
+                .chain(futures_util::stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Err(std::io::Error::other("decode connection reset"))
+                }));
                 (
                     [(CONTENT_TYPE, "text/event-stream")],
                     Body::from_stream(chunks),
@@ -319,14 +429,92 @@ async fn decode_error_after_role_event_cancels_prefill_before_first_token() {
         }),
     ))
     .await;
-    assert_eq!(
-        dispatch(&prefill.url, &decode.url, true).await.status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    let (response, metrics) = observe_metrics(dispatch(&prefill.url, &decode.url, true)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let lines: Vec<_> = metrics
+        .lines()
+        .filter(|line| line.starts_with("smg_router_stream_outcome_total{"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{metrics}");
+    assert!(lines[0].contains("outcome=\"upstream_error\""));
+    assert!(lines[0].ends_with(" 1"));
     tokio::time::timeout(Duration::from_secs(1), closed)
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn selection_failure_does_not_record_worker_errors() {
+    let router = create_test_pd_router();
+    let (response, metrics) = observe_metrics(router.execute_dual_dispatch(
+        None,
+        &json!({"text":"prompt", "stream":true}),
+        context(true),
+    ))
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!metrics.contains("smg_worker_errors_total{"), "{metrics}");
+    assert!(
+        !metrics.contains("smg_router_stream_outcome_total{"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("smg_router_request_errors_total{"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn streaming_error_closes_response_and_records_metrics_once() {
+    for (error_event, worker_failed) in [
+        ("data: {\"error\":{\"message\":\"KV handshake failed\",\"code\":503}}\n\n", true),
+        ("data: {\"text\":\"\",\"meta_info\":{\"finish_reason\":{\"type\":\"abort\",\"message\":\"KV handshake failed\",\"status_code\":503}}}\n\n", true),
+        ("data: {\"error\":{\"message\":\"invalid request\",\"code\":400}}\n\n", false),
+        ("data: {\"text\":\"\",\"meta_info\":{\"finish_reason\":{\"type\":\"abort\",\"message\":\"user abort\"}}}\n\n", false),
+    ] {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // Keep the recorder active for the spawned forwarding task as well.
+        metrics::with_local_recorder(&recorder, || runtime.block_on(async {
+            let router = create_test_pd_router();
+            let token = b"data: {\"text\":\"token\"}\n\n";
+            let split = error_event.len() / 2;
+            let chunks = [
+                bytes::Bytes::from_static(token),
+                bytes::Bytes::copy_from_slice(&error_event.as_bytes()[..split]),
+                bytes::Bytes::copy_from_slice(&error_event.as_bytes()[split..]),
+            ];
+            let stream = tokio_stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>))
+                .chain(futures_util::stream::pending());
+            let prefill = worker("http://prefill", WorkerType::Prefill { bootstrap_port: None });
+            let decode = worker("http://decode", WorkerType::Decode);
+            let response = router.create_streaming_response(
+                stream, StatusCode::OK, None, false, None,
+                prefill.clone(), decode.clone(), Some("test-model"),
+            );
+            let body = tokio::time::timeout(Duration::from_secs(1),
+                axum::body::to_bytes(response.into_body(), usize::MAX))
+                .await.expect("an error event must close the stream even if decode stalls").unwrap();
+            assert_eq!(body.as_ref(), [token.as_slice(), error_event.as_bytes()].concat());
+            let metrics = handle.render();
+            let stream_metrics: Vec<_> = metrics.lines().filter(|line| line.starts_with("smg_router_stream_outcome_total{")).collect();
+            assert_eq!(stream_metrics.len(), 1, "{metrics}");
+            assert!(stream_metrics[0].contains("outcome=\"stream_error_event\""));
+            assert!(stream_metrics[0].ends_with(" 1"));
+            assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+            assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+            assert_eq!(decode.circuit_breaker().total_successes(), u64::from(!worker_failed));
+            assert_eq!(decode.circuit_breaker().total_failures(), u64::from(worker_failed));
+            let worker_metrics: Vec<_> = metrics.lines().filter(|line| line.starts_with("smg_worker_errors_total{")).collect();
+            assert_eq!(worker_metrics.len(), usize::from(worker_failed), "{metrics}");
+            if worker_failed {
+                assert!(worker_metrics[0].contains("worker_type=\"decode\""));
+                assert!(worker_metrics[0].ends_with(" 1"));
+            }
+        }));
+    }
 }
 
 async fn broken_body() -> TestServer {
@@ -400,7 +588,7 @@ fn registered_router(p: &str, d: &str) -> PDRouter {
 }
 
 #[tokio::test]
-async fn deadline_includes_retry_backoff() {
+async fn failed_pd_request_returns_without_retry() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let prefill = serve(Router::new().route(
@@ -416,16 +604,13 @@ async fn deadline_includes_retry_backoff() {
             .await;
     let mut router = registered_router(&prefill.url, &decode.url);
     router.request_timeout = Duration::from_millis(150);
-    router.retry_config.initial_backoff_ms = 2000;
-    router.retry_config.max_backoff_ms = 2000;
-    router.retry_config.jitter_factor = 0.0;
     let response = tokio::time::timeout(
         Duration::from_secs(2),
         router.execute_dual_dispatch(None, &json!({"text":"prompt"}), context(false)),
     )
     .await
     .unwrap();
-    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -451,7 +636,7 @@ async fn deadline_cancels_both_silent_workers() {
 }
 
 #[tokio::test]
-async fn retry_selects_a_healthy_pair_with_a_new_bootstrap_room() {
+async fn failed_pd_request_is_not_replayed_on_another_pair() {
     let rooms = Arc::new(std::sync::Mutex::new(Vec::new()));
     let requests = rooms.clone();
     let prefill_app = Router::new().route(
@@ -476,24 +661,19 @@ async fn retry_selects_a_healthy_pair_with_a_new_bootstrap_room() {
     let decode =
         serve(Router::new().route("/generate", post(|| async { Json(json!({"text":"ok"})) })))
             .await;
-    let mut router = registered_router(&failed.url, &decode.url);
+    let router = registered_router(&failed.url, &decode.url);
     router.worker_registry.register(worker(
         &healthy.url,
         WorkerType::Prefill {
             bootstrap_port: None,
         },
     ));
-    router.retry_config.max_retries = 2;
-    router.retry_config.initial_backoff_ms = 1;
-    router.retry_config.max_backoff_ms = 1;
-    router.retry_config.jitter_factor = 0.0;
     let response = router
         .execute_dual_dispatch(None, &json!({"text":"prompt"}), context(false))
         .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let rooms = rooms.lock().unwrap();
-    assert_eq!(rooms.len(), 2);
-    assert_ne!(rooms[0], rooms[1]);
+    assert_eq!(rooms.len(), 1);
 }
 
 #[tokio::test]
@@ -544,8 +724,7 @@ async fn successful_stream_is_forwarded_once_without_replay() {
     let counter = calls.clone();
     let prefill =
         serve(Router::new().route("/generate", post(|| async { Json(json!({"text":""})) }))).await;
-    const SSE: &str =
-        "data: {\"text\":\"token\"}\n\ndata: {\"error\":\"later failure\"}\n\ndata: [DONE]\n\n";
+    const SSE: &str = "data: {\"text\":\"token\"}\n\ndata: [DONE]\n\n";
     let decode = serve(Router::new().route(
         "/generate",
         post(move || {

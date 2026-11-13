@@ -26,13 +26,10 @@ use tracing::{debug, error, warn};
 
 use super::pd_types::api_path;
 use crate::{
-    config::types::RetryConfig,
-    core::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
-    },
+    core::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
     observability::{
         events::{self, Event},
+        logging::rate_limited_log,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
@@ -60,7 +57,6 @@ pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub client: Client,
-    pub retry_config: RetryConfig,
     pub request_timeout: Duration,
     pub api_key: Option<String>,
     pub enable_igw: bool,
@@ -91,16 +87,15 @@ struct PDRequestContext<'a> {
     headers: Option<HeaderMap>,
 }
 
-/// Marker placed on a `Response` by paths inside
-/// `execute_dual_dispatch_internal` that have already recorded prefill and
-/// decode breaker outcomes against the workers' actual per-side results
-/// (rather than the final response status). The outer dispatcher reads this
-/// and skips its own status-based `record_outcome` calls so a decode-only
-/// transport failure can't be misattributed to a healthy prefill.
-#[derive(Clone, Copy)]
-struct BreakerOutcomesRecorded;
-
 impl PDRouter {
+    fn worker_transport_status(error: &reqwest::Error) -> StatusCode {
+        if error.is_timeout() {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::BAD_GATEWAY
+        }
+    }
+
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
     }
@@ -201,7 +196,6 @@ impl PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             client: ctx.client.clone(),
-            retry_config: ctx.router_config.effective_retry_config(),
             request_timeout: Duration::from_secs(ctx.router_config.request_timeout_secs),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
@@ -209,7 +203,7 @@ impl PDRouter {
     }
 
     fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
+        rate_limited_log!(ERROR, "Failed to select PD pair error={}", error);
         error::service_unavailable(
             "server_selection_failed",
             format!("No available servers: {}", error),
@@ -382,7 +376,7 @@ impl PDRouter {
         Ok((prefill_request, decode_request))
     }
 
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
+    async fn execute_dual_dispatch<T: Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
@@ -403,117 +397,43 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
         let deadline = tokio::time::Instant::now() + self.request_timeout;
-        let dispatch = RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
+        let dispatch = async {
+            let (prefill, decode) = match self
+                .select_pd_pair(
+                    context.request_text.as_deref(),
+                    context.model_id,
+                    context.headers.as_ref(),
+                )
+                .await
             {
-                move |attempt: u32| {
-                    // Clone Arc (cheap reference count increment) instead of cloning the entire request
-                    let shared_request = Arc::clone(&shared_request);
-                    let context = context.clone();
-                    async move {
-                        let (prefill, decode) = match self
-                            .select_pd_pair(
-                                context.request_text.as_deref(),
-                                context.model_id,
-                                context.headers.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                return Self::handle_server_selection_error(e);
-                            }
-                        };
+                Ok(pair) => pair,
+                Err(e) => return Self::handle_server_selection_error(e),
+            };
+            let json_request = match serde_json::to_value(original_request) {
+                Ok(value) => value,
+                Err(e) => return Self::handle_serialization_error(e),
+            };
+            let json_request = match Self::inject_bootstrap_into_value(
+                json_request,
+                prefill.as_ref(),
+                context.batch_size,
+            ) {
+                Ok(value) => value,
+                Err(e) => return Self::handle_serialization_error(e),
+            };
 
-                        debug!(
-                            "PD retry attempt {} using prefill={} decode={}",
-                            attempt,
-                            prefill.url(),
-                            decode.url()
-                        );
-
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
-                            prefill.as_ref(),
-                            context.batch_size,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-
-                        let ctx_is_stream = context.is_stream;
-                        let response = self
-                            .execute_dual_dispatch_internal(
-                                headers,
-                                json_request,
-                                context,
-                                Arc::clone(&prefill),
-                                Arc::clone(&decode),
-                                deadline,
-                            )
-                            .await;
-
-                        let status = response.status();
-                        let outcomes_already_recorded = response
-                            .extensions()
-                            .get::<BreakerOutcomesRecorded>()
-                            .is_some();
-                        if !outcomes_already_recorded {
-                            let not_error = status.is_success() || status.is_client_error();
-                            // Prefill is always non-streaming and fully read before
-                            // we get here, so its outcome is final.
-                            prefill.record_outcome(not_error);
-                            // Decode for a streaming request is still mid-flight at
-                            // this point; the `BreakerTrackedStream` wrapped around
-                            // its byte stream records the outcome on drop. Skip the
-                            // eager success record to avoid masking "200-then-broken"
-                            // decode workers.
-                            if !ctx_is_stream {
-                                decode.record_outcome(not_error);
-                            }
-                        }
-
-                        // Record worker errors for server errors (5xx)
-                        if status.is_server_error() {
-                            let error_type = error_type_from_status(status);
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_PREFILL,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_DECODE,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                        }
-
-                        response
-                    }
-                }
-            },
-            |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
-                // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
-                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
-            },
-            || {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
-            },
-        );
-        // One budget includes worker selection, both workers, and retry backoff.
+            // A failed PD pair is returned to the caller without replaying the request.
+            self.execute_dual_dispatch_internal(
+                headers,
+                json_request,
+                context,
+                prefill,
+                decode,
+                deadline,
+            )
+            .await
+        };
         let response = tokio::time::timeout_at(deadline, dispatch)
             .await
             .unwrap_or_else(|_| {
@@ -535,7 +455,7 @@ impl PDRouter {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_status(response.status()) {
+        } else {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
@@ -549,7 +469,7 @@ impl PDRouter {
         response
     }
 
-    // Internal method that performs the actual dual dispatch (without retry logic)
+    // Dispatch both workers and cancel the paired request on failure.
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -577,7 +497,7 @@ impl PDRouter {
             Ok(requests) => requests,
             Err(e) => return error::internal_error("pd_request_preparation_failed", e),
         };
-        // A retried upstream stream must not outlive the original request budget.
+        // Both workers share the request's existing timeout budget.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let prefill_request = self
             .build_post_with_headers(
@@ -603,6 +523,7 @@ impl PDRouter {
         }
         .emit();
 
+        let (prefill_ready_tx, prefill_ready_rx) = tokio::sync::oneshot::channel();
         let prefill_fut = async {
             let result = self
                 .process_prefill_response(
@@ -615,21 +536,35 @@ impl PDRouter {
                 Ok(_) => true,
                 Err(response) => response.status().is_client_error(),
             });
+            if let Err(response) = &result {
+                if response.status().is_server_error() {
+                    Metrics::record_worker_error(
+                        metrics_labels::WORKER_PREFILL,
+                        metrics_labels::CONNECTION_HTTP,
+                        error_type_from_status(response.status()),
+                    );
+                }
+            } else {
+                let _ = prefill_ready_tx.send(());
+            }
             result
         };
-        let decode_fut = async {
+        let decode_response_fut = async {
             let response = match decode_request.send().await {
                 Ok(response) => response,
                 Err(e) => {
-                    error!(decode_url = %decode.url(), error = ?e, "Decode request failed");
-                    decode.record_outcome(false);
-                    return Err(error::bad_gateway("decode_server_error", format!("{e:#}")));
+                    rate_limited_log!(ERROR, decode_url = %decode.url(), error = ?e, "Decode request failed");
+                    return Err(error::create_error(
+                        Self::worker_transport_status(&e),
+                        "decode_server_error",
+                        format!("{e:#}"),
+                    ));
                 }
             };
             let status = response.status();
             if !status.is_success() {
-                // Before downstream headers, use an HTTP error so retries remain possible.
-                decode.record_outcome(status.is_client_error());
+                // Return the failure before committing downstream stream headers.
+                rate_limited_log!(WARN, decode_url = decode.url(), %status, "Decode returned an HTTP error");
                 return Err(error::create_error(
                     status,
                     "decode_server_error",
@@ -638,42 +573,77 @@ impl PDRouter {
             }
             if context.is_stream {
                 let headers = header_utils::preserve_response_headers(response.headers());
-                match Self::prepare_decode_stream(response).await {
+                match Self::prepare_decode_stream(response, prefill_ready_rx).await {
                     Ok(stream) => Ok(DecodeResponse::Streaming(status, headers, stream)),
                     Err(response) => {
-                        decode.record_outcome(response.status().is_client_error());
+                        // These failures happen before create_streaming_response installs tracking.
+                        let outcome = if error::extract_error_code_from_response(&response)
+                            == "decode_response_error"
+                        {
+                            "stream_error_event"
+                        } else {
+                            "upstream_error"
+                        };
+                        Metrics::record_http_stream_outcome(
+                            metrics_labels::BACKEND_PD,
+                            context.model_id.unwrap_or_else(|| decode.model_id()),
+                            decode.url(),
+                            outcome,
+                        );
                         Err(response)
                     }
                 }
             } else {
                 let headers = header_utils::preserve_response_headers(response.headers());
-                match response.bytes().await {
-                    Ok(body) => {
-                        if let Err(response) = Self::check_json_worker_error(&body, "decode") {
-                            decode.record_outcome(response.status().is_client_error());
-                            return Err(response);
-                        }
-                        decode.record_outcome(true);
-                        Ok(DecodeResponse::Buffered(status, headers, body))
-                    }
-                    Err(e) => {
-                        decode.record_outcome(false);
-                        Err(error::bad_gateway("decode_read_failed", format!("{e:#}")))
-                    }
+                let mut stream = response.bytes_stream();
+                let mut body = bytes::BytesMut::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| {
+                        rate_limited_log!(ERROR, decode_url = decode.url(), error = ?e, "Failed to read decode body");
+                        error::create_error(
+                            Self::worker_transport_status(&e),
+                            "decode_read_failed",
+                            format!("{e:#}"),
+                        )
+                    })?;
+                    body.extend_from_slice(&chunk);
+                    Self::check_json_worker_error(&body, "decode")?;
+                }
+                decode.record_outcome(true);
+                Ok(DecodeResponse::Buffered(status, headers, body.freeze()))
+            }
+        };
+        let decode_fut = async {
+            let result = decode_response_fut.await;
+            if let Err(response) = &result {
+                decode.record_outcome(response.status().is_client_error());
+                if response.status().is_server_error() {
+                    Metrics::record_worker_error(
+                        metrics_labels::WORKER_DECODE,
+                        metrics_labels::CONNECTION_HTTP,
+                        error_type_from_status(response.status()),
+                    );
                 }
             }
+            result
         };
         // Dropping the other future/response closes its upstream HTTP request.
         // The engine's disconnect handling then aborts that paired request.
         let ((_, prefill_body), decode_response) = match tokio::try_join!(prefill_fut, decode_fut) {
             Ok(responses) => responses,
-            Err(mut response) => {
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
+            Err(response) => {
+                rate_limited_log!(WARN,
+                    prefill_url = prefill.url(),
+                    decode_url = decode.url(),
+                    status = %response.status(),
+                    error_code = error::extract_error_code_from_response(&response),
+                    "PD request failed, cancelling paired request"
+                );
                 return response;
             }
         };
         events::RequestReceivedEvent {}.emit();
-        let mut response = match decode_response {
+        match decode_response {
             DecodeResponse::Streaming(status, response_headers, stream) => {
                 let prefill_logprobs = prefill_body
                     .as_ref()
@@ -701,9 +671,7 @@ impl PDRouter {
                 *response.headers_mut() = headers;
                 response
             }
-        };
-        response.extensions_mut().insert(BreakerOutcomesRecorded);
-        response
+        }
     }
 
     fn policies_need_request_text(&self) -> bool {
@@ -907,6 +875,7 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            let mut events = bytes::BytesMut::new();
             loop {
                 tokio::select! {
                     biased;
@@ -914,6 +883,34 @@ impl PDRouter {
                         match chunk_result {
                             Some(Ok(chunk)) => {
                                 let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                                events.extend_from_slice(&chunk);
+                                let mut stream_error = false;
+                                loop {
+                                    let boundary = [
+                                        memmem::find(&events, b"\n\n").map(|i| (i, 2)),
+                                        memmem::find(&events, b"\r\n\r\n").map(|i| (i, 4)),
+                                    ].into_iter().flatten().min_by_key(|(i, _)| *i);
+                                    let Some((end, delimiter_len)) = boundary else { break };
+                                    let event = events.split_to(end + delimiter_len);
+                                    if memmem::find(&event, b"\"error\"").is_some()
+                                        || memmem::find(&event, b"\"abort\"").is_some()
+                                    {
+                                        if let Ok(payload) = serde_json::from_str::<Value>(&Self::sse_data(&event)) {
+                                            if let Err(response) = Self::check_worker_payload(&payload, "decode") {
+                                                if response.status().is_server_error() {
+                                                    Metrics::record_worker_error(
+                                                        metrics_labels::WORKER_DECODE,
+                                                        metrics_labels::CONNECTION_HTTP,
+                                                        error_type_from_status(response.status()),
+                                                    );
+                                                }
+                                                tracked.mark_error_event(response.status().is_server_error());
+                                                stream_error = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
 
                                 let result = if return_logprob && prefill_logprobs.is_some() {
                                     Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -928,7 +925,7 @@ impl PDRouter {
                                 // the worker deserves the success tick either
                                 // way. `mark_completed` is a no-op once Errored
                                 // is set, so the synthetic-error path is unaffected.
-                                if is_done {
+                                if is_done || stream_error {
                                     tracked.mark_completed();
                                 }
 
@@ -940,11 +937,16 @@ impl PDRouter {
                                     break;
                                 }
 
-                                if is_done {
+                                if is_done || stream_error {
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                Metrics::record_worker_error(
+                                    metrics_labels::WORKER_DECODE,
+                                    metrics_labels::CONNECTION_HTTP,
+                                    error_type_from_status(Self::worker_transport_status(&e)),
+                                );
                                 // BreakerTrackedStream already logged the error
                                 // and marked the terminal state as Errored so
                                 // the worker's circuit breaker will tick on drop.
@@ -955,7 +957,7 @@ impl PDRouter {
                         }
                     }
                     _ = tx.closed() => {
-                        tracing::info!(
+                        rate_limited_log!(INFO,
                             "Client disconnected, cancelling upstream PD stream from {}",
                             decode_for_log.url()
                         );
@@ -1031,19 +1033,13 @@ impl PDRouter {
         let prefill_response = match prefill_result {
             Ok(response) => response,
             Err(e) => {
-                error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
-                    prefill_url,
-                    e
-                );
+                rate_limited_log!(ERROR, prefill_url, error = ?e, "Prefill request failed; cancelling paired decode");
 
                 // Return error immediately - don't wait for decode to timeout
-                return Err(error::bad_gateway(
+                return Err(error::create_error(
+                    Self::worker_transport_status(&e),
                     "prefill_server_error",
-                    format!(
-                        "Prefill server error: {}. This will cause decode timeout.",
-                        e
-                    ),
+                    format!("Prefill server error: {e:#}"),
                 ));
             }
         };
@@ -1052,6 +1048,7 @@ impl PDRouter {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !prefill_status.is_success() {
+            rate_limited_log!(WARN, prefill_url, status = %prefill_status, "Prefill returned an HTTP error");
             return Err(error::create_error(
                 prefill_status,
                 "prefill_server_error",
@@ -1069,7 +1066,9 @@ impl PDRouter {
         let mut event_start = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
-                error::bad_gateway(
+                rate_limited_log!(ERROR, prefill_url, error = ?e, "Failed to read prefill body");
+                error::create_error(
+                    Self::worker_transport_status(&e),
                     "prefill_read_failed",
                     format!("Prefill {prefill_url}: {e:#}"),
                 )
@@ -1160,10 +1159,16 @@ impl PDRouter {
                 .and_then(|code| StatusCode::from_u16(code).ok())
                 .filter(|status| status.is_client_error() || status.is_server_error())
                 .unwrap_or(fallback);
+            let message = failure.to_string();
+            let mut log_end = message.len().min(4096);
+            while !message.is_char_boundary(log_end) {
+                log_end -= 1;
+            }
+            rate_limited_log!(WARN, side, %status, error = &message[..log_end], "PD worker returned an error payload");
             return Err(error::create_error(
                 status,
                 format!("{side}_response_error"),
-                failure.to_string(),
+                message,
             ));
         }
         Ok(())
@@ -1184,6 +1189,7 @@ impl PDRouter {
 
     async fn prepare_decode_stream(
         response: reqwest::Response,
+        mut prefill_ready: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<
         futures_util::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
         Response,
@@ -1197,9 +1203,35 @@ impl PDRouter {
         let mut prefix = bytes::BytesMut::new();
         let mut chunks = Vec::new();
         let mut event_start = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| error::bad_gateway("decode_read_failed", format!("{e:#}")))?;
+        let mut output_ready = false;
+        'reading: loop {
+            // Keep polling decode until prefill completes, even after the first token.
+            let next = tokio::select! {
+                biased;
+                _ = &mut prefill_ready, if output_ready => break,
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = next else {
+                if is_sse {
+                    output_ready |= Self::decode_event_ready(&prefix[event_start..])?;
+                    if !output_ready {
+                        rate_limited_log!(WARN, "Decode stream ended before any output");
+                        return Err(error::bad_gateway(
+                            "decode_stream_empty",
+                            "Decode stream ended before any output",
+                        ));
+                    }
+                }
+                return Ok(tokio_stream::iter(chunks.into_iter().map(Ok)).boxed());
+            };
+            let chunk = chunk.map_err(|e| {
+                rate_limited_log!(ERROR, error = ?e, "Decode stream failed before forwarding");
+                error::create_error(
+                    Self::worker_transport_status(&e),
+                    "decode_read_failed",
+                    format!("{e:#}"),
+                )
+            })?;
             prefix.extend_from_slice(&chunk);
             chunks.push(chunk);
             if is_sse {
@@ -1215,27 +1247,19 @@ impl PDRouter {
                     let Some((end, delimiter_len)) = boundary else {
                         break;
                     };
-                    let ready = Self::decode_event_ready(&rest[..end])?;
+                    output_ready |= Self::decode_event_ready(&rest[..end])?;
                     event_start += end + delimiter_len;
-                    if ready {
-                        return Ok(tokio_stream::iter(chunks.into_iter().map(Ok))
-                            .chain(stream)
-                            .boxed());
+                    if output_ready && prefill_ready.try_recv().is_ok() {
+                        break 'reading;
                     }
                 }
             } else {
                 Self::check_json_worker_error(&prefix, "decode")?;
             }
         }
-        if is_sse {
-            if !Self::decode_event_ready(&prefix[event_start..])? {
-                return Err(error::bad_gateway(
-                    "decode_stream_empty",
-                    "Decode stream ended before any output",
-                ));
-            }
-        }
-        Ok(tokio_stream::iter(chunks.into_iter().map(Ok)).boxed())
+        Ok(tokio_stream::iter(chunks.into_iter().map(Ok))
+            .chain(stream)
+            .boxed())
     }
 
     fn decode_event_ready(event: &[u8]) -> Result<bool, Response> {
@@ -1246,8 +1270,10 @@ impl PDRouter {
         if data.is_empty() {
             return Ok(false);
         }
-        let payload: Value = serde_json::from_str(&data)
-            .map_err(|e| error::bad_gateway("decode_stream_invalid", e.to_string()))?;
+        let payload: Value = serde_json::from_str(&data).map_err(|e| {
+            rate_limited_log!(WARN, error = %e, "Decode returned an invalid SSE event");
+            error::bad_gateway("decode_stream_invalid", e.to_string())
+        })?;
         Self::check_worker_payload(&payload, "decode")?;
         if let Some(choices) = payload.get("choices").and_then(Value::as_array) {
             return Ok(choices.iter().any(|choice| {
@@ -1657,7 +1683,6 @@ mod tests {
             worker_registry,
             policy_registry,
             client: Client::new(),
-            retry_config: RetryConfig::default(),
             request_timeout: Duration::from_secs(30),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,

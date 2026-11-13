@@ -65,18 +65,29 @@ decode worker. Requests without an explicit model use the worker's model ID.
 | `outcome` | Meaning |
 | --- | --- |
 | `ok` | Upstream reached EOF, or the existing PD loop recognized `[DONE]`. |
-| `stream_error_event` | An engine SSE line starts with `data:` and a JSON object whose first key is `error`. |
-| `upstream_error` | The byte stream yielded a transport error; this takes precedence over an in-band error. |
+| `stream_error_event` | An engine SSE line starts with `data:` and a JSON object whose first key is `error`, or PD detects an error/abort payload before forwarding. |
+| `upstream_error` | Upstream transport/read failure, or an invalid/empty PD stream before forwarding; transport errors take precedence over in-band errors. |
 | `client_disconnect` | The response stream was dropped before upstream completion or error. |
 
-This is observation only: bytes, circuit-breaker rules, retries, cancellation,
-and timeouts retain their existing behavior. Non-2xx responses remain in
-`smg_http_responses_total` and upstream status metrics. The new counter does not
+PD requests are sent once. Either worker's failure cancels its paired request
+and returns an error without retrying. Decode stays monitored while Prefill is
+pending, including after the first token. A forwarded error event closes the
+PD stream after that event is sent. Decode errors detected after upstream
+2xx headers but before forwarding are also counted in the stream metric.
+Prefill failures and non-2xx responses remain in
+`smg_http_responses_total` and `smg_router_request_errors_total`. The stream counter does not
 cover gRPC or external OpenAI response-processing paths. `ok` is an upstream
 completion observation, not proof that the client received every byte. A PD
 failure is attributed to the decode stream and does not identify the failing
 prefill as its root cause. No `expired` or `aborted` classifications are added.
-Series appear only after an observed stream is dropped.
+Series appear when an observed stream ends or an early decode error is detected.
+Error events are logged with their worker URL; each logged SSE line is capped
+at 4 KiB. Worker error counters only record the side that actually failed.
+Stream failure and PD cancellation logs are limited to one event per call site
+per router process every 30 seconds. The first event is logged immediately;
+the next emitted event includes `suppressed_logs`, the number skipped since the
+previous event. This limit is shared across requests and workers at that call
+site. It does not sample metrics, breaker outcomes, or request cancellation.
 
 ```promql
 sum by (outcome) (rate(smg_router_stream_outcome_total[5m]))
