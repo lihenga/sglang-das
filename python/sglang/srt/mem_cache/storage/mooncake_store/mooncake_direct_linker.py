@@ -724,9 +724,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return self._prepare_expanded_load(rid, expanded)
 
-    def _prepare_expanded_load(
-        self, rid: str, expanded: list[PoolTransfer]
-    ) -> bool:
+    def _prepare_expanded_load(self, rid: str, expanded: list[PoolTransfer]) -> bool:
         keys = []
         seen = set()
         for transfer in expanded:
@@ -740,54 +738,56 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not keys:
             return False
 
-        with self.session_lock:
-            if rid in self.prepared_load_sessions:
-                if self.prepared_load_sessions[rid] != keys:
-                    return False
-                reused_keys = keys
-            else:
-                acquired = []
-                new_keys = []
-                reused_keys = []
-                for key in keys:
-                    if key in self.session_refcounts:
-                        self.session_refcounts[key] += 1
-                        if self.host_prefetch_enabled:
-                            self.session_sources.setdefault(key, "unknown")
-                            # Shared keys have no reliable lease-age shortcut.
-                            self._lease_bases().pop(key, None)
-                        acquired.append(key)
-                        reused_keys.append(key)
+        # Reserve before dropping the lock: disjoint starts may query in
+        # parallel, while a shared key or RID waits for its owner to commit.
+        owned_tokens = []
+        while True:
+            with self.session_lock:
+                starting = getattr(self, "session_starting", None)
+                if starting is None:
+                    starting = self.session_starting = {}
+                tokens = [("rid", rid)] + [("key", key) for key in keys]
+                blockers = {starting[token] for token in tokens if token in starting}
+                if not blockers:
+                    if rid in self.prepared_load_sessions:
+                        if self.prepared_load_sessions[rid] != keys:
+                            return False
+                        reused_keys = keys
                     else:
-                        new_keys.append(key)
+                        acquired, new_keys, reused_keys = [], [], []
+                        for key in keys:
+                            if key in self.session_refcounts:
+                                self.session_refcounts[key] += 1
+                                if self.host_prefetch_enabled:
+                                    self.session_sources.setdefault(key, "unknown")
+                                    self._lease_bases().pop(key, None)
+                                acquired.append(key)
+                                reused_keys.append(key)
+                            else:
+                                new_keys.append(key)
+                        event = threading.Event()
+                        owned_tokens = [("rid", rid)] + [("key", key) for key in new_keys]
+                        for token in owned_tokens:
+                            starting[token] = event
+                    break
+            for blocker in blockers:
+                blocker.wait()
 
-                lease_base = time.monotonic() if self.host_prefetch_enabled else 0.0
-                try:
-                    if new_keys and self.host_prefetch_enabled:
-                        results, sources = (
-                            self.storage.store.batch_get_session_start_with_sources(
-                                new_keys
-                            )
-                        )
-                        results = list(results)
-                        sources = list(sources)
-                    elif new_keys:
-                        results = list(
-                            self.storage.store.batch_get_session_start(new_keys)
-                        )
-                        sources = []
-                    else:
-                        results = []
-                        sources = []
-                except BaseException:
-                    logger.warning(
-                        "Mooncake get session start raised for rid=%s",
-                        rid,
-                        exc_info=True,
-                    )
-                    self._rollback_session_refs_locked(acquired)
-                    return False
-
+        if owned_tokens:
+            lease_base = time.monotonic() if self.host_prefetch_enabled else 0.0
+            try:
+                if new_keys and self.host_prefetch_enabled:
+                    results, sources = self.storage.store.batch_get_session_start_with_sources(new_keys)
+                    results, sources = list(results), list(sources)
+                elif new_keys:
+                    results = list(self.storage.store.batch_get_session_start(new_keys))
+                    sources = []
+                else:
+                    results, sources = [], []
+            except BaseException:
+                logger.warning("Mooncake get session start raised for rid=%s", rid, exc_info=True)
+                results, sources = [], []
+            with self.session_lock:
                 failed = len(results) != len(new_keys) or any(
                     result != 0 for result in results
                 )
@@ -801,11 +801,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             self.session_sources[key] = str(source).lower()
                             self._lease_bases()[key] = lease_base
                         acquired.append(key)
-                if failed:
-                    self._rollback_session_refs_locked(acquired)
-                    return False
-
-                self.prepared_load_sessions[rid] = acquired
+                try:
+                    if failed:
+                        self._rollback_session_refs_locked(acquired)
+                    else:
+                        self.prepared_load_sessions[rid] = acquired
+                finally:
+                    for token in owned_tokens:
+                        starting.pop(token, None)
+                    event.set()
+            if failed:
+                return False
 
         # New keys already queried the master; only reused sessions need checking.
         if reused_keys and not self._refresh_session_keys(reused_keys):
@@ -813,7 +819,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return True
 
-    def _refresh_session_keys(self, keys: list[str]) -> bool:
+    def _refresh_session_keys(self, keys: list[str], *, force: bool = False) -> bool:
         """Apply the admission lease-age check before explicitly refreshing."""
         with self.session_lock:
             bases = [self._lease_bases().get(key) for key in keys]
@@ -824,7 +830,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Include time spent waiting for another request's session-start RPC.
         age = float("inf") if oldest is None else time.monotonic() - oldest
         if (
-            self.session_refresh_age_s > 0
+            not force
+            and self.session_refresh_age_s > 0
             and private
             and age < self.session_refresh_age_s
         ):
@@ -864,6 +871,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     "preparing",
                     "reading",
                     "dfs_prefetched",
+                    "no_prefetch_needed",
                     "claimed",
                     "loading",
                 }
@@ -904,56 +912,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             entry = self.host_prefetch_entries.get(rid)
             if (
                 entry is None
-                or entry.get("state") != "dfs_prefetched"
+                or entry.get("state") not in {"dfs_prefetched", "no_prefetch_needed"}
                 or entry.get("cancelled")
             ):
                 return False
             session_rid = str(entry["session_rid"])
+            memory_ready = entry.get("state") == "no_prefetch_needed"
         with self.session_lock:
             keys = list(self.prepared_load_sessions.get(session_rid, ()))
-        return self._refresh_session_keys(keys)
+        # A memory session must start its load with a fresh lease, as it did
+        # before retaining it across the waiting queue.
+        return self._refresh_session_keys(keys, force=memory_ready)
 
     def revalidate_no_prefetch_needed(self, rid: str) -> bool:
-        """Re-check the keys of a request that needed no DFS prefetch.
-
-        The worker released its session on finding no DFS keys, so nothing
-        pins the objects while the request waits for admission. Returning
-        False sends every rank back to the normal path, whose revalidation
-        degrades an evicted prefix to a cache miss.
-        """
-        if not self.host_prefetch_enabled:
-            return False
-        with self.host_prefetch_lock:
-            entry = self.host_prefetch_entries.get(rid)
-            if (
-                entry is None
-                or entry.get("state") != "no_prefetch_needed"
-                or entry.get("cancelled")
-            ):
-                return False
-            keys = list(entry.get("no_prefetch_keys", ()))
-        if not keys:
-            return False
-        try:
-            exist = list(self.storage._batch_exist(keys))
-        except BaseException:
-            logger.warning(
-                "Mooncake waiting-queue existence check failed for rid=%s",
-                rid,
-                exc_info=True,
-            )
-            return False
-        missing = len(keys) - sum(1 for state in exist if state == 1)
-        if len(exist) != len(keys) or missing:
-            logger.warning(
-                "Mooncake waiting-queue keys changed while queued for rid=%s: "
-                "missing=%d/%d, falling back to the normal load path",
-                rid,
-                missing,
-                len(keys),
-            )
-            return False
-        return True
+        """Validate the retained memory session before transferring ownership."""
+        return self.revalidate_host_prefetch(rid)
 
     def claim_ready_host_prefetch(self, rid: str) -> bool:
         if not self.host_prefetch_enabled:
@@ -962,7 +935,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Keep session ownership and the claimed state atomic under both locks.
         with self.session_lock, self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
-            if entry is None or entry.get("state") != "dfs_prefetched":
+            if entry is None or entry.get("state") not in {
+                "dfs_prefetched", "no_prefetch_needed"
+            }:
                 return False
             session_rid = str(entry["session_rid"])
             if (
@@ -1111,16 +1086,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 and outcome in {"dfs_prefetched", "no_prefetch_needed"}
                 and not cancelled
             ):
-                if outcome == "no_prefetch_needed":
-                    # The session is released below; keep the keys so
-                    # admission can re-check them (see
-                    # revalidate_no_prefetch_needed). Published together with
-                    # the state under the same lock.
-                    current["no_prefetch_keys"] = list(keys or ())
                 current["state"] = outcome
                 if outcome == "dfs_prefetched":
                     current["ready_at"] = time.monotonic()
-                keep_session = outcome == "dfs_prefetched"
+                # Memory hits retain metadata only; no DFS buffer was allocated.
+                keep_session = True
             if current is entry:
                 if cancelled:
                     self.host_prefetch_entries.pop(rid, None)

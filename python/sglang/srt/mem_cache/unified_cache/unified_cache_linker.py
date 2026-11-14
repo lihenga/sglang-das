@@ -706,20 +706,14 @@ class UnifiedCacheLinkerWrapper:
         if prefetched:
             status = self.cache_linker.get_host_prefetch_status(req.rid)
             locally_complete = status in {"dfs_prefetched", "no_prefetch_needed"}
-            ready = torch.tensor(int(locally_complete), dtype=torch.int)
-            cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
-            if int(ready.item()) == 0:
-                self.cache_linker.cancel_host_prefetch(req.rid)
-                self.hit_markers[req.rid] = hit
-                return self.load_back(req)
-
-            # Every rank must reach the reduction below, so any local failure,
-            # including an exception, becomes a local False.
+            # Validation is local; combine readiness and lease validity in one
+            # agreement before any rank builds or claims a load.
             try:
-                if status == "no_prefetch_needed":
-                    # Its session was released while queued; re-check that
-                    # the keys survived so eviction falls back to the normal
-                    # path instead of failing the later load.
+                if not locally_complete:
+                    locally_valid = False
+                elif status == "no_prefetch_needed":
+                    # Memory-ready entries retain their session just like DFS
+                    # entries; validate its lease before claiming it.
                     locally_valid = self.cache_linker.revalidate_no_prefetch_needed(
                         req.rid
                     )
@@ -745,16 +739,11 @@ class UnifiedCacheLinkerWrapper:
             # Build before claiming so that the claim reduction also carries
             # the construction verdict: one reduction instead of two.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=status == "no_prefetch_needed"
+                req, tail_hashes
             )
-            prepared_locally = status == "no_prefetch_needed" and constructed
             claim_error: BaseException | None = None
             try:
-                if status == "no_prefetch_needed":
-                    self.cache_linker.cancel_host_prefetch(req.rid)
-                    claimed = True
-                else:
-                    claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
+                claimed = self.cache_linker.claim_ready_host_prefetch(req.rid)
             except BaseException as error:
                 # Still join the reduction below, then re-raise after cleanup.
                 # Reporting "not constructed" sends every rank to the miss exit
@@ -779,7 +768,6 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=True,
                     pending=build_error if build_error is not None else claim_error,
-                    release_session=prepared_locally,
                 )
                 if not constructed_all:
                     # Building failed somewhere: a miss, as on the normal path.
