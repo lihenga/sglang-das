@@ -1,30 +1,18 @@
-"""A waiting-queue prefetch that needed no DFS read must still be re-checked.
-
-The worker releases the session of a ``no_prefetch_needed`` request right
-away, so its objects may be evicted while it waits for admission. Admission
-re-checks them and, if any is gone, sends every rank back to the normal path.
-"""
+"""Memory-only prefetches retain bounded sessions through admission."""
 
 import threading
 import time
 import types
 import unittest
-from unittest.mock import MagicMock
+from queue import Queue
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-    MooncakeDirectLinker,
-)
-from sglang.srt.mem_cache.unified_cache.components import (
-    ExternalLinkerLoadPhase,
-    LinkerTransferPhase,
-)
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
-    ExternalCacheHitMarker,
-    UnifiedCacheLinkerWrapper,
-)
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import MooncakeDirectLinker
+from sglang.srt.mem_cache.unified_cache.components import ExternalLinkerLoadPhase, LinkerTransferPhase
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import ExternalCacheHitMarker, UnifiedCacheLinkerWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,73 +23,120 @@ def _linker(exist=None, error=None):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
+    linker.session_lock = threading.Lock()
     linker.host_prefetch_entries = {}
+    linker.prepared_load_sessions = {}
+    linker.session_refcounts = {}
+    linker.session_sources = {}
+    linker.session_lease_base = {}
+    linker.session_refresh_age_s = 0
     linker._abort_prepared_load_now = MagicMock()
-
-    def batch_exist(keys):
+    def refresh(keys):
         if error is not None:
             raise error
-        return [exist.get(key, 0) for key in keys]
-
+        return [0 if exist is None or exist.get(key, 0) else -1 for key in keys]
     linker.storage = types.SimpleNamespace(
-        _batch_exist=MagicMock(side_effect=batch_exist)
+        _batch_exist=MagicMock(side_effect=AssertionError("redundant existence query")),
+        store=types.SimpleNamespace(batch_get_session_refresh=MagicMock(side_effect=refresh)),
     )
+    linker._log_host_prefetch_metric = MagicMock()
     return linker
 
 
 def _finish_no_prefetch(linker, rid="rid", keys=("k0", "k1")):
-    entry = {
-        "state": "preparing",
-        "session_rid": "session",
-        "queued_at": time.monotonic(),
-    }
+    entry = {"state": "preparing", "session_rid": "session", "queued_at": time.monotonic()}
     linker.host_prefetch_entries[rid] = entry
-    linker._finish_host_prefetch(
-        rid, entry, "session", "no_prefetch_needed", keys=list(keys)
-    )
+    linker.prepared_load_sessions["session"] = list(keys)
+    linker.session_refcounts.update({key: 1 for key in keys})
+    linker.session_sources.update({key: "memory" for key in keys})
+    linker.session_lease_base.update({key: time.monotonic() for key in keys})
+    linker._finish_host_prefetch(rid, entry, "session", "no_prefetch_needed", keys=list(keys))
     return entry
 
 
 class TestNoPrefetchNeededRevalidation(CustomTestCase):
-    def test_finish_keeps_keys_and_releases_session(self):
-        linker = _linker(exist={})
+    def test_finish_keeps_session_until_claim(self):
+        linker = _linker()
         entry = _finish_no_prefetch(linker)
         self.assertEqual(entry["state"], "no_prefetch_needed")
-        self.assertEqual(entry["no_prefetch_keys"], ["k0", "k1"])
-        linker._abort_prepared_load_now.assert_called_once_with("session")
+        self.assertEqual(linker.prepared_load_sessions, {"session": ["k0", "k1"]})
+        linker._abort_prepared_load_now.assert_not_called()
+        self.assertTrue(linker.claim_ready_host_prefetch("rid"))
+        self.assertEqual(linker.prepared_load_sessions, {"rid": ["k0", "k1"]})
+        self.assertFalse(linker.claim_ready_host_prefetch("rid"))
 
     def test_all_keys_present_is_valid(self):
-        linker = _linker(exist={"k0": 1, "k1": 1})
+        linker = _linker()
         _finish_no_prefetch(linker)
         self.assertTrue(linker.revalidate_no_prefetch_needed("rid"))
-        linker.storage._batch_exist.assert_called_once_with(["k0", "k1"])
+        linker.storage.store.batch_get_session_refresh.assert_called_once_with(["k0", "k1"])
+        linker.storage._batch_exist.assert_not_called()
 
-    def test_evicted_key_is_invalid(self):
+    def test_invalid_lease_rejects_admission(self):
         linker = _linker(exist={"k0": 1})
         _finish_no_prefetch(linker)
-        with self.assertLogs(level="WARNING"):
-            self.assertFalse(linker.revalidate_no_prefetch_needed("rid"))
+        self.assertFalse(linker.revalidate_no_prefetch_needed("rid"))
 
-    def test_existence_query_error_is_invalid(self):
-        linker = _linker(error=RuntimeError("master unreachable"))
+    def test_refresh_error_rejects_admission(self):
+        linker = _linker(error=RuntimeError("master unavailable"))
         _finish_no_prefetch(linker)
         with self.assertLogs(level="WARNING"):
             self.assertFalse(linker.revalidate_no_prefetch_needed("rid"))
 
+    def test_fresh_memory_lease_still_refreshes_at_admission(self):
+        linker = _linker()
+        _finish_no_prefetch(linker)
+        linker.session_refresh_age_s = 5
+        self.assertTrue(linker.revalidate_no_prefetch_needed("rid"))
+        linker.storage.store.batch_get_session_refresh.assert_called_once()
+
+    def test_nearly_expired_memory_lease_refreshes_at_admission(self):
+        linker = _linker()
+        _finish_no_prefetch(linker)
+        linker.session_refresh_age_s = 5
+        linker.session_lease_base = {key: 100.0 for key in ("k0", "k1")}
+        with patch("time.monotonic", return_value=104.9):
+            self.assertTrue(linker.revalidate_no_prefetch_needed("rid"))
+        linker.storage.store.batch_get_session_refresh.assert_called_once_with(["k0", "k1"])
+        self.assertEqual(linker.session_lease_base, {"k0": 104.9, "k1": 104.9})
+
+    def test_shared_lease_still_refreshes(self):
+        linker = _linker()
+        _finish_no_prefetch(linker)
+        linker.session_refresh_age_s = 5
+        linker.session_refcounts["k0"] = 2
+        self.assertTrue(linker.revalidate_no_prefetch_needed("rid"))
+        linker.storage.store.batch_get_session_refresh.assert_called_once()
+
+    def test_memory_ready_counts_against_request_limit(self):
+        linker = _linker()
+        _finish_no_prefetch(linker)
+        linker.host_prefetch_limit = 1
+        linker.host_prefetch_queue = Queue()
+        self.assertFalse(linker.submit_host_prefetch("other", [PoolTransfer(name=PoolName.KV, keys=["k2"])]))
+        self.assertTrue(linker.host_prefetch_queue.empty())
+
+    def test_cancelled_ready_session_is_released(self):
+        linker = _linker()
+        _finish_no_prefetch(linker)
+        linker.cancel_host_prefetch("rid")
+        linker._abort_prepared_load_now.assert_called_once_with("session")
+        self.assertEqual(linker.host_prefetch_entries, {})
+
     def test_other_states_are_invalid(self):
-        linker = _linker(exist={"k0": 1, "k1": 1})
+        linker = _linker()
         self.assertFalse(linker.revalidate_no_prefetch_needed("missing"))
         entry = _finish_no_prefetch(linker)
         entry["cancelled"] = True
         self.assertFalse(linker.revalidate_no_prefetch_needed("rid"))
-        linker.storage._batch_exist.assert_not_called()
+        linker.storage.store.batch_get_session_refresh.assert_not_called()
 
 
 class _Cache:
     """Records the admission reductions.
 
-    ``peer_mins[i]`` is the other ranks' MIN for the i-th reduction (ready,
-    valid, claimed); reductions beyond the list see no failing peer.
+    ``peer_mins[i]`` is the other ranks' MIN for the i-th reduction (valid,
+    claimed); reductions beyond the list see no failing peer.
     """
 
     def __init__(self, peer_mins=()):
@@ -369,48 +404,60 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         cache_linker = _no_prefetch_linker(True)
         cache = self._load_back(cache_linker)
         cache_linker.revalidate_no_prefetch_needed.assert_called_once_with("rid")
-        # ready, valid, then [claimed, constructed] in one reduction; the
+        # ready/valid, then [claimed, constructed] in one reduction; the
         # failed construction ends in a miss and retires the prefetch.
-        self.assertEqual(cache.reductions, [1, 1, [1, 0]])
+        self.assertEqual(cache.reductions, [1, [1, 0]])
         cache_linker.cancel_host_prefetch.assert_called_with("rid")
         cache_linker.abort_prepared_load.assert_not_called()
 
     def test_evicted_keys_fall_back_to_the_normal_path(self):
         cache_linker = _no_prefetch_linker(False)
         cache = self._load_back(cache_linker)
-        # ready, valid, then the normal path's construction.
-        self.assertEqual(cache.reductions, [1, 0, 0])
+        # Invalid lease, then the normal path's construction.
+        self.assertEqual(cache.reductions, [0, 0])
         cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
         cache_linker.abort_prepared_load.assert_not_called()
 
     def test_check_error_still_joins_the_reduction(self):
         cache_linker = _no_prefetch_linker(RuntimeError("boom"))
         cache = self._load_back(cache_linker)
-        self.assertEqual(cache.reductions, [1, 0, 0])
+        self.assertEqual(cache.reductions, [0, 0])
         cache_linker.abort_prepared_load.assert_not_called()
 
     def test_peer_failure_overrides_local_success(self):
         cache_linker = _no_prefetch_linker(True)
         cache = self._load_back(cache_linker, peer_mins=[0])
-        # ready is already 0 from the peer, so no rank reaches validation;
-        # the normal path then agrees on construction.
+        # Local validation completes before learning that the peer is not ready.
+        # The normal path then agrees on construction.
         self.assertEqual(cache.reductions, [1, 0])
-        cache_linker.revalidate_no_prefetch_needed.assert_not_called()
+        cache_linker.revalidate_no_prefetch_needed.assert_called_once_with("rid")
         cache_linker.abort_prepared_load.assert_not_called()
 
     def test_peer_validation_failure_sends_every_status_to_the_normal_path(self):
-        # Ready passes on every rank, then a peer fails validation: both a
+        # A peer fails validation: both a
         # local no_prefetch_needed and a local dfs_prefetched rank must drop
         # their prefetch and take the normal path, claiming nothing.
         dfs_linker = MagicMock()
         dfs_linker.get_host_prefetch_status.return_value = "dfs_prefetched"
         dfs_linker.revalidate_host_prefetch.return_value = True
         for cache_linker in (_no_prefetch_linker(True), dfs_linker):
-            cache = self._load_back(cache_linker, peer_mins=[1, 0])
-            self.assertEqual(cache.reductions, [1, 1, 0])
+            cache = self._load_back(cache_linker, peer_mins=[0])
+            self.assertEqual(cache.reductions, [1, 0])
             cache_linker.cancel_host_prefetch.assert_called_once_with("rid")
             cache_linker.claim_ready_host_prefetch.assert_not_called()
             cache_linker.abort_prepared_load.assert_not_called()
+
+    def test_incomplete_local_prefetch_skips_refresh_and_claim(self):
+        for status in (None, "queued", "preparing", "reading", "failed"):
+            with self.subTest(status=status):
+                backend = _no_prefetch_linker(True)
+                backend.get_host_prefetch_status.return_value = status
+                cache = self._load_back(backend)
+                self.assertEqual(cache.reductions, [0, 0])
+                backend.revalidate_no_prefetch_needed.assert_not_called()
+                backend.revalidate_host_prefetch.assert_not_called()
+                backend.claim_ready_host_prefetch.assert_not_called()
+                backend.cancel_host_prefetch.assert_called_once_with("rid")
 
 
 if __name__ == "__main__":
