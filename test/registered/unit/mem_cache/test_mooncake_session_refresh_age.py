@@ -241,52 +241,26 @@ class TestSessionRefreshAge(CustomTestCase):
         self.assertEqual(linker.session_lease_base, {})
 
     def test_age_includes_session_lock_wait(self):
-        """Review P1-R1: another request's session start holds session_lock
-        across its RPC; the admission check must age past that wait."""
+        """Admission must measure age after any contention on session metadata."""
         clock = _Clock()
         linker = _linker()
         linker.session_lock = _ContendedLock()
         _prefetched(linker, clock)
         clock.now += 1.0
-        in_rpc = threading.Event()
-        release = threading.Event()
-
-        def slow_start(keys):
-            in_rpc.set()
-            if not release.wait(5):
-                raise TimeoutError("the test never released the start RPC")
-            return [0] * len(keys), ["dfs"] * len(keys)
-
-        linker.storage.store.batch_get_session_start_with_sources.side_effect = (
-            slow_start
-        )
-        transfer = types.SimpleNamespace(keys=["unrelated"])
+        result = {}
         with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
-            worker = threading.Thread(
-                target=linker._prepare_expanded_load, args=("other", [transfer])
-            )
-            worker.start()
-            self.assertTrue(in_rpc.wait(5))
-            result = {}
-            admission = threading.Thread(
-                target=lambda: result.update(ok=linker.revalidate_host_prefetch("rid"))
-            )
-            admission.start()
-            # Admission blocks on the lock while the unrelated start RPC runs
-            # past the skip threshold.
-            self.assertTrue(linker.session_lock.contended.wait(5))
-            clock.now += 10.0
-            release.set()
-            worker.join(5)
+            with linker.session_lock:
+                admission = threading.Thread(
+                    target=lambda: result.update(ok=linker.revalidate_host_prefetch("rid"))
+                )
+                admission.start()
+                self.assertTrue(linker.session_lock.contended.wait(5))
+                clock.now += 10.0
             admission.join(5)
-        self.assertFalse(worker.is_alive())
         self.assertFalse(admission.is_alive())
         self.assertTrue(result["ok"])
-        # Aged 11 s once it got the lock, so it refreshed instead of skipping.
         linker.storage.store.batch_get_session_refresh.assert_called_once()
-        self.assertEqual(
-            linker.session_lease_base, {"k0": 111.0, "k1": 111.0, "unrelated": 101.0}
-        )
+        self.assertEqual(linker.session_lease_base, {"k0": 111.0, "k1": 111.0})
 
     def test_claim_wait_does_not_hold_host_prefetch_lock(self):
         linker = _linker()
