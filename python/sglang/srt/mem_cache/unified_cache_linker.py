@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -38,6 +39,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+)
+from sglang.srt.mem_cache.linker_experiment_trace import emit, make_trace
+from sglang.srt.mem_cache.linker_storage_groups import (
+    group_storage_refs,
+    make_storage_refs,
+    storage_plan_digest,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -167,6 +174,54 @@ class DevicePoolEntry:
 
     def prepare_locations(self, indices: torch.Tensor) -> list[int]:
         return self._rows(indices)
+
+    def get_grouped_page_buffer_meta(self, indices, refs):
+        """Page-major object: each GPU page's layer buffers in sequence."""
+        if not self.packed or len(self.components) != 1:
+            raise ValueError("Grouped objects require a packed DSA pool.")
+        groups = group_storage_refs(refs, complete=True)
+        ptrs, sizes = self.get_page_buffer_meta(indices)
+        width = len(self.kv_buffer)
+        if len(ptrs) != len(refs) * width:
+            raise ValueError("Storage references do not cover the source pages.")
+        return (
+            [
+                [ptrs[p * width + b] for p in positions for b in range(width)]
+                for _, positions in groups
+            ],
+            [
+                [sizes[p * width + b] for p in positions for b in range(width)]
+                for _, positions in groups
+            ],
+        )
+
+    def get_grouped_layer_range_meta(self, groups, layer, pages_per_object=2):
+        """Read selected pages, including multiple destinations for one object."""
+        if not self.packed or len(self.components) != 1:
+            raise ValueError("Grouped objects require a packed DSA pool.")
+        rows = [row for group in groups for row, _ in group]
+        meta = self.get_prepared_layer_range_meta(rows, layer)
+        if meta is None:
+            return None
+        ptrs, sizes, offsets = meta
+        page_bytes = sum(
+            size for component in self.buffer_meta for _, _, size in component
+        )
+        result = ([], [], [])
+        index = 0
+        for group in groups:
+            gp, gs, go = [], [], []
+            for _, half in group:
+                if not 0 <= half < pages_per_object:
+                    raise ValueError("Invalid storage page offset.")
+                gp.extend(ptrs[index])
+                gs.extend(sizes[index])
+                go.extend(offset + half * page_bytes for offset in offsets[index])
+                index += 1
+            result[0].append(gp)
+            result[1].append(gs)
+            result[2].append(go)
+        return result
 
     def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
         buffer_index = self.layer_mapping.get(layer)
@@ -312,9 +367,7 @@ class UnifiedCacheLinker(ABC):
         """Prepare a normal load while it can still degrade to a cache miss."""
         return False
 
-    def submit_host_prefetch(
-        self, rid: str, transfers: list[PoolTransfer]
-    ) -> bool:
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a request-scoped host prefetch without allocating device pages."""
         return False
 
@@ -456,6 +509,10 @@ class UnifiedCacheLinkerWrapper:
         self.taken_loads: list[tuple[list[str], bool]] = []
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[tuple[NodeId, DecLockRefParams]] = []
+        self.grouped_offloads: dict[NodeId, bool] = {}
+        self.storage_plan_sequence = 0
+        self._experiment_trace = make_trace(params.attn_cp_rank, cache)
+        emit(self, "wrapper_ready", gpu_page_size=cache.page_size)
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -534,7 +591,11 @@ class UnifiedCacheLinkerWrapper:
                             name=transfer.name,
                             host_indices=transfer.host_indices,
                             device_indices=transfer.device_indices,
-                            keys=(list(transfer.keys) if transfer.keys is not None else None),
+                            keys=(
+                                list(transfer.keys)
+                                if transfer.keys is not None
+                                else None
+                            ),
                             hit_policy=transfer.hit_policy,
                             nodes_to_load=transfer.nodes_to_load,
                             indices_from_pool=transfer.indices_from_pool,
@@ -616,6 +677,42 @@ class UnifiedCacheLinkerWrapper:
     def has_pending_operations(self) -> bool:
         return bool(self.pending_loads or self.pending_offloads)
 
+    @property
+    def grouped_storage(self) -> bool:
+        return getattr(self.cache_linker, "grouped_storage", False)
+
+    @property
+    def storage_group_pages(self) -> int:
+        return (
+            getattr(self.cache_linker, "storage_page_size", 128) // self.cache.page_size
+        )
+
+    def _agree_storage_plan(self, kind, payload, *, valid=True):
+        """Scheduler-thread agreement before branching or publishing a task."""
+        digest = storage_plan_digest(kind, self.storage_plan_sequence, payload)
+        self.storage_plan_sequence += 1
+        emit(
+            self,
+            "plan_begin",
+            kind=kind,
+            sequence=self.storage_plan_sequence - 1,
+            digest=digest,
+            valid=valid,
+        )
+        state = torch.tensor([int(valid), digest, -digest], dtype=torch.int64)
+        self.cache._all_reduce_attn_groups(state, torch.distributed.ReduceOp.MIN)
+        emit(
+            self,
+            "plan_end",
+            kind=kind,
+            sequence=self.storage_plan_sequence - 1,
+            digest=digest,
+            common=state.tolist(),
+        )
+        if state[1].item() != -state[2].item():
+            raise RuntimeError(f"CP grouped storage plan differs: {kind}.")
+        return bool(state[0].item())
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -645,12 +742,20 @@ class UnifiedCacheLinkerWrapper:
             # additional scheduler-side PP control message.
             req.external_cache_hit_length = device_hit_len
 
+        emit(self, "match", rid=req.rid, device_hit_tokens=device_hit_len)
         if device_hit_len >= len(key):
             if prefetched_hit is not None:
                 self.cancel_waiting_queue_prefetch(req.rid)
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
+        refs = None
+        if self.grouped_storage:
+            refs = make_storage_refs(
+                tail_hashes, device_hit_len // page, self.storage_group_pages
+            )
+            tail_hashes = tail_hashes[: len(refs)]
+            self._agree_storage_plan("lookup", [req.rid, device_hit_len, tail_hashes])
         if not tail_hashes:
             if prefetched_hit is not None:
                 self.cancel_waiting_queue_prefetch(req.rid)
@@ -665,13 +770,15 @@ class UnifiedCacheLinkerWrapper:
                 if prefetched_hit is not None:
                     self.cancel_waiting_queue_prefetch(req.rid)
                 return result
+            if refs is not None:
+                transfer.storage_refs = list(refs)
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         if prefetched_hit is not None:
-            expected_len = prefetched_hit.device_hit_len + len(
-                prefetched_hit.tail_hashes
-            ) * page
+            expected_len = (
+                prefetched_hit.device_hit_len + len(prefetched_hit.tail_hashes) * page
+            )
             current_prefix = key[:expected_len]
             same_prefix = (
                 current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
@@ -696,9 +803,11 @@ class UnifiedCacheLinkerWrapper:
                     host_hit_length=hit_tokens,
                     swa_host_hit_length=max(
                         result.swa_host_hit_length,
-                        min(len(swa_transfer.keys), hit_pages) * page
-                        if swa_transfer is not None
-                        else 0,
+                        (
+                            min(len(swa_transfer.keys), hit_pages) * page
+                            if swa_transfer is not None
+                            else 0
+                        ),
                     ),
                     mamba_host_hit_length=max(
                         result.mamba_host_hit_length,
@@ -763,7 +872,9 @@ class UnifiedCacheLinkerWrapper:
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
         if common.numel() == 0:
+            emit(self, "common_hit", pages=0)
             return 0
+        emit(self, "common_hit", pages=int(common[-1].item()))
         return int(common[-1].item())
 
     def _tail_hashes(
@@ -790,7 +901,12 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def _build_load_transfers(
-        self, req: Req, tail_hashes, *, prepare_session: bool = False
+        self,
+        req: Req,
+        tail_hashes,
+        *,
+        prepare_session: bool = False,
+        start_page: int = 0,
     ) -> tuple[list[tuple[TreeComponent, PoolTransfer]], bool, BaseException | None]:
         """Build LOAD transfers and optionally prepare their session locally.
 
@@ -813,6 +929,10 @@ class UnifiedCacheLinkerWrapper:
                 if transfer is None:
                     return component_transfers, False, None
                 component_transfers.append((component, transfer))
+                if self.grouped_storage:
+                    transfer.storage_refs = make_storage_refs(
+                        tail_hashes, start_page, self.storage_group_pages
+                    )
         except BaseException as error:
             return component_transfers, False, error
         if prepare_session:
@@ -948,7 +1068,10 @@ class UnifiedCacheLinkerWrapper:
             # Build before claiming so that the claim reduction also carries
             # the construction verdict: one reduction instead of two.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=status == "no_prefetch_needed"
+                req,
+                tail_hashes,
+                prepare_session=status == "no_prefetch_needed",
+                start_page=device_hit_len // cache.page_size,
             )
             prepared_locally = status == "no_prefetch_needed" and constructed
             claim_error: BaseException | None = None
@@ -996,7 +1119,10 @@ class UnifiedCacheLinkerWrapper:
             # Ordinary LOAD construction must agree across ranks even when
             # waiting-queue prefetch is disabled.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=self._waiting_queue_prefetch_enabled
+                req,
+                tail_hashes,
+                prepare_session=self._waiting_queue_prefetch_enabled,
+                start_page=device_hit_len // cache.page_size,
             )
             all_constructed = torch.tensor(int(constructed), dtype=torch.int)
             cache._all_reduce_attn_groups(
@@ -1011,7 +1137,8 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=False,
                     pending=build_error,
-                    release_session=constructed and self._waiting_queue_prefetch_enabled,
+                    release_session=constructed
+                    and self._waiting_queue_prefetch_enabled,
                 )
                 return empty_indices, req.last_node
             # With prefetch enabled, session start/refresh already checked
@@ -1116,6 +1243,22 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
+        if self.grouped_storage:
+            self._agree_storage_plan(
+                "load",
+                [
+                    req.rid,
+                    [
+                        [
+                            transfer.name.value,
+                            transfer.keys,
+                            [(ref.key, ref.half) for ref in transfer.storage_refs],
+                        ]
+                        for transfer in load_transfers
+                    ],
+                ],
+            )
+
         if load_transfers:
             anchor = req.last_node
             node_id = insert_result.last_device_node
@@ -1182,6 +1325,13 @@ class UnifiedCacheLinkerWrapper:
         for component, transfer in transfers:
             component_canonical = canonical_full
             if phase == ExternalLinkerLoadPhase.COMMIT:
+                refs_by_key = (
+                    dict(zip(transfer.keys, transfer.storage_refs))
+                    if transfer.storage_refs is not None
+                    else None
+                )
+                if refs_by_key is not None and len(refs_by_key) != len(transfer.keys):
+                    raise ValueError("Duplicate logical hashes in a storage load.")
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
@@ -1201,6 +1351,8 @@ class UnifiedCacheLinkerWrapper:
                     continue
                 transfer.device_indices = indices
                 transfer.keys = keys
+                if refs_by_key is not None:
+                    transfer.storage_refs = [refs_by_key[key] for key in keys]
                 component_canonical, _ = self._select_adopted_pages(
                     canonical_full, ranges, prefix_len
                 )
@@ -1259,6 +1411,9 @@ class UnifiedCacheLinkerWrapper:
                 self._offload_node(node_id)
 
     def _offload_node(self, node_id: NodeId) -> None:
+        if self.grouped_storage:
+            self._offload_grouped_node(node_id)
+            return
         cache = self.cache
         node = cache.resolve_node_handle(node_id)
         transfers = []
@@ -1282,7 +1437,97 @@ class UnifiedCacheLinkerWrapper:
         node.external_cache_stored = True
         self.pending_offloads.append((node_id, lock_params))
 
+    def _offload_grouped_node(self, node_id):
+        cache = self.cache
+        node = cache.resolve_node_handle(node_id)
+        # A pending entry holds an ancestry lock; splitting redistributes that
+        # lock. Do not issue a second task for the same node before common ACK.
+        if node_id in self.grouped_offloads:
+            return
+        component = cache._components_tuple[0]
+        transfer = component.build_external_linker_transfer(
+            LinkerTransferPhase.OFFLOAD, node, None
+        )
+        start = 0
+        parent = node.parent
+        while parent is not None:
+            start += len(parent.key)
+            parent = parent.parent
+        start_page = start // cache.page_size
+        keys = list(node.hash_value or [])
+        valid = transfer is not None and len(keys) * cache.page_size == len(node.key)
+        width = self.storage_group_pages
+        missing = start_page % width
+        if missing:
+            # Up to three leading pages may span multiple ancestors after
+            # radix splits. Gather them before pinning the descendant chain.
+            parent = node.parent
+            prefix_keys, prefix_indices = [], []
+            while missing and parent is not None:
+                source = parent.component_data[component.component_type].value
+                hashes = list(parent.hash_value or [])
+                take = min(missing, len(hashes))
+                if take and (source is None or len(source) < take * cache.page_size):
+                    valid = False
+                if take:
+                    prefix_keys[:0] = hashes[-take:]
+                    if source is not None and len(source) >= take * cache.page_size:
+                        prefix_indices.insert(
+                            0, source[-take * cache.page_size :].to(torch.int64)
+                        )
+                    missing -= take
+                parent = parent.parent
+            valid = valid and missing == 0
+            keys = prefix_keys + keys
+            if valid:
+                transfer.device_indices = torch.cat(
+                    [*prefix_indices, transfer.device_indices]
+                )
+        plan_keys = keys
+        if not self._agree_storage_plan(
+            "offload", [width, start_page, plan_keys], valid=valid
+        ):
+            return
+        refs = make_storage_refs(plan_keys, start_page - start_page % width, width)
+        if not refs:
+            return  # No single-page fallback and no waiting/pinning for a tail.
+        transfer.keys = plan_keys[: len(refs)]
+        transfer.device_indices = transfer.device_indices[: len(refs) * cache.page_size]
+        transfer.storage_refs = refs
+        fully_covered = (start_page + len(node.hash_value)) % width == 0
+        lock_params = cache.inc_lock_ref(node_id).to_dec_params()
+        try:
+            queued = self.cache_linker.offload([transfer])
+        except BaseException:
+            cache.dec_lock_ref(node_id, lock_params)
+            raise
+        if not queued:
+            cache.dec_lock_ref(node_id, lock_params)
+            raise RuntimeError("Failed to queue an agreed grouped offload.")
+        # A pending PUT is not published as a stored node. An incomplete final group
+        # remains uncovered even if earlier groups succeeded.
+        self.grouped_offloads[node_id] = fully_covered
+        self.pending_offloads.append((node_id, lock_params))
+        emit(
+            self,
+            "offload_queued",
+            node=node_id,
+            fully_covered=fully_covered,
+            pages=len(refs),
+            pending=len(self.pending_offloads),
+        )
+
     def num_completed_offloads(self) -> int:
+        if getattr(self, "_experiment_trace", None) is not None:
+            now = time.monotonic()
+            if now - getattr(self, "_last_trace_snapshot", 0) > 5:
+                self._last_trace_snapshot = now
+                emit(
+                    self,
+                    "snapshot",
+                    pending_offloads=len(self.pending_offloads),
+                    pending_loads=len(self.pending_loads),
+                )
         return min(
             self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
         )
@@ -1301,11 +1546,19 @@ class UnifiedCacheLinkerWrapper:
             device="cpu",
         )
         self.cache._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        emit(self, "offload_common", count=finish_count, successes=successes.tolist())
         for success in successes.tolist():
             node_id, lock_params = self.pending_offloads.pop(0)
             node = self.cache.resolve_node_handle(node_id)
-            node.external_cache_stored = bool(success)
+            covered = getattr(self, "grouped_offloads", {}).pop(node_id, True)
+            node.external_cache_stored = bool(success and covered)
             self.cache.dec_lock_ref(node_id, lock_params)
+        emit(
+            self,
+            "offload_drained",
+            count=finish_count,
+            pending=len(self.pending_offloads),
+        )
 
     def num_completed_loads(self) -> int:
         return self.cache_linker.num_completed_loads()
@@ -1353,11 +1606,21 @@ class UnifiedCacheLinkerWrapper:
                 job.cancelled.set()
             self.pending_host_prefetch_submissions.clear()
         self.cache_linker.reset()
+        self._release_grouped_offload_locks()
         self.hit_markers.clear()
         if self.host_prefetch_hits is not None:
             self.host_prefetch_hits.clear()
         self._release_pending_locks()
         self.pending_offloads.clear()
+
+    def _release_grouped_offload_locks(self):
+        if self.grouped_storage:
+            for node_id, lock_params in self.pending_offloads:
+                self.cache.resolve_node_handle(node_id).external_cache_stored = False
+                self.cache.dec_lock_ref(node_id, lock_params)
+            self.pending_offloads.clear()
+            self.grouped_offloads.clear()
+            self.storage_plan_sequence = 0
 
     def _release_pending_locks(self) -> None:
         for node_id, lock_params, _anchor in self.pending_loads.values():
@@ -1384,4 +1647,5 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
+        self._release_grouped_offload_locks()
         self._release_pending_locks()

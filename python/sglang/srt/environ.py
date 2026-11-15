@@ -707,6 +707,9 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
+    # Direct Mooncake objects in tokens; unset preserves the GPU-page default.
+    # Parse on the scheduler so invalid values are rejected collectively by CP.
+    SGLANG_HICACHE_DIRECT_STORAGE_PAGE_SIZE = EnvStr(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

@@ -14,6 +14,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
@@ -23,6 +24,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.linker_experiment_trace import emit, make_trace
+from sglang.srt.mem_cache.linker_storage_groups import (
+    group_storage_refs,
+    storage_namespace,
 )
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     arm_load_failure_injection,
@@ -278,6 +284,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if group is not None
                 and torch.distributed.get_world_size(group=group) > 1
             )
+        self._experiment_trace = make_trace(params.attn_cp_rank)
 
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -291,6 +298,85 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             windowed_draft=bool(params.mtp_draft_device_pools)
             and envs.SGLANG_DSPARK_SWA_KV_POOL.get(),
         )
+        # Explicit backend JSON wins over the environment. Invalid environment
+        # values must reach the same validation collectives on every rank.
+        if "direct_storage_page_size" in extra_config:
+            value = extra_config["direct_storage_page_size"]
+        else:
+            raw = envs.SGLANG_HICACHE_DIRECT_STORAGE_PAGE_SIZE.get()
+            try:
+                value = self.page_size if raw is None else int(raw)
+            except (ValueError, TypeError):
+                value = None
+        supported = (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value in (self.page_size, 128, 256)
+        )
+        self.storage_page_size = value if supported else -1
+        self.grouped_storage = (
+            supported and value in (128, 256) and self.page_size == 64
+        )
+        if value in (128, 256) and value != self.page_size:
+            supported = supported and self.page_size == 64
+        if self.grouped_storage:
+            supported = supported and (
+                params.pp_size == 1
+                and len(components) == 1
+                and next(iter(components)).name == "FULL"
+                and hasattr(kvcache, "index_k_with_scale_buffer")
+                and self.pool_group.is_mla_backend
+                # These paths still interpret hashes as individual GPU pages.
+                # Agree on unsupported combinations before starting any I/O.
+                and not self.host_prefetch_enabled
+                and os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") != "1"
+                and os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") != "1"
+                and all(
+                    entry.name in (PoolName.KV, PoolName.INDEXER)
+                    and entry.indices_from_pool == PoolName.KV
+                    and entry.packed
+                    and len(entry.components) == 1
+                    for entry in self.pools.values()
+                )
+            )
+        # All ranks validate before any mode-specific storage initialization.
+        # Keep these collectives on the scheduler thread, never in I/O workers.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            state = torch.tensor(
+                [
+                    int(supported),
+                    self.storage_page_size,
+                    -self.storage_page_size,
+                    self.page_size,
+                    -self.page_size,
+                ],
+                dtype=torch.int64,
+            )
+            for group in (params.attn_cp_cache_group, params.attn_tp_cache_group):
+                if group is not None and torch.distributed.get_world_size(group) > 1:
+                    torch.distributed.all_reduce(
+                        state, torch.distributed.ReduceOp.MIN, group
+                    )
+            supported = bool(state[0].item()) and (
+                state[1].item() == -state[2].item()
+                and state[3].item() == -state[4].item()
+            )
+        if not supported:
+            raise ValueError(
+                "direct_storage_page_size / SGLANG_HICACHE_DIRECT_STORAGE_PAGE_SIZE "
+                "must agree across CP/TP ranks; 128 or 256 "
+                "requires GPU page_size=64, DSA FULL-only packed pools and PP1, "
+                "with waiting-queue DFS prefetch and ReadPlan disabled."
+            )
+        if self.grouped_storage and torch.distributed.is_initialized():
+            # Revalidation is another scheduler-side branch: a missing object
+            # on one rank must make every rank recompute the same prefix.
+            self._load_revalidation_groups = tuple(
+                group
+                for group in (params.attn_cp_cache_group, params.attn_tp_cache_group)
+                if group is not None
+                and torch.distributed.get_world_size(group=group) > 1
+            )
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
@@ -322,6 +408,36 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         else:
             self.storage = storage
+        if self.grouped_storage:
+            prefix = getattr(self.storage, "config_prefix", None)
+            layout = [
+                self.page_size,
+                server_args.tp_size,
+                params.attn_cp_size,
+                params.pp_size,
+                self.num_layers,
+                [
+                    [
+                        name.value,
+                        sorted(pool.layer_mapping.items()),
+                        [
+                            [
+                                str(buffer.dtype),
+                                list(buffer.shape[1:]),
+                                list(buffer.stride()[1:]),
+                            ]
+                            for buffer in pool.kv_buffer
+                        ],
+                        [
+                            [size for _, _, size in component]
+                            for component in pool.buffer_meta
+                        ],
+                    ]
+                    for name, pool in self.pools.items()
+                ],
+            ]
+            tag = storage_namespace(layout, self.storage_page_size)
+            self.storage.config_prefix = f"{prefix}_{tag}" if prefix else tag
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
         rank_suffix = f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
@@ -404,6 +520,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 server_args, STAT_LOGGER_ROLE_STORAGE, StorageMetricsCollector
             )
             self.storage_metrics_collector = collector_cls(labels=labels)
+        emit(
+            self,
+            "storage_ready",
+            gpu_page_size=self.page_size,
+            storage_page_size=self.storage_page_size,
+            namespace=self.storage.config_prefix,
+            pools={str(n): len(p.kv_buffer) for n, p in self.pools.items()},
+        )
 
         self.register_buffers()
         if self.read_plan_enabled:
@@ -619,6 +743,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
+        if getattr(self, "grouped_storage", False):
+            try:
+                result = self._lookup_grouped(expanded)
+                emit(self, "lookup", rid=rid, pages=max(result) if result else 0)
+                return result
+            except Exception:
+                # A failed metadata RPC on one rank is a local miss. The
+                # scheduler still enters the common-prefix intersection.
+                logger.exception("Mooncake grouped lookup failed; treating as miss")
+                return []
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         page_keys = list(kv.keys)
         if not page_keys:
@@ -670,12 +804,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         if not resolved:
             return True
+        if getattr(self, "grouped_storage", False):
+            self._validate_grouped_transfers(resolved)
         key_strs: list[str] = []
         for transfer in resolved:
-            component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                list(transfer.keys), transfer
-            )
-            key_strs.extend(self.storage._tag_keys(component_keys))
+            if getattr(self, "grouped_storage", False):
+                groups = group_storage_refs(transfer.storage_refs)
+                key_strs.extend(
+                    self._storage_object_keys([key for key, _ in groups], transfer)
+                )
+            else:
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                key_strs.extend(self.storage._tag_keys(component_keys))
         if not key_strs:
             return True
         exist = self.storage._batch_exist(key_strs)
@@ -705,6 +847,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         if not expanded:
             return False
+        if getattr(self, "grouped_storage", False):
+            self._validate_grouped_transfers(expanded)
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
@@ -1269,6 +1413,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         *,
         request_ids: list[str] | None = None,
     ) -> bool:
+        if getattr(self, "grouped_storage", False):
+            return self._load_grouped_layer_wise(counter_index, request_transfers)
         started = []
         success = False
         read_plan_enabled = getattr(self, "read_plan_enabled", False)
@@ -1517,7 +1663,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 buffer_indices = (
                     ()
                     if mapped is None
-                    else (mapped,) if isinstance(mapped, int) else tuple(mapped)
+                    else (mapped,)
+                    if isinstance(mapped, int)
+                    else tuple(mapped)
                 )
                 layout.append(
                     [
@@ -1568,6 +1716,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
+        if getattr(self, "grouped_storage", False):
+            self._validate_grouped_transfers(expanded, complete=True)
         self.freeze_gc_once()
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
@@ -1585,8 +1735,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     return
                 expanded, tokens, started, ready_event = task
                 ready_event.synchronize()
-                results = self.storage.batch_set_v2(expanded)
-                success = all(all(pool_results) for pool_results in results.values())
+                if getattr(self, "grouped_storage", False):
+                    success = self._offload_grouped(expanded)
+                else:
+                    results = self.storage.batch_set_v2(expanded)
+                    success = all(
+                        all(pool_results) for pool_results in results.values()
+                    )
                 self._log_l4_backup_metric(
                     tokens, time.perf_counter() - started, success
                 )
@@ -1622,6 +1777,197 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Failed to record SGLang L4 backup metrics.",
                 exc_info=True,
             )
+
+    def _validate_grouped_transfers(self, transfers, *, complete=False):
+        for transfer in transfers:
+            if (
+                transfer.name not in self.pools
+                or transfer.storage_refs is None
+                or len(transfer.keys) != len(transfer.storage_refs)
+                or transfer.hit_policy.value != "all_pages"
+            ):
+                raise ValueError("Invalid grouped transfer mapping.")
+            group_storage_refs(transfer.storage_refs, complete=complete)
+            if any(
+                ref.pages_per_object != self.storage_page_size // self.page_size
+                for ref in transfer.storage_refs
+            ):
+                raise ValueError(
+                    "Storage references disagree with the configured object size."
+                )
+            if transfer.host_indices is not None:
+                if len(transfer.host_indices) != len(transfer.keys) * self.page_size:
+                    raise ValueError("Grouped transfer index count differs.")
+        if complete and transfers:
+            if any(t.storage_refs != transfers[0].storage_refs for t in transfers[1:]):
+                raise ValueError("DSA write pools disagree on storage groups.")
+
+    def _storage_object_keys(self, keys, transfer):
+        objects, multiplier = self.storage._get_hybrid_page_component_keys(
+            keys, transfer
+        )
+        if multiplier != 1:
+            raise ValueError("Grouped DSA pools require one object per group.")
+        return self.storage._tag_keys(objects)
+
+    def _lookup_grouped(self, transfers):
+        self._validate_grouped_transfers(transfers)
+        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
+        count = len(kv.keys)
+        page_exists = [True] * count
+        for transfer in transfers:
+            if transfer.storage_refs != kv.storage_refs:
+                raise ValueError("DSA pools disagree on logical storage groups.")
+            groups = group_storage_refs(transfer.storage_refs)
+            keys = self._storage_object_keys([key for key, _ in groups], transfer)
+            # Preserve the cold-prefix fast path: probe the first object before
+            # issuing metadata RPCs for the rest of a million-token request.
+            states = self.storage._prefix_component_exists(keys, 1, len(keys))
+            if len(states) != len(keys):
+                raise RuntimeError("Mooncake returned a short existence response.")
+            for (_, positions), state in zip(groups, states):
+                for index in positions:
+                    page_exists[index] &= state == 1
+        self.stats["lookup"] += 1
+        # Only complete absolute group endpoints are advertised. Relative to a
+        # 64-token GPU prefix, a valid hit can still be an odd number of pages.
+        restorable = []
+        for index, exists in enumerate(page_exists):
+            if not exists:
+                break
+            if (
+                kv.storage_refs[index].half
+                == self.storage_page_size // self.page_size - 1
+            ):
+                restorable.append(index + 1)
+        return restorable
+
+    def _offload_grouped(self, transfers):
+        self._validate_grouped_transfers(transfers, complete=True)
+        plans = []
+        # Validate every pool before issuing any writes.
+        for transfer in transfers:
+            groups = group_storage_refs(transfer.storage_refs, complete=True)
+            hashes = [key for key, _ in groups]
+            keys = self._storage_object_keys(hashes, transfer)
+            ptrs, sizes = self.pools[transfer.name].get_grouped_page_buffer_meta(
+                transfer.host_indices, transfer.storage_refs
+            )
+            plans.append((hashes, keys, ptrs, sizes))
+        success = True
+        for hashes, keys, ptrs, sizes in plans:
+            for start in range(0, len(keys), STORAGE_BATCH_SIZE):
+                end = start + STORAGE_BATCH_SIZE
+                batch = keys[start:end]
+                states = self.storage._batch_exist(batch)
+                if len(states) != len(batch):
+                    raise RuntimeError("Mooncake returned a short existence response.")
+                missing = [
+                    start + index for index, state in enumerate(states) if state != 1
+                ]
+                if not missing:
+                    continue  # Still exactly one task ACK, even without I/O.
+                ids = None
+                if self.storage._can_use_group_semantics():
+                    ids = self.storage._expand_group_ids(
+                        self.storage._tag_keys([hashes[index] for index in missing]), 1
+                    )
+                results = self.storage._put_batch_zero_copy_impl(
+                    [keys[index] for index in missing],
+                    [ptrs[index] for index in missing],
+                    [sizes[index] for index in missing],
+                    ids,
+                )
+                if (
+                    results is None
+                    or isinstance(results, int)
+                    or len(results) != len(missing)
+                ):
+                    raise RuntimeError(
+                        "Mooncake returned a short grouped PUT response."
+                    )
+                success &= all(result == 0 for result in results)
+                emit(
+                    self,
+                    "put",
+                    pool_keys=len(missing),
+                    bytes=sum(sum(sizes[i]) for i in missing),
+                    successes=sum(r == 0 for r in results),
+                    failed=sum(r != 0 for r in results),
+                    max_object_bytes=max(sum(sizes[i]) for i in missing),
+                )
+        return bool(success)
+
+    def _load_grouped_layer_wise(self, counter_index, request_transfers):
+        started = []
+        success = False
+        maybe_fail = arm_load_failure_injection(self.tp_rank)
+        try:
+            # One session entry per object, with potentially many GPU
+            # destinations if requests share a prefix or only adopt one half.
+            batches = {}
+            for transfers in request_transfers:
+                self._validate_grouped_transfers(transfers)
+                for transfer in transfers:
+                    rows = self.pools[transfer.name].prepare_locations(
+                        transfer.host_indices
+                    )
+                    if len(rows) != len(transfer.storage_refs):
+                        raise ValueError(
+                            "Grouped load locations differ from references."
+                        )
+                    objects = batches.setdefault(transfer.name, {})
+                    for ref, row in zip(transfer.storage_refs, rows):
+                        objects.setdefault(ref.key, []).append((row, ref.half))
+            prepared = {}
+            for name, objects in batches.items():
+                transfer = PoolTransfer(name=name)
+                keys = self._storage_object_keys(list(objects), transfer)
+                prepared[name] = (keys, list(objects.values()))
+                # Retain every successful session even if a sibling key fails.
+                results = self.storage.store.batch_get_session_start(keys)
+                if results is None or isinstance(results, int):
+                    raise RuntimeError("Invalid Mooncake GET session response.")
+                opened = [key for key, result in zip(keys, results) if result == 0]
+                if opened:
+                    started.append(opened)
+                if len(results) != len(keys) or len(opened) != len(keys):
+                    raise RuntimeError("Mooncake grouped GET session start failed.")
+            for layer in range(self.num_layers):
+                for name, (keys, groups) in prepared.items():
+                    meta = self.pools[name].get_grouped_layer_range_meta(
+                        groups, layer, self.storage_page_size // self.page_size
+                    )
+                    if meta is None:
+                        continue
+                    ptrs, sizes, offsets = meta
+                    maybe_fail(name, f"layer={layer}")
+                    results = self.storage.store.batch_get_into_multi_buffer_ranges(
+                        keys, ptrs, sizes, offsets
+                    )
+                    if (
+                        results is None
+                        or isinstance(results, int)
+                        or list(results) != [sum(s) for s in sizes]
+                    ):
+                        raise RuntimeError(
+                            f"Mooncake grouped range GET failed: {name}, {layer}."
+                        )
+                self.layer_done_counter.complete(counter_index, layer)
+            success = True
+        except BaseException as error:
+            self.layer_done_counter.fail(counter_index, error)
+            logger.exception("Mooncake grouped layer-wise load failed")
+        finally:
+            for keys in started:
+                try:
+                    self.storage.store.batch_get_session_end(keys)
+                except BaseException as error:
+                    self.layer_done_counter.fail(counter_index, error)
+                    logger.exception("Mooncake grouped session cleanup failed")
+                    success = False
+        emit(self, "load_finished", success=success, grouped=True)
+        return success
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()

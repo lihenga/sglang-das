@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -54,6 +55,7 @@ def _load_case(rank, fail_pool):
     node = NS(id=7, parent=root, external_cache_stored=False)
     cache = NS(
         page_size=64,
+        pp_size=1,
         evict=lambda params: evictions.append(params.num_tokens),
         _all_reduce_attn_groups=_reduce,
         tree_core=NS(
@@ -98,6 +100,7 @@ def _load_case(rank, fail_pool):
         )
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = cache
+    wrapper._waiting_queue_prefetch_enabled = False
     wrapper.hit_markers = {
         "rid": NS(
             device_hit_len=256, tail_hashes=["k0", "k1"], prefix_key=list(range(384))
@@ -210,6 +213,7 @@ def _req(tokens=128):
         prefix_indices=torch.empty(0),
         last_node=0,
         host_hit_length=0,
+        swa_host_hit_length=0,
         storage_hit_length=0,
         retracted_stain=False,
         needs_host_load_back=lambda: False,

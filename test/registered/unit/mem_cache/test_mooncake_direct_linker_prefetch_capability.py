@@ -223,6 +223,7 @@ class TestDisableHostPrefetch(CustomTestCase):
                     mooncake_dfs_health_probe_timeout_s=None,
                 )
                 params = MagicMock()
+                params.page_size = 64
                 params.pp_size = settings.get("pp_size", 1)
                 params.attn_cp_cache_group = None
                 params.attn_tp_cache_group = None
@@ -232,16 +233,20 @@ class TestDisableHostPrefetch(CustomTestCase):
                 class SetupReached(Exception):
                     pass
 
-                with mock.patch(
-                    f"{module}.resolve_hybrid_device_pool_group",
-                    return_value=pool_group,
-                ), mock.patch(
-                    f"{module}.HybridCacheController.parse_storage_backend_extra_config",
-                    return_value=({},),
-                ), mock.patch(
-                    "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
-                    side_effect=SetupReached,
-                ) as setup:
+                with (
+                    mock.patch(
+                        f"{module}.resolve_hybrid_device_pool_group",
+                        return_value=pool_group,
+                    ),
+                    mock.patch(
+                        f"{module}.HybridCacheController.parse_storage_backend_extra_config",
+                        return_value=({},),
+                    ),
+                    mock.patch(
+                        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
+                        side_effect=SetupReached,
+                    ) as setup,
+                ):
                     with self.assertRaises(SetupReached):
                         MooncakeDirectLinker(args, params, components=set())
                 setup.assert_called_once()

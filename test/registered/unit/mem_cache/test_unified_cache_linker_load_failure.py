@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.disaggregation.utils import EXTERNAL_KV_LOAD_ERR_TYPE
+from sglang.srt.disaggregation.utils import (
+    EXTERNAL_KV_LOAD_ERR_TYPE,
+    DisaggregationMode,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
@@ -11,6 +14,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     LayerWiseLoadCounter,
     MooncakeDirectLinker,
 )
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
     InjectedLinkerLoadFailure,
     arm_load_failure_injection,
@@ -20,7 +24,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedTreeNode,
 )
 from sglang.srt.mem_cache.unified_cache_linker import UnifiedCacheLinkerWrapper
-from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -122,6 +125,7 @@ def test_unified_radix_event_path_records_failed_load_rids():
         drain_offloads=lambda count: None,
     )
     cache._failed_linker_rids = []
+    cache._sync_dfs_health_policy = lambda: None
     cache._all_reduce_attn_groups = lambda _tensor, _op: None
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -150,6 +154,7 @@ def test_scheduler_marks_failed_load_request_for_abort():
         external_kv_abort_requested=False,
         external_kv_pending_chunk_cleared=False,
         external_kv_linker_released=False,
+        external_kv_cache_released=False,
         external_kv_sender_abort_requested=False,
     )
     released = []
@@ -166,6 +171,7 @@ def test_scheduler_marks_failed_load_request_for_abort():
         ),
         running_batch=SimpleNamespace(is_empty=lambda: True),
         chunked_req=None,
+        disaggregation_mode=DisaggregationMode.NULL,
         _release_aborted_request=released.append,
     )
 

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.linker_storage_groups import StoragePageRef
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -108,6 +109,9 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # DirectLinker-only mapping, one entry per original 64-token key. Kept
+    # through insert/adoption filtering; ordinary HiCache v2 remains unchanged.
+    storage_refs: Optional[List[StoragePageRef]] = None
 
 
 @dataclass(frozen=True)
@@ -369,7 +373,6 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
-
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
