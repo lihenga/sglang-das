@@ -23,6 +23,10 @@ def is_hcu_gfx936() -> bool:
     return get_hcu_gfx_arch() == "gfx936"
 
 
+def is_hcu_gfx938() -> bool:
+    return get_hcu_gfx_arch() == "gfx938"
+
+
 def _register_runtime_buffer(
     layer: torch.nn.Module, name: str, value: torch.Tensor
 ) -> None:

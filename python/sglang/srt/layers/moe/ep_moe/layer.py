@@ -80,7 +80,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.layers.quantization.hcu_deepgemm_w8a8_utils import is_hcu_gfx936
+from sglang.srt.layers.quantization.hcu_deepgemm_w8a8_utils import (
+    is_hcu_gfx936,
+    is_hcu_gfx938,
+)
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
     SlimQuantW4A8Int8MarlinConfig,
@@ -563,6 +566,21 @@ def _apply_swiglu_limit_inplace(
     gateup_output[..., half:].clamp_(min=-swiglu_limit, max=swiglu_limit)
 
 
+# MODE 1000/1001/1002 select deepgemm's gfx938 fp8 masked "pair32" block_m
+# (64/128/256); see deepgemm/configs/gfx938/w8a8_masked/hipc_pair32/*.json.
+_FP8_MASKED_PAIR32_MODE_BM128 = 1001
+
+
+def _select_fp8_masked_pair32_config(
+    expected_m: int, *, force_bm128: bool
+) -> Optional[Dict[str, Any]]:
+    # Below 128 the heuristic defaults to block_m=64; force 128. Above 128 it
+    # already escalates to block_m=256, so defer to it there.
+    if force_bm128 and expected_m <= 128:
+        return {"MODE": _FP8_MASKED_PAIR32_MODE_BM128}
+    return None
+
+
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -764,6 +782,9 @@ class DeepEPMoE(FusedMoE):
                 is_hcu_gfx936() and not _use_int8_deepgemm_asm
             )
             self.use_w8a8_marlin = False
+
+        if self.use_fp8_w8a8:
+            self.use_fp8_w8a8_deepgemm_bm128 = is_hcu_gfx938()
 
         self.deepep_mode = get_deepep_mode()
 
@@ -2022,6 +2043,9 @@ class DeepEPMoE(FusedMoE):
             gateup_output,
             masked_m,
             expected_m,
+            config=_select_fp8_masked_pair32_config(
+                expected_m, force_bm128=self.use_fp8_w8a8_deepgemm_bm128
+            ),
         )
 
         q_a2_all, q_a2_scale = fuse_silu_mul_fp8_quant_ep(
@@ -2052,6 +2076,9 @@ class DeepEPMoE(FusedMoE):
             expected_m,
             enable_overlap,
             down_gemm_overlap_args.signal if enable_overlap else None,
+            config=_select_fp8_masked_pair32_config(
+                expected_m, force_bm128=self.use_fp8_w8a8_deepgemm_bm128
+            ),
         )
 
         if meta_overlap_args is not None:
