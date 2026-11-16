@@ -84,7 +84,8 @@ if _is_hcu:
 
     _mqa_quant_gate = (
         getattr(lightop_quant, "per_token_dynamic_quant_int8", None)
-        if getattr(lightop_native, "per_token_quant_int8_out_supports_gate", False) else None
+        if getattr(lightop_native, "per_token_quant_int8_out_supports_gate", False)
+        else None
     )
 
     from sglang.kernels.ops.attention.dsa.triton_kernel import (
@@ -240,7 +241,8 @@ def _hcu_paged_mqa_logits(
             seqlens,
             block_tables,
             max_seq_len,
-            group_size=3, clean_logits=False,
+            group_size=3,
+            clean_logits=False,
         )
     return lightop_attention.paged_mqa_logits(
         q.unsqueeze(1),
@@ -273,9 +275,7 @@ def _hcu_mqa_logits(
     )
 
 
-def _legacy_hcu_hadamard_transform(
-    x: torch.Tensor, scale: float
-) -> torch.Tensor:
+def _legacy_hcu_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
     """Torch equivalent of the legacy HCU indexer's cached Hadamard GEMM."""
     hidden_size = x.shape[-1]
     cache_key = (hidden_size, x.device, x.dtype)
@@ -586,8 +586,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if (
                 _tokenflow_legacy_compat
                 and is_hcu()
-                and type(self).__module__
-                == "tokenflow.models.sparkv1.layers.attention"
+                and type(self).__module__ == "tokenflow.models.sparkv1.layers.attention"
                 and type(self).__name__ == "SparkV1Indexer"
             ):
                 return weights.float()
@@ -726,17 +725,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             or envs.SGLANG_DSA_HCU_FUSE_LN_ROPE.get()
             or (self.n_heads, self.head_dim, self.rope_head_dim) != (32, 128, 64)
             or tokens > 36
-            or q_lora.dtype != torch.bfloat16 or not q_lora.is_cuda
-            or not (mode.is_decode_or_idle() or mode.is_target_verify()
-                    or mode.is_draft_extend_v2())
-            or batch.attn_cp_metadata is not None or self.dsa_enable_prefill_cp
-            or parallel.attn_tp_size != 1 or getattr(parallel, "dcp_enabled", False)
+            or q_lora.dtype != torch.bfloat16
+            or not q_lora.is_cuda
+            or not (
+                mode.is_decode_or_idle()
+                or mode.is_target_verify()
+                or mode.is_draft_extend_v2()
+            )
+            or batch.attn_cp_metadata is not None
+            or self.dsa_enable_prefill_cp
+            or parallel.attn_tp_size != 1
+            or getattr(parallel, "dcp_enabled", False)
             or getattr(batch, "attn_dcp_metadata", None) is not None
             or not self.paged_mqa_logits_backend.is_lightop()
-            or not isinstance(norm, LayerNorm) or norm.dtype != torch.float32
+            or not isinstance(norm, LayerNorm)
+            or norm.dtype != torch.float32
             or not norm.elementwise_affine
-            or any(getattr(layer, "set_lora", False)
-                   for layer in (self.weights_proj, self.wq_b, self.wk))
+            or any(
+                getattr(layer, "set_lora", False)
+                for layer in (self.weights_proj, self.wq_b, self.wk)
+            )
             or (rope.rotary_dim, rope.head_size) != (64, 64)
             or rope.cos_sin_cache.dtype != torch.bfloat16
             or positions.dtype not in (torch.int32, torch.int64)
@@ -749,31 +757,44 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         key, _ = self.wk(x)
         # TokenFlow owns the gate-input context and the quantized projections.
         query, gates = op.indexer_q_rope_hadamard_quant(
-            query.view(tokens, 32, 128), positions, rope.cos_sin_cache,
-            self._weights_proj_bf16_in_fp32_out(x_for_gate), rope.is_neox_style,
-            128 ** -0.5, 32 ** -0.5, self.softmax_scale,
+            query.view(tokens, 32, 128),
+            positions,
+            rope.cos_sin_cache,
+            self._weights_proj_bf16_in_fp32_out(x_for_gate),
+            rope.is_neox_style,
+            128**-0.5,
+            32**-0.5,
+            self.softmax_scale,
         )
         # Keep K's original FP32 LayerNorm and BF16 Hadamard accumulation.
         key = norm.forward_native(key.view(tokens, 1, 128))
-        key_rope = key[..., :self.rope_head_dim]
-        if (envs.SGLANG_DSA_HCU_FUSE_INDEXER_K_ROPE.get()
-                and positions.dtype == torch.int64):
-            rotated_key = torch.empty(key_rope.shape, dtype=key_rope.dtype,
-                                      device=key_rope.device)
+        key_rope = key[..., : self.rope_head_dim]
+        if (
+            envs.SGLANG_DSA_HCU_FUSE_INDEXER_K_ROPE.get()
+            and positions.dtype == torch.int64
+        ):
+            rotated_key = torch.empty(
+                key_rope.shape, dtype=key_rope.dtype, device=key_rope.device
+            )
             op.rotary_embedding_deepseek_fuse(
-                positions, key_rope, None, 64, rope.cos_sin_cache,
-                rope.is_neox_style, round_bf16_products=True,
+                positions,
+                key_rope,
+                None,
+                64,
+                rope.cos_sin_cache,
+                rope.is_neox_style,
+                round_bf16_products=True,
                 query_out=rotated_key,
             )
         else:
-            _, rotated_key = self._apply_indexer_rope(
-                positions, key_rope, key_rope
-            )
+            _, rotated_key = self._apply_indexer_rope(positions, key_rope, key_rope)
         self._update_rope_guarded(key_rope, rotated_key)
         key = rotate_activation(key)
         if not getattr(self, "_lightop_preprocess_logged", False):
-            logger.info("Spark LightOp Indexer Q preprocessing active: M<=36, "
-                        "native projection, K preprocessing and INT8 store retained")
+            logger.info(
+                "Spark LightOp Indexer Q preprocessing active: M<=36, "
+                "native projection, K preprocessing and INT8 store retained"
+            )
             self._lightop_preprocess_logged = True
         return query, key, gates.unsqueeze(-1)
 
@@ -1397,9 +1418,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     f"active query count ({paged_row_count}): {available_rows}; "
                     f"forward_mode={forward_mode}."
                 )
-            paged_seqlens = (
-                flat_seqlens[:paged_row_count].to(torch.int32).contiguous()
-            )
+            paged_seqlens = flat_seqlens[:paged_row_count].to(torch.int32).contiguous()
             paged_block_tables = (
                 block_tables[:paged_row_count].to(torch.int32).contiguous()
             )
@@ -1467,19 +1486,60 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 ),
             )
             if sparse_route is None:
-                use_grouped_mqa = (
+                can_grouped_mqa = (
                     envs.SGLANG_DSA_HCU_TARGET_VERIFY_GROUPED_MQA.get()
                     and use_int8_index_cache
                     and self.hcu_arch_name == "gfx936"
                     and self.sm_count == 80
                     and (self.n_heads, self.head_dim) == (32, 128)
                     and forward_mode.is_target_verify()
-                    and forward_batch.batch_size == 2
-                    and paged_row_count == 18
-                    and metadata.get_dsa_extend_len_cpu() in ([9, 9], [1] * 18)
                     and paged_schedule_metadata is None
                     and hasattr(lightop_attention, "paged_mqa_logits_persisten")
                 )
+                use_grouped_mqa = (
+                    can_grouped_mqa
+                    and forward_batch.batch_size == 2
+                    and paged_row_count == 18
+                    and metadata.get_dsa_extend_len_cpu() in ([9, 9], [1] * 18)
+                )
+                if (
+                    can_grouped_mqa
+                    and envs.SGLANG_DSA_HCU_LONG_PAGED_MQA_TOPK_SAMPLE.get()
+                    and 1 <= forward_batch.batch_size <= 32
+                    and paged_row_count == 9 * forward_batch.batch_size
+                    and metadata.get_dsa_extend_len_cpu()
+                    in ([9] * forward_batch.batch_size, [1] * paged_row_count)
+                    and metadata.topk_backend.is_lightop()
+                    and metadata.topk_transform_method.name == "PAGED"
+                    and envs.SGLANG_DSA_FUSE_TOPK.get()
+                    and not metadata.force_unfused_topk
+                    and self.index_topk == 2048
+                    and self.num_init_tokens == 0
+                    and self.num_local_tokens == 0
+                    and hasattr(lightop_attention, "paged_mqa_topk_sampled_int8")
+                ):
+                    selected = lightop_attention.paged_mqa_topk_sampled_int8(
+                        active_q,
+                        kv_cache,
+                        active_weights,
+                        paged_seqlens,
+                        paged_block_tables,
+                        metadata.attn_metadata.page_table_1,
+                        metadata.attn_metadata.cu_seqlens_q,
+                        max_seq_len,
+                        enabled=True,
+                    )
+                    if selected is not None:
+                        metadata.attn_metadata.lightop_kv_reuse.page_indices = selected
+                        metadata.attn_metadata.lightop_kv_reuse.dedup_key = None
+                        if not hasattr(self, "_long_sampled_paged_mqa_logged"):
+                            logger.info(
+                                "Sampled paged MQA+TopK active: q=%s width=%s",
+                                tuple(active_q.shape),
+                                max_seq_len,
+                            )
+                            self._long_sampled_paged_mqa_logged = True
+                        return selected
                 logits = _hcu_paged_mqa_logits(
                     paged_q,
                     kv_cache,
@@ -1522,9 +1582,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if use_int8_index_cache and not hasattr(
                 self, "_hcu_int8_indexer_path_logged"
             ):
-                logger.info(
-                    "DSA INT8 index-K consumer=LightOp dense INT8 Paged MQA"
-                )
+                logger.info("DSA INT8 index-K consumer=LightOp dense INT8 Paged MQA")
                 self._hcu_int8_indexer_path_logged = True
         else:
             kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
@@ -1597,9 +1655,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # NOTE(dark): logits should be cleaned in topk_transform.
             self._mask_init_and_local_tokens(
                 logits,
-                paged_seqlens
-                if self.paged_mqa_logits_backend.is_lightop()
-                else seqlens_32,
+                (
+                    paged_seqlens
+                    if self.paged_mqa_logits_backend.is_lightop()
+                    else seqlens_32
+                ),
             )
             if self.paged_mqa_logits_backend.is_lightop():
                 topk_result = metadata.topk_transform(
@@ -2838,7 +2898,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 or forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata,
+                    forward_batch,
+                    layer_id,
+                    q_fp8,
+                    weights,
+                    metadata,
                     q_int8_prepared=q_int8_prepared,
                 )
             else:
