@@ -1,5 +1,7 @@
 # SWA extend attention 优化与 Spark 缓存性能记录
 
+后续已补充 [SGLang / Mooncake 完整直通路径复核](spark_direct_path_audit_20261116.md)，包含逐阶段计时、预取/写回/pipeline 因果对照与两处直通元数据优化。下文保留本轮 kernel 实验的原始范围；后续瓶颈判断以补充记录为准。
+
 ## 修改动机与范围
 
 Triton `extend_attention_fwd` 的 SWA 路径从 KV tile 0 开始遍历，再通过窗口掩码跳过完全不可见的 tile。长前缀和较长 extend 下，这些循环仍支付索引、掩码和分支成本。
@@ -67,7 +69,7 @@ Spark PC95、4个prefill step的 GPU trace：
 
 这份trace的H2D scatter与attention时间区间没有重叠，符合当前page-wise读完后才开放计算的结构。H2D属于Mooncake→设备的传输路径，不是物理DFS读。layer-wise对照未提升吞吐（PC95 111K、PC90 84K），故不能据此直接改成分层加载；细粒度调用、协调和正确性依赖也需计入。
 
-后续优先级：
+初轮待验证方向（后续已按完整直通路径复核，不能据本段排除 Mooncake）：
 
 1. **SGLang attention计算和rank间负载/等待。** 新后缀仍需访问长历史KV；高PC不意味着成本按未命中tokens比例线性下降。采集同形状、完整预热、低扰动的逐rank kernel与collective区间，检查慢rank是否可重复，避免直接归因于网络。
 2. **SGLang与Mooncake之间的H2D调度。** 检查预取缓冲到设备的scatter粒度、合并、跨batch/层重叠，同时保留租约与失败传播约束。分别量化scatter执行、等待、metadata，不能把它们都算成DFS读取慢。
