@@ -1746,12 +1746,16 @@ def _release_glm_received_part(pool, engine, buffer, slot):
 class GlmWaitingRDMARequest(WaitingRDMARequest):
     """Source GLM per-part pipeline on main's scheduler-owned GPU receive pool."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, keep_parts_for_broadcast=False, **kwargs):
         super().__init__(*args, **kwargs)
         self._part_buffers = {}
         self._part_finalizers = []
         self._posted_rdma = False
         self._received_all_parts = False
+        # Leader under SGLANG_OPT_EPD_RDMA_LEADER_BROADCAST: part views the
+        # receiver broadcasts to the other TP ranks in the tick this succeeds.
+        self._keep_parts_for_broadcast = keep_parts_for_broadcast
+        self.broadcast_parts: Optional[List[torch.Tensor]] = None
 
     def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
         if recv_obj.dtype is not None and recv_obj.dtype != self.dtype:
@@ -1761,6 +1765,15 @@ class GlmWaitingRDMARequest(WaitingRDMARequest):
         return super()._extract_embedding_from_buffer(recv_obj, parts)
 
     def send_encode_request(self):
+        self._ensure_part_routes()
+        if getattr(self.mm_processor, "tp_rank", 0) == 0:
+            logger.debug(
+                "EPD per-part RDMA pipeline: rid=%s parts=%d",
+                self.rid, len(self.recv_req.encoder_part_routes),
+            )
+        super().send_encode_request()
+
+    def _ensure_part_routes(self):
         # Older tokenizers omit explicit routes, but their assignments still
         # define the same modality-major part IDs. Never fall back to waiting
         # for every part's metadata before posting the first RDMA transfer.
@@ -1778,12 +1791,6 @@ class GlmWaitingRDMARequest(WaitingRDMARequest):
             self.recv_req.encoder_part_routes = routes
         if not self.recv_req.encoder_part_routes:
             raise ValueError(f"No encoder parts assigned for {self.rid}")
-        if getattr(self.mm_processor, "tp_rank", 0) == 0:
-            logger.debug(
-                "EPD per-part RDMA pipeline: rid=%s parts=%d",
-                self.rid, len(self.recv_req.encoder_part_routes),
-            )
-        super().send_encode_request()
 
     async def _pull_meta_and_receive_embedding(self):
         routes = self.recv_req.encoder_part_routes
@@ -1878,6 +1885,11 @@ class GlmWaitingRDMARequest(WaitingRDMARequest):
             embeddings = {
                 modality: EmbeddingChunks(parts) for modality, parts in groups.items()
             }
+            if self._keep_parts_for_broadcast:
+                self.broadcast_parts = [
+                    self._part_buffers[idx][0][: self._part_buffers[idx][2]]
+                    for idx in range(len(self.recv_embedding_data.embedding_shape_list))
+                ]
             self._finish_assemble(embeddings)
             self._cleanup_gpu_buffer()
         except Exception as error:
@@ -1926,9 +1938,83 @@ class GlmWaitingRDMARequest(WaitingRDMARequest):
 
     def release_resources(self):
         super().release_resources()
+        self.broadcast_parts = None
         finalizers, self._part_finalizers = self._part_finalizers, []
         for finalizer in finalizers:
             finalizer()
+
+
+class GlmRDMAFollowerRequest(GlmWaitingRDMARequest):
+    """Non-leader TP rank under SGLANG_OPT_EPD_RDMA_LEADER_BROADCAST.
+
+    Posts no /send and opens no ACK socket: TP rank 0 receives the embedding
+    over RDMA and broadcasts the part bytes, this rank only assembles them.
+    Stays SUCCESS locally so the TP status MIN-reduce follows the leader.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Any non-None port skips the per-request ACK socket.
+        kwargs["embedding_port"] = 0
+        super().__init__(*args, **kwargs)
+
+    def send_encode_request(self):
+        self._ensure_part_routes()
+        self.status = WaitingMMRequestStatus.SUCCESS
+
+    def alloc_broadcast_parts(self, part_nbytes) -> List[torch.Tensor]:
+        """Allocate one landing buffer per part, in part order."""
+        tensors = []
+        unpooled = 0
+        for idx, nbytes in enumerate(part_nbytes):
+            allocation = (
+                self.embedding_pool.try_alloc(nbytes)
+                if self.embedding_pool is not None and nbytes
+                else None
+            )
+            if allocation is not None:
+                buffer, _, slot = allocation
+            else:
+                # Blocking on the pool would desync the TP collectives, so fall
+                # back to a plain allocation and surface the extra VRAM.
+                if self.embedding_pool is not None and nbytes:
+                    unpooled += 1
+                buffer = torch.empty(
+                    nbytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+                )
+                slot = None
+            self._part_buffers[idx] = (buffer, slot, nbytes)
+            tensors.append(buffer[:nbytes])
+        if unpooled:
+            logger.warning(
+                "EPD broadcast staging fell back to %d unpooled part(s) for "
+                "rid=%s: the embedding pool is full on this TP rank",
+                unpooled,
+                self.rid,
+            )
+        return tensors
+
+    def assemble_from_broadcast(self, recv_embedding_data) -> bool:
+        self.recv_embedding_data = recv_embedding_data
+        self._received_all_parts = True
+        self.status = WaitingMMRequestStatus.PENDING
+        self._assemble_mm_inputs_from_embeddings()
+        return self.status == WaitingMMRequestStatus.SUCCESS
+
+    def _bind_pool_slot_to_mm_inputs(self, mm_inputs):
+        # Unpooled parts are plain tensors kept alive by the mm_inputs views.
+        for _, slot, _ in self._part_buffers.values():
+            if slot is not None:
+                self._part_finalizers.append(
+                    self.embedding_pool.release_on_gc(mm_inputs, slot)
+                )
+        _mark_keep_device_embedding(mm_inputs)
+        self._part_buffers.clear()
+        return True
+
+    def _release_part(self, buffer, slot):
+        # Nothing was registered with mooncake on this rank.
+        if slot is not None:
+            self.embedding_pool.release(slot)
 
 
 async def _extract_encoder_error(responses, endpoint, context, encode_requests=None):
@@ -2190,6 +2276,8 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
 
 
 class MMReceiverBase(ABC):
+    supports_rdma_leader_broadcast = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -2260,6 +2348,7 @@ class MMReceiverBase(ABC):
         self.gpu_id = scheduler.ps.gpu_id if scheduler is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.embedding_pool = None
+        self.rdma_leader_broadcast = False
 
         self.model_type = (
             getattr(hf_config, "model_type", "").lower()
@@ -2301,6 +2390,7 @@ class MMReceiverBase(ABC):
                         "falling back to per-request register"
                     )
                     self.embedding_pool = None
+            self._init_rdma_leader_broadcast(scheduler)
             if hf_config is not None:
                 self._init_mm_processor(server_args, hf_config)
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
@@ -2649,6 +2739,208 @@ class MMReceiverBase(ABC):
             obj.need_wait_for_mm_inputs = False
             return None
 
+    def _init_rdma_leader_broadcast(self, scheduler) -> None:
+        """Enable rank-0 RDMA receive + intra-node broadcast (GLM mooncake).
+
+        The broadcast gets its own communicator and stream so it never
+        interleaves with the TP collectives of the overlapped forward.
+        """
+        if (
+            not envs.SGLANG_OPT_EPD_RDMA_LEADER_BROADCAST.get()
+            or not self.supports_rdma_leader_broadcast
+            or scheduler is None
+            or "glm" not in (self.model_type or "")
+            or self.tp_group is None
+            or self.tp_size <= 1
+        ):
+            return
+        if scheduler._forward_ingress_enabled:
+            # Ingress keeps submitting TP collectives from its forward thread
+            # while this thread receives, so a stream wait cannot order the
+            # broadcast behind them; the receiver would also share the model's
+            # original Gloo groups with that thread.
+            logger.warning(
+                "SGLANG_OPT_EPD_RDMA_LEADER_BROADCAST cannot be ordered against "
+                "a background forward (waiting-queue ingress); keeping per-rank "
+                "RDMA receive."
+            )
+            return
+        if self.tp_group.world_size != torch.distributed.get_world_size():
+            # new_group must be entered by every rank of the default group.
+            logger.warning(
+                "SGLANG_OPT_EPD_RDMA_LEADER_BROADCAST needs the receive TP group "
+                "to span the whole world; keeping per-rank RDMA receive."
+            )
+            return
+        self.bcast_group = torch.distributed.new_group(
+            ranks=self.tp_group.ranks,
+            backend=torch.distributed.get_backend(self.tp_group.device_group),
+        )
+        self.bcast_stream = torch.cuda.Stream(device=self.gpu_id)
+        # NCCL communicators init lazily; warm up now so the first request
+        # neither pays the setup nor allocates comm buffers mid-serving.
+        warmup = torch.zeros(1, dtype=torch.uint8, device=f"cuda:{self.gpu_id}")
+        with torch.cuda.stream(self.bcast_stream):
+            torch.distributed.broadcast(
+                warmup, src=self.tp_group.ranks[0], group=self.bcast_group
+            )
+        self.bcast_stream.synchronize()
+        self.rdma_leader_broadcast = True
+        if self.tp_group.rank_in_group == 0:
+            logger.info(
+                "EPD RDMA leader broadcast enabled across %d TP ranks", self.tp_size
+            )
+
+    def _replicate_leader_embeddings(self, local_status) -> None:
+        """Copy embeddings from TP rank 0 to the other ranks for every request
+        that became SUCCESS this tick.
+
+        ``local_status`` is already TP-reduced, so every rank walks the same
+        requests in the same order. A request that fails to assemble on any
+        rank is downgraded to FAIL everywhere.
+        """
+        ready = [
+            (i, waiting_req)
+            for i, waiting_req in enumerate(self.waiting_list)
+            if local_status[i].item() == WaitingMMRequestStatus.SUCCESS
+        ]
+        if not ready:
+            return
+        is_leader = self.tp_group.rank_in_group == 0
+        metas = self.tp_group.broadcast_object(
+            (
+                [
+                    (
+                        waiting_req.recv_embedding_data,
+                        [t.numel() for t in waiting_req.broadcast_parts or []],
+                    )
+                    for _, waiting_req in ready
+                ]
+                if is_leader
+                else None
+            ),
+            src=0,
+        )
+        # Stage every buffer before any rank enters the broadcast: a rank that
+        # then runs out of memory fails its own requests instead of dropping
+        # out mid-collective and hanging the rest of the TP group.
+        staged = []
+        alloc_flags = []
+        for (i, waiting_req), (recv_embedding_data, part_nbytes) in zip(ready, metas):
+            try:
+                tensors = (
+                    waiting_req.broadcast_parts or []
+                    if is_leader
+                    else waiting_req.alloc_broadcast_parts(part_nbytes)
+                )
+                flag = 1
+            except Exception:
+                logger.exception(
+                    "EPD broadcast staging failed on tp rank %d, rid=%s",
+                    self.tp_group.rank_in_group,
+                    waiting_req.rid,
+                )
+                tensors, flag = [], 0
+            staged.append((i, waiting_req, recv_embedding_data, tensors))
+            alloc_flags.append(flag)
+        alloc_flags = torch.tensor(alloc_flags, dtype=torch.int32)
+        torch.distributed.all_reduce(
+            alloc_flags,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_group.cpu_group,
+        )
+
+        live = []
+        for req, flag in zip(staged, alloc_flags.tolist()):
+            if flag:
+                live.append(req)
+                continue
+            # The outer FAIL path releases whatever this rank did allocate.
+            i, waiting_req = req[0], req[1]
+            local_status[i] = WaitingMMRequestStatus.FAIL
+            if waiting_req.error_msg is None:
+                waiting_req.error_msg = (
+                    "Failed to allocate the multimodal embedding broadcast buffer"
+                )
+        if not live:
+            return
+
+        schedule_stream = torch.cuda.current_stream()
+        self.bcast_stream.wait_stream(schedule_stream)
+        # Two communicators with kernels resident at once can deadlock, and
+        # the WAR barrier that would serialize them is off on HIP. Queue the
+        # broadcast behind the in-flight forward (GPU-side wait, no CPU sync).
+        forward_stream = getattr(self.scheduler, "forward_stream", None)
+        if forward_stream is not None:
+            self.bcast_stream.wait_stream(forward_stream)
+        src = self.tp_group.ranks[0]
+        checked = []
+        with torch.cuda.stream(self.bcast_stream):
+            for _, _, _, tensors in live:
+                checked.append(tensors)
+                for tensor in tensors:
+                    if tensor.numel():
+                        torch.distributed.broadcast(
+                            tensor, src=src, group=self.bcast_group
+                        )
+        # forward_stream waits on schedule_stream at batch launch, so this
+        # orders the model's reads after the broadcast without a CPU sync.
+        schedule_stream.wait_stream(self.bcast_stream)
+        if envs.SGLANG_DEBUG_EPD_RDMA_LEADER_BROADCAST_VERIFY.get():
+            self._verify_leader_broadcast(checked, is_leader)
+
+        assembled = []
+        for _, waiting_req, recv_embedding_data, _ in live:
+            if is_leader:
+                waiting_req.broadcast_parts = None
+                assembled.append(1)
+            else:
+                assembled.append(
+                    int(waiting_req.assemble_from_broadcast(recv_embedding_data))
+                )
+        assembled = torch.tensor(assembled, dtype=torch.int32)
+        torch.distributed.all_reduce(
+            assembled,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_group.cpu_group,
+        )
+        for (i, waiting_req, _, _), ok in zip(live, assembled.tolist()):
+            if ok:
+                continue
+            local_status[i] = WaitingMMRequestStatus.FAIL
+            if waiting_req.error_msg is None:
+                waiting_req.error_msg = (
+                    "Failed to replicate multimodal embedding across TP ranks"
+                )
+
+    def _verify_leader_broadcast(self, checked, is_leader) -> None:
+        """Debug: compare position-weighted byte checksums with rank 0."""
+        torch.cuda.current_stream().synchronize()
+
+        def checksum(t):
+            u = t.view(torch.uint8).to(torch.int64)
+            w = torch.arange(u.numel(), device=u.device, dtype=torch.int64) % 251 + 1
+            return int((u * w).sum().item())
+
+        sums = [[checksum(t) for t in tensors] for tensors in checked]
+        ref = self.tp_group.broadcast_object(sums if is_leader else None, src=0)
+        ok = int(sums == ref)
+        if not ok:
+            logger.error(
+                "EPD broadcast verify MISMATCH on tp rank %d: got=%s ref=%s",
+                self.tp_group.rank_in_group, sums, ref,
+            )
+        flag = torch.tensor([ok], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=self.tp_group.cpu_group
+        )
+        if is_leader:
+            logger.info(
+                "EPD broadcast verify %s: reqs=%d parts=%d",
+                "OK" if flag.item() else "MISMATCH",
+                len(checked), sum(len(t) for t in checked),
+            )
+
     def _sync_fail_info_across_tp(self, waiting_req: WaitingMMRequestBase) -> None:
         """Share encoder error fields across TP ranks before abort.
 
@@ -2745,7 +3037,7 @@ class MMReceiverBase(ABC):
                         encoder_urls=encode_urls,
                         model_type=self.model_type,
                         host_name=self.hostname,
-                        receive_count=self.tp_size,
+                        receive_count=1 if self.rdma_leader_broadcast else self.tp_size,
                         zmq_context=(
                             None
                             if self.scheduler_recv_socket is not None
@@ -2831,6 +3123,8 @@ class MMReceiverBase(ABC):
             op=torch.distributed.ReduceOp.MIN,
             group=self.tp_group.cpu_group,
         )
+        if self.rdma_leader_broadcast:
+            self._replicate_leader_embeddings(local_status)
 
         new_waiting = []
         for i, waiting_req in enumerate(self.waiting_list):
@@ -3112,6 +3406,8 @@ class MMReceiverBase(ABC):
 
 
 class MMReceiverHTTP(MMReceiverBase):
+    supports_rdma_leader_broadcast = True
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -3137,15 +3433,25 @@ class MMReceiverHTTP(MMReceiverBase):
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
-            return self._process_waiting_requests(
-                recv_reqs,
+            waiting_cls = (
                 GlmWaitingRDMARequest
                 if "glm" in (self.model_type or "")
-                else WaitingRDMARequest,
+                else WaitingRDMARequest
+            )
+            leader_kwargs = {}
+            if self.rdma_leader_broadcast:
+                if self.tp_group.rank_in_group == 0:
+                    leader_kwargs["keep_parts_for_broadcast"] = True
+                else:
+                    waiting_cls = GlmRDMAFollowerRequest
+            return self._process_waiting_requests(
+                recv_reqs,
+                waiting_cls,
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
                 gpu_id=self.gpu_id,
                 embedding_pool=self.embedding_pool,
+                **leader_kwargs,
             )
         return self._process_waiting_requests(
             recv_reqs,
