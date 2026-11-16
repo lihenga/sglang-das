@@ -53,6 +53,62 @@ maturin build --release --out dist --features vendored-openssl
 pip install dist/sglang_router-*.whl
 ```
 
+## HTTP streaming outcome metrics
+
+The native `sglang-router` wheel exports
+`smg_router_stream_outcome_total{router_type,backend_type,model,worker_url,outcome}`
+on its configured Prometheus endpoint. This counter observes HTTP regular and
+HTTP PD streams whose upstream response status is 2xx; PD labels identify the
+decode worker. Requests without an explicit model use the worker's model ID.
+
+| `outcome` | Meaning |
+| --- | --- |
+| `ok` | Upstream reached EOF, or PD recognized `[DONE]` or a Responses completed/incomplete event. |
+| `stream_error_event` | An engine SSE line starts with `data:` and a JSON object whose first key is `error`, or PD detects an error/abort/failed Responses payload. |
+| `upstream_error` | Upstream transport/read failure, or an invalid/empty PD stream before forwarding; transport errors take precedence over in-band errors. |
+| `client_disconnect` | The response stream was dropped before upstream completion or error. |
+
+HTTP PD requests are sent once, even when router retry options are configured.
+Regular HTTP, external OpenAI, and gRPC retry behavior is unchanged.
+Either worker's failure cancels its paired request
+and returns an error without retrying. Decode stays monitored while Prefill is
+pending, including after the first token. A forwarded error event closes the
+PD stream after that event is sent. Decode errors detected after upstream
+2xx headers but before forwarding are also counted in the stream metric.
+Prefill failures and non-2xx responses remain in
+`smg_http_responses_total` and `smg_router_request_errors_total`. The stream counter does not
+cover gRPC or external OpenAI response-processing paths. `ok` is an upstream
+completion observation, not proof that the client received every byte. A PD
+failure is attributed to the decode stream and does not identify the failing
+prefill as its root cause. No `expired` or `aborted` classifications are added.
+Series appear when an observed stream ends or an early decode error is detected.
+Error events are logged with their worker URL; each logged SSE line is capped
+at 4 KiB. Worker error counters only record the side that actually failed.
+Stream failure and PD cancellation logs are limited to one event per call site
+per router process every 30 seconds. The first event is logged immediately;
+the next emitted event includes `suppressed_logs`, the number skipped since the
+previous event. This limit is shared across requests and workers at that call
+site. It does not sample metrics, breaker outcomes, or request cancellation.
+
+HTTP PD preserves `/v1/responses` routing, bootstrap/DP metadata, explicit
+boolean normalization of an omitted `stream`, and rejection of detached
+background requests. Both workers are checked for nested `response.error`,
+`response.failed`, flat error events, and failed response objects, including
+when HTTP status is 200. Completed/incomplete Responses events are successful
+stream termination signals; length-limited incomplete output is not a worker
+failure. Before downstream headers, failures return HTTP errors without
+waiting for the upstream error body. After streaming starts, the original
+error event is forwarded and the stream closes. Updating the Python Engine
+package alone does not install these gateway changes.
+
+```promql
+sum by (outcome) (rate(smg_router_stream_outcome_total[5m]))
+```
+
+Build and install this directory's wheel to use the metric with the existing
+`python -m sglang_router.launch_router` entry point. Updating only the `sglang`
+Engine wheel or building `experimental/sgl-router` does not update this package.
+
 ## Testing
 
 ```bash
