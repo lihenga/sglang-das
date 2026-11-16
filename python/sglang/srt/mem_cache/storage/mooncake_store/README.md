@@ -505,3 +505,154 @@ python3 [path of test_mooncake_store.py]
 ```
 
 If all tests pass, the message "✅ All tests passed" will be printed at the end.
+
+## DeepSeek 4.1 direct Mooncake L3/L4
+
+This port is based on HYGON `feat/20260920_deepseek-v4.1` at
+`7888b28e77` and brings the Mooncake direct-cache behavior from
+`lihenga/sglang-das` `feature/optimize_main` at `61321c04df`.
+The 4.1 C1/C2 KV, indexer payload/scale, SWA, CP layer ownership and packed
+DSpark draft mappings remain the target implementation.
+
+### Enable the direct path
+
+Add these options to the model's existing supported launch configuration:
+
+```bash
+--enable-unified-cache-external-linker \
+--unified-cache-external-linker-backend mooncake \
+--schedule-policy fcfs \
+--mooncake-enable-page-wise-load \
+--mooncake-enable-waiting-queue-dfs-prefetch \
+--mooncake-waiting-queue-dfs-prefetch-workers 1 \
+--mooncake-waiting-queue-dfs-prefetch-max-requests 12
+```
+
+Do not combine direct linking with `--enable-hierarchical-cache` or
+`--hicache-storage-backend`. DeepSeek 4.1 currently rejects PP > 1 and
+encoder SWA bounded replay together with the external linker. This port does
+not remove those model compatibility gates. The unified radix tree is already
+the default; `SGLANG_ENABLE_UNIFIED_RADIX_TREE` is obsolete.
+
+The added runtime options are opt-in. Keep the existing layer-wise path to
+establish a baseline before enabling page-wise/ReadPlan and queued prefetch.
+For a supporting embedded L4 client, the relevant settings are:
+
+```bash
+export SGLANG_MOONCAKE_READ_PLAN=1
+export SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES=0
+export SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE=1073741824
+export MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE=1
+
+# Example per-embedded-client buffer budget; size for the actual model/load.
+export MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES=12884901888
+export MC_STORE_DFS_PREFETCH_CAPACITY_RATIO=0.5
+```
+
+ReadPlan page-wise reads pass the mode directly to native code. The ordinary
+range path uses `--mooncake-page-wise-load-threshold` (default 10 expanded keys).
+ReadLayout is selected when supported; otherwise session range reads remain
+available. Address reuse is incompatible with page-wise mode.
+
+Queued prefetch reads DFS objects into the native pinned session cache before
+GPU admission. It requires FCFS, a non-PD or prefill role, PP=1, all-rank API
+support and an available native arena. If any attention rank lacks these,
+all ranks disable it before traffic. Distinct Gloo groups isolate background
+prefetch and input reception from model-forward collectives. Unsupported input
+such as multimodal/control/grammar work is deferred in receive order until the
+forward returns; shared-memory materialization stays on the scheduler thread.
+
+The background state uses attempt-scoped backend IDs, so an old submission ACK
+or cleanup cannot cancel a newer request attempt with the same public RID.
+Session references are shared by physical key; failures, cancellations and
+shutdown retain buffers until the owning I/O has drained. The Python TreeCore
+owns failed-chain detachment/reclamation; selecting Rust with this direct path
+uses the existing compatibility fallback to Python (already HCU's default).
+
+### L3/L4 package compatibility
+
+Optional APIs are negotiated through declared capabilities and callable
+methods, without parsing wheel version strings. Community, HYGON L3 and DAS L4
+packages keep their baseline setup/session reads. Unsupported ReadPlan falls
+back to ReadLayout or session ranges; unsupported queued DFS prefetch disables
+that feature. Storage placement and tenant options are never silently dropped.
+Both the older extension module and the newer `mooncake.store` facade are
+supported for ReadLayout types. This matches the compatibility behavior from
+the donor's community/HYGON L3/L4 integration PR, adapted to this branch's
+resolved RuntimeContext config bags.
+
+For standalone mode, use matching Python/client-daemon packages and matching
+Client/Master RPC protocols. A callable Python method does not establish daemon
+support; current L4 declares ReadPlan, ReadLayout and queued DFS prefetch for
+embedded clients. No transport performance or driver compatibility follows
+from successful Python API negotiation.
+
+### DFS deployment and lease settings
+
+Keep the working Mooncake master/client DFS configuration for the shared root,
+bucket allocator/alignment/capacity, offload and replica placement. SGLang's
+per-rank SSD subdirectories apply to local-disk backends; a distributed backend
+retains its shared root and can start with L3 while that mount is unavailable.
+The mounted root and actual DFS capacity/permissions still require deployment
+validation.
+
+`SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S=0` refreshes reused sessions
+unconditionally. A positive age skips refresh only for a private, sufficiently
+fresh session. Declare the real master TTL in seconds through
+`SGLANG_MOONCAKE_LEASE_TTL_S`; for master `--default_kv_lease_ttl=30000`, use `30`.
+Grouped or shared keys use conservative refresh behavior. Admission, queueing,
+synchronization and actual reads still consume the lease; this is an RPC-saving
+optimization, not a guarantee for arbitrary read duration.
+
+The current `v0.3.14_dev_l4` native configuration uses the unified DFS buffer
+and prefetch-capacity ratio. The old `MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES`,
+`MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`,
+`MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES`, and
+`MC_STORE_DFS_WRITE_ARENA_COUNT` should not be used to calculate its capacity.
+Read and write chunks use `MC_STORE_DFS_READ_CHUNK_SIZE_BYTES` and
+`MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES`. Count embedded clients/processes when
+budgeting memory; an external storage client has a separate budget.
+
+DFS health has independent read/write probes and fail-closed policy before
+warmup. Configure interval, failure/success thresholds and timeout with the
+`--mooncake-dfs-health-*` options, or corresponding
+`SGLANG_MOONCAKE_DFS_HEALTH_*` environment variables. Attention ranks apply a
+common conservative policy. Recovery does not promise backfill of every write
+made while DFS was unavailable.
+
+### Observability and validation
+
+With `--enable-metrics`, each embedded client reports cumulative native metrics
+to its SGLang service; HTTP and gRPC sidecar receivers expose them through
+`/metrics`. Reports wait for receiver startup, retain authentication/TLS
+settings and omit successful snapshot traffic from access logs. Queue events,
+worker outcome/duration and ready-to-claim lead time are separate from actual
+load completion. Direct `l4_*` counters cover successful external-store loads
+or writes; the metric name alone does not prove every object came from DFS.
+
+CPU-only tests live under `test/registered/unit/{mem_cache,managers,disaggregation,observability}`.
+`test/manual/mooncake/test_package_compatibility.py` exercises package negotiation
+without native allocation. `test_native_read_plan.py` uses a private in-process
+Master for CPU/TCP native ReadLayout/ReadPlan/session smoke.
+`test_wheel_swap.py` checks multi-pool SGLang writes/reads against a matching
+wheel; choose `MATRIX_DEVICES=cpu` for CPU checks. These tests do not substitute
+for DeepSeek 4.1 output-consistency, HCU, RDMA, DFS fault, or performance runs.
+
+### Implementation batches and evidence
+
+The functional changes are grouped as Store/API compatibility and diagnostics;
+read/session plans plus queued prefetch and tree ownership; scheduler/PD
+lifetime integration; then regression coverage and deployment notes. Existing
+4.1 pool/model code remains authoritative. Other-model-specific GLM/Mamba
+features are outside this DeepSeek 4.1 port. Existing PP > 1 and encoder bounded
+replay restrictions remain in force.
+
+Validation in the supplied `sglang0518_0920_yb` container uses an isolated task
+directory and leaves its installed Mooncake package untouched. A matching
+`v0.3.14_dev_l4` wheel was built with SHCA, HIP/HYGON and etcd via
+`scripts/variant_build.sh --shca --hip --etcd`. The script enables fake HIP RPC
+compatibility; this build does not establish HIP fabric RPC functionality.
+Native CPU/TCP ReadLayout/ReadPlan/session checks and multi-pool SGLang
+round-trips passed. The container has Python 3.10 whereas this branch declares
+Python >= 3.11, so successful component tests do not establish a supported full
+serving installation.
