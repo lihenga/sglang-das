@@ -1443,6 +1443,11 @@ class Envs:
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
+    # GLM mooncake EPD: only TP rank 0 RDMA-receives each embedding, then
+    # broadcasts it to the other TP ranks over the intra-node device link.
+    SGLANG_OPT_EPD_RDMA_LEADER_BROADCAST = EnvBool(False)
+    # Debug: checksum every broadcast part on each rank against rank 0.
+    SGLANG_DEBUG_EPD_RDMA_LEADER_BROADCAST_VERIFY = EnvBool(False)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
     # ===================================================================
