@@ -197,6 +197,19 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
             }
             self.assertEqual(len(paths), 8)
 
+    def test_distributed_backend_retains_shared_root_without_creating_a_mount(self):
+        with tempfile.TemporaryDirectory() as base:
+            shared_root = os.path.join(base, "offline-shared-root")
+            with patch.dict(
+                os.environ,
+                {
+                    "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR": "distributed_storage_backend"
+                },
+            ):
+                client = _make_store(tp_rank=3, pp_rank=0, ssd_offload_path=shared_root)
+            self.assertEqual(client.setup_kwargs["ssd_offload_path"], shared_root)
+            self.assertFalse(os.path.exists(shared_root))
+
 
 if __name__ == "__main__":
     unittest.main()

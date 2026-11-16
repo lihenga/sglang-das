@@ -3,11 +3,13 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
 import ctypes
+import ipaddress
 import json
 import logging
 import os
 import time
 import uuid
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
@@ -27,7 +29,18 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage.mooncake_store.compat import (
+    setup_store,
+    supports_feature,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_parallel,
+    get_server_args,
+    get_serving,
+)
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -92,6 +105,33 @@ def _normalize_tenant_id(value) -> str:
         return DEFAULT_TENANT_ID
     tenant_id = str(value).strip()
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
+def _get_service_endpoint(server_args) -> str:
+    """Use existing serving/network settings for both direct and HiCache stores."""
+    host = (
+        NetworkAddress.parse(get_parallel().dist_init_addr).host
+        if get_parallel().nnodes > 1
+        else server_args.host or "0.0.0.0"
+    )
+    address = ipaddress.ip_address(NetworkAddress.resolve_host(host))
+    if address.is_unspecified:
+        address = ipaddress.ip_address(get_local_ip_auto())
+    port = int(server_args.port)
+    if address.is_unspecified or not 1 <= port <= 65535:
+        raise ValueError("Cannot resolve a concrete SGLang service IP:business-port")
+    return NetworkAddress(str(address), port).to_host_port_str()
+
+
+def _get_mooncake_client_http_setup_kwargs(
+    enable_client_http_server: bool,
+) -> dict[str, Any]:
+    if not enable_client_http_server:
+        return {}
+    return {
+        "enable_client_http_server": True,
+        "client_http_port": 0,
+    }
 
 
 @dataclass
@@ -391,9 +431,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return total
 
     def __init__(
-        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+        self,
+        storage_config: HiCacheStorageConfig = None,
+        mem_pool: HostKVCache = None,
+        enable_client_http_server: Optional[bool] = None,
+        enable_dfs_prefetch: Optional[bool] = None,
+        dfs_health_config: Optional[dict[str, int]] = None,
     ):
         MooncakeBaseStore.__init__(self)
+        self._dfs_health_manager = None
+        self._client_metrics_reporter = None
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -407,6 +454,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            if dfs_health_config is None and extra_config:
+                dfs_health_config = extra_config.get("_mooncake_dfs_health_config")
+            if enable_client_http_server is None:
+                enable_client_http_server = bool(
+                    getattr(storage_config, "enable_storage_metrics", False)
+                )
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -478,7 +531,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
                     required_bytes,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    envs.SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE.get(),  # Zero copy interface does not need local buffer
                     self.config.client_server_address,
                 )
             else:
@@ -514,7 +567,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
 
-                setup_kwargs = {}
+                setup_kwargs = _get_mooncake_client_http_setup_kwargs(
+                    enable_client_http_server,
+                )
+                if enable_dfs_prefetch is False:
+                    # Override the arena environment for this client only.
+                    setup_kwargs["enable_dfs_prefetch"] = False
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
@@ -525,58 +583,125 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     # O_CREAT|O_TRUNC, so a filename collision truncates
                     # another rank's bucket. Give every rank a private subdir.
                     ssd_offload_path = self.config.ssd_offload_path
-                    if storage_config is not None:
+                    distributed_backend = (
+                        envs.MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR.get()
+                        == "distributed_storage_backend"
+                    )
+                    if storage_config is not None and not distributed_backend:
                         ssd_offload_path = os.path.join(
                             ssd_offload_path,
                             f"rank_{storage_config.dp_rank}"
                             f"_{storage_config.tp_rank}_{storage_config.pp_rank}"
                             f"_{storage_config.attn_cp_rank}",
                         )
-                    os.makedirs(ssd_offload_path, exist_ok=True)
+                    # A missing shared DFS mount must not prevent memory-only startup.
+                    if not distributed_backend:
+                        os.makedirs(ssd_offload_path, exist_ok=True)
                     setup_kwargs["ssd_offload_path"] = ssd_offload_path
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
 
-                while True:
-                    try:
-                        ret_code = self.store.setup(
-                            client_hostname,
-                            self.config.metadata_server,
-                            per_rank_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                            self.config.protocol,
-                            device_name,
-                            self.config.master_server_address,
-                            transfer_engine,
-                            **setup_kwargs,
-                        )
-                        break
-                    except TypeError as e:
-                        unsupported_kwargs = [
-                            key for key in list(setup_kwargs) if key in str(e)
-                        ]
-                        if not unsupported_kwargs:
-                            raise
-                        if "tenant_id" in unsupported_kwargs:
-                            raise RuntimeError(
-                                "The installed Mooncake version does not support "
-                                "tenant_id in MooncakeDistributedStore.setup(). "
-                                "Please upgrade Mooncake to use non-default "
-                                "Mooncake tenants with SGLang."
-                            ) from e
-                        logger.warning(
-                            "The installed Mooncake version does not support the "
-                            f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
-                            f"Retrying without {', '.join(unsupported_kwargs)}. "
-                            "Please upgrade Mooncake to enable SSD offload support."
-                        )
-                        for key in unsupported_kwargs:
-                            setup_kwargs.pop(key, None)
+                ret_code = setup_store(
+                    self.store,
+                    (
+                        client_hostname,
+                        self.config.metadata_server,
+                        per_rank_global_segment_size,
+                        envs.SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE.get(),
+                        self.config.protocol,
+                        device_name,
+                        self.config.master_server_address,
+                        transfer_engine,
+                    ),
+                    setup_kwargs,
+                )
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
                 )
+            try:
+                service_endpoint = _get_service_endpoint(get_serving())
+            except (TypeError, ValueError) as exc:
+                # Standalone storage users may not have a serving runtime.
+                # Identity discovery must not prevent cache I/O.
+                logger.warning(
+                    "Cannot identify SGLang service for Mooncake metrics: %s", exc
+                )
+                service_endpoint = None
+            if service_endpoint is not None:
+                set_service_endpoint = getattr(self.store, "set_service_endpoint", None)
+                if not callable(set_service_endpoint):
+                    logger.warning(
+                        "Mooncake Master service metrics are disabled: rebuild/install "
+                        "Mooncake with set_service_endpoint support."
+                    )
+                elif set_service_endpoint(service_endpoint) != 0:
+                    logger.warning(
+                        "Failed to register Mooncake Master service metrics for %s; "
+                        "continuing cache initialization. A shared client daemon "
+                        "retains its original endpoint; use separate daemons per "
+                        "service for correct metric attribution.",
+                        service_endpoint,
+                    )
+                else:
+                    logger.info(
+                        "Mooncake Master service metrics endpoint: %s", service_endpoint
+                    )
+                if enable_client_http_server and not self.config.standalone_storage:
+                    from sglang.srt.observability.mooncake_client_metrics import (
+                        start_client_metrics_reporter,
+                    )
+
+                    rank = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0
+                    )
+                    self._client_metrics_reporter = start_client_metrics_reporter(
+                        self.store, get_server_args(), service_endpoint, rank
+                    )
+                    if self._client_metrics_reporter is not None:
+                        weakref.finalize(self, self._client_metrics_reporter.close)
             logger.info("Mooncake store setup successfully.")
+
+            distributed_dfs = (
+                envs.MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR.get()
+                == "distributed_storage_backend"
+            )
+            if distributed_dfs and not supports_feature(self.store, "dfs_health"):
+                logger.warning(
+                    "Mooncake package lacks DFS health/policy APIs; preserving its "
+                    "legacy DFS behavior without SGLang health-based failover."
+                )
+            elif distributed_dfs:
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    MooncakeDfsHealthManager,
+                    resolve_dfs_health_config,
+                )
+
+                try:
+                    health_memory_config = get_memory()
+                except ValueError:
+                    health_memory_config = None
+
+                # Constructor installs fail-closed read/write policy before
+                # warmup. No setup parameter is used for the initial policy.
+                coordinate_health_policy = (
+                    storage_config is not None
+                    and torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                    and (
+                        getattr(storage_config, "tp_size", 1) > 1
+                        or getattr(storage_config, "attn_cp_size", 1) > 1
+                    )
+                )
+                self._dfs_health_manager = MooncakeDfsHealthManager(
+                    self.store,
+                    resolve_dfs_health_config(
+                        dfs_health_config, server_args=health_memory_config
+                    ),
+                    defer_policy_application=coordinate_health_policy,
+                )
 
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
@@ -631,6 +756,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+
+            if self._dfs_health_manager is not None:
+                self._dfs_health_manager.start()
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -1003,7 +1131,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_set_v2_aggregated(transfers)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1350,7 +1478,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
-        pass
+        if self._client_metrics_reporter is not None:
+            self._client_metrics_reporter.close()
+            self._client_metrics_reporter = None
+        if self._dfs_health_manager is not None:
+            self._dfs_health_manager.close()
+            self._dfs_health_manager = None
 
     def clear(self) -> None:
         self.store.remove_all()
@@ -1373,9 +1506,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config.group_ids = group_ids
 
         if self._uses_multi_buffer(buffer_ptrs):
-            config = config or self._replicate_config_cls()
+            if config is not None:
+                return self.store.batch_put_from_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes, config
+                )
             return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes, config
+                key_strs, buffer_ptrs, buffer_sizes
             )
         elif config is not None:
             return self.store.batch_put_from(
@@ -1421,3 +1557,110 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
         return storage_metrics
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        if self._dfs_health_manager is None:
+            return None
+        return self._dfs_health_manager.local_policy()
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        if self._dfs_health_manager is not None:
+            self._dfs_health_manager.apply_effective_policy(allow_read, allow_write)
+
+    def _batch_set_v2_aggregated(self, transfers: List[PoolTransfer]) -> dict:
+        """Write all v2 pool transfers with one Mooncake batch-put call.
+
+        A logical page may expand to several Mooncake objects, and different
+        pools may expose either one buffer or multiple buffers per object.  The
+        object ranges recorded here allow the single, flattened put result to
+        be converted back to the existing per-pool, per-page result format.
+        """
+        all_key_strs: List[str] = []
+        all_buffer_ptrs: List[Any] = []
+        all_buffer_sizes: List[Any] = []
+        all_group_ids: Optional[List[str]] = (
+            [] if self._can_use_group_semantics() else None
+        )
+        transfer_ranges = []
+
+        for transfer in transfers:
+            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            keys = transfer.keys
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            host_indices = transfer.host_indices
+            assert len(keys) > 0
+            assert len(keys) == len(host_indices) // page_size
+
+            tagged_keys = self._tag_keys(keys)
+            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+            key_strs = self._tag_keys(key_strs)
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            if len(ptr_list) != len(key_strs):
+                ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                    key_strs, ptr_list, element_size_list
+                )
+
+            if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
+                raise ValueError(
+                    "Mooncake v2 write metadata must align with component keys: "
+                    f"pool={transfer.name}, keys={len(key_strs)}, "
+                    f"ptrs={len(ptr_list)}, sizes={len(element_size_list)}"
+                )
+
+            start = len(all_key_strs)
+            all_key_strs.extend(key_strs)
+            all_buffer_ptrs.extend(ptr_list)
+            all_buffer_sizes.extend(element_size_list)
+            if all_group_ids is not None:
+                all_group_ids.extend(
+                    self._expand_group_ids(tagged_keys, key_multiplier)
+                )
+            transfer_ranges.append(
+                (transfer.name, start, len(all_key_strs), key_multiplier)
+            )
+
+        if not all_key_strs:
+            return {}
+
+        # batch_put_from_multi_buffers requires every object to use the same
+        # vector-of-vectors representation. Normalize scalar entries only when
+        # at least one pool already supplies multiple buffers per object.
+        if any(isinstance(ptr, Sequence) for ptr in all_buffer_ptrs):
+            all_buffer_ptrs = [
+                list(ptr) if isinstance(ptr, Sequence) else [ptr]
+                for ptr in all_buffer_ptrs
+            ]
+            all_buffer_sizes = [
+                list(size) if isinstance(size, Sequence) else [size]
+                for size in all_buffer_sizes
+            ]
+
+        exist_result = self._batch_exist(all_key_strs)
+        if len(exist_result) != len(all_key_strs):
+            raise RuntimeError(
+                "Mooncake batch_is_exist returned an unexpected result count: "
+                f"expected={len(all_key_strs)}, actual={len(exist_result)}"
+            )
+
+        io_results = [0 if state == 1 else -1 for state in exist_result]
+        missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+        if missing_idx:
+            put_results = self._put_batch_zero_copy_impl(
+                [all_key_strs[i] for i in missing_idx],
+                [all_buffer_ptrs[i] for i in missing_idx],
+                [all_buffer_sizes[i] for i in missing_idx],
+                self._filter_group_ids(all_group_ids, missing_idx),
+            )
+            for i, result in zip(missing_idx, put_results):
+                io_results[i] = result
+
+        results = {}
+        for pool_name, start, end, key_multiplier in transfer_ranges:
+            results[pool_name] = self._batch_postprocess(
+                io_results[start:end],
+                is_set_operate=True,
+                key_multiplier=key_multiplier,
+            )
+        return results

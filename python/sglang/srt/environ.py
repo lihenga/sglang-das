@@ -860,6 +860,20 @@ class Envs:
     # ===================================================================
     # Mooncake store
     # ===================================================================
+    SGLANG_DAS_PREFETCH_TRACE = EnvBool(False)
+    SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE = EnvInt(16 * 1024 * 1024)
+    SGLANG_TEST_LINKER_LOAD_FAILURE_PROB = EnvFloat(0.0)
+    SGLANG_TEST_LINKER_LOAD_FAILURE_RANKS = EnvStr(None)
+    SGLANG_MOONCAKE_READ_PLAN = EnvBool(False)
+    SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES = EnvBool(False)
+    SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S = EnvFloat(0.0)
+    SGLANG_MOONCAKE_LEASE_TTL_S = EnvFloat(10.0)
+    SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS = EnvFloat(0.0)
+    SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S = EnvInt(None)
+    SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD = EnvInt(None)
+    SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD = EnvInt(None)
+    SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S = EnvInt(None)
+
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
     MOONCAKE_MASTER = EnvStr(None)
@@ -874,6 +888,7 @@ class Envs:
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
+    MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
 
     # ===================================================================
@@ -1327,7 +1342,9 @@ class Envs:
     SGLANG_EXPERIMENTAL_LPLB_STATIC_PROBS = EnvStr(None)
     # HIP per-batch LPLB: water-filling solver (device | host), its passes, and
     # the routed (token, expert) pairs per layer below which replicas split evenly.
-    SGLANG_LPLB_HIP_SOLVER = EnvStr("host")  # device kernel fails its unit test (rows do not sum to 1)
+    SGLANG_LPLB_HIP_SOLVER = EnvStr(
+        "host"
+    )  # device kernel fails its unit test (rows do not sum to 1)
     SGLANG_LPLB_HOST_PASSES = EnvInt(4)
     SGLANG_LPLB_HOST_MIN_PAIRS = EnvInt(6144)
     # Chunk size for the rebalance expert-weight P2P exchange; set
