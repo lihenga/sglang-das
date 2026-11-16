@@ -1,10 +1,11 @@
 import importlib.util
-import os
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+
+from sglang.srt.environ import envs
 
 _MODULE_PATH = (
     Path(__file__).parents[4]
@@ -44,6 +45,19 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class MooncakeDfsHealthManagerTest(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        overrides = ExitStack()
+        self.addCleanup(overrides.close)
+        for field in (
+            envs.SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S,
+            envs.SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD,
+            envs.SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD,
+            envs.SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S,
+        ):
+            overrides.enter_context(field.override(None))
+            field.clear()
+
     def test_resolver_uses_cli_then_environment_then_defaults(self):
         env = {
             "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S": "4",
@@ -61,37 +75,33 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
                 "mooncake_dfs_health_probe_timeout_s": None,
             },
         )()
-        with patch.dict(os.environ, env, clear=True):
-            self.assertEqual(
-                resolve_dfs_health_config(server_args=server_args),
-                {
-                    "probe_interval_s": 8,
-                    "failure_threshold": 5,
-                    "success_threshold": 6,
-                    "probe_timeout_s": 7,
-                },
-            )
+        for name, value in env.items():
+            getattr(envs, name).set(value)
+        self.assertEqual(
+            resolve_dfs_health_config(server_args=server_args),
+            {
+                "probe_interval_s": 8,
+                "failure_threshold": 5,
+                "success_threshold": 6,
+                "probe_timeout_s": 7,
+            },
+        )
 
     def test_resolver_uses_defaults_when_unset(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(
-                resolve_dfs_health_config(),
-                {
-                    "probe_interval_s": 10,
-                    "failure_threshold": 3,
-                    "success_threshold": 3,
-                    "probe_timeout_s": 2,
-                },
-            )
+        self.assertEqual(
+            resolve_dfs_health_config(),
+            {
+                "probe_interval_s": 10,
+                "failure_threshold": 3,
+                "success_threshold": 3,
+                "probe_timeout_s": 2,
+            },
+        )
 
     def test_resolver_rejects_non_positive_value(self):
-        with patch.dict(
-            os.environ,
-            {"SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S": "0"},
-            clear=True,
-        ):
-            with self.assertRaisesRegex(ValueError, "probe_timeout_s must be positive"):
-                resolve_dfs_health_config()
+        envs.SGLANG_MOONCAKE_DFS_HEALTH_PROBE_TIMEOUT_S.set(0)
+        with self.assertRaisesRegex(ValueError, "probe_timeout_s must be positive"):
+            resolve_dfs_health_config()
 
     def _manager(self, read_probes, write_probes):
         env = {
@@ -99,9 +109,8 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
             "SGLANG_MOONCAKE_DFS_HEALTH_SUCCESS_THRESHOLD": "2",
             "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S": "10",
         }
-        patcher = patch.dict(os.environ, env)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, value in env.items():
+            getattr(envs, name).set(value)
         store = _FakeStore(read_probes, write_probes)
         return store, MooncakeDfsHealthManager(store)
 

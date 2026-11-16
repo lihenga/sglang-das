@@ -37,19 +37,20 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
     TransferInfo,
 )
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_kv_layer_ids,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     get_qsa_pending_state_indices,
+    pack_state_types,
     poll_and_all_reduce,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_with_staging,
+    resolve_state_component_dst_index,
     setup_state_kv_args,
     should_send_replicated_state,
-    build_kv_layer_ids,
-    pack_state_types,
-    resolve_state_component_dst_index,
     unpack_state_types,
 )
 from sglang.srt.environ import envs
@@ -164,6 +165,8 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.state_strides_validated = set()
                     manager.failure_records = {}
                     manager._staging_outstanding = defaultdict(int)
+                    manager._source_drain = SourceDrainTracker()
+                    manager._transfer_completion_condition = threading.Condition()
                     manager.request_status = {
                         42: KVPoll.Transferring,
                         43: KVPoll.Transferring,
@@ -203,7 +206,8 @@ class TestDisaggregationWire(unittest.TestCase):
                                 dst_aux_ptrs=[0x6000],
                             )
                         )
-                        queue.put(
+                        manager._publish_source_chunk(
+                            queue,
                             TransferKVChunk(
                                 room=room,
                                 prefill_kv_indices=np.array([], dtype=np.int32),
@@ -211,7 +215,7 @@ class TestDisaggregationWire(unittest.TestCase):
                                 is_last_chunk=True,
                                 prefill_aux_index=2,
                                 state_indices=[[2], [2]],
-                            )
+                            ),
                         )
                     queue.put(None)
 
@@ -478,6 +482,8 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_failures = defaultdict(int)
         manager.failure_records = {}
         manager._staging_outstanding = defaultdict(int)
+        manager._source_drain = SourceDrainTracker()
+        manager._transfer_completion_condition = threading.Condition()
         manager.request_status = {42: KVPoll.Transferring}
         manager.req_to_decode_prefix_len = {42: 0}
         reason = f"{StateType.SWA} item length mismatch for positional entry 0"
@@ -499,7 +505,8 @@ class TestDisaggregationWire(unittest.TestCase):
         manager._send_multipart_locked = Mock()
         manager._transfer_data = Mock(return_value=0)
         queue = FastQueue()
-        queue.put(
+        manager._publish_source_chunk(
+            queue,
             TransferKVChunk(
                 room=42,
                 prefill_kv_indices=np.array([], dtype=np.int32),
@@ -507,7 +514,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 is_last_chunk=True,
                 prefill_aux_index=2,
                 state_indices=[[2]],
-            )
+            ),
         )
         queue.put(None)
         manager.transfer_worker(queue, executor=None)

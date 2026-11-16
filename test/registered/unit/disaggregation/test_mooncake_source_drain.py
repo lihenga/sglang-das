@@ -1,11 +1,15 @@
 import ast
 import concurrent.futures
+import logging
 import queue
 import threading
+import time
 import unittest
+from collections import OrderedDict, defaultdict
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -115,6 +119,196 @@ class TestMooncakeSourceDrain(CustomTestCase):
             waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
         self.assertEqual(results, [-1])
+
+
+class TestMooncakeLateBootstrap(CustomTestCase):
+    """A drained abort stays terminal when a delayed destination arrives."""
+
+    def _make_room(self):
+        root = Path(__file__).parents[4] / "python/sglang/srt/disaggregation"
+        namespace = {
+            "KVPoll": KVPoll,
+            "time": time,
+            "logger": logging.getLogger(__name__),
+        }
+
+        def load(path, class_name, names):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            cls = next(
+                n
+                for n in tree.body
+                if isinstance(n, ast.ClassDef) and n.name == class_name
+            )
+            body = [
+                n
+                for n in cls.body
+                if isinstance(n, ast.FunctionDef) and n.name in names
+            ]
+            module = ast.Module(
+                body=[
+                    ast.ImportFrom(
+                        module="__future__",
+                        names=[ast.alias(name="annotations")],
+                        level=0,
+                    ),
+                    *body,
+                ],
+                type_ignores=[],
+            )
+            ast.fix_missing_locations(module)
+            exec(compile(module, str(path), "exec"), namespace)
+
+        methods = (
+            "_prune_drained_abort_rooms",
+            "finish_drained_abort",
+            "_register_bootstrap_transfer",
+            "_notify_drained_abort_target_if_needed",
+        )
+        load(root / "mooncake/conn.py", "MooncakeKVManager", methods)
+        load(root / "common/conn.py", "CommonKVManager", ("update_status",))
+        manager = SimpleNamespace(
+            _drained_abort_lock=threading.Lock(),
+            _drained_abort_rooms=OrderedDict(),
+            bootstrap_timeout=30,
+            waiting_timeout=600,
+            request_status={9: KVPoll.Failed},
+            transfer_infos={},
+            req_to_decode_prefix_len={},
+            req_to_pd_hidden_meta={},
+            failure_lock=threading.Lock(),
+            failure_records={9: "original failure"},
+            deferred_bootstrap=None,
+            _deferred_ack_targets={},
+            _deferred_ack_poisoned_rooms=set(),
+            _staging_outstanding={},
+        )
+        for name in (*methods, "update_status"):
+            setattr(manager, name, MethodType(namespace[name], manager))
+        tracker = SourceDrainTracker()
+        manager.source_transfers_drained = tracker.drained
+        manager.resolve_kv_replica_factor = lambda infos: None
+        manager._maybe_ack_drained_abort = lambda room: None
+        notifications = []
+
+        def send(**message):
+            # A slow PUSH must not hold the bootstrap/cleanup lock.
+            self.assertTrue(manager._drained_abort_lock.acquire(blocking=False))
+            manager._drained_abort_lock.release()
+            notifications.append(message)
+
+        manager.send_kv_status_message = send
+        load(root / "mooncake/conn.py", "MooncakeKVSender", ("notify_drained_abort",))
+        load(root / "common/conn.py", "CommonKVSender", ("clear",))
+        sender = SimpleNamespace(
+            kv_mgr=manager, bootstrap_room=9, _drained_abort_targets=set()
+        )
+        sender.is_transfer_drained = lambda: tracker.drained(9)
+        sender.clear = MethodType(namespace["clear"], sender)
+        sender.notify_drained_abort = MethodType(
+            namespace["notify_drained_abort"], sender
+        )
+        return manager, sender, tracker, notifications
+
+    @staticmethod
+    def _info(endpoint="decode"):
+        return SimpleNamespace(
+            endpoint=endpoint,
+            dst_port=8000,
+            is_dummy=False,
+            decode_prefix_len=4,
+            spec_metadata=None,
+        )
+
+    def test_late_destination_does_not_reopen_cleared_abort(self):
+        manager, sender, _, notifications = self._make_room()
+        manager.transfer_infos[9] = {"first": self._info()}
+        sender.notify_drained_abort()
+        self.assertNotIn(9, manager.request_status)
+        self.assertNotIn(9, manager.transfer_infos)
+        self.assertNotIn(9, manager.failure_records)
+        manager._register_bootstrap_transfer(9, "late", self._info("late"), 1)
+        self.assertNotIn(9, manager.request_status)
+        self.assertNotIn(9, manager.transfer_infos)
+        self.assertEqual(
+            [item["targets"] for item in notifications],
+            [[("decode", 8000)], [("late", 8000)]],
+        )
+        self.assertTrue(all(item["status"] == KVPoll.Failed for item in notifications))
+
+    def test_abort_waits_for_source_then_includes_late_target(self):
+        manager, sender, tracker, notifications = self._make_room()
+        chunk = SimpleNamespace(room=9)
+        tracker.publish(chunk, queue.Queue(), lambda: True)
+        manager._register_bootstrap_transfer(9, "late", self._info("late"), 1)
+        sender.notify_drained_abort()
+        self.assertEqual(notifications, [])
+        self.assertEqual(manager.request_status[9], KVPoll.Failed)
+        tracker.complete(chunk)
+        sender.notify_drained_abort()
+        self.assertNotIn(9, manager.request_status)
+        self.assertEqual(notifications[0]["targets"], [("late", 8000)])
+        self.assertEqual(notifications[0]["status"], KVPoll.Failed)
+
+    def test_terminal_records_expire_and_have_a_capacity_bound(self):
+        manager, _, _, _ = self._make_room()
+        now = time.monotonic()
+        manager._drained_abort_rooms.update((room, now + 600) for room in range(4097))
+        manager._prune_drained_abort_rooms()
+        self.assertEqual(len(manager._drained_abort_rooms), 4096)
+        self.assertNotIn(0, manager._drained_abort_rooms)
+        manager._drained_abort_rooms = OrderedDict([(9, now - 1)])
+        manager._register_bootstrap_transfer(9, "new", self._info(), 1)
+        self.assertEqual(manager.request_status[9], KVPoll.Failed)
+        # Reopening is allowed after expiry only once the old status is cleared.
+        manager.request_status.pop(9)
+        manager._register_bootstrap_transfer(9, "new", self._info(), 1)
+        self.assertEqual(manager.request_status[9], KVPoll.WaitingForInput)
+
+    def test_hidden_transfer_failure_uses_target_status_transport(self):
+        manager, _, _, notifications = self._make_room()
+        manager.session_lock = threading.Lock()
+        manager.session_failures = defaultdict(int)
+        manager.failed_sessions = set()
+        manager.record_failure = lambda room, reason: manager.failure_records.update(
+            {room: reason}
+        )
+        path = (
+            Path(__file__).parents[4]
+            / "python/sglang/srt/disaggregation/hidden_events.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        method = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "mark_session_failed_and_sync"
+        )
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                method,
+            ],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(module)
+        namespace = {"KVPoll": KVPoll, "logger": logging.getLogger(__name__)}
+        exec(compile(module, str(path), "exec"), namespace)
+        events = SimpleNamespace(owner=manager, wake_ack_waiters=lambda room: None)
+        req = self._info()
+        req.room, req.mooncake_session_id = 9, "session"
+        namespace[method.name](
+            events,
+            kv_chunk=SimpleNamespace(room=9),
+            req=req,
+            prefill_unique_rank=0,
+            failure_reason="hidden write failed",
+        )
+        self.assertEqual(manager.request_status[9], KVPoll.Failed)
+        self.assertEqual(manager.failed_sessions, {"session"})
+        self.assertEqual(manager.failure_records[9], "hidden write failed")
+        self.assertEqual(notifications[0]["failure_reason"], "hidden write failed")
 
 
 if __name__ == "__main__":

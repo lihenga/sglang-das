@@ -7,11 +7,15 @@ from unittest.mock import Mock, call, patch
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
     ReadPlanLoadCounter,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,6 +23,55 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
+    def test_lookup_uses_real_store_signature_and_physical_pool_hits(self):
+        """PP=1 lookups return common physical-pool hits without an API error."""
+        entries = [
+            DevicePoolEntry(
+                name=name,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[[torch.zeros((2, 2), dtype=torch.uint8)]],
+                layer_mapping={0: 0},
+                page_size=2,
+                rows_are_pages=True,
+            )
+            for name in (PoolName.DEEPSEEK_V4_C1, PoolName.DEEPSEEK_V4_C2)
+        ]
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.pool_group = DevicePoolGroup(entries, num_layers=1, page_size=2)
+        # Keep the real Store methods: a permissive fake hid the keyword mismatch.
+        storage = MooncakeStore.__new__(MooncakeStore)
+        storage.mem_pool_host = linker.pool_group
+        storage.registered_pools = linker.pool_group.entry_map
+        storage.config_prefix = "lookup"
+        storage.mla_suffix = "cp0_pp0"
+        storage.pp_rank = 0
+        storage.pp_size = 1
+        linker.storage = storage
+        transfers = [PoolTransfer(name=PoolName.KV, keys=["a", "b"])]
+        all_keys = {
+            f"lookup_{page}_cp0_pp0_{entry.name}"
+            for entry in entries
+            for page in ("a", "b")
+        }
+        for stored_keys, expected in (
+            (all_keys, [1, 2]),
+            (all_keys - {f"lookup_b_cp0_pp0_{PoolName.DEEPSEEK_V4_C2}"}, [1]),
+            (set(), []),
+        ):
+            with self.subTest(expected=expected):
+                storage.store = types.SimpleNamespace(
+                    batch_is_exist=Mock(
+                        side_effect=lambda keys: [
+                            int(key in stored_keys) for key in keys
+                        ]
+                    )
+                )
+                linker.stats = {"lookup": 0}
+
+                self.assertEqual(linker.lookup("rid", transfers), expected)
+                self.assertEqual(linker.stats["lookup"], 1)
+
     def _layout_linker(self, *, packed=True, bad_result=False):
         linker = self._read_plan_linker(prefetch=False)
         linker.read_plan_enabled = False

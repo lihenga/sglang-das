@@ -656,3 +656,20 @@ Native CPU/TCP ReadLayout/ReadPlan/session checks and multi-pool SGLang
 round-trips passed. The container has Python 3.10 whereas this branch declares
 Python >= 3.11, so successful component tests do not establish a supported full
 serving installation.
+
+### Port review follow-ups
+
+The port also validates direct lookup against the target Store signature and
+registers a batch's request IDs atomically, so a later duplicate or state-creation
+failure leaves no partial request registration. Drained PD aborts retain bounded
+terminal room records to reject late bootstrap destinations; failure notices use
+the target status-message API and preserve its generation-tagged drain ACKs.
+
+The accompanying `sgl-model-gateway` changes add HTTP stream outcomes, SSE/JSON
+error detection, paired PD cancellation with one shared deadline, and failure-log
+rate limiting. HTTP PD requests are dispatched once without replay; regular HTTP,
+external OpenAI and gRPC retries retain their existing behavior. The target
+Responses API, bootstrap metadata and logprob merging remain supported. Build and
+install the gateway wheel separately to use these changes; updating the Engine
+package alone does not install them. See `sgl-model-gateway/bindings/python/README.md`
+for the metric definitions and scope.

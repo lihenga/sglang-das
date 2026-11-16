@@ -3,7 +3,7 @@ import ctypes
 import unittest
 from collections import defaultdict
 from queue import SimpleQueue
-from threading import Event, Lock
+from threading import Condition, Event, Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -12,6 +12,7 @@ import numpy as np
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
@@ -449,10 +450,14 @@ class TestMooncakeEarlySend(unittest.TestCase):
         ready = MagicMock()
         manager = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
+            _source_drain=SourceDrainTracker(),
             request_status={1: KVPoll.WaitingForInput},
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+        )
+        manager._publish_source_chunk = MooncakeKVManager._publish_source_chunk.__get__(
+            manager
         )
         MooncakeKVManager.add_transfer_request(
             manager, 1, [0], slice(0, 1), False, wait_event=ready
@@ -465,8 +470,6 @@ class TestMooncakeEarlySend(unittest.TestCase):
             1, [0], slice(0, 1), False, None, None, wait_event=event
         )
         queue = SimpleQueue()
-        queue.put(chunk)
-        queue.put(None)
         peer = SimpleNamespace(
             is_dummy=False,
             mooncake_session_id="peer",
@@ -485,6 +488,8 @@ class TestMooncakeEarlySend(unittest.TestCase):
             enable_staging=False,
             enable_deferred_decode_kv_release=True,
             _staging_outstanding=defaultdict(int),
+            _source_drain=SourceDrainTracker(),
+            _transfer_completion_condition=Condition(),
             request_status={1: KVPoll.WaitingForInput},
             transfer_infos={1: {"peer": peer}},
             _prefill_unique_rank=lambda: 0,
@@ -503,6 +508,14 @@ class TestMooncakeEarlySend(unittest.TestCase):
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]
+        manager._publish_source_chunk = MooncakeKVManager._publish_source_chunk.__get__(
+            manager
+        )
+        manager._complete_source_chunk = (
+            MooncakeKVManager._complete_source_chunk.__get__(manager)
+        )
+        manager._publish_source_chunk(queue, chunk)
+        queue.put(None)
         return manager, queue
 
     def test_worker_waits_before_reading_kv(self):
@@ -543,6 +556,8 @@ class TestMooncakeEarlySend(unittest.TestCase):
         manager, queue = self._worker(None)
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
         manager.send_kvcache.assert_called_once()
+
+
 class TestMooncakeBatchRegistration(unittest.TestCase):
     @staticmethod
     def _make_engine(return_value=0, side_effect=None):

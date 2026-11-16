@@ -6,13 +6,14 @@ seconds ago. The age is measured from a monotonic timestamp taken before the
 RPC that granted the lease, so it never understates the lease Mooncake sees.
 """
 
-import os
 import threading
 import types
 import unittest
+from contextlib import ExitStack
 from unittest import mock
 from unittest.mock import MagicMock
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -444,14 +445,18 @@ class TestSharedSessionPreparation(CustomTestCase):
 
 class TestSessionRefreshAgeConfig(CustomTestCase):
     def _config(self, **env):
-        with mock.patch.dict(os.environ, env, clear=False):
+        overrides = ExitStack()
+        try:
             for name in (
                 "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S",
                 "SGLANG_MOONCAKE_LEASE_TTL_S",
             ):
-                if name not in env:
-                    os.environ.pop(name, None)
+                field = getattr(envs, name)
+                overrides.enter_context(field.override(env.get(name, field.default)))
             return mooncake_direct_linker._session_refresh_age_config()
+        finally:
+            # close() restores descriptors even when configuration validation raises.
+            overrides.close()
 
     def test_default_is_disabled(self):
         self.assertEqual(self._config(), 0.0)
