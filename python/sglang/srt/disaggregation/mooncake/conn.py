@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_string_list,
 )
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
@@ -60,9 +61,9 @@ from sglang.srt.disaggregation.utils import (
     compute_mamba_state_slice_byte_blocks,
     pack_state_types,
     resolve_dcp_dst_entry_indices,
+    resolve_state_component_dst_index,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
-    resolve_state_component_dst_index,
     unpack_state_types,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
@@ -223,9 +224,7 @@ class KVArgsRegisterInfo:
                 else []
             ),
             dst_state_data_formats=(
-                unpack_string_list(msg[20])
-                if len(msg) > 20 and msg[20] != b""
-                else []
+                unpack_string_list(msg[20]) if len(msg) > 20 and msg[20] != b"" else []
             ),
             # Index 19 carries kv_item_lens; state types follow the data formats.
             dst_state_types=unpack_state_types(msg[21]) if len(msg) > 21 else [],
@@ -323,6 +322,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            self._source_drain = SourceDrainTracker()
+            self._transfer_completion_condition = threading.Condition()
+            self._final_poll_enabled = (
+                envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
+            )
             self.pd_hidden_events.init_prefill_state()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -507,9 +511,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _has_pd_hidden_state(self, state_indices: Optional[List]) -> bool:
         return self.pd_hidden_events.has_state(state_indices)
 
-    def _without_pd_hidden_state(
-        self, state_indices: Optional[List]
-    ) -> Optional[List]:
+    def _without_pd_hidden_state(self, state_indices: Optional[List]) -> Optional[List]:
         return self.pd_hidden_events.without_state(state_indices)
 
     def _pd_hidden_release_state_indices(
@@ -1305,7 +1307,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         has_layer_ids = bool(src_layer_ids or dst_layer_ids)
         if src_layout is not None:
             if dst_layout is None or dst_item_lens is None:
-                raise RuntimeError("LayerSplit PD requires V4 descriptors on both P and D")
+                raise RuntimeError(
+                    "LayerSplit PD requires V4 descriptors on both P and D"
+                )
             pairs = match_transfer_entries(
                 src_layout, dst_layout, item_lens, dst_item_lens
             )
@@ -1532,10 +1536,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
     def _await_transfer_futures(self, futures) -> int:
-        """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+        """Drain every running write before releasing the tracked source chunk."""
         ret = 0
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -1546,8 +1547,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ret = status
                 for f in futures:
                     f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
         return ret
 
     def send_kvcache(
@@ -1958,9 +1957,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             kv_cache_layout = "hnd" if envs.SGLANG_USE_HND_KVCACHE.get() else "nhd"
         is_hnd = kv_cache_layout == "hnd"
         is_hcu_legacy = (
-            _kv_layout_hcu_fa
-            and not is_hnd
-            and not envs.SGLANG_USE_HND_KVCACHE.get()
+            _kv_layout_hcu_fa and not is_hnd and not envs.SGLANG_USE_HND_KVCACHE.get()
         )
         if is_hnd:
             # HND/BHSD pages are laid out as [page, head, token, dim]. Heads
@@ -2531,7 +2528,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # MHA branch would compute zero layers and ship nothing
                         # (same reason as in `send_kvcache`).
                         force_flat=(
-                            st in (
+                            st
+                            in (
                                 StateType.QSA_PENDING,
                                 StateType.QSA_COMPRESSED,
                                 StateType.DSV41_SWA_WINDOW,
@@ -2558,7 +2556,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 or st == StateType.DSV41_SWA_WINDOW
                             )
                             and target_rank_registration_info is not None
-                            and dst_layout_index < len(
+                            and dst_layout_index
+                            < len(
                                 target_rank_registration_info.v4_transfer_metadata.get(
                                     "states", []
                                 )
@@ -2974,9 +2973,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             self.pd_hidden_events.inflight_chunks.pop(
                                 kv_chunk.room, None
                             )
-                    if (
-                        not kv_chunk.pd_hidden_sent
-                        and self._has_pd_hidden_state(kv_chunk.state_indices)
+                    if not kv_chunk.pd_hidden_sent and self._has_pd_hidden_state(
+                        kv_chunk.state_indices
                     ):
                         self._release_or_mark_pd_hidden_done(kv_chunk)
                     if self.enable_trace:
@@ -2985,6 +2983,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
+                    self._complete_source_chunk(kv_chunk)
                     self._staging_outstanding.pop(kv_chunk.room, None)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
@@ -3042,6 +3041,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
+                    self._complete_source_chunk(kv_chunk)
                     self._staging_outstanding[kv_chunk.room] -= 1
                     if self._staging_outstanding[kv_chunk.room] <= 0:
                         self._staging_outstanding.pop(kv_chunk.room, None)
@@ -3098,10 +3098,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             inflight_key = self.pd_hidden_events.inflight_chunks.get(
                                 kv_chunk.room
                             )
-                        if inflight_key is not None and inflight_key != hidden_inflight_key:
-                            self._park_pd_hidden_chunk_behind_room(
-                                queue, kv_chunk
-                            )
+                        if (
+                            inflight_key is not None
+                            and inflight_key != hidden_inflight_key
+                        ):
+                            self._park_pd_hidden_chunk_behind_room(queue, kv_chunk)
                             continue
                     ack_ready = False
                     if waiting_for_ack:
@@ -3134,13 +3135,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 continue
                             self._begin_pd_hidden_transfer(kv_chunk.room)
                             try:
-                                ret, pd_hidden_done = (
-                                    self._send_pd_hidden_packet(
-                                        req,
-                                        kv_chunk.state_indices,
-                                        kv_chunk.pd_hidden_packet_idx,
-                                        executor,
-                                    )
+                                ret, pd_hidden_done = self._send_pd_hidden_packet(
+                                    req,
+                                    kv_chunk.state_indices,
+                                    kv_chunk.pd_hidden_packet_idx,
+                                    executor,
                                 )
                             finally:
                                 self._end_pd_hidden_transfer(kv_chunk.room)
@@ -3209,9 +3208,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ):
                         if hidden_inflight_key is not None:
                             with self.pd_hidden_events.inflight_lock:
-                                self.pd_hidden_events.inflight_chunks[
-                                    kv_chunk.room
-                                ] = hidden_inflight_key
+                                self.pd_hidden_events.inflight_chunks[kv_chunk.room] = (
+                                    hidden_inflight_key
+                                )
                         kv_chunk.pd_hidden_ready_sent = True
                         if self.park_pd_hidden_chunk_for_ack(
                             transfer_queue=queue,
@@ -3552,7 +3551,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Success
-                    or (kv_chunk.is_last_chunk and self.check_status(kv_chunk.room) == KVPoll.Failed)
+                    or (
+                        kv_chunk.is_last_chunk
+                        and self.check_status(kv_chunk.room) == KVPoll.Failed
+                    )
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
@@ -3569,9 +3571,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
+                self._complete_source_chunk(kv_chunk)
+
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
+                    self._source_drain.poison(kv_chunk.room)
                     self.poison_deferred_ack_room(kv_chunk.room)
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -3665,9 +3670,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     room = int(waiting_req_bytes[1].decode("ascii"))
                     prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
                     hidden_start = int(waiting_req_bytes[3].decode("ascii"))
-                    self._handle_pd_hidden_chunk_ack(
-                        room, prefill_rank, hidden_start
-                    )
+                    self._handle_pd_hidden_chunk_ack(room, prefill_rank, hidden_start)
                     continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
@@ -3913,7 +3916,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
+        self._publish_source_chunk(
+            self.transfer_queues[shard_idx],
             TransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
@@ -3929,7 +3933,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 pd_hidden_release_indices=pd_hidden_release_indices,
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
-            )
+            ),
         )
 
     def get_session_id(self):
@@ -3971,6 +3975,63 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.failed_session_probe_interval
         ):
             self._run_one_probe_pass()
+
+    def _publish_source_chunk(self, queue, chunk):
+        self._source_drain.publish(
+            chunk,
+            queue,
+            lambda: chunk.room in self.request_status
+            and self.check_status(chunk.room) != KVPoll.Failed,
+        )
+
+    def source_transfers_drained(self, room):
+        if self.request_status.get(room) in (None, KVPoll.Failed):
+            # failure_exception() may already have removed request_status.
+            # Also covers abort racing with a worker parking after its status
+            # check. Each scheduler poll wakes any newly parked chunks.
+            self._wake_pd_hidden_ack_waiters(room)
+        return self._source_drain.drained(room)
+
+    def _complete_source_chunk(self, chunk):
+        self._source_drain.complete(chunk)
+        with self._transfer_completion_condition:
+            self._transfer_completion_condition.notify_all()
+
+    def update_status(self, bootstrap_room, status):
+        super().update_status(bootstrap_room, status)
+        condition = getattr(self, "_transfer_completion_condition", None)
+        if condition is not None:
+            with condition:
+                condition.notify_all()
+
+    def wait_for_transfer_rooms(
+        self, bootstrap_rooms: Set[int], timeout_s: float
+    ) -> bool:
+        """Wait briefly for final rooms so the scheduler can poll before forward."""
+        if not self._final_poll_enabled or not bootstrap_rooms or timeout_s <= 0:
+            return False
+
+        def all_terminal() -> bool:
+            # Mirror MooncakeKVSender.poll(): Success is set before the worker
+            # finishes the chunk, so it only counts once nothing is outstanding.
+            for room in bootstrap_rooms:
+                status = self.request_status.get(room)
+                if status not in (None, KVPoll.Success, KVPoll.Failed):
+                    return False
+                if status == KVPoll.Success and (
+                    self._staging_outstanding.get(room, 0) > 0
+                    or (
+                        self.defer_decode_allocation
+                        and room in self._staging_outstanding
+                    )
+                ):
+                    return False
+            return True
+
+        with self._transfer_completion_condition:
+            return self._transfer_completion_condition.wait_for(
+                all_terminal, timeout=timeout_s
+            )
 
 
 class MooncakeFailureExceptionMixin:
@@ -4151,9 +4212,45 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.trace_ctx.trace_req_start()
 
     def abort(self):
-        super().abort()
+        with self.kv_mgr._source_drain.lock:
+            if not hasattr(self, "_drained_abort_targets"):
+                self._drained_abort_targets = set()
+                self._drained_abort_notified_targets = set()
+            self._drained_abort_targets.update(self._current_drained_abort_targets())
+            super().abort()
+        self.kv_mgr._wake_pd_hidden_ack_waiters(self.bootstrap_room)
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
+
+    def is_transfer_drained(self):
+        return self.kv_mgr.source_transfers_drained(self.bootstrap_room)
+
+    def _current_drained_abort_targets(self):
+        infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+        snapshot = list(infos.values())
+        return {
+            (info.endpoint, info.dst_port) for info in snapshot if not info.is_dummy
+        }
+
+    def notify_drained_abort(self):
+        if not self.is_transfer_drained():
+            return
+        targets = getattr(self, "_drained_abort_targets", set())
+        notified = getattr(self, "_drained_abort_notified_targets", set())
+        for endpoint, port in targets - notified:
+            # Retain the target protocol: decode requests its generation-tagged drain ACK.
+            self.kv_mgr.sync_status_to_decode_endpoint(
+                endpoint,
+                port,
+                self.bootstrap_room,
+                KVPoll.Failed,
+                self.kv_mgr._prefill_unique_rank(),
+            )
+            notified.add((endpoint, port))
+        self._drained_abort_notified_targets = notified
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        self.clear()
 
 
 class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):

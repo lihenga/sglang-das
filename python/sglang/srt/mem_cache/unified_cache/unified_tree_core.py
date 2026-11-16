@@ -133,6 +133,7 @@ class UnifiedTreeNode:
         self._tlru_cached_prefix_len = 0
         self._tlru_history_len = 0
         self.external_cache_stored = False
+        self.detached = False
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
@@ -484,6 +485,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
+        self._detached_roots: dict[NodeId, UnifiedTreeNode] = {}
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
@@ -647,7 +649,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         of nodes filled.
         """
         filled = 0
-        stack = [self.root_node]
+        stack = [self.root_node, *self._detached_roots.values()]
         while stack:
             node = stack.pop()
             # The root anchors every chain and is seeded with an empty hash list.
@@ -677,6 +679,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _unregister_node(self, node: UnifiedTreeNode) -> None:
         """Drop a tree node from the arena."""
         self._node_arena.pop(node.id, None)
+        if self._detached_roots.pop(node.id, None) is not None:
+            # Only the chain's top node is anchored in _detached_roots, and
+            # the chain frees endpoint-first, so a node above can go while one
+            # below is still owned. Dropping it without re-anchoring its
+            # children strands them: in the arena and in the leaf sets, but
+            # unreachable from the walk -- a stale device leaf.
+            for child in node.children.values():
+                self._detached_roots[child.id] = child
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -848,9 +858,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(
-            key, return_full_match=params.return_full_match
-        )
+        ) = self._match_prefix_helper(key, return_full_match=params.return_full_match)
         return self._match_post_processor(
             params,
             value,
@@ -1494,6 +1502,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
+        new_node.detached = child.detached
         new_node.creation_time = child.creation_time
         if self.tlru_bookkeeping:
             # A split adds no depth to the branch: the new parent sits at
@@ -1611,6 +1620,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
+        if self._node_arena.get(node.id) is not node:
+            self.evictable_device_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            return
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
         else:
@@ -1918,8 +1931,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, StorageMedium.GPU, tracker, device_frees, host_frees
         )
         parent = node.parent
+        detached = node.detached
         self._remove_leaf_from_parent(node)
         self._update_evictable_leaf_sets(parent)
+        if detached:
+            return
         self._iteratively_delete_tombstone_leaf(
             node, tracker, device_frees=device_frees, host_frees=host_frees
         )
@@ -2187,10 +2203,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             component.discard_deleted_session_leaf(node)
 
         key = node.key.child_key(self.page_size)
-        v = node.parent.children.pop(key, None)
-        assert v == node
+        if node.parent.children.get(key) is node:
+            node.parent.children.pop(key)
+        else:
+            # Already cut out by detach_external_load_chain. Never pop the key
+            # blind here: a later request may have built its own node under it,
+            # and popping would delete that request's live KV.
+            assert node.detached, f"node {node.id} is not its parent's child"
         # Deleted nodes must not linger in duplicate tracking as ghosts.
         self.full_host_duplicates.pop(node.id, None)
+        # Nor in the leaf sets. Every deletion passes through here, so this is
+        # the one place that cannot be forgotten -- and it has been, twice:
+        # both the tombstone cascade and _evict_host_leaf discarded only the
+        # host set before unregistering, leaving the device set pointing at a
+        # node that no longer exists. sanity_check reports that as
+        # `stale nodes in device_leaves`, and the strict idle check makes it
+        # fatal.
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
         self._unregister_node(node)
 
     def _evict_component_and_detach_lru(
@@ -2754,6 +2784,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> Optional[list[PoolTransfer]]:
         """Build transfers for a node with no stored or pending external copy."""
         node = self.node_by_id(node_id)
+        if self.is_on_detached_chain(node_id):
+            return None
         if not self._needs_external_linker_offload(node):
             return None
 
@@ -3238,7 +3270,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _collect_all_nodes(self) -> list[UnifiedTreeNode]:
         nodes = []
-        stack = [self.root_node]
+        stack = [self.root_node, *self._detached_roots.values()]
         while stack:
             node = stack.pop()
             nodes.append(node)
@@ -3334,7 +3366,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def total_size(self) -> tuple[int, int]:
         total_size = 0
         total_aux_size = 0
-        stack = [self.root_node]
+        stack = [self.root_node, *self._detached_roots.values()]
         while stack:
             node = stack.pop()
             full_value = node.component_data[BASE_COMPONENT_TYPE].value
@@ -3397,39 +3429,136 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def all_values_flatten(self) -> torch.Tensor:
-        values = []
-
-        def _dfs(node: UnifiedTreeNode):
-            for child in node.children.values():
-                v = child.component_data[BASE_COMPONENT_TYPE].value
-                if v is not None:
-                    values.append(v)
-                _dfs(child)
-
-        _dfs(self.root_node)
-        if values:
-            return torch.cat(values)
-        return torch.tensor([], dtype=torch.int64, device=self.device)
+        values = [
+            node.component_data[BASE_COMPONENT_TYPE].value
+            for node in self._collect_all_nodes()
+            if node is not self.root_node
+            and node.component_data[BASE_COMPONENT_TYPE].value is not None
+        ]
+        return (
+            torch.cat(values)
+            if values
+            else torch.tensor([], dtype=torch.int64, device=self.device)
+        )
 
     def _all_component_values_flatten(
         self, component_type: ComponentType
     ) -> torch.Tensor:
         if component_type not in self.components_by_type:
             return torch.tensor([], dtype=torch.int64, device=self.device)
-
-        values = []
-
-        def _dfs(node: UnifiedTreeNode):
-            value = node.component_data[component_type].value
-            if value is not None:
-                values.append(value)
-            for child in node.children.values():
-                _dfs(child)
-
-        _dfs(self.root_node)
-        if values:
-            return torch.cat(values)
-        return torch.tensor([], dtype=torch.int64, device=self.device)
+        values = [
+            node.component_data[component_type].value
+            for node in self._collect_all_nodes()
+            if node is not self.root_node
+            and node.component_data[component_type].value is not None
+        ]
+        return (
+            torch.cat(values)
+            if values
+            else torch.tensor([], dtype=torch.int64, device=self.device)
+        )
 
     def all_mamba_values_flatten(self) -> torch.Tensor:
         return self._all_component_values_flatten(ComponentType.MAMBA)
+
+    def detach_external_load_chain(
+        self, endpoint_id: NodeId, anchor_id: NodeId
+    ) -> list[NodeId]:
+        """Cut a failed load's chain out of the tree; return its ids, endpoint first.
+
+        The chain's pages hold no KV, so nothing may match or extend it.
+        Flagging the nodes is not enough: match_prefix does not consult the
+        flag. Cutting the top link makes the whole chain unreachable in one
+        operation, and a later request with the same tokens simply builds a
+        fresh node under the anchor.
+
+        The nodes keep their arena entry, parent pointer, locks and LRU
+        membership, so whoever still held them releases normally and the
+        reclaim -- or eviction -- frees them. Endpoint first: a parent only
+        becomes a device leaf once its child is gone.
+        """
+        ids: list[NodeId] = []
+        node = self._node_arena.get(endpoint_id)
+        top: Optional[UnifiedTreeNode] = None
+        while node is not None and node is not self.root_node and node.id != anchor_id:
+            node.detached = True
+            ids.append(node.id)
+            top = node
+            node = node.parent
+        if top is None:
+            return ids
+
+        anchor = top.parent
+        key = top.key.child_key(self.page_size)
+        if anchor is not None and anchor.children.get(key) is top:
+            anchor.children.pop(key)
+            # The anchor may have just become a device leaf.
+            self._update_evictable_leaf_sets(anchor)
+        self._detached_roots[top.id] = top
+        return ids
+
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        """Whether the arena still holds this node.
+
+        A chain the reclaim gave up on is retried until it is freed, and a node
+        eviction reached first is simply gone -- there is nothing left to free
+        and nothing left to retry. Distinguishing that from "still owned" is
+        what keeps the retry list from growing without bound.
+        """
+        return node_id in self._node_arena
+
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        """Whether node_id hangs off a chain a failed load left cut out.
+
+        The chain's pages hold no KV, so anything still pointing into it is
+        pointing at KV that never arrived: the chain nodes themselves, and any
+        node a request built underneath one before the load's verdict landed.
+        Hence a walk to the root rather than a test of the node alone.
+
+        A detached node is unreachable from the root but keeps its own parent
+        pointer, so the walk still terminates at the root.
+        """
+        node = self._node_arena.get(node_id)
+        while node is not None and node is not self.root_node:
+            if node.detached:
+                return True
+            node = node.parent
+        return False
+
+    def invalidate_external_load_chain(
+        self, node_id: NodeId
+    ) -> DropSubtreeNoHostResult:
+        """Free a chain detach_external_load_chain already cut out of the tree.
+
+        The chain is unreachable by then, so this only reclaims its slots.
+        Declines for a node something else still owns (a child, a lock, a host
+        copy) rather than dropping it from under that owner; the caller retries.
+        """
+        result = DropSubtreeNoHostResult(is_dropped=False)
+        node = self._node_arena.get(node_id)
+        if node is None or node is self.root_node:
+            return result
+        if node.backuped or node.write_through_pending_id is not None:
+            return result
+        if node.load_back_pending_id is not None:
+            return result
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return result
+        if node.children:
+            # _is_device_leaf below only rejects children holding Full KV on
+            # device, so a host-only or empty child leaves the node looking
+            # free. Deleting it would strand that child: still in the arena and
+            # in evictable_host_leaves, but reachable from no walk -- which
+            # sanity_check reports as `stale nodes in host_leaves`.
+            return result
+        # Covers the lock_ref, device-child and evicted checks in one place.
+        if not self._is_device_leaf(node):
+            return result
+        self._delete_unbacked_device_leaf(
+            node,
+            result.tracker,
+            device_frees=result.device_frees,
+            host_frees=result.host_frees,
+        )
+        result.is_dropped = True
+        return result

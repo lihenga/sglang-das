@@ -45,6 +45,8 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_capture_layer_ids,
+)
+from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_req_state as pd_hidden_state,
 )
 from sglang.srt.disaggregation.utils import (
@@ -77,6 +79,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.cleanup import CleanupOutcomeUnknown, run_cleanup_step
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     kv_to_page_indices,
@@ -110,6 +113,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+EXTERNAL_KV_LOAD_ERR_TYPE = "external_kv_load_error"
 
 # TP=1 yield between polls of a pending result. An initial heuristic rather
 # than a tuned value: long enough that the bootstrap, transfer and cache
@@ -147,6 +151,7 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
     return sum(
         1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
     )
+
 
 def clear_pd_hidden_request_state(req: Req) -> None:
     pd_hidden_state(req).meta = None
@@ -204,9 +209,7 @@ def maybe_release_pd_hidden_rows(req: Req, pd_hidden_pool) -> None:
         clear_pd_hidden_request_state(req)
 
 
-def maybe_release_pd_hidden_rows_on_hidden_done(
-    req: Req, pd_hidden_pool
-) -> bool:
+def maybe_release_pd_hidden_rows_on_hidden_done(req: Req, pd_hidden_pool) -> bool:
     """Release source hidden rows after PD_HIDDEN finishes, before KV success."""
     indices = pd_hidden_state(req).src_indices
     if not indices or pd_hidden_pool is None:
@@ -396,19 +399,17 @@ class PrefillBootstrapQueue:
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
-        kv_args.kv_cache_layout = getattr(self.token_to_kv_pool, "kv_cache_layout", None)
+        kv_args.kv_cache_layout = getattr(
+            self.token_to_kv_pool, "kv_cache_layout", None
+        )
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
         transfer_draft_cache = (
-            (self.pp_size <= 1 or self.pp_rank == self.pp_size - 1)
-            and (
-                not layer_shard_enabled
-                or layer_shard_rank == layer_shard_size - 1
-            )
-        )
+            self.pp_size <= 1 or self.pp_rank == self.pp_size - 1
+        ) and (not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1)
         kv_args.prefill_start_layer = (
             getattr(
                 self.token_to_kv_pool,
@@ -508,7 +509,9 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
-        kv_manager.pd_hidden_pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        kv_manager.pd_hidden_pool = getattr(
+            self.metadata_buffers, "pd_hidden_pool", None
+        )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -740,12 +743,8 @@ class PrefillBootstrapQueue:
         only the common FIFO prefix before performing any allocation.
         """
         ready = [True] * len(self.queue)
-        metadata_credits = (
-            self.req_to_metadata_buffer_idx_allocator.available_size()
-        )
-        pool = getattr(
-            getattr(self, "metadata_buffers", None), "pd_hidden_pool", None
-        )
+        metadata_credits = self.req_to_metadata_buffer_idx_allocator.available_size()
+        pool = getattr(getattr(self, "metadata_buffers", None), "pd_hidden_pool", None)
         hidden_row_credits = pool.available_size() if pool is not None else 0
 
         resource_blocked = False
@@ -797,9 +796,7 @@ class PrefillBootstrapQueue:
         prefix_tensor = torch.tensor(
             [
                 int(
-                    self.kv_manager.req_to_decode_prefix_len.get(
-                        req.bootstrap_room, 0
-                    )
+                    self.kv_manager.req_to_decode_prefix_len.get(req.bootstrap_room, 0)
                     or 0
                 )
                 for req in self.queue
@@ -876,9 +873,7 @@ class PrefillBootstrapQueue:
             return True
 
         src_indices = (
-            None
-            if plan.streaming_hidden
-            else plan.pool.alloc(plan.source_window_rows)
+            None if plan.streaming_hidden else plan.pool.alloc(plan.source_window_rows)
         )
         if src_indices is None and not plan.streaming_hidden:
             # A request that fits in the pool can still lose a local allocation
@@ -1067,12 +1062,8 @@ class PrefillBootstrapQueue:
             self.scheduler.attn_tp_cpu_group,
         )
 
-        metadata_credits = (
-            self.req_to_metadata_buffer_idx_allocator.available_size()
-        )
-        pool = getattr(
-            getattr(self, "metadata_buffers", None), "pd_hidden_pool", None
-        )
+        metadata_credits = self.req_to_metadata_buffer_idx_allocator.available_size()
+        pool = getattr(getattr(self, "metadata_buffers", None), "pd_hidden_pool", None)
         hidden_row_credits = pool.available_size() if pool is not None else 0
         admission_blocked = False
 
@@ -1167,13 +1158,14 @@ class SchedulerDisaggregationPrefillMixin:
         checkpoint_kv_cache(req, cache)
 
     def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
-        self.clear_pending_chunk_send(req)
-        sender = getattr(req, "disagg_kv_sender", None)
-        if sender is not None and hasattr(sender, "abort"):
-            sender.abort()
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+        req.external_kv_response_sent = True
+        self.abort_external_kv_request(
+            req,
+            forward_drained=self.prefill_abort_forward_drained(req),
+            sender_terminal=self.prefill_abort_sender_terminal(req),
+            abort_message="Aborted",
+            emit_response=False,
+        )
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -1225,6 +1217,7 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
+        self._process_mooncake_cleanup_requests()
         self.process_pending_chunked_abort()
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
@@ -1292,6 +1285,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            self.maybe_supplemental_poll_final_chunks()
 
             # Update last_batch
             self.last_batch = batch
@@ -1415,6 +1409,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            self.maybe_supplemental_poll_final_chunks()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1460,9 +1455,7 @@ class SchedulerDisaggregationPrefillMixin:
         if hidden_states is None and result.pp_hidden_states_proxy_tensors is not None:
             proxy_tensors = result.pp_hidden_states_proxy_tensors.tensors
             aux_keys = sorted(
-                key
-                for key in proxy_tensors
-                if key.startswith("pd_aux_hidden_states_")
+                key for key in proxy_tensors if key.startswith("pd_aux_hidden_states_")
             )
             if aux_keys:
                 hidden_states = (
@@ -1479,9 +1472,7 @@ class SchedulerDisaggregationPrefillMixin:
         if current_indices is None:
             return None
 
-        state_types = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
-        )
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
         state_indices = []
         for st in state_types:
             if st == StateType.PD_HIDDEN:
@@ -1512,7 +1503,9 @@ class SchedulerDisaggregationPrefillMixin:
                 int(current_start),
                 int(current_rows),
                 bool(pd_hidden_state(req).current_is_last),
-                current_indices if streaming_hidden else pd_hidden_state(req).src_indices,
+                current_indices
+                if streaming_hidden
+                else pd_hidden_state(req).src_indices,
             )
 
         req.disagg_kv_sender.send(np.asarray([], dtype=np.int32), state_indices)
@@ -1542,10 +1535,7 @@ class SchedulerDisaggregationPrefillMixin:
                     pd_hidden_state(req).src_indices
                     or pd_hidden_state(req).capture_layer_ids
                 )
-                and (
-                    send_owner_direct
-                    or not pd_hidden_state(req).owner_direct_sent
-                )
+                and (send_owner_direct or not pd_hidden_state(req).owner_direct_sent)
             )
         ]
         if pool is not None and needs_pd_hidden_reqs and hidden_states is None:
@@ -1610,9 +1600,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if local_slice_len > 0 and req_hidden_to_write.shape[-1] != local_slice_len:
                 local_slice_start = (
-                    int(local_pp_slice.get("slice_start", 0))
-                    if local_pp_slice
-                    else 0
+                    int(local_pp_slice.get("slice_start", 0)) if local_pp_slice else 0
                 )
                 local_slice_end = local_slice_start + local_slice_len
                 if req_hidden_to_write.shape[-1] < local_slice_end:
@@ -1670,7 +1658,9 @@ class SchedulerDisaggregationPrefillMixin:
             pd_hidden_state(req).current_start = write_start
             pd_hidden_state(req).current_row_len = rows
             pd_hidden_state(req).current_src_indices = write_indices
-            pd_hidden_state(req).current_is_last = write_end >= hidden_start + hidden_len
+            pd_hidden_state(req).current_is_last = (
+                write_end >= hidden_start + hidden_len
+            )
             written = pd_hidden_state(req).written
             if written is not None:
                 written[local_start:local_end] = [True] * rows
@@ -1683,24 +1673,18 @@ class SchedulerDisaggregationPrefillMixin:
         result: GenerationBatchResult,
     ) -> bool:
         capture_reqs = [
-            req
-            for req in batch.reqs
-            if pd_hidden_state(req).capture_layer_ids
+            req for req in batch.reqs if pd_hidden_state(req).capture_layer_ids
         ]
         if not capture_reqs:
             return False
         if any(req.pending_bootstrap for req in capture_reqs):
             return False
         if not all(
-            bool(
-                (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
-            )
+            bool((pd_hidden_state(req).meta or {}).get("streaming_hidden", False))
             for req in capture_reqs
         ):
             return False
-        self._write_pd_hidden_rows_for_batch(
-            batch, result, send_owner_direct=True
-        )
+        self._write_pd_hidden_rows_for_batch(batch, result, send_owner_direct=True)
         return True
 
     def process_batch_result_disagg_prefill(
@@ -2008,8 +1992,10 @@ class SchedulerDisaggregationPrefillMixin:
                     if not local_transfer_stopped:
                         undone_reqs.append(req)
                         continue
-                    self.handle_inflight_transfer_failure(req)
-                    done_reqs.append(req)
+                    if self.handle_inflight_transfer_failure(req):
+                        done_reqs.append(req)
+                    else:
+                        undone_reqs.append(req)
                     continue
 
                 # In PP mode, the previous rank may have reached a terminal
@@ -2061,15 +2047,44 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
-                self.handle_inflight_transfer_failure(req)
-                done_reqs.append(req)
+                if self.handle_inflight_transfer_failure(req):
+                    done_reqs.append(req)
+                else:
+                    undone_reqs.append(req)
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                 )
 
+        if self.disagg_prefill_inflight_queue:
+            ready_ids = {id(req) for req in done_reqs}
+            retire = torch.tensor(
+                [
+                    int(id(req) in ready_ids)
+                    for req in self.disagg_prefill_inflight_queue
+                ],
+                dtype=torch.int,
+            )
+            self._all_reduce_mooncake_cleanup(retire, torch.distributed.ReduceOp.MIN)
+            done_reqs = [
+                req
+                for req, ready in zip(
+                    self.disagg_prefill_inflight_queue, retire.tolist()
+                )
+                if ready
+            ]
+            undone_reqs = [
+                req
+                for req, ready in zip(
+                    self.disagg_prefill_inflight_queue, retire.tolist()
+                )
+                if not ready
+            ]
         for req in done_reqs:
             req.time_stats.set_completion_time()
+            if req.external_kv_abort_requested:
+                req.external_kv_response_sent = True
+                self._mooncake_cleanup_requests.pop(id(req), None)
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -2112,38 +2127,21 @@ class SchedulerDisaggregationPrefillMixin:
 
         return done_reqs
 
-    def handle_inflight_transfer_failure(
-        self: Scheduler, req: Req
-    ) -> Optional[Exception]:
-        """Conclude an inflight request whose KV transfer failed."""
-        error_message = (
-            f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
-            f"{req.rid=} {req.bootstrap_room=}"
+    def handle_inflight_transfer_failure(self: Scheduler, req: Req) -> bool:
+        message = (
+            f"Prefill transfer failed for request {req.rid} room={req.bootstrap_room}"
         )
-        exc: Optional[Exception] = None
-        try:
-            req.disagg_kv_sender.failure_exception()
-        except Exception as e:
-            exc = e
-            error_message += f" with exception {e}"
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if getattr(exc, "is_from_another_rank", False):
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if req.finished_reason is None:
-            req.finished_reason = FINISH_LENGTH(length=0)
-        # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
-        self._release_aborted_request(req)
-        if not isinstance(req.finished_reason, FINISH_ABORT):
-            prepare_abort(
-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-            )
-        if self.metrics_reporter.enable_metrics:
-            self.metrics_collector.increment_transfer_failed_reqs()
-        return exc
+        if not req.external_kv_abort_requested:
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            if self.metrics_reporter.enable_metrics:
+                self.metrics_collector.increment_transfer_failed_reqs()
+        return self.abort_external_kv_request(
+            req,
+            forward_drained=self.prefill_abort_forward_drained(req),
+            sender_terminal=self.prefill_abort_sender_terminal(req),
+            abort_message=message,
+            emit_response=False,
+        )
 
     def get_transferred_rids(
         self: Scheduler,
@@ -2159,9 +2157,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         success_rids: List[str] = []
         failed_rids: List[str] = []
-        pd_hidden_pool = getattr(
-            self.disagg_metadata_buffers, "pd_hidden_pool", None
-        )
+        pd_hidden_pool = getattr(self.disagg_metadata_buffers, "pd_hidden_pool", None)
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             maybe_release_pd_hidden_rows_on_hidden_done(req, pd_hidden_pool)
@@ -2182,32 +2178,17 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
-        """Release an aborted request when its last prefill result is safe."""
-        self.clear_pending_chunk_send(req)
-        owns_resources = (
-            req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
+        self.abort_external_kv_request(
+            req,
+            forward_drained=True,
+            sender_terminal=self.prefill_abort_sender_terminal(req),
+            abort_message=getattr(
+                req.to_finish or req.finished_reason, "message", "Aborted"
+            ),
+            emit_response=False,
         )
-        if not owns_resources:
-            # A bootstrap failure or earlier abort already retired it.
-            return False
-
-        sender = req.disagg_kv_sender
-        if sender is not None:
-            try:
-                sender.abort()
-            except Exception:
-                # Transport notification is best effort; local ownership must
-                # still be released or the next idle invariant check will fail.
-                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
-
-        if req.to_finish is not None and not req.finished():
-            req.update_finish_state()
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
-        return True
+        # The common retained-cleanup owner emits exactly once after retirement is safe.
+        return False
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
@@ -2357,7 +2338,9 @@ class SchedulerDisaggregationPrefillMixin:
         pages = full_pages
         window_start = None
         if end == len(req.origin_input_ids):
-            window_start = max(req.disagg_decode_prefix_len, end - self.sliding_window_size)
+            window_start = max(
+                req.disagg_decode_prefix_len, end - self.sliding_window_size
+            )
             window_start = window_start // page_size * page_size
             swa = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                 raw[window_start:end]
@@ -2441,9 +2424,12 @@ class SchedulerDisaggregationPrefillMixin:
         if is_hcu() and self.enable_overlap and not self.enable_staging:
             # Do not let an optional early send fall back to a blocking page
             # read. The normal send still covers the unchanged send cursor.
-            if self.cached_disagg_page_indices(
-                req, req.start_send_idx, cached_end, wait=False
-            ) is None:
+            if (
+                self.cached_disagg_page_indices(
+                    req, req.start_send_idx, cached_end, wait=False
+                )
+                is None
+            ):
                 return
         elif cached is not None and not cached["ready"].query():
             return
@@ -2464,6 +2450,14 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
+        if (
+            last_chunk
+            and get_parallel().pp_size == 1
+            and self._mooncake_final_poll_timeout_ms > 0
+        ):
+            if not hasattr(self, "_disagg_final_chunk_rooms"):
+                self._disagg_final_chunk_rooms = set()
+            self._disagg_final_chunk_rooms.add(req.bootstrap_room)
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
@@ -2519,16 +2513,13 @@ class SchedulerDisaggregationPrefillMixin:
         current_pd_hidden_start = pd_hidden_state(req).current_start
         current_pd_hidden_row_len = int(pd_hidden_state(req).current_row_len or 0)
         has_current_pd_hidden = (
-            current_pd_hidden_src_indices is not None
-            and current_pd_hidden_row_len > 0
+            current_pd_hidden_src_indices is not None and current_pd_hidden_row_len > 0
         )
         streaming_pd_hidden = bool(
             (pd_hidden_state(req).meta or {}).get("streaming_hidden", False)
         )
 
-        state_types = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
-        )
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
         state_indices: Optional[List] = None
         if last_chunk or (streaming_pd_hidden and has_current_pd_hidden):
             if last_chunk:
@@ -2646,9 +2637,13 @@ class SchedulerDisaggregationPrefillMixin:
                     StateType.BLOCK_SCALE_SWA: _swa_payload,
                 }
                 payloads[StateType.PD_HIDDEN] = _pd_hidden_payload
-            if last_chunk and _is_npu and isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(),
-                DeepSeekV4TokenToKVPool,
+            if (
+                last_chunk
+                and _is_npu
+                and isinstance(
+                    self.token_to_kv_pool_allocator.get_kvcache(),
+                    DeepSeekV4TokenToKVPool,
+                )
             ):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     dsv4_state_payloads,
@@ -2812,3 +2807,261 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
             self.waiting_queue.insert(0, req)
+
+    def prefill_abort_sender_terminal(self: Scheduler, req: Req) -> bool:
+        """A failure on a peer rank does not prove the local sender stopped."""
+        if req.disagg_kv_sender is None:
+            return True
+        try:
+            sender = req.disagg_kv_sender
+            if sender.poll() not in (KVPoll.Success, KVPoll.Failed):
+                return False
+            # Mooncake logical Failed is immediate; source ownership is separate.
+            drained = getattr(sender, "is_transfer_drained", None)
+            return bool(drained()) if drained is not None else True
+        except Exception:
+            logger.exception("Failed to poll aborting sender for request %s", req.rid)
+            return False
+
+    def prefill_abort_forward_drained(self: Scheduler, req: Req) -> bool:
+        """Do not reclaim a chunk still referenced by an unresolved result."""
+        if req.inflight_middle_chunks > 0:
+            return False
+        return not any(
+            any(candidate is req for candidate in batch.reqs)
+            for batch, _ in getattr(self, "result_queue", ())
+        )
+
+    def abort_external_kv_request(
+        self: Scheduler,
+        req: Req,
+        *,
+        forward_drained: bool,
+        sender_terminal: bool,
+        abort_message: str = "External KV load failed",
+        is_insert: bool = False,
+        emit_response: bool = False,
+    ) -> bool:
+        """Retry incomplete cleanup stages; callers must keep the Req reachable.
+
+        With emit_response=False, completion covers resources only. The caller
+        owns response delivery and must track external_kv_response_sent.
+        """
+        self._mooncake_cleanup_requests[id(req)] = req
+        try:
+            if getattr(self, "_pending_chunked_abort_req", None) is req:
+                req.external_kv_abort_response_via_chunked = True
+            if getattr(req, "external_kv_abort_response_via_chunked", False):
+                emit_response = False
+            # A resource-only caller may return later to deliver the response.
+            if req.external_kv_cleanup_done:
+                if emit_response and not req.external_kv_response_sent:
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    req.external_kv_response_sent = True
+                return True
+
+            if not req.external_kv_abort_requested:
+                req.skip_radix_cache_insert = True
+                if not isinstance(req.to_finish, FINISH_ABORT) and not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ):
+                    reason = FINISH_ABORT(
+                        message=abort_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+                    )
+                    if req.finished_reason is None:
+                        req.to_finish = reason
+                    else:
+                        req.finished_reason = reason
+                        req.to_finish = None
+                req.external_kv_abort_requested = True
+                self._external_kv_abort_rids.add(req.rid)
+
+            if not req.external_kv_pending_chunk_cleared:
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.clear_pending_chunk_send(req)
+                req.external_kv_pending_chunk_cleared = True
+
+            if not req.external_kv_linker_released:
+                self._release_aborted_request(req)
+                req.external_kv_linker_released = True
+
+            sender = req.disagg_kv_sender
+            if sender is None:
+                req.external_kv_sender_abort_requested = True
+            elif not req.external_kv_sender_abort_requested:
+                sender.abort()
+                req.external_kv_sender_abort_requested = True
+
+            if (
+                not forward_drained
+                or not sender_terminal
+                # Recheck after abort closes publication; the caller's earlier
+                # observation may precede the final enqueue.
+                or not self.prefill_abort_sender_terminal(req)
+            ):
+                return False
+
+            # A decode request can only be failed safely after every local
+            # source transfer has drained. The Mooncake sender fans this
+            # terminal marker out to its saved/current decode targets.
+            notify_drained_abort = getattr(sender, "notify_drained_abort", None)
+            if notify_drained_abort is not None:
+                notify_drained_abort()
+
+            if not req.external_kv_finish_state_applied:
+                if isinstance(req.to_finish, FINISH_ABORT):
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
+                elif not isinstance(req.finished_reason, FINISH_ABORT):
+                    req.finished_reason = FINISH_ABORT(
+                        message=abort_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        err_type=EXTERNAL_KV_LOAD_ERR_TYPE,
+                    )
+                # Keep the existing failure response shape for logprob requests.
+                # prepare_abort initializes the empty logprob lists, but its new
+                # reason must not replace the original error type or message.
+                if req.return_logprob:
+                    reason = req.finished_reason
+                    prepare_abort(req, reason.message, status_code=reason.status_code)
+                    req.finished_reason = reason
+                req.external_kv_finish_state_applied = True
+
+            if not req.external_kv_metadata_released:
+                if self.disaggregation_mode in (
+                    DisaggregationMode.PREFILL,
+                    DisaggregationMode.DECODE,
+                ):
+                    run_cleanup_step(
+                        req,
+                        "metadata.release",
+                        lambda: maybe_release_metadata_buffer(
+                            req,
+                            self.req_to_metadata_buffer_idx_allocator,
+                            getattr(
+                                getattr(self, "disagg_metadata_buffers", None),
+                                "pd_hidden_pool",
+                                None,
+                            ),
+                        ),
+                    )
+                req.external_kv_metadata_released = True
+
+            if not req.external_kv_cache_released:
+                if req.kv.holds_kv or req.kv.holds_mamba:
+                    run_cleanup_step(
+                        req,
+                        "kv.release",
+                        lambda: release_kv_cache(
+                            req, self.tree_cache, checkpoint=False
+                        ),
+                    )
+                reclaim = getattr(self.tree_cache, "_reclaim_failed_linker_chain", None)
+                if reclaim is not None:
+                    reclaim(req.rid)
+                req.external_kv_cache_released = True
+
+            if emit_response and not req.external_kv_response_sent:
+                req.time_stats.set_completion_time()
+                self.output_streamer.stream_output([req], req.return_logprob)
+                req.external_kv_response_sent = True
+
+            self._external_kv_abort_rids.discard(req.rid)
+            # The chunked protocol owner clears its marker after delivery.
+            req.external_kv_cleanup_done = True
+            return True
+        except CleanupOutcomeUnknown:
+            # The original exception was logged on the first attempt. Keep the
+            # request reachable without flooding logs on every scheduler tick.
+            return False
+        except Exception:
+            logger.exception(
+                "External KV abort cleanup failed for request %s; pending cleanup retained",
+                req.rid,
+            )
+            return False
+
+    def maybe_supplemental_poll_final_chunks(self: Scheduler) -> List[Req]:
+        """Give newly submitted final chunks one bounded chance to finish."""
+        timeout_ms = self._mooncake_final_poll_timeout_ms
+        if timeout_ms <= 0:
+            final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+            if final_rooms:
+                final_rooms.clear()
+            return []
+        final_rooms = getattr(self, "_disagg_final_chunk_rooms", None)
+        if not final_rooms:
+            return []
+        self._disagg_final_chunk_rooms = set()
+
+        remaining_rooms = {
+            req.bootstrap_room
+            for req in self.disagg_prefill_inflight_queue
+            if req.bootstrap_room in final_rooms
+        }
+        if not remaining_rooms:
+            return []
+
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        wait_for_rooms = getattr(kv_mgr, "wait_for_transfer_rooms", None)
+        if wait_for_rooms is None:
+            return []
+
+        start = time.perf_counter()
+        all_done = wait_for_rooms(remaining_rooms, timeout_ms / 1000.0)
+        waited = time.perf_counter()
+        done_reqs = self.process_disagg_prefill_inflight_queue()
+        self._record_final_poll_wait(
+            len(remaining_rooms),
+            len(done_reqs),
+            waited - start,
+            time.perf_counter() - waited,
+            all_done,
+        )
+        return done_reqs
+
+    def _record_final_poll_wait(
+        self: Scheduler,
+        num_rooms: int,
+        num_done: int,
+        wait_s: float,
+        poll_s: float,
+        all_done: bool,
+    ) -> None:
+        """Accumulate final-chunk wait stats and log a summary every minute.
+
+        wait_ms is this rank's local wait; poll_ms is the extra all-reduced poll,
+        which includes waiting for slower ranks. Their sum is the added
+        scheduler stall per round.
+        """
+        now = time.monotonic()
+        stats = getattr(self, "_final_poll_wait_stats", None)
+        if stats is None:
+            stats = self._final_poll_wait_stats = {"start": now}
+        stats["rounds"] = stats.get("rounds", 0) + 1
+        stats["rooms"] = stats.get("rooms", 0) + num_rooms
+        stats["done"] = stats.get("done", 0) + num_done
+        stats["wait_s"] = stats.get("wait_s", 0.0) + wait_s
+        stats["poll_s"] = stats.get("poll_s", 0.0) + poll_s
+        stats["max_s"] = max(stats.get("max_s", 0.0), wait_s + poll_s)
+        stats["timeouts"] = stats.get("timeouts", 0) + (not all_done)
+        if now - stats["start"] < 60.0:
+            return
+        rounds = stats["rounds"]
+        logger.info(
+            "Final KV chunk poll (last %.0f s): rounds=%d rooms=%d done=%d "
+            "local_wait_ms avg=%.1f extra_poll_ms avg=%.1f stall_ms total=%.0f "
+            "max=%.1f timeouts=%d",
+            now - stats["start"],
+            rounds,
+            stats["rooms"],
+            stats["done"],
+            stats["wait_s"] * 1000 / rounds,
+            stats["poll_s"] * 1000 / rounds,
+            (stats["wait_s"] + stats["poll_s"]) * 1000,
+            stats["max_s"] * 1000,
+            stats["timeouts"],
+        )
+        self._final_poll_wait_stats = {"start": now}

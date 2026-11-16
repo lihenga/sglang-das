@@ -87,6 +87,7 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     select_tree_core_backend,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    PreparedHostPrefetch,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
@@ -390,6 +391,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
+        self._failed_linker_rids = []
+        self._stranded_linker_nodes = []
         self.session_refs.reset()
 
         # Reset Controller.
@@ -1083,10 +1086,15 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
-        return self.session.try_cache_finished_req(req)
+        claimed = self.session.try_cache_finished_req(req)
+        if claimed and self.linker is not None:
+            self.linker.release_request(req.cache_request_handle)
+        return claimed
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.linker is not None:
+            self.linker.release_request(req.cache_request_handle)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -2645,7 +2653,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         if self.linker is not None:
-            self.linker.release_request(rid)
+            self.linker.release_request(request)
+            self._reclaim_failed_linker_chain(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
@@ -3516,6 +3525,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._sync_dfs_health_policy()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [
@@ -3527,7 +3537,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
             load_count, offload_count = map(int, finish_counts.tolist())
-            self.linker.drain_loads(load_count)
+            self._collect_failed_linker_loads(load_count)
+            self.retry_stranded_failed_linker_chains()
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
@@ -3836,3 +3847,253 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def dfs_weight_order(self, node_handles: Sequence[NodeId]) -> list[int]:
         return self.tree_core.dfs_weight_order(node_handles)
+
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        """Rank-consistent switch resolved when the linker was built."""
+        return self.linker is not None and self.linker.waiting_queue_prefetch_enabled()
+
+    def disable_waiting_queue_prefetch(self) -> None:
+        if self.linker is not None:
+            self.linker.disable_waiting_queue_prefetch()
+
+    def prefetch_external_linker_to_host(self, req) -> bool:
+        if self.linker is None:
+            return False
+        return self.linker.prefetch_to_host(req)
+
+    def prepare_external_linker_prefetch(self, req) -> Optional[PreparedHostPrefetch]:
+        if self.linker is None:
+            return None
+        return self.linker.prepare_host_prefetch(req)
+
+    def complete_external_linker_prefetch(
+        self, job: PreparedHostPrefetch, submitted: bool
+    ) -> bool:
+        if self.linker is None:
+            if submitted:
+                job.cache_linker.cancel_host_prefetch(job.rid)
+            return False
+        return self.linker.complete_host_prefetch_submission(job, submitted)
+
+    def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
+        """Return one rank-wide admission state for a queued DFS prefetch."""
+        return self.get_waiting_queue_prefetch_admission_states([rid])[rid]
+
+    def get_waiting_queue_prefetch_admission_states(
+        self, rids: Sequence[str]
+    ) -> dict[str, str]:
+        """Resolve variable local request lists in one fixed-shape collective round.
+
+        The request-id union and state matrix make this safe when ranks have
+        different waiting-queue lengths, including an empty queue on some
+        ranks. This method remains scheduler-thread only.
+        """
+        groups = []
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                groups.append(group)
+        if not groups and self.tp_world_size > 1:
+            groups.append(self.tp_group)
+
+        all_rids = list(dict.fromkeys(rids))
+        has_rids = torch.tensor([int(bool(all_rids))], dtype=torch.int)
+        self._all_reduce_attn_groups(has_rids, torch.distributed.ReduceOp.MAX)
+        if int(has_rids.item()) == 0:
+            return {}
+
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(gathered, all_rids, group=group)
+            all_rids = sorted({rid for rank_rids in gathered for rid in rank_rids})
+
+        if not all_rids:
+            return {}
+
+        state_names = (
+            "not_tracked",
+            "pending",
+            "dfs_prefetched",
+            "no_prefetch_needed",
+            "terminal",
+        )
+        local_states = [
+            "not_tracked"
+            if self.linker is None
+            else self.linker.get_host_prefetch_admission_state(rid)
+            for rid in all_rids
+        ]
+        counts = torch.tensor(
+            [
+                [int(local_state == state) for state in state_names]
+                for local_state in local_states
+            ],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
+
+        def state_from_counts(row) -> str:
+            not_tracked, pending, dfs_prefetched, no_prefetch_needed, terminal = (
+                int(value) for value in row
+            )
+            # PENDING wins: an in-flight native read owns its private session
+            # and must finish before any rank can fall back to normal load.
+            if pending:
+                return "pending"
+            completed = dfs_prefetched + no_prefetch_needed
+            if terminal or (not_tracked and completed):
+                return "terminal"
+            if dfs_prefetched:
+                return "dfs_prefetched"
+            if no_prefetch_needed:
+                return "no_prefetch_needed"
+            if not_tracked:
+                return "not_tracked"
+            return "terminal"
+
+        return {
+            rid: state_from_counts(counts[index]) for index, rid in enumerate(all_rids)
+        }
+
+    def cancel_waiting_queue_prefetch(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.cancel_waiting_queue_prefetch(rid)
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across all attention ranks."""
+        owner = self.linker
+        if owner is None and self.cache_controller is not None:
+            owner = self.cache_controller.storage_backend
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if local_policy is None:
+            return
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+        apply_policy(*(bool(value) for value in effective.tolist()))
+
+    def drain_linker_loads(self, *, wait_for_completion: bool = False) -> list[str]:
+        """Retire finished linker loads and return the rids that must abort.
+
+        The batch count is MIN-reduced first because a load failure is
+        rank-local: unreduced, one rank aborts a request the others keep. The
+        optional wait covers only loads already issued to the backend worker.
+        """
+        if self.linker is None:
+            return []
+        if wait_for_completion:
+            self.linker.wait_for_pending_loads()
+        finish_count = torch.tensor(
+            [self.linker.num_completed_loads()], dtype=torch.int, device="cpu"
+        )
+        self._all_reduce_attn_groups(finish_count, torch.distributed.ReduceOp.MIN)
+        self._collect_failed_linker_loads(int(finish_count[0].item()))
+        failed = self._failed_linker_rids
+        self._failed_linker_rids = []
+        return failed
+
+    def _collect_failed_linker_loads(self, finish_count: int) -> None:
+        if finish_count <= 0:
+            return
+        # The verdict has to agree across the attention group, not just the
+        # batch count. A load failure is rank-local: acting on the local
+        # verdict aborts the request on the ranks that saw the failure while
+        # the rest serve it, and the rank owning the output stream commits
+        # output over KV that never arrived. finish_count is already reduced,
+        # so every rank builds a tensor of the same length here.
+        local_successes = self.linker.take_completed_loads(finish_count)
+        successes = torch.tensor(
+            [int(success) for success in local_successes],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+        failed = self.linker.commit_completed_loads(
+            [bool(success) for success in successes.tolist()]
+        )
+        if failed:
+            logger.error(
+                "External linker load failed for %d request(s); aborting them: %s",
+                len(failed),
+                failed,
+            )
+            self._failed_linker_rids.extend(failed)
+
+    def _reclaim_failed_linker_chain(self, rid: str) -> None:
+        """Free the tree chains a failed external-linker load published.
+
+        Called from cache_finished_req once the request has dropped its tree
+        lock -- the one point where the whole chain becomes reclaimable, since
+        Full is a path-unlock. Endpoint-first: a parent only becomes a device
+        leaf once its child is gone.
+
+        The loading request is not always the last owner; a request that
+        matched the chain while the load was in flight holds it too. A node
+        that declines here is retried rather than abandoned, or its slots
+        would be owned twice once that request re-inserts them. A node that
+        has left the arena is dropped instead: eviction reached it first.
+        """
+        if self.linker is None:
+            return
+        pending = self._stranded_linker_nodes + self.linker.take_failed_chain(rid)
+        if not pending:
+            return
+        # Keep the endpoint-first order but name each node once: retrying is
+        # only bounded if the list cannot accumulate the same node twice.
+        pending = list(dict.fromkeys(pending))
+        self._stranded_linker_nodes = []
+        stranded: list[NodeId] = []
+        for node_id in pending:
+            result = self.tree_core.invalidate_external_load_chain(node_id)
+            self._free_values(result.device_frees, result.host_frees)
+            if result.is_dropped:
+                continue
+            if not self.tree_core.holds_detached_node(node_id):
+                # Evicted out from under us; its slots are already back.
+                continue
+            stranded.append(node_id)
+        if stranded:
+            self._stranded_linker_nodes = stranded
+            logger.debug(
+                "Failed external-linker chain at nodes %s is still owned "
+                "elsewhere; detached, so it cannot be matched -- retrying "
+                "when its other owner releases",
+                stranded,
+            )
+
+    def retry_stranded_failed_linker_chains(self) -> None:
+        """Retry reclaiming stranded failed linker chains.
+
+        When a failed load's chain cannot be immediately reclaimed (because
+        another request still holds it), the nodes are marked as stranded.
+        This method provides a way to periodically retry the reclaim without
+        waiting for a specific request to call cache_finished_req().
+
+        Called from the scheduler's idle loop or after processing disagg queues.
+        """
+        if self.linker is None:
+            return
+
+        if not self._stranded_linker_nodes:
+            return
+
+        # Pass empty rid to trigger retry of stranded nodes only
+        self._reclaim_failed_linker_chain("")
+
+    def has_outstanding_failed_linker_chains(self) -> bool:
+        """Whether any failed load's chain is still in the tree.
+
+        While one is, a request that never issued a load can still be holding
+        it, so the scheduler has to look for owners by where they point.
+        """
+        if self.linker is None:
+            return False
+        return bool(self._stranded_linker_nodes or self.linker.failed_chains)
+
+    def is_on_failed_linker_chain(self, node_id: Optional[NodeId]) -> bool:
+        """Whether a request anchored at node_id holds a failed load's pages."""
+        if self.linker is None or node_id is None:
+            return False
+        return self.tree_core.is_on_detached_chain(node_id)
