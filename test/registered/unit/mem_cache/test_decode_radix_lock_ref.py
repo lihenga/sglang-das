@@ -42,7 +42,7 @@ register_hcu_ci(est_time=10, suite="nightly-hcu-1", nightly=True)
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -53,7 +53,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.utils.common import Range
 
 
@@ -449,7 +451,13 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         # still release the original matched-node lock.
         queue._allocatable_token_budgets = MagicMock(return_value=3)
 
-        preallocated, failed = queue.pop_preallocated()
+        with patch(
+            "sglang.srt.disaggregation.decode.get_disagg",
+            return_value=SimpleNamespace(
+                disaggregation_decode_retraction_rebootstrap=False
+            ),
+        ):
+            preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
@@ -461,7 +469,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             skip_swa=True,
         )
         self.assertFalse(req.swa_prefix_lock_released)
-        queue._swa_tail_len.assert_called_once_with(8)
+        queue._swa_tail_len.assert_called_with(8)
         queue._allocatable_token_budgets.assert_called_once()
 
     def test_repeated_incremental_no_leak(self):
@@ -501,6 +509,89 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)
         self.assertEqual(cache.protected_size(), 0)
+
+
+class TestUnifiedDecodeLockRef(unittest.TestCase):
+    def test_failed_rebootstrap_without_prefix_lock_releases_kv(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.disable = False
+        cache.enable_session_radix_cache = False
+        cache.session = MagicMock()
+        cache.session.try_cache_finished_req.return_value = False
+        cache._components_tuple = (MagicMock(),)
+        cache._reclaim_failed_linker_chain = MagicMock()
+        cache.dec_lock_ref = MagicMock(side_effect=lambda node, *a, **kw: {}[node])
+        cache.token_to_kv_pool_allocator = MagicMock(page_size=1)
+        req = SimpleNamespace(
+            rid="rebootstrap-aborted",
+            req_pool_idx=0,
+            kv=SimpleNamespace(kv_allocated_len=4),
+            kv_committed_len=3,
+            effective_kv_committed_len=lambda: 3,
+            origin_input_ids=[1, 2, 3],
+            output_ids=[],
+            cache_protected_len=0,
+            last_node=None,
+            swa_prefix_lock_released=False,
+            swa_uuid_for_lock=None,
+            skip_lock_node_ids={},
+        )
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[11, 12, 13, 14]]),
+            free=MagicMock(side_effect=lambda r: setattr(r, "req_pool_idx", None)),
+        )
+
+        with patch(
+            "sglang.srt.mem_cache.common.get_spec",
+            return_value=SimpleNamespace(speculative_algorithm="EAGLE"),
+        ):
+            release_kv_cache(req, cache, is_insert=False)
+
+        cache.dec_lock_ref.assert_not_called()
+        frees = cache.token_to_kv_pool_allocator.free_segment.call_args_list
+        self.assertEqual(len(frees), 2)
+        self.assertEqual(frees[0].args[0].tolist(), [11, 12, 13])
+        self.assertEqual(frees[0].kwargs, {"start_pos": 0})
+        self.assertEqual(frees[1].args[0].tolist(), [14])
+        self.assertEqual(frees[1].kwargs, {"start_pos": 3})
+        cache._components_tuple[0].cleanup_after_caching_req.assert_called_once()
+        cache._reclaim_failed_linker_chain.assert_called_once_with(req.rid)
+        cache.req_to_token_pool.free.assert_called_once_with(req)
+        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.kv)
+
+    def test_locked_node_preserves_swa_release_parameters(self):
+        for node in (0, 7):
+            for skip_swa in (False, True):
+                with self.subTest(node=node, skip_swa=skip_swa):
+                    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+                    cache.dec_lock_ref = MagicMock()
+                    req = SimpleNamespace(
+                        last_node=node,
+                        swa_uuid_for_lock=123,
+                        skip_lock_node_ids={node: (1,)},
+                    )
+
+                    cache._dec_req_lock(req, skip_swa=skip_swa)
+
+                    cache.dec_lock_ref.assert_called_once_with(
+                        node,
+                        DecLockRefParams(
+                            swa_uuid_for_lock=123,
+                            skip_lock_node_ids=req.skip_lock_node_ids,
+                        ),
+                        skip_swa=skip_swa,
+                    )
+
+    def test_invalid_non_null_node_is_not_suppressed(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.dec_lock_ref = MagicMock(side_effect=KeyError(123))
+        req = SimpleNamespace(
+            last_node=123, swa_uuid_for_lock=None, skip_lock_node_ids={}
+        )
+
+        with self.assertRaises(KeyError):
+            cache._dec_req_lock(req)
 
 
 if __name__ == "__main__":

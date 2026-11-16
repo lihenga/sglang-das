@@ -873,6 +873,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
         """Release the tree lock a request holds on its last_node, honoring the
         components it skipped locking so it never drops a lock it never took."""
+        if req.last_node is None:
+            return
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(
