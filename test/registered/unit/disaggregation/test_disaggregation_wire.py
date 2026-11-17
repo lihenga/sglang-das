@@ -117,9 +117,10 @@ def _init_notification_state(manager):
     # Preserve wire assertions at the external delivery boundary, while the
     # manager still owns status encoding, admission and outbox transitions.
     manager._drained_abort_notifier = SimpleNamespace(
+        wake=lambda: None,
         submit=lambda room, endpoint, ipv6, parts, deadline: (
             manager._send_multipart_locked(endpoint, list(parts), is_ipv6=ipv6) or True
-        )
+        ),
     )
 
 
@@ -745,9 +746,10 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.register_deferred_ack_target(42, target)
                 wire = []
                 manager._drained_abort_notifier = SimpleNamespace(
+                    wake=lambda: None,
                     submit=lambda room, endpoint, ipv6, parts, deadline: (
                         wire.append(tuple(parts)) or True
-                    )
+                    ),
                 )
                 sender.clear()
                 manager._retry_pending_control_notifications()

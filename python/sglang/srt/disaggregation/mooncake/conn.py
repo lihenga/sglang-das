@@ -2112,14 +2112,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
 
-            self.send_aux_data_to_endpoint(
-                remote=req.endpoint,
-                dst_port=req.dst_port,
-                room=req.room,
-                buffer_index=i,
-                aux_index=req.dst_aux_index,
-                data=data,
-            )
+            if (
+                self.send_aux_data_to_endpoint(
+                    remote=req.endpoint,
+                    dst_port=req.dst_port,
+                    room=req.room,
+                    buffer_index=i,
+                    aux_index=req.dst_aux_index,
+                    data=data,
+                )
+                is False
+            ):
+                return -1
 
         return 0
 
@@ -2133,16 +2137,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         data: bytes,
     ):
         na = NetworkAddress(remote, dst_port)
+        parts = [
+            MooncakeKVManager.AUX_DATA_HEADER,
+            str(room).encode("ascii"),
+            str(buffer_index).encode("ascii"),
+            str(aux_index).encode("ascii"),
+            struct.pack(">I", len(data)),
+            data,
+        ]
+        if self.deferred_bootstrap is not None:
+            # Deferred Success must follow AUX on the same worker-owned pipe.
+            return self._queue_control_notification(room, remote, dst_port, parts)
         self._send_multipart_locked(
             na.to_tcp(),
-            [
-                MooncakeKVManager.AUX_DATA_HEADER,
-                str(room).encode("ascii"),
-                str(buffer_index).encode("ascii"),
-                str(aux_index).encode("ascii"),
-                struct.pack(">I", len(data)),
-                data,
-            ],
+            parts,
             is_ipv6=na.is_ipv6,
         )
 
@@ -4115,15 +4123,30 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ):
                     return False
                 self._pending_control_notifications[key] = (na.is_ipv6, deadline)
+                self._drained_abort_notifier.wake()
                 return True
         with self._control_notification_lock:
             if not self._admit_control_target(room, endpoint, port):
                 return False
             if key in self._pending_control_notifications or deadline <= now:
                 return True
-            _, pending = self._control_rooms[room].targets[na.to_tcp()]
+            state = self._control_rooms[room]
+            _, pending = state.targets[na.to_tcp()]
             # Reasons cannot expand the reserved endpoint's status budget.
-            pending.setdefault(parts[1], (parts, deadline))
+            payload_key = (
+                (self.AUX_DATA_HEADER, parts[2])
+                if parts[0] == self.AUX_DATA_HEADER
+                else parts[1]
+            )
+            pending.setdefault(payload_key, (parts, deadline))
+            if (
+                not state.active
+                and parts[0] != self.AUX_DATA_HEADER
+                and parts[1] == str(int(KVPoll.Failed)).encode()
+            ):
+                state.closed = True
+                state.failed = True
+            self._drained_abort_notifier.wake()
             return True
 
     def _prune_control_notifications(self, now):
@@ -4155,21 +4178,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 continue
                             self._pending_control_notifications[key] = (ipv6, deadline)
                         del pending[status]
-                if (
-                    state.closed
-                    and not state.failed
-                    and not any(pending for _, pending in state.targets.values())
+                if state.closed and not any(
+                    pending for _, pending in state.targets.values()
                 ):
                     del self._control_rooms[room]
 
     def send_kv_status_message(
         self, *, targets, bootstrap_room, status, failure_reason=None
     ) -> None:
-        parts = self._encode_kv_status_message(
-            bootstrap_room=bootstrap_room, status=status, failure_reason=failure_reason
+        # Normal transfer status shares the manager socket with TCP AUX, as in
+        # CommonKVManager; only explicit bootstrap/drain control is asynchronous.
+        super().send_kv_status_message(
+            targets=targets,
+            bootstrap_room=bootstrap_room,
+            status=status,
+            failure_reason=failure_reason,
         )
-        for endpoint, port in targets:
-            self._queue_control_notification(bootstrap_room, endpoint, port, parts)
 
     def queue_drained_abort_notification(self, room, endpoint, port) -> bool:
         parts = self._encode_kv_status_message(
@@ -4334,9 +4358,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         required_dst_info_num: int,
     ) -> None:
         # Admit reply ownership before accepting pointers or enabling writes.
-        if not transfer_info.is_dummy and not self._admit_control_target(
-            room, transfer_info.endpoint, transfer_info.dst_port
+        if (
+            self.deferred_bootstrap is not None
+            and not transfer_info.is_dummy
+            and not self._admit_control_target(
+                room, transfer_info.endpoint, transfer_info.dst_port
+            )
         ):
+            self.send_kv_status_message(
+                targets=[(transfer_info.endpoint, transfer_info.dst_port)],
+                bootstrap_room=room,
+                status=KVPoll.Failed,
+                failure_reason="Mooncake control target capacity exhausted",
+            )
             return
         with self._drained_abort_lock:
             self._prune_drained_abort_rooms()
@@ -4496,8 +4530,10 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             req_has_disagg_prefill_dp_rank,
         )
         # A rejected bootstrap open owns no room and must not activate credits.
-        if self._owns_bootstrap_room and not mgr._reserve_control_room(
-            bootstrap_room, active=True
+        if (
+            mgr.deferred_bootstrap is not None
+            and self._owns_bootstrap_room
+            and not mgr._reserve_control_room(bootstrap_room, active=True)
         ):
             mgr.record_failure(
                 bootstrap_room, "Mooncake control room capacity exhausted"

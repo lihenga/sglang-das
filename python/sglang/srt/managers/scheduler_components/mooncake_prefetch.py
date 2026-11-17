@@ -55,6 +55,7 @@ def trace_disagg_prefill(event: str, rid, bootstrap_room, rank, **state) -> None
 
 class MooncakePrefetchSchedulerMixin:
     BG_PREFETCH_JOIN_GRACE_EPOCHS = 4
+    EXTERNAL_ADMISSION_PENDING_LIMIT = 8
     FORWARD_DEFERRED_HIGH_WATER = 1024
     FORWARD_RECV_LIMIT = 128
     enable_waiting_queue_dfs_prefetch = False
@@ -687,6 +688,10 @@ class MooncakePrefetchSchedulerMixin:
         state = self.tree_cache.prepare_external_linker_loads([req])[0]
         if state == "pending":
             return False
+        if self.tree_cache.supports_mamba():
+            # Probe rounds never retain COW metadata or reserve a Mamba slot.
+            # Materialize from a fresh local match only once admission can run.
+            req.init_next_round_input(self.tree_cache)
         if state == "failed":
             self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
             req.host_hit_length = req.swa_host_hit_length = (
@@ -767,16 +772,15 @@ class MooncakePrefetchSchedulerMixin:
 
             with self.device_module.StreamContext(self.schedule_stream):
                 receiver = self.request_receiver
-                previous_limit = receiver.max_recv_per_poll
-                receiver.max_recv_per_poll = (
-                    min(previous_limit, self.FORWARD_RECV_LIMIT)
-                    if previous_limit >= 0
-                    else self.FORWARD_RECV_LIMIT
+                limit = receiver.max_recv_per_poll
+                recv_reqs = receiver.recv_requests(
+                    defer_mm=True,
+                    max_recv_per_poll=(
+                        min(limit, self.FORWARD_RECV_LIMIT)
+                        if limit >= 0
+                        else self.FORWARD_RECV_LIMIT
+                    ),
                 )
-                try:
-                    recv_reqs = receiver.recv_requests(defer_mm=True)
-                finally:
-                    receiver.max_recv_per_poll = previous_limit
                 self._trace_prefill_reqs(
                     "scheduler_receive", recv_reqs, ingress="forward"
                 )

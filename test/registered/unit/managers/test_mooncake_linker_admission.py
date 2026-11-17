@@ -3,10 +3,14 @@
 import __future__
 
 import ast
+import threading
 import unittest
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
@@ -255,6 +259,138 @@ class TestMooncakeLinkerAdmission(CustomTestCase):
             {key: proof for key, proof in proofs.items() if key != first},
         )
         self.assertFalse(wrapper._pending_session_cleanup)
+
+    def test_pending_session_rounds_bound_lookups_without_allocating_mamba_cow(self):
+        owner, run, backend, wrapper, matches, lookups = self._scheduler(
+            hit=True, tokens=0
+        )
+        owner.waiting_queue.extend(
+            Req(str(i), "", array("q", [1, 2, 3, 4]), SamplingParams(max_new_tokens=1))
+            for i in range(65, 257)
+        )
+        backend.host_prefetch_limit = 1
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def exists(keys):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("refresh was not released")
+            return [1] * len(keys)
+
+        backend.storage._batch_exist = exists
+        # Match-only probes must leave all Mamba ownership and COW fields alone.
+        owner.tree_cache.supports_mamba = lambda: True
+        cow_probes = []
+        original_match = owner.tree_cache.match_prefix
+
+        def match(params):
+            cow_probes.append(params.cow_mamba)
+            return original_match(params)
+
+        owner.tree_cache.match_prefix = match
+        reductions = []
+        owner.tree_cache._all_reduce_attn_groups = lambda value, op: reductions.append(
+            (tuple(value.shape), op)
+        )
+        try:
+            for round_index in range(3):
+                before = len(reductions)
+                self.assertIsNone(run()[0])
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(len(lookups), owner.EXTERNAL_ADMISSION_PENDING_LIMIT)
+                self.assertEqual(
+                    len(matches),
+                    (round_index + 1) * owner.EXTERNAL_ADMISSION_PENDING_LIMIT,
+                )
+                self.assertLessEqual(
+                    len(reductions) - before, 2 * owner.EXTERNAL_ADMISSION_PENDING_LIMIT
+                )
+                self.assertTrue(all(not cow for cow in cow_probes))
+                self.assertTrue(
+                    all(
+                        not req.kv.holds_mamba and req.kv.mamba_cow_src_index is None
+                        for req in owner.waiting_queue
+                    )
+                )
+                self.assertEqual(len(backend.session_jobs), 1)
+                self.assertEqual(
+                    len(wrapper._load_admissions),
+                    owner.EXTERNAL_ADMISSION_PENDING_LIMIT,
+                )
+                self.assertEqual(len(owner.waiting_queue), 257)
+        finally:
+            release.set()
+            for job in list(backend.session_jobs.values()):
+                job.result(timeout=5)
+
+    def test_ready_admissions_are_not_limited_by_the_pending_lookahead(self):
+        owner, run, backend, wrapper, matches, lookups = self._scheduler()
+        batch, _ = run()
+        self.assertEqual(len(batch.reqs), 65)
+        self.assertEqual(matches, [str(i) for i in range(65)])
+        self.assertEqual(len(lookups), 65)
+        self.assertFalse(owner.waiting_queue)
+
+    def test_pending_match_reuse_agrees_before_a_peer_invalidates_its_prefix(self):
+        owner, run, backend, wrapper, matches, lookups = self._scheduler(
+            hit=True, tokens=0
+        )
+        req = owner.waiting_queue[0]
+        req.init_next_round_input(owner.tree_cache, cow_mamba=False)
+        # Hold the native credit without starting any RPC so admission is pending.
+        blocker = _SessionJob()
+        backend.host_prefetch_limit = 1
+        backend.session_jobs[("refresh", "blocked")] = blocker
+        self.assertEqual(wrapper.prepare_load_admission(req), "pending")
+        order = []
+
+        def reduce(value, op):
+            order.append((tuple(value.shape), op))
+            if value.ndim == 0:
+                # This rank still matches; another rank's anchor changed.
+                value.fill_(0)
+
+        owner.tree_cache._all_reduce_attn_groups = reduce
+        try:
+            req.init_next_round_input(owner.tree_cache, cow_mamba=False)
+            self.assertEqual(req.host_hit_length, 0)
+            self.assertEqual(wrapper.prepare_load_admission(req), "ready")
+            self.assertNotIn(req.rid, wrapper.hit_markers)
+            self.assertEqual(len(lookups), 1)
+            self.assertEqual(
+                order,
+                [
+                    ((), torch.distributed.ReduceOp.MIN),
+                    ((1, 2), torch.distributed.ReduceOp.MAX),
+                ],
+            )
+        finally:
+            blocker.set_result(False)
+
+    def test_mamba_cow_is_materialized_only_from_the_ready_round_match(self):
+        owner, run, backend, wrapper, matches, lookups = self._scheduler()
+        owner.tree_cache.supports_mamba = lambda: True
+        req = owner.waiting_queue[0]
+        states = iter(["pending", "ready"])
+        owner.tree_cache.prepare_external_linker_loads = lambda reqs: [next(states)]
+        node = [1]
+        observed = []
+
+        def initialize(cache, cow_mamba=None):
+            observed.append((node[0], cow_mamba))
+            if cow_mamba is not False:
+                req.kv.mamba_cow_src_index = node[0]
+
+        with patch.object(req, "init_next_round_input", side_effect=initialize):
+            req.init_next_round_input(owner.tree_cache, cow_mamba=False)
+            self.assertFalse(owner._apply_external_linker_admission(req))
+            self.assertIsNone(req.kv.mamba_cow_src_index)
+            node[0] = 2
+            req.init_next_round_input(owner.tree_cache, cow_mamba=False)
+            self.assertTrue(owner._apply_external_linker_admission(req))
+        self.assertEqual(req.kv.mamba_cow_src_index, 2)
+        self.assertEqual(observed, [(1, False), (2, False), (2, None)])
 
 
 if __name__ == "__main__":

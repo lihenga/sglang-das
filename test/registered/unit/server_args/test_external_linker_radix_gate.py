@@ -20,6 +20,16 @@ class TestExternalLinkerRadixGate(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
             handle_hicache(args)
 
+    def test_linker_rejects_streaming_session_virtual_owners(self):
+        with self.assertRaisesRegex(ValueError, "--enable-streaming-session"):
+            handle_hicache(
+                ServerArgs(
+                    model_path="dummy",
+                    enable_unified_cache_external_linker=True,
+                    enable_streaming_session=True,
+                )
+            )
+
     def test_linker_with_radix_cache_is_valid(self):
         handle_hicache(
             ServerArgs(model_path="dummy", enable_unified_cache_external_linker=True)

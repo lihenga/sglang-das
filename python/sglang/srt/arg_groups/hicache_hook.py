@@ -29,6 +29,12 @@ def handle_hicache(server_args: Any):
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
+        if cfg.enable_streaming_session:
+            raise ValueError(
+                "--enable-unified-cache-external-linker does not support "
+                "--enable-streaming-session: session-owned virtual nodes bypass "
+                "external load publication and failure ownership checks."
+            )
         if cfg.disable_radix_cache:
             raise ValueError(
                 "--enable-unified-cache-external-linker and "

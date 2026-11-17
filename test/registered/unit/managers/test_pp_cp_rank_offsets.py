@@ -227,6 +227,8 @@ class TestDSparkPPOutput(CustomTestCase):
         )
         tokens = torch.tensor([13, 29])
         batch = SimpleNamespace(
+            reqs=[],
+            device=tokens.device,
             return_logprob=False,
             req_pool_indices=torch.tensor([0, 1]),
             seq_lens=torch.tensor([8, 15]),

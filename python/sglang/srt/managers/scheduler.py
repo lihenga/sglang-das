@@ -4182,6 +4182,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        pending_linker_admissions = 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4246,7 +4247,10 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(
+                self.tree_cache,
+                cow_mamba=False if self.enable_unified_cache_external_linker else None,
+            )
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -4263,6 +4267,9 @@ class Scheduler(
             ):
                 self._log_waiting_queue_prefetch_event("wait_session")
                 self._trace_prefill_reqs("admission_wait", [req], reason="session")
+                pending_linker_admissions += 1
+                if pending_linker_admissions >= self.EXTERNAL_ADMISSION_PENDING_LIMIT:
+                    break
                 continue
             res = adder.add_one_req(
                 req,

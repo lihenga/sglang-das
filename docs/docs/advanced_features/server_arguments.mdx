@@ -2179,6 +2179,23 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
 </tbody>
 </table>
 
+## Mooncake direct cache and DFS
+
+<table>
+  <thead><tr><th>Argument</th><th>Description</th><th>Default</th><th>Type</th></tr></thead>
+  <tbody>
+    <tr><td>`--mooncake-page-wise-load-threshold`</td><td>Minimum key count for complete-page loading when Mooncake page-wise load is enabled.</td><td>`10`</td><td>int</td></tr>
+    <tr><td>`--mooncake-enable-page-wise-load`</td><td>Enable complete-page loading for the Mooncake direct linker.</td><td>`False`</td><td>bool</td></tr>
+    <tr><td>`--mooncake-enable-waiting-queue-dfs-prefetch`</td><td>Prefetch DFS objects while requests wait in the FCFS queue; requires a compatible Mooncake pinned arena.</td><td>`False`</td><td>bool</td></tr>
+    <tr><td>`--mooncake-waiting-queue-dfs-prefetch-max-requests`</td><td>Maximum preparing, queued, reading or ready prefetch requests retained per scheduler rank.</td><td>`8`</td><td>int</td></tr>
+    <tr><td>`--mooncake-waiting-queue-dfs-prefetch-workers`</td><td>Maximum background DFS-prefetch workers, capped by the retained-request limit.</td><td>`2`</td><td>int</td></tr>
+    <tr><td>`--mooncake-dfs-health-probe-interval-s`</td><td>Seconds between DFS read/write health probes; None uses the backend default.</td><td>`None`</td><td>int</td></tr>
+    <tr><td>`--mooncake-dfs-health-failure-threshold`</td><td>Consecutive failed probes before disabling the affected DFS capability.</td><td>`None`</td><td>int</td></tr>
+    <tr><td>`--mooncake-dfs-health-success-threshold`</td><td>Consecutive successful probes before enabling the affected DFS capability.</td><td>`None`</td><td>int</td></tr>
+    <tr><td>`--mooncake-dfs-health-probe-timeout-s`</td><td>Seconds allowed for one DFS health probe; None uses the backend default.</td><td>`None`</td><td>int</td></tr>
+  </tbody>
+</table>
+
 ## LMCache
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>

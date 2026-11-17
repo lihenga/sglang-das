@@ -157,9 +157,10 @@ class TestAllocationIntegration(CustomTestCase):
             (endpoint, msg)
         )
         mgr._drained_abort_notifier = SimpleNamespace(
+            wake=lambda: None,
             submit=lambda room, endpoint, ipv6, parts, deadline: (
                 self.wire.append((endpoint, parts)) or True
-            )
+            ),
         )
         return mgr
 

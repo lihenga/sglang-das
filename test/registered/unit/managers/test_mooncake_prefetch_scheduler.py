@@ -14,17 +14,23 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import zmq
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import msgpack_encode
 from sglang.srt.managers.scheduler_components.mooncake_prefetch import (
     MooncakePrefetchSchedulerMixin,
+)
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import PreparedHostPrefetch
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,16 +146,32 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
         owner.schedule_stream, owner.forward_stream = Mock(), Mock()
         owner._trace_prefill_reqs = Mock()
 
-        def receive(**kwargs):
-            future.set_result("finished")
-            return []
+        def receive(*args, **kwargs):
+            if not future.done():
+                future.set_result("finished")
+            raise zmq.Again()
 
-        owner.request_receiver = SimpleNamespace(
-            ingress_sync_groups=lambda: [], recv_requests=receive, max_recv_per_poll=-1
+        owner.request_receiver = SchedulerRequestReceiver(
+            recv_from_tokenizer=Mock(),
+            recv_from_rpc=Mock(),
+            recv_skipper=None,
+            input_blocker=None,
+            mm_receiver=None,
+            server_args=get_server_args(),
+            model_config=None,
+            max_recv_per_poll=-1,
+            stream_output=Mock(),
+            get_last_batch=Mock(),
         )
-        with patch(
-            "sglang.srt.managers.scheduler_components.mooncake_prefetch.time.sleep",
-            side_effect=AssertionError("fixed sleep after forward completion"),
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.sock_recv",
+                side_effect=receive,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.mooncake_prefetch.time.sleep",
+                side_effect=AssertionError("fixed sleep after forward completion"),
+            ),
         ):
             self.assertEqual(
                 owner._forward_with_waiting_queue_ingress(
@@ -159,6 +181,47 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
                 ),
                 "finished",
             )
+
+    def test_frozen_receiver_call_limit_preserves_unconsumed_work(self):
+        class Socket:
+            def __init__(self, items):
+                self.items = list(items)
+
+            def recv_pyobj(self, flags=0):
+                if not self.items:
+                    raise zmq.Again()
+                return self.items.pop(0)
+
+            def recv(self, flags=0):
+                return msgpack_encode(self.recv_pyobj(flags))
+
+            def drain(self, limit):
+                result, self.items = self.items[:limit], self.items[limit:]
+                return result
+
+        for rust in (False, True):
+            with self.subTest(rust=rust), envs.SGLANG_RUST_SERVER.override(rust):
+                socket = Socket(["one", "two"])
+                receiver = SchedulerRequestReceiver(
+                    recv_from_tokenizer=socket,
+                    recv_from_rpc=Socket([]),
+                    recv_skipper=None,
+                    input_blocker=None,
+                    mm_receiver=None,
+                    server_args=get_server_args(),
+                    model_config=None,
+                    max_recv_per_poll=-1,
+                    stream_output=Mock(),
+                    get_last_batch=Mock(),
+                )
+                self.assertEqual(
+                    receiver.recv_requests(defer_mm=True, max_recv_per_poll=1), ["one"]
+                )
+                self.assertEqual(socket.items, ["two"])
+                self.assertEqual(
+                    receiver.recv_requests(defer_mm=True, max_recv_per_poll=1), ["two"]
+                )
+                self.assertEqual(receiver.max_recv_per_poll, -1)
 
     def test_cancelled_old_lifecycle_does_not_swallow_the_new_job(self):
         owner = MooncakePrefetchSchedulerMixin()
@@ -213,7 +276,7 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
                 def receive(**kwargs):
                     item = object()
                     received.append(item)
-                    limits.append(owner.request_receiver.max_recv_per_poll)
+                    limits.append(kwargs["max_recv_per_poll"])
                     if len(received) > 2:
                         future.set_result("overflow")
                     return [item]
@@ -254,6 +317,9 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
         )
         scope.install()
         self.addCleanup(scope.restore)
+        ranks = get_parallel().override(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
+        ranks.__enter__()
+        self.addCleanup(ranks.__exit__, None, None, None)
 
     def test_startup_follows_native_capability(self):
         owner = MooncakePrefetchSchedulerMixin()
@@ -291,6 +357,7 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
         owner.tree_cache = SimpleNamespace(
             cancel_waiting_queue_prefetch=lambda rid: hits.pop(rid, None),
             prepare_external_linker_loads=lambda reqs: ["failed"],
+            supports_mamba=lambda: False,
         )
         # The final match finds keys even though the asynchronous refresh failed.
         req = SimpleNamespace(

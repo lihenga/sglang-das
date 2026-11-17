@@ -301,7 +301,7 @@ You can enable it in any of the three supported configuration methods:
       --model-path [model_path]
   ```
 
-> **Note:** `enable_ssd_offload` requires a Mooncake version that supports the `enable_ssd_offload` parameter in `MooncakeDistributedStore.setup()`. If the installed version does not support it, SGLang will automatically fall back to the old behavior and print a warning.
+> **Note:** `enable_ssd_offload` requires a Mooncake version that supports the `enable_ssd_offload` parameter in `MooncakeDistributedStore.setup()`. If the installed version does not support an explicitly requested SSD option, startup fails with a compatibility error; SGLang does not silently remove storage configuration.
 
 **Mooncake Group Semantics (`enable_group_semantics`):**
 
@@ -725,7 +725,7 @@ establish that it passes.
 The functional changes are grouped as Store/API compatibility and diagnostics;
 read/session plans plus queued prefetch and tree ownership; scheduler/PD
 lifetime integration; then regression coverage and deployment notes. Existing
-4.1 pool/model code remains authoritative. Other-model-specific GLM/Mamba
+4.1 pool/model code remains authoritative. External linker deployments reject streaming sessions because their virtual session nodes do not expose external-load ownership for failure recovery. Other-model-specific GLM/Mamba
 features are outside this DeepSeek 4.1 port. Existing PP > 1 and encoder bounded
 replay restrictions remain in force.
 

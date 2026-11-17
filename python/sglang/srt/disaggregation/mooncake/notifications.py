@@ -35,6 +35,7 @@ class DrainedAbortNotifier:
         self._condition = threading.Condition()
         self._closed = False
         self._retry_pending = retry_pending
+        self._producer_woken = False
         self._thread = threading.Thread(
             target=self._run, name="mooncake-drained-notify", daemon=True
         )
@@ -65,11 +66,18 @@ class DrainedAbortNotifier:
             self._condition.notify_all()
         self._thread.join()
 
+    def wake(self):
+        with self._condition:
+            self._producer_woken = True
+            self._condition.notify()
+
     def _run(self):
         # No manager socket/endpoint lock is ever acquired by this worker.
         sockets = OrderedDict()
         retry_at = {}
         retry_delay = {}
+        again_count = {}
+        next_producer_retry = 0.0
         failures = expired_count = 0
         last_summary = time.monotonic()
         try:
@@ -82,7 +90,12 @@ class DrainedAbortNotifier:
                     )
                     if self._closed:
                         return
-                    retry_pending = self._retry_pending
+                    now = time.monotonic()
+                    retry_pending = None
+                    if self._producer_woken or now >= next_producer_retry:
+                        retry_pending = self._retry_pending
+                        self._producer_woken = False
+                        next_producer_retry = now + 0.05
                 # Producers retain rejected work in their existing room tables.
                 # Never call back while holding the queue lock (source -> queue).
                 if retry_pending is not None:
@@ -122,10 +135,17 @@ class DrainedAbortNotifier:
                             sent = True
                             retry_at.pop(endpoint, None)
                             retry_delay.pop(endpoint, None)
+                            again_count.pop(endpoint, None)
                         except zmq.Again:
                             # IMMEDIATE also reports Again during connection
                             # setup and ordinary HWM pressure, not peer failure.
-                            retry_at[endpoint] = time.monotonic() + 0.001
+                            count = again_count.get(endpoint, 0) + 1
+                            again_count[endpoint] = count
+                            delay = 0.001
+                            if count > 10:
+                                delay = min(5.0, retry_delay.get(endpoint, 0.025) * 2)
+                                retry_delay[endpoint] = delay
+                            retry_at[endpoint] = time.monotonic() + delay
                         except Exception:
                             failures += 1
                             sock = sockets.pop(endpoint, None)
@@ -148,6 +168,9 @@ class DrainedAbortNotifier:
                     retry_delay = {
                         k: v for k, v in retry_delay.items() if k in endpoints
                     }
+                    again_count = {
+                        k: v for k, v in again_count.items() if k in endpoints
+                    }
                     now = time.monotonic()
                     if (failures or expired_count) and now - last_summary >= 30:
                         logger.warning(
@@ -166,8 +189,9 @@ class DrainedAbortNotifier:
                             default=now + 5,
                         )
                         if self._retry_pending is not None:
-                            wake_at = min(wake_at, now + 0.05)
-                        self._condition.wait(timeout=max(0.001, wake_at - now))
+                            wake_at = min(wake_at, next_producer_retry)
+                        if not self._producer_woken:
+                            self._condition.wait(timeout=max(0.001, wake_at - now))
         finally:
             if failures or expired_count:
                 logger.warning(

@@ -50,7 +50,9 @@ class TestDrainedNotifications(CustomTestCase):
         manager.deferred_bootstrap = None
         manager.failure_lock = threading.Lock()
         manager.failure_records = {7: "failure"}
-        manager._drained_abort_notifier = SimpleNamespace(submit=lambda *args: True)
+        manager._drained_abort_notifier = SimpleNamespace(
+            submit=lambda *args: True, wake=lambda: None
+        )
         sender = MooncakeKVSender.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 7
         sender.conclude_state = None
@@ -479,6 +481,7 @@ class TestDrainedNotifications(CustomTestCase):
         notifier.capacity = 32
         notifier._pending = OrderedDict()
         notifier._closed = False
+        notifier._producer_woken = False
         notifier._retry_pending = None
         now, attempts, delivered = [0.0], [], []
 
@@ -659,6 +662,7 @@ class TestDrainedNotifications(CustomTestCase):
                 notifier._pending = OrderedDict()
                 notifier._condition = threading.Condition()
                 notifier._closed = False
+                notifier._producer_woken = False
                 self.assertTrue(
                     notifier.submit(
                         99, "tcp://busy:99", False, [b"occupied"], float("inf")
@@ -758,43 +762,74 @@ class TestDrainedNotifications(CustomTestCase):
         )
         self.assertEqual(manager._pending_control_notifications, {})
 
-    def test_normal_conclude_uses_the_same_retry_owner_for_success_and_failure(self):
-        """Normal completion and explicit transfer errors cannot bypass the outbox."""
-        for status in (KVPoll.Success, KVPoll.Failed):
-            with self.subTest(status=status):
-                manager, _ = self._make_sender()
-                manager.request_status[7] = KVPoll.Transferring
-                manager.failure_records.clear()
-                accepted, wire = [], []
+    def test_normal_conclude_shares_tcp_aux_socket_without_reserving_credit(self):
+        """Ordinary PD keeps FIFO AUX/Success delivery and has no new room cap."""
+        manager = self._make_constructor_manager()
+        manager.deferred_bootstrap = None
+        manager._drained_abort_capacity = 0
+        manager.request_status[7] = KVPoll.Transferring
+        manager.transfer_infos[7] = {
+            "peer": SimpleNamespace(endpoint="peer", dst_port=1, is_dummy=False)
+        }
+        wire = []
+        manager._send_multipart_locked = lambda endpoint, parts, **kwargs: wire.append(
+            (endpoint, tuple(parts))
+        )
+        manager.send_aux_data_to_endpoint("peer", 1, 7, 0, 0, b"aux")
+        manager.conclude_transfer(bootstrap_room=7, status=KVPoll.Success)
+        self.assertEqual(
+            [parts[0] for _, parts in wire], [manager.AUX_DATA_HEADER, b"7"]
+        )
+        self.assertEqual([endpoint for endpoint, _ in wire], ["tcp://peer:1"] * 2)
+        self.assertEqual(manager._control_rooms, {})
+        manager.is_dummy_cp_rank = True
+        sender = MooncakeKVSender(manager, "prefill:8998", 8)
+        self.assertIsNone(sender.conclude_state)
+        self.assertEqual(manager._control_rooms, {})
 
-                def submit(room, endpoint, ipv6, parts, deadline):
-                    if not accepted:
-                        return False
-                    wire.append(tuple(parts))
-                    return True
+    def test_deferred_tcp_aux_precedes_success_on_the_notifier_pipe(self):
+        manager, sender = self._make_sender()
+        bootstrap = manager.deferred_bootstrap = DeferredBootstrap(10)
+        bootstrap.open(7, sender)
+        bootstrap.register(7, ("peer", 1))
+        manager.request_status[7] = KVPoll.Success
+        wire = []
+        manager._drained_abort_notifier.submit = (
+            lambda room, endpoint, ipv6, parts, deadline: wire.append(
+                (endpoint, tuple(parts))
+            )
+            or True
+        )
+        manager.send_aux_data_to_endpoint("peer", 1, 7, 0, 0, b"aux0")
+        manager.send_aux_data_to_endpoint("peer", 1, 7, 1, 0, b"aux1")
+        sender.clear()
+        manager._retry_pending_control_notifications()
+        self.assertEqual(
+            [parts[0] for _, parts in wire],
+            [manager.AUX_DATA_HEADER, manager.AUX_DATA_HEADER, b"7"],
+        )
+        self.assertEqual([endpoint for endpoint, _ in wire], ["tcp://peer:1"] * 3)
+        self.assertEqual(wire[-1][1][1], str(int(KVPoll.Success)).encode())
 
-                manager._drained_abort_notifier.submit = submit
-                manager.conclude_transfer(bootstrap_room=7, status=status)
+    def test_closed_failed_rooms_release_credits_after_status_handoff(self):
+        manager = self._make_constructor_manager()
+        manager._drained_abort_capacity = 2
+        manager._drained_abort_notifier.submit = lambda *args: True
+        with patch(
+            "sglang.srt.disaggregation.common.conn.get_parallel",
+            return_value=SimpleNamespace(num_dp_ranks=1),
+        ):
+            for room in range(12):
+                sender = MooncakeKVSender(manager, "prefill:8998", room)
+                manager.deferred_bootstrap.register(room, ("peer", 1))
+                manager.request_status[room] = KVPoll.Failed
+                sender.clear()
                 manager._retry_pending_control_notifications()
-                self.assertEqual(len(manager._pending_control_notifications), 1)
-                accepted.append(True)
-                manager._retry_pending_control_notifications()
-                self.assertEqual(
-                    wire,
-                    [
-                        tuple(
-                            manager._encode_kv_status_message(
-                                bootstrap_room=7,
-                                status=status,
-                                failure_reason=(
-                                    "KV transfer failed"
-                                    if status == KVPoll.Failed
-                                    else None
-                                ),
-                            )
-                        )
-                    ],
-                )
+                self.assertEqual(manager._control_credits_used(), 0)
+                manager.deferred_bootstrap.rooms.pop(room)
+            sender = MooncakeKVSender(manager, "prefill:8998", 100)
+            self.assertIsNone(sender.conclude_state)
+            self.assertTrue(manager._control_rooms[100].active)
 
     def test_failure_clear_does_not_hold_source_lock_during_control_sends(self):
         """Block ACK delivery; failure inspection and another room still drain."""
@@ -980,6 +1015,7 @@ class TestDrainedNotifications(CustomTestCase):
         notifier.capacity = 64
         notifier._pending = OrderedDict()
         notifier._closed = False
+        notifier._producer_woken = False
         notifier._retry_pending = None
         now, attempts, delivered = [0.0], [], []
 
@@ -1039,6 +1075,78 @@ class TestDrainedNotifications(CustomTestCase):
         for index, attempted_at in enumerate(attempts[:6]):
             self.assertAlmostEqual(attempted_at, index * 0.001)
         self.assertEqual({sent_at for sent_at, _ in delivered}, {attempts[5]})
+
+    def test_sustained_again_backs_off_and_producer_wakeup_bypasses_scan_cadence(self):
+        """A dead peer cannot drive producer scans; new work wakes an idle scan."""
+        notifier = DrainedAbortNotifier.__new__(DrainedAbortNotifier)
+        notifier.capacity = 4
+        notifier._pending = OrderedDict()
+        notifier._closed = False
+        notifier._producer_woken = False
+        now, attempts, scans, healthy = [0.0], [], [], []
+
+        def retry():
+            scans.append(now[0])
+            if notifier._producer_woken is False and now[0] == 0.001:
+                notifier.submit(2, "healthy", False, [b"healthy"], 1)
+
+        notifier._retry_pending = retry
+
+        class Condition:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def notify(self):
+                pass
+
+            def wait_for(self, predicate):
+                assert predicate()
+
+            def wait(self, timeout):
+                if now[0] == 0:
+                    now[0] = 0.001
+                    notifier.wake()
+                elif not notifier._pending:
+                    notifier._closed = True
+                else:
+                    now[0] += timeout
+
+        class Socket:
+            def setsockopt(self, *args):
+                pass
+
+            def connect(self, endpoint):
+                self.endpoint = endpoint
+
+            def close(self, **kwargs):
+                pass
+
+            def send_multipart(self, parts, flags):
+                if self.endpoint == "dead":
+                    attempts.append(now[0])
+                    raise zmq.Again()
+                healthy.append((now[0], tuple(parts)))
+
+        notifier._condition = Condition()
+        notifier.submit(1, "dead", False, [b"failed"], 1)
+        with (
+            patch(
+                "sglang.srt.disaggregation.mooncake.notifications.time.monotonic",
+                side_effect=lambda: now[0],
+            ),
+            patch(
+                "sglang.srt.disaggregation.mooncake.notifications.zmq.Context.instance",
+                return_value=SimpleNamespace(socket=lambda *_: Socket()),
+            ),
+        ):
+            notifier._run()
+        self.assertEqual(healthy, [(0.001, (b"healthy",))])
+        self.assertLess(len(attempts), 20)
+        self.assertEqual(scans[:2], [0, 0.001])
+        self.assertTrue(all(b - a >= 0.049 for a, b in zip(scans[1:], scans[2:])))
 
     def test_native_zmq_immediate_connection_and_healthy_status_ack_burst(self):
         """A real IMMEDIATE handshake may Again; all subsequent frames survive."""

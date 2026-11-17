@@ -74,14 +74,21 @@ class SchedulerRequestReceiver:
     ingress_attn_tp_cpu_group: Any = None
     ingress_tp_cpu_group: Any = None
 
-    def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        if self.max_recv_per_poll < 0:
-            return False
-        return num_recv_reqs >= self.max_recv_per_poll
+    def recv_limit_reached(
+        self, num_recv_reqs: int, *, max_recv_per_poll: Optional[int] = None
+    ) -> bool:
+        limit = (
+            self.max_recv_per_poll if max_recv_per_poll is None else max_recv_per_poll
+        )
+        return limit >= 0 and num_recv_reqs >= limit
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
-        self, local_reqs: Optional[List[AbortReq]] = None, *, defer_mm: bool = False
+        self,
+        local_reqs: Optional[List[AbortReq]] = None,
+        *,
+        defer_mm: bool = False,
+        max_recv_per_poll: Optional[int] = None,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks.
 
@@ -96,7 +103,7 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
-        recv_reqs = self._pull_raw_reqs()
+        recv_reqs = self._pull_raw_reqs(max_recv_per_poll=max_recv_per_poll)
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
@@ -111,7 +118,12 @@ class SchedulerRequestReceiver:
 
         return recv_reqs
 
-    def _pull_raw_reqs(self) -> Optional[List]:
+    def _pull_raw_reqs(
+        self, *, max_recv_per_poll: Optional[int] = None
+    ) -> Optional[List]:
+        limit = (
+            self.max_recv_per_poll if max_recv_per_poll is None else max_recv_per_poll
+        )
         if get_parallel().pp_rank == 0:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 recv_reqs = []
@@ -120,14 +132,14 @@ class SchedulerRequestReceiver:
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
                 # non-blocking, msgpack-decoded contract as the zmq path below.
                 if envs.SGLANG_RUST_SERVER.get():
-                    recv_reqs.extend(
-                        self.recv_from_tokenizer.drain(self.max_recv_per_poll)
-                    )
+                    recv_reqs.extend(self.recv_from_tokenizer.drain(limit))
                     return recv_reqs
 
                 while True:
                     try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                        if self.recv_limit_reached(
+                            len(recv_reqs), max_recv_per_poll=limit
+                        ):
                             break
                         recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
                     except zmq.ZMQError:
@@ -136,7 +148,9 @@ class SchedulerRequestReceiver:
 
                 while True:
                     try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                        if self.recv_limit_reached(
+                            len(recv_reqs), max_recv_per_poll=limit
+                        ):
                             break
                         recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:

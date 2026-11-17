@@ -341,19 +341,54 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
-        self.hit_markers.pop(req.rid, None)
+        previous_hit = self.hit_markers.pop(req.rid, None)
+        has_admission = (
+            self._load_admissions is not None and req.rid in self._load_admissions
+        )
         prefetched_hit = (
             self.host_prefetch_hits.get(req.rid)
             if self._waiting_queue_prefetch_enabled
             else None
         )
+        retained_hit = previous_hit if has_admission else prefetched_hit
+        tail_hashes = (
+            self._tail_hashes(key, result, device_hit_len)
+            if device_hit_len < len(key)
+            else []
+        )
+        reusable = False
+        if retained_hit is not None:
+            expected_len = (
+                retained_hit.device_hit_len + len(retained_hit.tail_hashes) * page
+            )
+            current_prefix = key[:expected_len]
+            reusable = (
+                device_hit_len == retained_hit.device_hit_len
+                and list(tail_hashes[: len(retained_hit.tail_hashes)])
+                == retained_hit.tail_hashes
+                and current_prefix.extra_key == retained_hit.prefix_key.extra_key
+                and current_prefix.cache_salt == retained_hit.prefix_key.cache_salt
+                and current_prefix.is_bigram == retained_hit.prefix_key.is_bigram
+                and current_prefix.raw_token_ids()
+                == retained_hit.prefix_key.raw_token_ids()
+            )
+        if has_admission:
+            # Every rank has the prior consensus record, even if a local tree
+            # change removed its marker. Agree before skipping the store lookup.
+            reuse = torch.tensor(int(reusable), dtype=torch.int)
+            cache._all_reduce_attn_groups(reuse, torch.distributed.ReduceOp.MIN)
+            reusable = bool(reuse.item())
+            if not reusable:
+                # A changed prefix invalidates admission on every rank. Retire
+                # its session in the poll below instead of probing different tails.
+                self.cancel_waiting_queue_prefetch(req.rid)
+                return result
 
         if device_hit_len >= len(key):
             if prefetched_hit is not None:
                 self.cancel_waiting_queue_prefetch(req.rid)
             return result
 
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
             if prefetched_hit is not None:
                 self.cancel_waiting_queue_prefetch(req.rid)
@@ -371,46 +406,29 @@ class UnifiedCacheLinkerWrapper:
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
-        if prefetched_hit is not None:
-            expected_len = (
-                prefetched_hit.device_hit_len + len(prefetched_hit.tail_hashes) * page
-            )
-            current_prefix = key[:expected_len]
-            same_prefix = (
-                current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
-                and current_prefix.cache_salt == prefetched_hit.prefix_key.cache_salt
-                and current_prefix.is_bigram == prefetched_hit.prefix_key.is_bigram
-                and current_prefix.raw_token_ids()
-                == prefetched_hit.prefix_key.raw_token_ids()
-            )
-            reusable = (
-                device_hit_len == prefetched_hit.device_hit_len
-                and list(tail_hashes[: len(prefetched_hit.tail_hashes)])
-                == prefetched_hit.tail_hashes
-                and same_prefix
-            )
-            if reusable:
-                hit_pages = len(prefetched_hit.tail_hashes)
-                hit_tokens = hit_pages * page
-                swa_transfer = by_pool.get(PoolName.SWA)
-                self.hit_markers[req.rid] = prefetched_hit
-                return result._replace(
-                    last_host_node=result.best_match_node,
-                    host_hit_length=hit_tokens,
-                    swa_host_hit_length=max(
-                        result.swa_host_hit_length,
-                        (
-                            min(len(swa_transfer.keys), hit_pages) * page
-                            if swa_transfer is not None
-                            else 0
-                        ),
+        if reusable:
+            hit_pages = len(retained_hit.tail_hashes)
+            hit_tokens = hit_pages * page
+            swa_transfer = by_pool.get(PoolName.SWA)
+            self.hit_markers[req.rid] = retained_hit
+            return result._replace(
+                last_host_node=result.best_match_node,
+                host_hit_length=hit_tokens,
+                swa_host_hit_length=max(
+                    result.swa_host_hit_length,
+                    (
+                        min(len(swa_transfer.keys), hit_pages) * page
+                        if swa_transfer is not None
+                        else 0
                     ),
-                    mamba_host_hit_length=max(
-                        result.mamba_host_hit_length,
-                        1 if PoolName.MAMBA in by_pool else 0,
-                    ),
-                )
+                ),
+                mamba_host_hit_length=max(
+                    result.mamba_host_hit_length,
+                    1 if PoolName.MAMBA in by_pool else 0,
+                ),
+            )
 
+        if prefetched_hit is not None:
             self.cancel_waiting_queue_prefetch(req.rid)
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
