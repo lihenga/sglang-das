@@ -331,6 +331,7 @@ def _scheduler(*, flag, tree_cache):
         "prefetch-switch-test", mooncake_enable_waiting_queue_dfs_prefetch=flag
     )
     s = Scheduler.__new__(Scheduler)
+    s.input_blocker = None
     s.server_args = types.SimpleNamespace(
         mooncake_enable_waiting_queue_dfs_prefetch=flag,
         enable_unified_cache_external_linker=True,

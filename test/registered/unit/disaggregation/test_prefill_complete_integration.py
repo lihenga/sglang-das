@@ -122,6 +122,7 @@ class TestAllocationIntegration(CustomTestCase):
         mgr._transfer_completion_condition = threading.Condition()
         mgr._drained_abort_lock = threading.Lock()
         mgr._drained_abort_rooms = OrderedDict()
+        mgr._drained_abort_capacity = 4096
         mgr.pd_hidden_events = PDHiddenEventManager(mgr)
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.request_status = {}
@@ -131,6 +132,7 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.bootstrap_timeout = 3
         mgr.bootstrap_port = port
         mgr.req_to_decode_prefix_len = {}
+        mgr.req_to_pd_hidden_meta = {}
         mgr.transfer_infos = {}
         mgr._deferred_ack_targets = {}
         mgr._deferred_ack_poisoned_rooms = set()
@@ -147,6 +149,9 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.get_session_id = Mock(return_value="decode-session")
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(
             (endpoint, msg)
+        )
+        mgr._queue_control_notification = lambda room, ip, port, parts: (
+            self.wire.append((f"tcp://{ip}:{port}", parts)) or True
         )
         return mgr
 
@@ -325,6 +330,8 @@ class TestAllocationIntegration(CustomTestCase):
         sender = self.sender()
         self.assertEqual(sender.poll(), KVPoll.Failed)
         sender.clear()
+        self.assertEqual(self.prefill.request_status[1], KVPoll.Failed)
+        self.assertTrue(sender.notify_drained_abort())
         self.assertNotIn(1, self.prefill.request_status)
 
     def test_readiness_timeout_aborts_before_allocation(self):
@@ -639,11 +646,14 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(sender.poll(), KVPoll.Success)
         self.prefill.req_to_decode_prefix_len[1] = 0
         self.prefill.transfer_infos[1] = {}
-        send = self.prefill.send_kv_status_message
+        enqueue = self.prefill._queue_control_notification
         next_transfer = []
 
-        def success(**kwargs):
-            self.assertEqual(kwargs["status"], KVPoll.Success)
+        def success(room, endpoint, port, parts):
+            self.assertEqual(room, 1)
+            self.assertEqual(
+                self.decode.parse_kv_status_message(parts)[1], KVPoll.Success
+            )
             for table in (
                 self.prefill.deferred_bootstrap.rooms,
                 self.prefill.request_status,
@@ -651,7 +661,7 @@ class TestAllocationIntegration(CustomTestCase):
                 self.prefill.transfer_infos,
             ):
                 self.assertNotIn(1, table)
-            send(**kwargs)
+            enqueue(room, endpoint, port, parts)
             self.flush()
             self.assertEqual(receiver.poll(), KVPoll.Success)
             receiver.clear()
@@ -659,11 +669,12 @@ class TestAllocationIntegration(CustomTestCase):
             new_sender, new_receiver = self.sender(), self.receiver()
             self.flush()
             next_transfer.extend((new_sender, new_receiver))
+            return True
 
-        self.prefill.send_kv_status_message = Mock(side_effect=success)
+        self.prefill._queue_control_notification = Mock(side_effect=success)
         sender.clear()
         sender.clear()
-        self.prefill.send_kv_status_message.assert_called_once()
+        self.prefill._queue_control_notification.assert_called_once()
         new_sender, new_receiver = next_transfer
         self.assertIs(self.prefill.deferred_bootstrap.rooms[1].owner, new_sender)
         self.assertEqual(new_receiver.poll(), KVPoll.Bootstrapping)

@@ -3,6 +3,8 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
@@ -24,6 +26,8 @@ class TestMooncakeLinkerBroadcast(CustomTestCase):
         linker.broadcast_loads = {0: (0, {}, ["rid"], Mock())}
         linker.broadcast_failed, linker.broadcast_events = set(), []
         linker.load_batch_futures = {0: Future()}
+        linker.load_batch_cleanup_futures = {}
+        linker.follower_cleanup_outcomes = {}
         linker.load_queue = Mock()
         linker.num_layers, linker.tp_group = 2, object()
         linker.mla_broadcaster = SimpleNamespace(
@@ -42,31 +46,46 @@ class TestMooncakeLinkerBroadcast(CustomTestCase):
         self.assertFalse(following.done())
         self.assertEqual(linker.broadcast_events, [(event, ["rid"], True)])
 
-    def test_cp_shard_uses_its_own_attention_tp_source(self):
-        captured = {}
-
-        class Broadcaster(LinkerMLADedupBroadcaster):
-            def __init__(self, pool, group, src_global_rank):
-                captured.update(group=group, source=src_global_rank)
-
-            def _warmup_group(self):
-                captured["warmup"] = True
-
-        with (
-            patch(
-                "torch.distributed.get_process_group_ranks", return_value=[4, 5]
-            ) as ranks,
-            patch(
-                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
-                return_value="attention-broadcast",
-            ) as create,
-        ):
-            Broadcaster.build(object(), "full-tp", "attention-tp")
-        ranks.assert_called_once_with("attention-tp")
-        create.assert_called_once_with([4, 5], backend="nccl")
-        self.assertEqual(
-            captured, {"group": "attention-broadcast", "source": 4, "warmup": True}
+    def test_each_cp_shard_has_one_reader_before_warmup(self):
+        pool = SimpleNamespace(
+            components=[[torch.zeros((4, 2), dtype=torch.uint8)]],
+            buffer_meta=[[(0, 0, 2)]],
+            page_size=1,
         )
+        pools = SimpleNamespace(
+            rank_replicated=True, entry_map={"full": pool}, num_layers=1
+        )
+        for ranks in ([0, 1], [2, 3]):
+            readers = []
+            for rank in ranks:
+                warmed = []
+                with (
+                    self.subTest(rank=rank, ranks=ranks),
+                    patch("torch.distributed.get_rank", return_value=rank),
+                    patch(
+                        "torch.distributed.get_process_group_ranks", return_value=ranks
+                    ),
+                    patch(
+                        "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                        return_value="attention-broadcast",
+                    ),
+                    patch(
+                        "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                        return_value=(rank, 4),
+                    ),
+                    patch.object(
+                        LinkerMLADedupBroadcaster,
+                        "_warmup_group",
+                        lambda broadcaster: warmed.append(broadcaster.is_src),
+                    ),
+                ):
+                    broadcaster = LinkerMLADedupBroadcaster.build(
+                        pools, "full-tp", "attention-tp"
+                    )
+                self.assertEqual(broadcaster.src_global_rank, ranks[0])
+                self.assertEqual(warmed, [rank == ranks[0]])
+                readers.append(broadcaster.is_src)
+            self.assertEqual(readers, [True, False])
 
     def test_repeated_layer_access_never_reenters_consensus(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -75,12 +94,14 @@ class TestMooncakeLinkerBroadcast(CustomTestCase):
             linker._broadcast_loaded_layers(0, 1)
         reduce.assert_not_called()
 
-    def test_follower_completion_releases_session_and_accounting(self):
+    def test_follower_forward_does_not_end_sessions_or_retire_worker_accounting(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.broadcast_loads = {0: (1, {}, ["rid"], Mock())}
         linker.broadcast_failed = set()
         linker.broadcast_events = []
         linker.load_batch_futures = {0: Future()}
+        linker.load_batch_cleanup_futures = {}
+        linker.follower_cleanup_outcomes = {}
         linker.num_layers = 2
         linker.tp_group = object()
         linker.mla_broadcaster = SimpleNamespace(
@@ -99,9 +120,9 @@ class TestMooncakeLinkerBroadcast(CustomTestCase):
             ),
         ):
             linker._broadcast_loaded_layers(0, 1)
-        linker.abort_prepared_load.assert_called_once_with("rid")
-        self.assertFalse(linker.pending_load_tokens)
-        self.assertFalse(linker.pending_load_started)
+        linker.abort_prepared_load.assert_not_called()
+        self.assertEqual(linker.pending_load_tokens, {"rid": 128})
+        self.assertEqual(linker.pending_load_started, {"rid": 1.0})
         self.assertEqual(linker.broadcast_events, [(event, ["rid"], True)])
         linker.wait_for_load_batch(0)
         event.synchronize.assert_called_once()

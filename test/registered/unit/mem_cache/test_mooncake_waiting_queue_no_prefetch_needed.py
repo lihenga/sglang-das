@@ -141,6 +141,7 @@ def _wrapper(cache, cache_linker):
     wrapper._waiting_queue_prefetch_enabled = True
     wrapper.hit_markers = {}
     wrapper.host_prefetch_hits = {}
+    wrapper.pending_loads = {}
     wrapper._update_load = MagicMock()
     hit = ExternalCacheHitMarker(prefix_key=None, tail_hashes=["h"], device_hit_len=0)
     wrapper.hit_markers["rid"] = hit
@@ -212,6 +213,7 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
         wrapper._components = getattr(cache, "_components_tuple", ())
         wrapper.cache_linker = MagicMock()
         wrapper._waiting_queue_prefetch_enabled = False
+        wrapper.pending_loads = {}
         wrapper.hit_markers = {}
         wrapper.host_prefetch_hits = _NoPrefetchMapAccess()
         wrapper.pending_host_prefetch_submissions = _NoPrefetchMapAccess()
@@ -339,7 +341,6 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
         self.assertEqual(
             wrapper.get_host_prefetch_admission_state("rid"), "not_tracked"
         )
-        self.assertFalse(wrapper.prefetch_to_host(object()))
         cache_linker.get_host_prefetch_status.assert_not_called()
         cache._all_reduce_attn_groups.assert_not_called()
 
@@ -385,7 +386,7 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         backend.revalidate_load_async.return_value = "ready"
         backend.abort_prepared_load_async.side_effect = [False, True]
         cache._all_reduce_attn_groups.side_effect = lambda value, op: value.__setitem__(
-            1, 1
+            (0, 1), 1
         )
         self.assertEqual(wrapper.prepare_load_admission(req), "failed")
         self.assertEqual(req.host_hit_length, 0)
@@ -404,7 +405,7 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         backend.revalidate_load_async.assert_called_once()
         backend.abort_prepared_load_async.assert_called_once_with("rid")
 
-    def test_rejected_admission_waits_for_cleanup_before_starting_again(self):
+    def test_rejected_admission_recomputes_while_native_cleanup_remains_owned(self):
         wrapper, backend, _, req = self._admission()
         backend.revalidate_load_async.return_value = "ready"
         backend.abort_prepared_load_async.return_value = False
@@ -413,10 +414,14 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         wrapper.discard_load_admission(req)
         self.assertFalse(wrapper._admitted_loads)
         wrapper.hit_markers[req.rid] = hit
-        self.assertEqual(wrapper.prepare_load_admission(req), "pending")
+        self.assertEqual(wrapper.prepare_load_admission(req), "failed")
+        self.assertEqual(req.host_hit_length, 0)
+        self.assertNotIn(req.rid, wrapper.hit_markers)
+        self.assertEqual(wrapper._pending_session_cleanup, {"rid"})
         backend.revalidate_load_async.assert_called_once()
         backend.abort_prepared_load_async.return_value = True
         wrapper.poll_session_cleanup()
+        wrapper.hit_markers[req.rid] = hit
         self.assertEqual(wrapper.prepare_load_admission(req), "ready")
 
     def test_admitted_claim_failure_is_a_miss_without_synchronous_retry(self):

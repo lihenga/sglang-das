@@ -101,6 +101,8 @@ class _SessionJob(Future):
     def __init__(self):
         super().__init__()
         self.valid_until = float("inf")
+        self.admission_deadline = float("inf")
+        self.admission_timed_out = False
 
 
 class LayerWiseLoadCounter:
@@ -444,6 +446,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.broadcast_loads = {}
         self.broadcast_events = []
         self.broadcast_outcomes = {}
+        self.follower_cleanup_outcomes = {}
+        self.load_batch_cleanup_futures = {}
         self.broadcast_failed = set()
         if get_memory().enable_linker_mla_dedup and rank_replicated and tp_size > 1:
             self.mla_broadcaster = LinkerMLADedupBroadcaster.build(
@@ -523,6 +527,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.ending_load_sessions = set()
         self.failed_session_keys = set()
         self.failed_session_cleanups = set()
+        self.session_cleanup_retry_at = {}
+        self.session_cleanup_stats = {"failures": 0, "retries": 0, "recovered": 0}
         self.session_jobs = {}
         self.cancelled_session_jobs = set()
         self.cancelled_load_session_cleanup = set()
@@ -810,12 +816,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 del self.session_jobs[key]
                 if renew is not None:
                     operation = renew
-            if (
-                sum(job_kind == kind for job_kind, _ in self.session_jobs)
-                >= self.host_prefetch_limit
-            ):
+            owners = {
+                owner for job_kind, owner in self.session_jobs if job_kind == kind
+            }
+            if kind in {"prepare", "refresh"}:
+                owners.update(self.failed_session_cleanups)
+            if len(owners) >= self.host_prefetch_limit:
                 return None
             future = _SessionJob()
+            future.admission_deadline = time.monotonic() + self.session_lease_ttl_s
             self.session_jobs[key] = future
 
         def run():
@@ -865,11 +874,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             future.set_result(False)
         return future
 
-    @staticmethod
-    def _session_job_status(future) -> str:
+    def _session_job_status(self, future) -> str:
         if future is None:
-            return "failed"
+            with self.session_lock:
+                cleanup_pressure = bool(self.failed_session_cleanups)
+            if cleanup_pressure:
+                self._log_host_prefetch_metric("event", "session_cleanup_backpressure")
+                return "failed"
+            return "pending"
         if not future.done():
+            if time.monotonic() >= future.admission_deadline:
+                if not future.admission_timed_out:
+                    future.admission_timed_out = True
+                    self._log_host_prefetch_metric("event", "session_admission_timeout")
+                    logger.warning(
+                        "Mooncake session admission timed out; retaining its active owner"
+                    )
+                return "failed"
             return "pending"
         if not future.result():
             return "failed"
@@ -914,6 +935,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         )
 
+    def discard_load_admission(self, rid: str) -> None:
+        # A budget rejection retires only the proof; the waiting prefetch still
+        # owns its native buffers and is refreshed at the next admission.
+        with self.session_lock:
+            job = self.session_jobs.get(("refresh", rid))
+            if job is not None and job.done():
+                del self.session_jobs[("refresh", rid)]
+
     def abort_prepared_load_async(self, rid: str) -> bool:
         """Return False until all preparation/refresh/end work has retired."""
         with self.session_lock:
@@ -927,7 +956,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if owner == rid
             ):
                 return False
-            if rid in self.failed_session_cleanups:
+            if time.monotonic() < self.session_cleanup_retry_at.get(rid, 0):
                 return False
             if preparing is not None:
                 return False
@@ -1061,9 +1090,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             rid,
                             exc_info=True,
                         )
-                        # The remote start may still complete after an RPC timeout.
-                        with self.session_lock:
-                            self.failed_session_keys.update(new_keys)
+                        # The native call has returned; rollback under the same
+                        # key guards retires any partially constructed session.
                         results, sources, ok = [], [], False
                     with self.session_lock:
                         # Even a short/failed result may have created a session.
@@ -1102,9 +1130,35 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         with self.session_lock:
             self.prepared_load_sessions.pop(rid, None)
         if not self._release_session_refs(keys):
-            with self.session_lock:
-                self.failed_session_cleanups.add(rid)
+            self._retain_failed_session_cleanup(rid, keys)
         return False
+
+    def _retain_failed_session_cleanup(self, rid, keys) -> None:
+        with self.session_lock:
+            first_failure = rid not in self.failed_session_cleanups
+            self.prepared_load_sessions[rid] = [
+                key for key in keys if key in self.failed_session_keys
+            ]
+            self.failed_session_cleanups.add(rid)
+            self.cancelled_load_session_cleanup.add(rid)
+            self.session_cleanup_retry_at[rid] = time.monotonic() + 1.0
+            self.session_cleanup_stats["failures"] += 1
+        self._log_host_prefetch_metric("event", "session_cleanup_failed")
+        if first_failure:
+            self._log_host_prefetch_metric("event", "session_cleanup_quarantined")
+
+    def get_session_cleanup_state(self) -> dict[str, int]:
+        """A snapshot for diagnostics; quarantined credits survive cache reset."""
+        with self.session_lock:
+            return {
+                **self.session_cleanup_stats,
+                "quarantined_requests": len(self.failed_session_cleanups),
+                "quarantined_keys": len(self.failed_session_keys),
+                "pending_cleanups": len(self.cancelled_load_session_cleanup),
+                "active_jobs": sum(
+                    not job.done() for job in self.session_jobs.values()
+                ),
+            }
 
     def _refresh_session_keys(self, keys: list[str], *, force_refresh=False) -> bool:
         """Serialize refresh with same-key start/end, never unrelated RPCs."""
@@ -1201,7 +1255,27 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             entry = self.host_prefetch_entries.get(rid)
             if entry is None:
                 return None
-            return str(entry.get("state"))
+            state = str(entry.get("state"))
+            # This is a scheduling budget, never evidence that native writes
+            # stopped. Cancellation retains the entry/credit until its worker
+            # returns and ends the session; recomputation uses no native slots.
+            timed_out = entry.get("admission_timed_out", False)
+            if (
+                state in {"queued", "preparing", "reading"}
+                and entry.get("queued_at") is not None
+                and time.monotonic() - entry["queued_at"] >= self.session_lease_ttl_s
+            ):
+                first_timeout = not timed_out
+                entry["admission_timed_out"] = timed_out = True
+            else:
+                first_timeout = False
+        if first_timeout:
+            self._log_host_prefetch_metric("event", "prefetch_admission_timeout")
+            logger.warning(
+                "Mooncake prefetch admission timed out for rid=%s; retaining its active owner",
+                rid,
+            )
+        return "admission_timeout" if timed_out else state
 
     def revalidate_host_prefetch(self, rid: str, *, force_refresh=False) -> bool:
         if not self.host_prefetch_enabled:
@@ -1440,11 +1514,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if outcome == "dfs_prefetched":
                     current["ready_at"] = time.monotonic()
                 keep_session = outcome == "dfs_prefetched"
-            if current is entry:
-                if cancelled:
-                    self.host_prefetch_entries.pop(rid, None)
-                elif outcome not in {"dfs_prefetched", "no_prefetch_needed"}:
-                    current["state"] = "failed"
+            if current is entry and not keep_session:
+                # Reserve the host credit while native end is still running.
+                current["state"] = "cleanup_pending"
+                current["cleanup_rid"] = session_rid
         if current is entry:
             self._log_host_prefetch_metric(
                 "result",
@@ -1452,7 +1525,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 time.monotonic() - entry["queued_at"],
             )
         if not keep_session:
-            self._abort_prepared_load_now(session_rid)
+            released = self._abort_prepared_load_now(session_rid)
+            with self.host_prefetch_lock:
+                if current is entry and self.host_prefetch_entries.get(rid) is entry:
+                    if not released:
+                        entry["state"] = "cleanup_pending"
+                        entry["cleanup_rid"] = session_rid
+                        self.host_prefetch_session_cleanup[rid] = (entry, session_rid)
+                    elif entry.get("cancelled"):
+                        del self.host_prefetch_entries[rid]
+                    else:
+                        entry["state"] = (
+                            "no_prefetch_needed"
+                            if outcome == "no_prefetch_needed"
+                            else "failed"
+                        )
+                        entry.pop("cleanup_rid", None)
 
     def _log_host_prefetch_metric(
         self, kind: str, event: str, duration: float = 0.0
@@ -1480,9 +1568,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             for key in keys:
                 count = self.session_refcounts.get(key, 0)
                 if count <= 1:
-                    self.session_refcounts.pop(key, None)
-                    self.session_sources.pop(key, None)
-                    self._lease_bases().pop(key, None)
                     to_end.append(key)
                 else:
                     self.session_refcounts[key] = count - 1
@@ -1500,6 +1585,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     exc_info=True,
                 )
                 return False
+            with self.session_lock:
+                for key in to_end:
+                    self.session_refcounts.pop(key, None)
+                    self.session_sources.pop(key, None)
+                    self._lease_bases().pop(key, None)
+                    self.failed_session_keys.discard(key)
         return True
 
     def _abort_prepared_load_now(self, rid: str) -> bool:
@@ -1508,13 +1599,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if preparing is not None:
                 preparing["cancelled"] = True
                 return False
-            if rid in self.failed_session_cleanups:
-                return False
             if rid in self.ending_load_sessions:
                 return False
             keys = self.prepared_load_sessions.get(rid)
+            retry = rid in self.failed_session_cleanups
+            if retry:
+                self.session_cleanup_stats["retries"] += 1
         if keys is None:
             return True
+        if retry:
+            self._log_host_prefetch_metric("event", "session_cleanup_retry")
         with self._session_key_guard(keys):
             with self.session_lock:
                 preparing = self.preparing_load_sessions.get(rid)
@@ -1526,10 +1620,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 del self.prepared_load_sessions[rid]
                 self.ending_load_sessions.add(rid)
             ok = self._release_session_refs(keys)
+            if not ok:
+                self._retain_failed_session_cleanup(rid, keys)
             with self.session_lock:
-                if not ok:
-                    self.failed_session_cleanups.add(rid)
+                if ok:
+                    self.failed_session_cleanups.discard(rid)
+                    self.session_cleanup_retry_at.pop(rid, None)
+                    if retry:
+                        self.session_cleanup_stats["recovered"] += 1
                 self.ending_load_sessions.discard(rid)
+            if ok and retry:
+                self._log_host_prefetch_metric("event", "session_cleanup_recovered")
             return ok
 
     def abort_prepared_load(self, rid: str) -> bool:
@@ -1594,7 +1695,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             getattr(self, "broadcast_events", None)
             and self.broadcast_events[0][0].query()
         ):
+            rids = self.broadcast_events[0][1]
+            cleanup = self.follower_cleanup_outcomes.get(tuple(rids))
+            if cleanup is not None and not cleanup.done():
+                break
             _, rids, success = self.broadcast_events.pop(0)
+            if cleanup is not None:
+                success = success and cleanup.result()
+                del self.follower_cleanup_outcomes[tuple(rids)]
             self.completed_loads.put((rids, success))
         return self.completed_loads.qsize()
 
@@ -1603,6 +1711,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         for event, _, _ in getattr(self, "broadcast_events", ()):
             event.synchronize()
         self.load_batch_futures.clear()
+        self.load_batch_cleanup_futures.clear()
 
     def wait_for_load_batch(self, index: int) -> None:
         if index < 0:
@@ -1613,6 +1722,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         event = completed.result()
         if event is not None:
             event.synchronize()
+        cleanup = self.load_batch_cleanup_futures.get(index)
+        if cleanup is not None:
+            # Result processing must see this batch's cleanup verdict before
+            # emitting tokens. Forward only publishes the GPU event.
+            cleanup.result()
+            self.load_batch_cleanup_futures.pop(index, None)
         self.load_batch_futures.pop(index, None)
 
     def pop_completed_load(self) -> tuple[list[str], bool]:
@@ -1670,14 +1785,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if broadcaster is not None:
             if broadcaster.is_src:
                 self.broadcast_outcomes[counter_index] = Future()
+            else:
+                cleanup = Future()
+                self.follower_cleanup_outcomes[tuple(pending)] = cleanup
+                self.load_batch_cleanup_futures[counter_index] = cleanup
             self.broadcast_loads[counter_index] = (
                 0,
                 prepared,
                 list(pending),
                 ready_event,
             )
-        if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, ready_event))
+        self.load_queue.put((counter_index, pending, ready_event))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -1690,9 +1808,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counter_index, pending, ready_event = task
                 replicated = counter_index in self.broadcast_loads
                 success = False
+                follower_cleanup = self.follower_cleanup_outcomes.get(tuple(pending))
                 try:
                     ready_event.synchronize()
-                    if self.host_prefetch_enabled:
+                    if follower_cleanup is not None:
+                        success = True
+                        if self.host_prefetch_enabled:
+                            for rid in pending:
+                                if not self.abort_prepared_load(rid):
+                                    success = False
+                    elif self.host_prefetch_enabled:
                         success = self.load_layer_wise(
                             counter_index,
                             list(pending.values()),
@@ -1707,7 +1832,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
                     self._finish_prefetch_metrics(list(pending), success is True)
-                    if replicated:
+                    if follower_cleanup is not None:
+                        follower_cleanup.set_result(success)
+                    elif replicated:
                         self.broadcast_outcomes[counter_index].set_result(success)
                     else:
                         self.completed_loads.put((list(pending), success))
@@ -2177,11 +2304,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         getattr(self, "pending_load_started", {}).clear()
         self.load_queue.join()
         self.offload_queue.join()
+        for rid in list(self.prepared_load_sessions):
+            self.abort_prepared_load(rid)
         if self.host_prefetch_threads:
-            for rid in list(self.prepared_load_sessions):
-                self.abort_prepared_load(rid)
             with self.host_prefetch_lock:
-                self.host_prefetch_entries.clear()
+                retained = {}
+                for rid, entry in self.host_prefetch_entries.items():
+                    owner = entry.get("cleanup_rid", entry["session_rid"])
+                    if rid in self.failed_session_cleanups:
+                        owner = rid
+                    if owner in self.failed_session_cleanups:
+                        entry["state"] = "cleanup_pending"
+                        entry["cleanup_rid"] = owner
+                        retained[rid] = entry
+                        self.host_prefetch_session_cleanup[rid] = (entry, owner)
+                self.host_prefetch_entries = retained
         while True:
             try:
                 self.offload_results.get_nowait()
@@ -2197,15 +2334,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.broadcast_events.clear()
         self.broadcast_loads.clear()
         self.broadcast_outcomes.clear()
+        self.follower_cleanup_outcomes.clear()
+        self.load_batch_cleanup_futures.clear()
         self.broadcast_failed.clear()
         self.load_batch_futures.clear()
         self.layer_done_counter.reset()
         with self.session_lock:
-            self.session_jobs.clear()
+            self.session_jobs = {
+                key: job
+                for key, job in self.session_jobs.items()
+                if key[1] in self.failed_session_cleanups
+            }
             self.cancelled_session_jobs.clear()
-            self.cancelled_load_session_cleanup.clear()
+            self.cancelled_load_session_cleanup = set(self.failed_session_cleanups)
         with self.host_prefetch_lock:
-            self.host_prefetch_session_cleanup.clear()
+            self.host_prefetch_session_cleanup = {
+                rid: pending
+                for rid, pending in self.host_prefetch_session_cleanup.items()
+                if pending[1] in self.failed_session_cleanups
+            }
 
     def close(self) -> None:
         self.reset()
@@ -2253,12 +2400,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         else:
             self.broadcast_failed.add(index)
         if last:
-            if not self.mla_broadcaster.is_src:
-                for rid in rids:
-                    self.pending_load_tokens.pop(rid, None)
-                    self.pending_load_started.pop(rid, None)
-                    if self.host_prefetch_enabled:
-                        self.abort_prepared_load(rid)
             event = device_module.Event()
             event.record()
             self.broadcast_events.append((event, rids, success))

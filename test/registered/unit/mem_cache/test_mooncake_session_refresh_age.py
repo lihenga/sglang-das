@@ -11,13 +11,22 @@ import types
 import unittest
 from concurrent.futures import Future
 from contextlib import ExitStack
+from queue import Queue
 from unittest import mock
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+)
+from sglang.srt.mem_cache.unified_cache.components import LinkerTransferPhase
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    ExternalCacheHitMarker,
+    UnifiedCacheLinkerWrapper,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -59,6 +68,8 @@ def _linker(age_s=5.0, refresh_results=None, refresh_error=None):
     linker.host_prefetch_limit = 8
     linker.host_prefetch_worker_count = 2
     linker._init_session_runtime()
+    linker.follower_cleanup_outcomes = {}
+    linker.load_batch_cleanup_futures = {}
 
     def start(keys):
         return [0] * len(keys), ["dfs"] * len(keys)
@@ -570,7 +581,7 @@ class TestSessionOwnershipRaces(CustomTestCase):
         self.assertIn(linker.prepare_load_async("a", [transfer]), {"pending", "ready"})
         self.assertTrue(entered.wait(5))
         self.assertFalse(linker.abort_prepared_load_async("a"))
-        self.assertEqual(linker.prepare_load_async("b", [transfer]), "failed")
+        self.assertEqual(linker.prepare_load_async("b", [transfer]), "pending")
         self.assertEqual(len(linker.session_jobs), 1)
         release.set()
         self.assertFalse(linker.session_jobs[("prepare", "a")].result(timeout=5))
@@ -612,7 +623,7 @@ class TestSessionOwnershipRaces(CustomTestCase):
         self.assertIn(("prepare", "a"), linker.session_jobs)
         self.assertEqual(linker.host_prefetch_entries["a"]["state"], "cleanup_pending")
         self.assertEqual(linker.cancelled_load_session_cleanup, {"a"})
-        self.assertEqual(linker.prepare_load_async("b", [transfer]), "failed")
+        self.assertEqual(linker.prepare_load_async("b", [transfer]), "pending")
         linker._poll_cancelled_load_sessions()
         self.assertEqual(linker.cancelled_load_session_cleanup, {"a"})
         ended = linker.session_jobs[("end", "a")]
@@ -784,6 +795,504 @@ class TestAsyncSessionAdmission(CustomTestCase):
             linker.revalidate_host_prefetch_async("rid")
             self.assertFalse(linker.session_jobs[("refresh", "rid")].result(timeout=5))
             self.assertEqual(linker.revalidate_host_prefetch_async("rid"), "failed")
+
+
+class TestAdmissionResourceRecovery(CustomTestCase):
+    def _wrapper(self, linker):
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache_linker = linker
+        wrapper._waiting_queue_prefetch_enabled = linker.host_prefetch_enabled
+        wrapper.hit_markers = {}
+        wrapper.host_prefetch_hits = {} if linker.host_prefetch_enabled else None
+        wrapper.pending_host_prefetch_submissions = (
+            {} if linker.host_prefetch_enabled else None
+        )
+        wrapper.pending_loads, wrapper.pending_offloads = {}, []
+        wrapper._load_admissions, wrapper._admitted_loads = {}, {}
+        wrapper._pending_session_cleanup = set()
+        wrapper._update_load = MagicMock(return_value=[])
+        component = MagicMock()
+        component.build_external_linker_transfer.side_effect = (
+            lambda phase, node, keys: (
+                types.SimpleNamespace(name=PoolName.KV, keys=keys)
+                if phase == LinkerTransferPhase.LOOKUP
+                else None
+            )
+        )
+        wrapper._components = [component]
+        wrapper.cache = types.SimpleNamespace(
+            page_size=1, _all_reduce_attn_groups=MagicMock()
+        )
+        linker.pool_group = types.SimpleNamespace(
+            resolve_transfers=lambda transfers, **_: transfers
+        )
+        linker.storage._batch_exist = lambda keys: [1] * len(keys)
+        return wrapper
+
+    def _ready(self, wrapper, req, kind):
+        state = wrapper.prepare_load_admission(req)
+        job = wrapper.cache_linker.session_jobs[(kind, req.rid)]
+        self.assertTrue(job.result(timeout=5))
+        if state != "ready":
+            state = wrapper.prepare_load_admission(req)
+        self.assertEqual(state, "ready")
+
+    def test_admitted_construction_misses_recycle_credits_beyond_capacity(self):
+        """Slot exhaustion after ready must not exhaust future admission credits."""
+        for enabled, status, failed_pool in (
+            (False, None, PoolName.KV),
+            (False, None, PoolName.SWA),
+            (True, None, PoolName.KV),
+            (True, None, PoolName.SWA),
+            (True, "no_prefetch_needed", PoolName.KV),
+            (True, "no_prefetch_needed", PoolName.SWA),
+        ):
+            with self.subTest(prefetch=enabled, status=status, failed_pool=failed_pool):
+                linker = _linker()
+                self.addCleanup(linker.session_executor.shutdown, wait=True)
+                linker.host_prefetch_enabled = enabled
+                linker.host_prefetch_limit = 1
+                wrapper = self._wrapper(linker)
+                wrapper._components = []
+                for name in (PoolName.KV, PoolName.SWA):
+                    component = MagicMock()
+                    component.build_external_linker_transfer.side_effect = (
+                        lambda phase, node, keys, name=name: (
+                            types.SimpleNamespace(name=name, keys=keys)
+                            if phase == LinkerTransferPhase.LOOKUP
+                            or name != failed_pool
+                            else None
+                        )
+                    )
+                    wrapper._components.append(component)
+                for index in range(3):
+                    req = types.SimpleNamespace(rid=str(index), last_node="node")
+                    hit = ExternalCacheHitMarker(None, ["key"], 0)
+                    wrapper.hit_markers[req.rid] = hit
+                    if status is not None:
+                        linker.host_prefetch_entries[req.rid] = {
+                            "state": status,
+                            "session_rid": "internal:" + req.rid,
+                            "no_prefetch_keys": ["key"],
+                        }
+                        wrapper.host_prefetch_hits[req.rid] = hit
+                        # The no-DFS existence proof is separate from preparation.
+                        linker.revalidate_no_prefetch_needed_async(req.rid)
+                        self.assertTrue(
+                            linker.session_jobs[("refresh", req.rid)].result(timeout=5)
+                        )
+                    self._ready(wrapper, req, "prepare" if enabled else "refresh")
+                    self.assertEqual(wrapper.load_back(req), (0, "node"))
+                    self.assertEqual(
+                        len(wrapper._update_load.call_args.args[2]),
+                        int(failed_pool == PoolName.SWA),
+                    )
+                    with linker.session_lock:
+                        end = linker.session_jobs.get(("end", req.rid))
+                    if end is not None:
+                        self.assertTrue(end.result(timeout=5))
+                    wrapper.poll_session_cleanup()
+                    linker._poll_cancelled_load_sessions()
+                    self.assertEqual(linker.session_jobs, {})
+                    self.assertEqual(linker.prepared_load_sessions, {})
+                    self.assertEqual(linker.session_refcounts, {})
+
+    def test_admitted_construction_exception_keeps_its_error_and_retires_proof(self):
+        """An unexpected builder error must release an already admitted RPC result."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        linker.host_prefetch_enabled = False
+        wrapper = self._wrapper(linker)
+        req = types.SimpleNamespace(rid="r", last_node="n")
+        wrapper.hit_markers["r"] = ExternalCacheHitMarker(None, ["key"], 0)
+        self._ready(wrapper, req, "refresh")
+        wrapper._components[
+            0
+        ].build_external_linker_transfer.side_effect = RuntimeError("build")
+        with self.assertRaisesRegex(RuntimeError, "build"):
+            wrapper.load_back(req)
+        self.assertEqual(linker.session_jobs, {})
+
+    def test_budget_discard_preserves_native_prefetch_until_real_cancellation(self):
+        """Repeated budget rejections retain completed DFS I/O, renewing only proof."""
+        linker = _linker(age_s=0.0)
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        wrapper = self._wrapper(linker)
+        _prefetched(linker, _Clock(), rid="r", session="internal", keys=("key",))
+        hit = ExternalCacheHitMarker(None, ["key"], 0)
+        wrapper.hit_markers["r"] = wrapper.host_prefetch_hits["r"] = hit
+        req = types.SimpleNamespace(rid="r", last_node="node")
+        for _ in range(3):
+            self._ready(wrapper, req, "refresh")
+            wrapper.discard_load_admission(req)
+            self.assertEqual(linker.get_host_prefetch_status("r"), "dfs_prefetched")
+            self.assertEqual(linker.prepared_load_sessions, {"internal": ["key"]})
+            self.assertEqual(linker.session_jobs, {})
+            self.assertIs(wrapper.host_prefetch_hits["r"], hit)
+        linker.storage.store.batch_get_session_end.assert_not_called()
+        self.assertTrue(linker.claim_ready_host_prefetch("r"))
+        self.assertTrue(linker.abort_prepared_load("r"))
+        self.assertEqual(linker.prepared_load_sessions, {})
+
+    def test_failed_cancel_retains_credit_and_recovers_same_prefix_after_retry(self):
+        """A failed end cannot free quota early or permanently poison the prefix."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        linker.host_prefetch_limit = 1
+        linker.host_prefetch_generation = 0
+        linker.host_prefetch_queue = Queue()
+        wrapper = self._wrapper(linker)
+        transfer = types.SimpleNamespace(name=PoolName.KV, keys=["key"])
+        self.assertTrue(linker._prepare_expanded_load("internal", [transfer]))
+        entry = {
+            "state": "reading",
+            "session_rid": "internal",
+            "cancelled": True,
+            "queued_at": 100.0,
+        }
+        linker.host_prefetch_entries["r"] = entry
+        linker.storage.store.batch_get_session_end.side_effect = [-1, 0]
+        clock = _Clock()
+        with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
+            with self.assertLogs(level="WARNING"):
+                linker._finish_host_prefetch("r", entry, "internal", "dfs_prefetched")
+            self.assertEqual(entry["state"], "cleanup_pending")
+            self.assertEqual(linker.prepared_load_sessions, {"internal": ["key"]})
+            self.assertFalse(linker.submit_host_prefetch("new", [transfer]))
+            self.assertEqual(linker.prepare_load_async("other", [transfer]), "failed")
+            self.assertFalse(linker._prepare_expanded_load("same", [transfer]))
+            wrapper._pending_session_cleanup.add("internal")
+            self.assertFalse(wrapper.has_pending_operations())
+            clock.now += 1.0
+            linker.abort_prepared_load_async("internal")
+            with linker.session_lock:
+                end = linker.session_jobs.get(("end", "internal"))
+            if end is not None:
+                self.assertTrue(end.result(timeout=5))
+            linker._poll_cancelled_load_sessions()
+            wrapper.poll_session_cleanup()
+        self.assertEqual(linker.host_prefetch_entries, {})
+        self.assertEqual(linker.session_jobs, {})
+        self.assertEqual(linker.session_refcounts, {})
+        self.assertEqual(linker.failed_session_keys, set())
+        self.assertEqual(linker.failed_session_cleanups, set())
+        self.assertFalse(wrapper._pending_session_cleanup)
+        self.assertTrue(linker._prepare_expanded_load("same", [transfer]))
+
+    def test_batched_admission_bounds_collectives_and_keeps_hits_under_backpressure(
+        self,
+    ):
+        """A full queue stays pending; a peer miss affects only its candidate row."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        linker.host_prefetch_enabled = False
+        wrapper = self._wrapper(linker)
+        reqs = [
+            types.SimpleNamespace(rid=str(i), last_node="n", host_hit_length=1)
+            for i in range(65)
+        ]
+        for req in reqs:
+            wrapper.hit_markers[req.rid] = ExternalCacheHitMarker(None, [req.rid], 0)
+        # Occupy every refresh credit before polling to make the result deterministic.
+        blocker = Future()
+        linker.host_prefetch_limit = 1
+        linker.session_jobs[("refresh", "blocker")] = blocker
+        rows = []
+
+        def reduce(value, op):
+            self.assertEqual(op, torch.distributed.ReduceOp.MAX)
+            rows.append(value.shape[0])
+
+        wrapper.cache._all_reduce_attn_groups.side_effect = reduce
+        self.assertEqual(wrapper.prepare_load_admissions(reqs), ["pending"] * 65)
+        self.assertEqual(rows, [64, 1])
+        self.assertEqual(len(wrapper.hit_markers), 65)
+        self.assertTrue(all(req.host_hit_length == 1 for req in reqs))
+        blocker.set_result(True)
+
+    def test_rematch_after_ready_cannot_load_keys_from_an_old_admission(self):
+        """A batch proof for old keys must join the miss consensus after rematch."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        linker.host_prefetch_enabled = False
+        wrapper = self._wrapper(linker)
+        req = types.SimpleNamespace(rid="r", last_node="n")
+        wrapper.hit_markers["r"] = ExternalCacheHitMarker(None, ["old"], 0)
+        self._ready(wrapper, req, "refresh")
+        wrapper.hit_markers["r"] = ExternalCacheHitMarker(None, ["new"], 0)
+        wrapper._components[0].build_external_linker_transfer.side_effect = (
+            lambda phase, node, keys: types.SimpleNamespace(name=PoolName.KV, keys=keys)
+        )
+        self.assertEqual(wrapper.load_back(req), (0, "n"))
+        self.assertEqual(linker.session_jobs, {})
+        self.assertEqual(
+            wrapper.cache._all_reduce_attn_groups.call_args.args[0].item(), 0
+        )
+
+    def test_hitless_admission_cannot_load_a_new_remote_hit_after_rematch(self):
+        """Ready-to-recompute cannot authorize synchronous I/O for a later hit."""
+        for enabled in (False, True):
+            with self.subTest(prefetch=enabled):
+                linker = _linker()
+                self.addCleanup(linker.session_executor.shutdown, wait=True)
+                linker.host_prefetch_enabled = enabled
+                wrapper = self._wrapper(linker)
+                req = types.SimpleNamespace(rid="r", last_node="n")
+                self.assertEqual(wrapper.prepare_load_admissions([req]), ["ready"])
+                self.assertEqual(wrapper._load_admissions["r"], ())
+                wrapper.hit_markers["r"] = ExternalCacheHitMarker(None, ["new"], 0)
+                wrapper._components[0].build_external_linker_transfer.side_effect = (
+                    lambda phase, node, keys: types.SimpleNamespace(
+                        name=PoolName.KV, keys=keys, device_indices=torch.tensor([1])
+                    )
+                )
+                with (
+                    mock.patch.object(
+                        linker,
+                        "prepare_load",
+                        side_effect=AssertionError("sync prepare"),
+                    ) as prepare,
+                    mock.patch.object(
+                        linker,
+                        "revalidate_load",
+                        side_effect=AssertionError("sync revalidate"),
+                    ) as revalidate,
+                ):
+                    self.assertEqual(wrapper.load_back(req), (0, "n"))
+                prepare.assert_not_called()
+                revalidate.assert_not_called()
+                self.assertEqual(linker.session_jobs, {})
+                self.assertEqual(linker.prepared_load_sessions, {})
+                self.assertEqual(wrapper._load_admissions, {})
+                self.assertEqual(wrapper._admitted_loads, {})
+                self.assertEqual(
+                    wrapper.cache._all_reduce_attn_groups.call_args.args[0].item(), 0
+                )
+
+    def test_partial_start_exception_is_rolled_back_without_permanent_key_poison(self):
+        """A returned start error may leave local sessions, which end can retire."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        sessions = set()
+
+        def start(keys):
+            sessions.update(keys)
+            raise RuntimeError("partial local start")
+
+        def end(keys):
+            sessions.difference_update(keys)
+            return 0
+
+        linker.storage.store.batch_get_session_start_with_sources.side_effect = start
+        linker.storage.store.batch_get_session_end.side_effect = end
+        transfer = types.SimpleNamespace(keys=["key"])
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(linker._prepare_expanded_load("failed", [transfer]))
+        self.assertEqual(sessions, set())
+        linker.storage.store.batch_get_session_start_with_sources.side_effect = (
+            lambda keys: ([0] * len(keys), ["dfs"] * len(keys))
+        )
+        self.assertTrue(linker._prepare_expanded_load("retry", [transfer]))
+        self.assertEqual(linker.failed_session_keys, set())
+
+    def test_retry_only_releases_exclusive_keys_once_after_shared_refs_drop(self):
+        """Retrying a mixed cleanup must not consume the other reader's reference."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        self.assertTrue(
+            linker._prepare_expanded_load(
+                "a", [types.SimpleNamespace(keys=["shared", "private"])]
+            )
+        )
+        self.assertTrue(
+            linker._prepare_expanded_load("b", [types.SimpleNamespace(keys=["shared"])])
+        )
+        linker.storage.store.batch_get_session_end.side_effect = [-1, 0, 0]
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(linker._abort_prepared_load_now("a"))
+        self.assertEqual(linker.prepared_load_sessions["a"], ["private"])
+        self.assertTrue(linker._abort_prepared_load_now("a"))
+        self.assertEqual(linker.session_refcounts, {"shared": 1})
+        self.assertEqual(linker.prepared_load_sessions, {"b": ["shared"]})
+        self.assertTrue(linker._abort_prepared_load_now("b"))
+        self.assertEqual(linker.session_refcounts, {})
+
+    def test_reset_retains_failed_native_owner_and_then_releases_after_recovery(self):
+        """Flush preserves failed host cleanup credits, and succeeds after recovery."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        linker.host_prefetch_limit = 1
+        linker.host_prefetch_generation = 0
+        linker.host_prefetch_threads = [object()]
+        for name in (
+            "host_prefetch_queue",
+            "load_queue",
+            "offload_queue",
+            "completed_loads",
+            "offload_results",
+        ):
+            setattr(linker, name, Queue())
+        for name in (
+            "pending_loads",
+            "broadcast_loads",
+            "broadcast_outcomes",
+            "follower_cleanup_outcomes",
+            "load_batch_cleanup_futures",
+            "load_batch_futures",
+        ):
+            setattr(linker, name, {})
+        linker.broadcast_events, linker.broadcast_failed = [], set()
+        linker.layer_done_counter = types.SimpleNamespace(reset=lambda: None)
+        transfer = types.SimpleNamespace(name=PoolName.KV, keys=["key"])
+        self.assertTrue(linker._prepare_expanded_load("internal", [transfer]))
+        linker.host_prefetch_entries["r"] = {
+            "state": "dfs_prefetched",
+            "session_rid": "internal",
+        }
+        linker.storage.store.batch_get_session_end.return_value = -1
+        with self.assertLogs(level="WARNING"):
+            linker.reset()
+        self.assertEqual(linker.prepared_load_sessions, {"internal": ["key"]})
+        self.assertEqual(linker.host_prefetch_entries["r"]["state"], "cleanup_pending")
+        self.assertFalse(linker.submit_host_prefetch("new", [transfer]))
+        linker.storage.store.batch_get_session_end.return_value = 0
+        linker.reset()
+        self.assertEqual(linker.prepared_load_sessions, {})
+        self.assertEqual(linker.host_prefetch_entries, {})
+        self.assertEqual(linker.failed_session_keys, set())
+        self.assertEqual(linker.cancelled_load_session_cleanup, set())
+
+    def test_reading_deadline_recomputes_without_reclaiming_active_native_buffers(self):
+        """Admission can stop waiting while native DFS still owns its host credit."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        wrapper = self._wrapper(linker)
+        linker.host_prefetch_limit, linker.host_prefetch_generation = 1, 0
+        linker.host_prefetch_queue = Queue()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def read(keys):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("read was not released")
+            return [0] * len(keys)
+
+        linker.storage.store.batch_get_session_prefetch = MagicMock(side_effect=read)
+        req = types.SimpleNamespace(rid="r", last_node="n", host_hit_length=1)
+        hit = ExternalCacheHitMarker(None, ["key"], 0)
+        wrapper.hit_markers["r"] = wrapper.host_prefetch_hits["r"] = hit
+        transfer = types.SimpleNamespace(name=PoolName.KV, keys=["key"])
+        clock = _Clock()
+        with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
+            self.assertTrue(linker.submit_host_prefetch("r", [transfer]))
+            linker.host_prefetch_queue.put(None)
+            worker = threading.Thread(target=linker.host_prefetch_thread_func)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            entry = linker.host_prefetch_entries["r"]
+            owner = entry["session_rid"]
+            clock.now += linker.session_lease_ttl_s + 0.1
+            with self.assertLogs(level="WARNING"):
+                self.assertEqual(
+                    wrapper.get_host_prefetch_admission_state("r"), "terminal"
+                )
+                self.assertEqual(wrapper.prepare_load_admission(req), "failed")
+            self.assertEqual(req.host_hit_length, 0)
+            self.assertEqual(entry["state"], "reading")
+            self.assertTrue(entry["cancelled"])
+            self.assertIn(owner, linker.prepared_load_sessions)
+            self.assertFalse(linker.submit_host_prefetch("other", [transfer]))
+            linker.storage.store.batch_get_session_end.assert_not_called()
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(linker.host_prefetch_entries, {})
+        self.assertEqual(linker.prepared_load_sessions, {})
+        self.assertEqual(linker.session_refcounts, {})
+
+    def test_prepare_deadline_retains_running_job_until_native_start_rolls_back(self):
+        """Timing out admission cancels ownership, never the running native call."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        wrapper = self._wrapper(linker)
+        linker.host_prefetch_limit = 1
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def start(keys):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("start was not released")
+            return [0] * len(keys), ["dfs"] * len(keys)
+
+        linker.storage.store.batch_get_session_start_with_sources.side_effect = start
+        req = types.SimpleNamespace(rid="r", last_node="n", host_hit_length=1)
+        wrapper.hit_markers["r"] = ExternalCacheHitMarker(None, ["key"], 0)
+        clock = _Clock()
+        with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
+            self.assertEqual(wrapper.prepare_load_admission(req), "pending")
+            self.assertTrue(entered.wait(5))
+            job = linker.session_jobs[("prepare", "r")]
+            clock.now += linker.session_lease_ttl_s + 0.1
+            with self.assertLogs(level="WARNING"):
+                self.assertEqual(wrapper.prepare_load_admission(req), "failed")
+            self.assertFalse(job.done())
+            self.assertEqual(len(linker.session_jobs), 1)
+            self.assertEqual(wrapper._pending_session_cleanup, {"r"})
+            self.assertEqual(
+                linker.prepare_load_async(
+                    "other", [types.SimpleNamespace(keys=["other-key"])]
+                ),
+                "pending",
+            )
+            release.set()
+            self.assertFalse(job.result(timeout=5))
+            wrapper.poll_session_cleanup()
+        self.assertEqual(linker.session_jobs, {})
+        self.assertEqual(linker.prepared_load_sessions, {})
+        self.assertEqual(linker.session_refcounts, {})
+
+    def test_current_batch_barrier_waits_own_cleanup_before_publishing_failure(self):
+        """The result barrier observes follower cleanup without joining a later batch."""
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        waiting, finished = threading.Event(), threading.Event()
+
+        class CleanupFuture(Future):
+            def result(self, timeout=None):
+                waiting.set()
+                return super().result(timeout=timeout)
+
+        cleanup, following = CleanupFuture(), Future()
+        self.addCleanup(
+            lambda: cleanup.set_result(False) if not cleanup.done() else None
+        )
+        event = MagicMock()
+        event.query.return_value = True
+        completed = Future()
+        completed.set_result(event)
+        linker.load_batch_futures = {0: completed}
+        linker.load_batch_cleanup_futures = {0: cleanup, 1: following}
+        linker.follower_cleanup_outcomes = {("r",): cleanup}
+        linker.broadcast_events = [(event, ["r"], True)]
+        linker.completed_loads = Queue()
+
+        def wait_current():
+            linker.wait_for_load_batch(0)
+            finished.set()
+
+        worker = threading.Thread(target=wait_current)
+        worker.start()
+        self.assertTrue(waiting.wait(5))
+        self.assertFalse(finished.is_set())
+        cleanup.set_result(False)
+        worker.join(5)
+        self.assertTrue(finished.is_set())
+        self.assertFalse(following.done())
+        self.assertEqual(linker.num_completed_loads(), 1)
+        self.assertEqual(linker.pop_completed_load(), (["r"], False))
+        self.assertEqual(linker.load_batch_cleanup_futures, {1: following})
 
 
 class TestSessionRefreshAgeConfig(CustomTestCase):

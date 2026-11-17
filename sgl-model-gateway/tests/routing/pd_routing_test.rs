@@ -315,6 +315,7 @@ mod pd_responses_routing_tests {
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             client: reqwest::Client::new(),
             request_timeout: Duration::from_secs(30),
+            max_payload_size: RouterConfig::default().max_payload_size,
             api_key: None,
             enable_igw: false,
         }

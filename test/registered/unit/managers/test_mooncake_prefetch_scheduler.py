@@ -152,7 +152,12 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
             side_effect=AssertionError("fixed sleep after forward completion"),
         ):
             self.assertEqual(
-                owner._forward_with_waiting_queue_ingress(object()), "finished"
+                owner._forward_with_waiting_queue_ingress(
+                    SimpleNamespace(
+                        forward_mode=SimpleNamespace(is_extend=lambda: True)
+                    )
+                ),
+                "finished",
             )
 
     def test_cancelled_old_lifecycle_does_not_swallow_the_new_job(self):
@@ -196,10 +201,48 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
         owner = MooncakePrefetchSchedulerMixin()
         owner.disaggregation_mode = DisaggregationMode.PREFILL
         owner.schedule_policy = "fcfs"
+        owner.input_blocker = None
         owner.tree_cache = SimpleNamespace(waiting_queue_prefetch_enabled=lambda: True)
         self.assertEqual(owner._resolve_prefetch_startup_switches(None), (True, True))
         owner.tree_cache.waiting_queue_prefetch_enabled = lambda: False
         self.assertEqual(owner._resolve_prefetch_startup_switches(None), (False, False))
+
+    def test_input_blocker_disables_forward_ingress_but_keeps_prefetch(self):
+        owner = MooncakePrefetchSchedulerMixin()
+        owner.disaggregation_mode = DisaggregationMode.PREFILL
+        owner.schedule_policy = "fcfs"
+        owner.input_blocker = object()
+        owner.tree_cache = SimpleNamespace(waiting_queue_prefetch_enabled=lambda: True)
+        self.assertEqual(owner._resolve_prefetch_startup_switches(None), (True, False))
+
+    def test_decode_uses_direct_forward_without_ingress_collectives(self):
+        owner = MooncakePrefetchSchedulerMixin()
+        owner._forward_ingress_enabled = True
+        owner.model_worker = SimpleNamespace(
+            forward_batch_generation=lambda batch: batch
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend=lambda: False),
+            is_extend_in_batch=False,
+        )
+        self.assertIs(owner._forward_with_waiting_queue_ingress(batch), batch)
+
+    def test_rematch_cannot_restore_a_failed_external_admission(self):
+        owner = MooncakePrefetchSchedulerMixin()
+        hits = {"rid": object()}
+        owner.tree_cache = SimpleNamespace(
+            cancel_waiting_queue_prefetch=lambda rid: hits.pop(rid, None)
+        )
+        # The final match finds keys even though the asynchronous refresh failed.
+        req = SimpleNamespace(
+            rid="rid",
+            host_hit_length=64,
+            swa_host_hit_length=32,
+            mamba_host_hit_length=0,
+        )
+        self.assertTrue(owner._apply_external_linker_admission(req, {"rid": "failed"}))
+        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
+        self.assertFalse(hits)
 
     def test_encoder_waiting_input_is_deferred_even_before_mm_inputs_arrive(self):
         req = SimpleNamespace(

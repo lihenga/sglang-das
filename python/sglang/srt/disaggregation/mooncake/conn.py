@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict, defaultdict
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -20,6 +21,7 @@ from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
+    AbortAck,
     AbortNotification,
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -49,7 +51,10 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_string_list,
 )
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
-from sglang.srt.disaggregation.mooncake.notifications import DrainedAbortNotifier
+from sglang.srt.disaggregation.mooncake.notifications import (
+    DRAINED_ABORT_REJECTIONS,
+    DrainedAbortNotifier,
+)
 from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
@@ -327,15 +332,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._drained_abort_lock = threading.Lock()
             self._drained_abort_rooms = OrderedDict()
             self._drained_abort_capacity = 4096
-            self._drained_abort_notifier = DrainedAbortNotifier(
-                self._drained_abort_capacity
-            )
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             self._transfer_completion_condition = threading.Condition()
             self._final_poll_enabled = (
                 envs.SGLANG_MOONCAKE_FINAL_POLL_TIMEOUT_MS.get() > 0
             )
             self.pd_hidden_events.init_prefill_state()
+            self._drained_abort_notifier = DrainedAbortNotifier(
+                self._drained_abort_capacity, self._retry_pending_control_notifications
+            )
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -3572,10 +3577,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
-                if self.enable_deferred_decode_kv_release:
-                    # In-flight write finished; if aborted and nothing outstanding,
-                    # the pages are idle -> release the held ack.
-                    self._maybe_ack_drained_abort(kv_chunk.room)
                 if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Success
@@ -3600,6 +3601,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
                 self._complete_source_chunk(kv_chunk)
+                if self.enable_deferred_decode_kv_release:
+                    self._maybe_ack_drained_abort(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -4000,6 +4003,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 and len(self._drained_abort_rooms) >= self._drained_abort_capacity
             ):
                 # Backpressure cleanup instead of resurrecting a live terminal room.
+                DRAINED_ABORT_REJECTIONS.labels("terminal_capacity").inc()
                 return None
             targets = {
                 (info.endpoint, info.dst_port)
@@ -4011,17 +4015,100 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._drained_abort_rooms[room] = time.monotonic() + ttl
             return targets
 
-    def queue_drained_abort_notification(self, room, endpoint, port) -> bool:
+    def _queue_control_notification(self, room, endpoint, port, parts) -> bool:
         na = NetworkAddress(endpoint, port)
+        ttl = max(300, self.bootstrap_timeout, self.waiting_timeout)
+        return self._drained_abort_notifier.submit(
+            room, na.to_tcp(), na.is_ipv6, parts, time.monotonic() + ttl
+        )
+
+    def queue_drained_abort_notification(self, room, endpoint, port) -> bool:
         parts = self._encode_kv_status_message(
             bootstrap_room=room,
             status=KVPoll.Failed,
             failure_reason="Prefill request aborted after source drain",
         )
-        ttl = max(300, self.bootstrap_timeout, self.waiting_timeout)
-        return self._drained_abort_notifier.submit(
-            room, na.to_tcp(), na.is_ipv6, parts, time.monotonic() + ttl
+        return self._queue_control_notification(room, endpoint, port, parts)
+
+    def _notify_bootstrap(self, room, notification) -> None:
+        if notification is None:
+            return
+        endpoint, failed = notification
+        if failed:
+            self._queue_bootstrap_notification(room, notification)
+            return
+        # DeferredBootstrap marks readiness before handing it to the backend.
+        # Keep retry ownership in its room table until the bounded queue accepts.
+        with self.deferred_bootstrap.lock:
+            state = self.deferred_bootstrap.rooms.get(room)
+            if state is None or state.failed or state.endpoint != endpoint:
+                return
+            state.ready_notified = False
+            state.ready_notified = self._queue_bootstrap_notification(
+                room, notification
+            )
+
+    def _queue_bootstrap_notification(self, room, notification) -> bool:
+        (endpoint, port), failed = notification
+        return self._queue_control_notification(
+            room,
+            endpoint,
+            port,
+            self._encode_kv_status_message(
+                bootstrap_room=room,
+                status=KVPoll.Failed if failed else KVPoll.WaitingForInput,
+                failure_reason="Prefill bootstrap failed" if failed else None,
+            ),
         )
+
+    def _retry_pending_control_notifications(self) -> None:
+        if self._stopped:
+            return
+        bootstrap = self.deferred_bootstrap
+        if bootstrap is not None:
+            with bootstrap.lock:
+                ready_rooms = [
+                    (room, state.owner)
+                    for room, state in bootstrap.rooms.items()
+                    if state.ready and not state.failed and not state.ready_notified
+                ]
+            for room, owner in ready_rooms:
+                self._notify_bootstrap(room, bootstrap.complete(room, owner))
+        # ABORT can arrive after the sender and its last chunk have retired.
+        with self._source_drain.lock:
+            rooms = list(self._deferred_ack_targets)
+        for room in rooms:
+            self._maybe_ack_drained_abort(room)
+
+    def register_deferred_ack_target(self, room, target) -> None:
+        with self._source_drain.lock:
+            super().register_deferred_ack_target(room, target)
+
+    def _maybe_ack_drained_abort(self, room: int) -> bool:
+        with self._source_drain.lock:
+            if self._staging_outstanding.get(room, 0) > 0:
+                return False
+            targets = self._deferred_ack_targets.get(room)
+            if not targets:
+                return True
+            if not self._source_drain.drained(room):
+                return False
+            remaining = dict(targets)
+            for key, target in targets.items():
+                if self._queue_control_notification(
+                    room,
+                    target.ip,
+                    target.port,
+                    AbortAck(
+                        room, self._prefill_unique_rank(), target.generation
+                    ).to_zmq(),
+                ):
+                    remaining.pop(key)
+            if remaining:
+                self._deferred_ack_targets[room] = remaining
+                return False
+            self._deferred_ack_targets.pop(room, None)
+            return True
 
     def _register_bootstrap_transfer(
         self,
@@ -4032,7 +4119,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ) -> None:
         with self._drained_abort_lock:
             self._prune_drained_abort_rooms()
-            if room not in self._drained_abort_rooms:
+            if (
+                room not in self._drained_abort_rooms
+                or self.request_status.get(room) == KVPoll.Failed
+            ):
                 infos = self.transfer_infos.setdefault(room, {})
                 infos[session_id] = transfer_info
                 if (
@@ -4167,6 +4257,8 @@ class MooncakeFailureExceptionMixin:
 
 
 class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+    _bootstrap_room_cleared = False
+
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -4174,6 +4266,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
+        self._drained_abort_targets = set()
+        self._drained_abort_notified_targets = set()
         super().__init__(
             mgr,
             bootstrap_addr,
@@ -4318,47 +4412,125 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
     def abort(self):
         with self.kv_mgr._source_drain.lock:
+            if (
+                self.kv_mgr.deferred_bootstrap is not None
+                and not self._owns_bootstrap_room
+            ):
+                return
             self._remember_drained_abort_targets()
             super().abort()
         self.kv_mgr._wake_pd_hidden_ack_waiters(self.bootstrap_room)
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
-    def failure_exception(self):
-        # The common implementation clears transfer_infos before raising the cause.
+    def clear(self) -> None:
+        notification = None
         with self.kv_mgr._source_drain.lock:
+            if self.kv_mgr.deferred_bootstrap is not None:
+                if not self._owns_bootstrap_room:
+                    return
+            failed = (
+                self.conclude_state == KVPoll.Failed
+                or self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed
+            )
+            if failed:
+                self.conclude_state = KVPoll.Failed
             self._remember_drained_abort_targets()
-            super().failure_exception()
+            if self.kv_mgr.deferred_bootstrap is not None:
+                notification = self.kv_mgr.deferred_bootstrap.close(
+                    self.bootstrap_room,
+                    self,
+                    success=self.kv_mgr.request_status.get(self.bootstrap_room)
+                    == KVPoll.Success,
+                )
+                self._owns_bootstrap_room = False
+            with self.kv_mgr._drained_abort_lock:
+                # Keep the small Failed guard until retry ownership is handed
+                # off, even if a terminal marker expires while backpressured.
+                if failed:
+                    self.kv_mgr.request_status[self.bootstrap_room] = KVPoll.Failed
+                else:
+                    self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+                # Registration can race the first snapshot above.
+                self._drained_abort_targets.update(
+                    (info.endpoint, info.dst_port)
+                    for info in self.kv_mgr.transfer_infos.get(
+                        self.bootstrap_room, {}
+                    ).values()
+                    if not info.is_dummy
+                )
+                self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+                self.kv_mgr.req_to_pd_hidden_meta.pop(self.bootstrap_room, None)
+                self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+            self._bootstrap_room_cleared = True
+        self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+        if notification is not None:
+            (endpoint, port), bootstrap_failed = notification
+            self.kv_mgr._queue_control_notification(
+                self.bootstrap_room,
+                endpoint,
+                port,
+                self.kv_mgr._encode_kv_status_message(
+                    bootstrap_room=self.bootstrap_room,
+                    status=KVPoll.Failed if bootstrap_failed else KVPoll.Success,
+                    failure_reason=(
+                        "Prefill bootstrap failed" if bootstrap_failed else None
+                    ),
+                ),
+            )
 
     def _remember_drained_abort_targets(self):
-        if not hasattr(self, "_drained_abort_targets"):
-            self._drained_abort_targets = set()
-            self._drained_abort_notified_targets = set()
         self._drained_abort_targets.update(self._current_drained_abort_targets())
+        bootstrap = self.kv_mgr.deferred_bootstrap
+        if bootstrap is not None:
+            with bootstrap.lock:
+                state = bootstrap.rooms.get(self.bootstrap_room)
+                if (
+                    state is not None
+                    and state.endpoint
+                    and (
+                        state.owner is self
+                        or (
+                            state.owner is None
+                            and state.failed
+                            and self._bootstrap_room_cleared
+                        )
+                    )
+                ):
+                    self._drained_abort_targets.add(state.endpoint)
 
     def is_transfer_drained(self):
         return self.kv_mgr.source_transfers_drained(self.bootstrap_room)
 
     def _current_drained_abort_targets(self):
-        infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
-        snapshot = list(infos.values())
+        with self.kv_mgr._drained_abort_lock:
+            infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+            snapshot = list(infos.values())
         return {
             (info.endpoint, info.dst_port) for info in snapshot if not info.is_dummy
         }
 
     def notify_drained_abort(self) -> bool:
+        if (
+            self.kv_mgr.deferred_bootstrap is not None
+            and not self._owns_bootstrap_room
+            and not self._bootstrap_room_cleared
+        ):
+            # A duplicate sender never owned this room's transport state.
+            return True
         if not self.is_transfer_drained():
             return False
-        targets = getattr(self, "_drained_abort_targets", set())
+        # Local transport cleanup must run even when the worker refuses ownership.
+        self.clear()
+        self._remember_drained_abort_targets()
+        targets = self._drained_abort_targets
         current = self.kv_mgr.finish_drained_abort(self.bootstrap_room)
         if current is None:
             return False
         targets.update(current)
-        self._drained_abort_targets = targets
         # "Notified" means the bounded worker owns delivery/retry. Decode's
         # generation-tagged ACK protocol still governs remote buffer release.
-        notified = getattr(self, "_drained_abort_notified_targets", set())
-        self._drained_abort_notified_targets = notified
+        notified = self._drained_abort_notified_targets
         for endpoint, port in targets - notified:
             # Retain the target protocol: decode requests its generation-tagged drain ACK.
             if not self.kv_mgr.queue_drained_abort_notification(
@@ -4366,10 +4538,44 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             ):
                 return False
             notified.add((endpoint, port))
-        self._drained_abort_notified_targets = notified
+        if not self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room):
+            return False
+        bootstrap = self.kv_mgr.deferred_bootstrap
+        with (
+            self.kv_mgr._drained_abort_lock,
+            bootstrap.lock if bootstrap is not None else nullcontext(),
+        ):
+            # A terminal marker could expire during backpressure. Registration
+            # still sees Failed, but its newly arrived endpoint also needs retry.
+            targets.update(
+                (info.endpoint, info.dst_port)
+                for info in self.kv_mgr.transfer_infos.get(
+                    self.bootstrap_room, {}
+                ).values()
+                if not info.is_dummy
+            )
+            if bootstrap is not None:
+                state = bootstrap.rooms.get(self.bootstrap_room)
+                if (
+                    state is not None
+                    and state.owner is None
+                    and state.failed
+                    and state.endpoint
+                ):
+                    targets.add(state.endpoint)
+            if targets - notified:
+                return False
+            if self.bootstrap_room not in self.kv_mgr._drained_abort_rooms:
+                return False
+            ttl = max(300, self.kv_mgr.bootstrap_timeout, self.kv_mgr.waiting_timeout)
+            self.kv_mgr._drained_abort_rooms[self.bootstrap_room] = (
+                time.monotonic() + ttl
+            )
+            self.kv_mgr._drained_abort_rooms.move_to_end(self.bootstrap_room)
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         with self.kv_mgr.failure_lock:
             self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-        self.clear()
         return True
 
 

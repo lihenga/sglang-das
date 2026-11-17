@@ -1,8 +1,9 @@
 import logging
 import threading
 import time
-from dataclasses import dataclass
 from typing import Any
+
+import msgspec
 
 from sglang.srt.environ import envs
 
@@ -51,7 +52,7 @@ def resolve_dfs_health_config(
     for key, (arg_name, env_name, default) in _HEALTH_CONFIG_SOURCES.items():
         value = config.get(key)
         if value is None and server_args is not None:
-            value = getattr(server_args, arg_name, None)
+            value = getattr(server_args, arg_name)
         if value is None:
             raw = getattr(envs, env_name).get()
             value = default if raw is None else int(raw)
@@ -62,8 +63,7 @@ def resolve_dfs_health_config(
     return resolved
 
 
-@dataclass(frozen=True)
-class DfsHealthSnapshot:
+class DfsHealthSnapshot(msgspec.Struct, frozen=True):
     read_state: str
     write_state: str
     generation: int
@@ -75,8 +75,7 @@ class DfsHealthSnapshot:
     write_error: int
 
 
-@dataclass
-class _NativeProbeCall:
+class _NativeProbeCall(msgspec.Struct):
     capability: str
     done: threading.Event
     started_at: float
@@ -104,8 +103,11 @@ class MooncakeDfsHealthManager:
         self._probe_timeout_s = config["probe_timeout_s"]
         self._lock = threading.Lock()
         self._policy_lock = threading.Lock()
+        self._policy_condition = threading.Condition(self._policy_lock)
+        self._policy_apply_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._policy_thread: threading.Thread | None = None
         self._probe_lock = threading.Lock()
         self._probe_calls: dict[str, _NativeProbeCall | None] = {
             "read": None,
@@ -121,6 +123,7 @@ class MooncakeDfsHealthManager:
         self._read_error = 0
         self._write_error = 0
         self._effective_policy = (False, False)
+        self._desired_policy = self._effective_policy
         self._policy_dirty = False
         self._policy_warning_at = float("-inf")
 
@@ -148,10 +151,18 @@ class MooncakeDfsHealthManager:
 
     def close(self) -> None:
         self._stop.set()
+        with self._policy_condition:
+            self._policy_condition.notify_all()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(1.0, float(self._interval_s) + 1.0))
         self._thread = None
+        policy_thread = self._policy_thread
+        if (
+            policy_thread is not None
+            and policy_thread is not threading.current_thread()
+        ):
+            policy_thread.join(timeout=1.0)
 
     def snapshot(self) -> DfsHealthSnapshot:
         with self._lock:
@@ -176,36 +187,85 @@ class MooncakeDfsHealthManager:
             )
 
     def apply_effective_policy(self, allow_read: bool, allow_write: bool) -> bool:
-        """Apply a scheduler-coordinated policy to this rank's native client."""
+        """Publish a coordinated policy; True means its native update is confirmed.
+
+        Deferred mode keeps one worker and one latest target, so neither a slow
+        native call nor its retries run on the scheduler. Local probes never
+        publish a policy in this mode.
+        """
         policy = (bool(allow_read), bool(allow_write))
-        with self._policy_lock:
+        with self._policy_condition:
+            if self._stop.is_set():
+                return False
+            self._desired_policy = policy
             if policy == self._effective_policy and not self._policy_dirty:
                 return True
-            old_policy = self._effective_policy
+            # A pending call can have applied even without a successful reply.
+            self._policy_dirty = True
+            if self._defer_policy_application:
+                if self._policy_thread is None:
+                    self._policy_thread = threading.Thread(
+                        target=self._run_policy,
+                        name="mooncake-dfs-policy",
+                        daemon=True,
+                    )
+                    self._policy_thread.start()
+                self._policy_condition.notify()
+                return False
+        self._apply_pending_policy()
+        with self._policy_lock:
+            return policy == self._effective_policy and not self._policy_dirty
+
+    def _apply_pending_policy(self) -> bool:
+        # Serialize native calls, but never hold the scheduler-facing state lock
+        # across an RPC. A stuck call occupies this one worker until it returns.
+        with self._policy_apply_lock:
+            with self._policy_lock:
+                if self._stop.is_set() or not self._policy_dirty:
+                    return True
+                policy = self._desired_policy
             try:
                 self._apply_policy(*policy)
             except Exception:
-                # A failed reply cannot tell us whether the native side applied it.
-                self._policy_dirty = True
                 now = time.monotonic()
-                if now - self._policy_warning_at >= self._interval_s:
-                    self._policy_warning_at = now
+                with self._policy_lock:
+                    warn = now - self._policy_warning_at >= self._interval_s
+                    if warn:
+                        self._policy_warning_at = now
+                if warn:
                     logger.warning(
-                        "Mooncake DFS policy application failed; retrying next poll",
+                        "Mooncake DFS policy application failed; native policy "
+                        "is unknown and will be retried",
                         exc_info=True,
                     )
                 return False
-            self._effective_policy = policy
-            self._policy_dirty = False
-        logger.warning(
-            "Mooncake DFS effective policy transition: "
-            "old_read=%s old_write=%s new_read=%s new_write=%s",
-            old_policy[0],
-            old_policy[1],
-            policy[0],
-            policy[1],
-        )
+            with self._policy_condition:
+                old_policy = self._effective_policy
+                self._effective_policy = policy
+                self._policy_dirty = self._desired_policy != policy
+                self._policy_condition.notify_all()
+            if old_policy != policy:
+                logger.warning(
+                    "Mooncake DFS effective policy transition: "
+                    "old_read=%s old_write=%s new_read=%s new_write=%s",
+                    old_policy[0],
+                    old_policy[1],
+                    policy[0],
+                    policy[1],
+                )
         return True
+
+    def _run_policy(self) -> None:
+        while not self._stop.is_set():
+            with self._policy_condition:
+                self._policy_condition.wait_for(
+                    lambda: self._stop.is_set() or self._policy_dirty
+                )
+                if self._stop.is_set():
+                    return
+            if not self._apply_pending_policy():
+                # Scheduler polls cannot accelerate retries of a failed RPC.
+                self._stop.wait(self._interval_s)
 
     def probe_once(self) -> DfsHealthSnapshot:
         # Launch both operations before waiting for either one. Each operation has

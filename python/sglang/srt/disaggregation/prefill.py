@@ -1125,15 +1125,31 @@ class PrefillBootstrapQueue:
 
 
 class SchedulerDisaggregationPrefillMixin:
+    """Coordinate disaggregated prefill and reclaim aborted requests."""
+
     def init_external_kv_cleanup(self, *, coordinated: bool) -> None:
         self._coordinated_kv_cleanup = coordinated
         self._deferred_linker_rids = set()
         self._mooncake_cleanup_requests = {}
         self._quarantined_external_kv_requests = {}
+        self._external_kv_quarantine_limit = 4096
+        self._external_kv_cleanup_warning_at = float("-inf")
+        self._external_kv_cleanup_suppressed_warnings = 0
 
-    """
-    Mixin for Scheduler to handle disaggregation prefill
-    """
+    def _log_external_kv_cleanup_failure(self, message: str, rid: str) -> None:
+        now = time.monotonic()
+        if now - self._external_kv_cleanup_warning_at < 5.0:
+            self._external_kv_cleanup_suppressed_warnings += 1
+            return
+        self._external_kv_cleanup_warning_at = now
+        logger.error(
+            "%s for request %s; suppressed retry errors=%d",
+            message,
+            rid,
+            self._external_kv_cleanup_suppressed_warnings,
+            exc_info=True,
+        )
+        self._external_kv_cleanup_suppressed_warnings = 0
 
     def _observe_grammar_first_mask_fill(self: Scheduler, req: Req) -> None:
         # GLM NOTE: the prefill engine samples exactly one token per request,
@@ -2864,7 +2880,9 @@ class SchedulerDisaggregationPrefillMixin:
             drained = getattr(sender, "is_transfer_drained", None)
             return bool(drained()) if drained is not None else True
         except Exception:
-            logger.exception("Failed to poll aborting sender for request %s", req.rid)
+            self._log_external_kv_cleanup_failure(
+                "Failed to poll aborting sender", req.rid
+            )
             return False
 
     def prefill_abort_forward_drained(self: Scheduler, req: Req) -> bool:
@@ -2877,10 +2895,20 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
     def _quarantine_external_kv_request(self: Scheduler, req: Req) -> None:
+        if (
+            id(req) not in self._quarantined_external_kv_requests
+            and len(self._quarantined_external_kv_requests)
+            >= self._external_kv_quarantine_limit
+        ):
+            raise RuntimeError("External KV cleanup quarantine capacity exhausted")
         if isinstance(req.to_finish, FINISH_ABORT):
             req.finished_reason, req.to_finish = req.to_finish, None
         self._mooncake_cleanup_requests.pop(id(req), None)
         self._quarantined_external_kv_requests[id(req)] = req
+        if self.metrics_reporter.enable_metrics:
+            self.metrics_collector.set_external_kv_quarantined_reqs(
+                len(self._quarantined_external_kv_requests)
+            )
         self.waiting_queue = [
             candidate for candidate in self.waiting_queue if candidate is not req
         ]
@@ -2987,7 +3015,8 @@ class SchedulerDisaggregationPrefillMixin:
             # terminal marker out to its saved/current decode targets.
             notify_drained_abort = getattr(sender, "notify_drained_abort", None)
             if notify_drained_abort is not None:
-                notify_drained_abort()
+                if notify_drained_abort() is False:
+                    return False
 
             if not req.external_kv_finish_state_applied:
                 if isinstance(req.to_finish, FINISH_ABORT):
@@ -3051,8 +3080,8 @@ class SchedulerDisaggregationPrefillMixin:
             req.external_kv_cleanup_quarantined = True
             return False
         except Exception:
-            logger.exception(
-                "External KV abort cleanup failed for request %s; pending cleanup retained",
+            self._log_external_kv_cleanup_failure(
+                "External KV abort cleanup failed; pending cleanup retained",
                 req.rid,
             )
             return False

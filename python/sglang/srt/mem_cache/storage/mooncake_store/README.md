@@ -581,6 +581,10 @@ supported for ReadLayout types. This matches the compatibility behavior from
 the donor's community/HYGON L3/L4 integration PR, adapted to this branch's
 resolved RuntimeContext config bags.
 
+Direct-linker storage suffixes now include the pool group's layout tag. This
+changes L3/L4 keys: existing untagged caches are cold after this upgrade, and
+prefill workers running different key layouts cannot share those entries.
+
 For standalone mode, use matching Python/client-daemon packages and matching
 Client/Master RPC protocols. A callable Python method does not establish daemon
 support; current L4 declares ReadPlan, ReadLayout and queued DFS prefetch for
@@ -619,6 +623,26 @@ warmup. Configure interval, failure/success thresholds and timeout with the
 `SGLANG_MOONCAKE_DFS_HEALTH_*` environment variables. Attention ranks apply a
 common conservative policy. Recovery does not promise backfill of every write
 made while DFS was unavailable.
+
+Initial fail-closed setup must succeed synchronously before any client warms up.
+In deferred mode, only scheduler-coordinated policies reach a single background
+worker; pending updates coalesce to the latest target. Failed updates retry at
+the probe interval without scheduler polling. Non-deferred clients keep
+synchronous policy application. An unconfirmed native reply stays dirty when the
+target returns to the last confirmed policy. A hung call occupies the one worker
+until it returns; it is neither cancelled nor replaced by concurrent RPCs.
+Embedded RealClient policy updates are local atomic stores. Standalone
+DummyClient updates synchronously call the external RealClient by RPC. Before
+using deferred policy application with standalone storage, verify that the
+installed Mooncake build releases the Python GIL in its policy binding;
+otherwise its RPC can still stall the scheduler from the background worker.
+The `dfs_health` capability only checks API availability and does not certify
+GIL release. No minimum fixed wheel version is established by these checks.
+An unconfirmed disable cannot guarantee that the native client stopped DFS
+access; the last confirmed policy is not proof of its current permissions.
+Storage/linker policy wrappers currently discard the manager's confirmation
+result, and loads do not gate on pending policy application. Deferred application
+alone therefore does not provide fail-closed load admission during that window.
 
 ### Observability and validation
 
@@ -697,6 +721,27 @@ For device destinations, decode can release after
 even without complete drain ACKs. That timeout is not proof that remote writes
 stopped. Host-staged destinations remain held until drain consensus; the device
 timeout fallback does not apply to them.
+
+Terminal-room or notification capacity exhaustion retains a scheduler cleanup
+owner for retry. Local transport maps are cleared independently of successful
+notification handoff; Failed guards and target snapshots survive backpressure.
+Notifications use a bounded worker with endpoint backoff and aggregated logs.
+`sglang:mooncake_drained_abort_rejections_total` counts rejected handoffs.
+
+Unknown allocator cleanup outcomes retain request resources instead of repeating
+an unsafe free. `sglang:external_kv_quarantined_reqs` reports this quarantine;
+4096 retained requests exhaust its capacity and stop the scheduler rather than
+grow without bound. Recover these opaque allocator failures by restarting the
+worker. This differs from native get-session cleanup, which retains bounded
+credits and retries its idempotent end operation without preventing idle/flush.
+Inflight user cancellation preserves a computed prefix when no external KV
+failure has already made it unsafe to cache.
+
+Forward ingress runs only when the synchronized batch contains extend work,
+and is disabled when the input blocker or KV canary is active. Direct-linker
+health policy shares the completion-count reduction. Cleanup presence and
+inflight retirement still require rank consensus; a locally empty queue cannot
+safely gate these operations. No throughput or TTFT A/B is established here.
 
 The accompanying `sgl-model-gateway` changes add HTTP stream outcomes, SSE/JSON
 error detection, paired PD cancellation with one shared deadline, and failure-log

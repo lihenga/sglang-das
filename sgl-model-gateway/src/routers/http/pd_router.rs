@@ -53,8 +53,6 @@ use crate::{
     },
 };
 
-const MAX_PD_BUFFER_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PENDING_DECODE_CHUNKS: usize = 8192;
 const MAX_WORKER_ERROR_BYTES: usize = 4096;
 const WORKER_ERROR_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -64,6 +62,7 @@ pub struct PDRouter {
     pub policy_registry: Arc<PolicyRegistry>,
     pub client: Client,
     pub request_timeout: Duration,
+    pub max_payload_size: usize,
     pub api_key: Option<String>,
     pub enable_igw: bool,
 }
@@ -93,9 +92,62 @@ struct PDRequestContext<'a> {
     headers: Option<HeaderMap>,
 }
 
+#[derive(Default)]
+struct SseEventBuffer {
+    bytes: bytes::BytesMut,
+    line_has_content: bool,
+    after_cr: bool,
+}
+
+impl SseEventBuffer {
+    // Keep the concrete HTTP error response used by the PD router's callers.
+    #[allow(clippy::result_large_err)]
+    fn next_event(
+        &mut self,
+        input: &mut &[u8],
+        limit: usize,
+    ) -> Result<Option<bytes::Bytes>, Response> {
+        while !input.is_empty() {
+            if self.after_cr {
+                self.after_cr = false;
+                if input[0] == b'\n' {
+                    *input = &input[1..];
+                    if !self.bytes.is_empty() {
+                        PDRouter::check_buffer_capacity(self.bytes.len(), 1, limit)?;
+                        self.bytes.extend_from_slice(b"\n");
+                    }
+                    continue;
+                }
+            }
+            let end = memchr::memchr2(b'\r', b'\n', input);
+            let len = end.map_or(input.len(), |i| i + 1);
+            let (part, rest) = input.split_at(len);
+            *input = rest;
+            if let Some(end) = end {
+                self.after_cr = part[end] == b'\r';
+                let empty_line = !self.line_has_content && end == 0;
+                self.line_has_content = false;
+                if empty_line {
+                    return Ok(Some(self.bytes.split().freeze()));
+                }
+            } else {
+                self.line_has_content = true;
+            }
+            PDRouter::check_buffer_capacity(self.bytes.len(), part.len(), limit)?;
+            self.bytes.extend_from_slice(part);
+        }
+        Ok(None)
+    }
+}
+
 impl PDRouter {
-    fn check_buffer_capacity(current: usize, incoming: usize) -> Result<(), Response> {
-        if incoming > MAX_PD_BUFFER_BYTES.saturating_sub(current) {
+    #[allow(clippy::result_large_err)]
+    fn check_buffer_capacity(
+        current: usize,
+        incoming: usize,
+        limit: usize,
+    ) -> Result<(), Response> {
+        if incoming > limit.saturating_sub(current) {
             return Err(error::bad_gateway(
                 "pd_response_buffer_limit",
                 "Worker response exceeded the PD buffering limit",
@@ -269,6 +321,7 @@ impl PDRouter {
             policy_registry: Arc::clone(&ctx.policy_registry),
             client: ctx.client.clone(),
             request_timeout: Duration::from_secs(ctx.router_config.request_timeout_secs),
+            max_payload_size: ctx.router_config.max_payload_size,
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
         })
@@ -645,7 +698,7 @@ impl PDRouter {
             }
             if context.is_stream {
                 let headers = header_utils::preserve_response_headers(response.headers());
-                match Self::prepare_decode_stream(response, prefill_ready_rx).await {
+                match self.prepare_decode_stream(response, prefill_ready_rx).await {
                     Ok(stream) => Ok(DecodeResponse::Streaming(status, headers, stream)),
                     Err(response) => {
                         // These failures happen before create_streaming_response installs tracking.
@@ -678,7 +731,7 @@ impl PDRouter {
                             "Decode worker response could not be read",
                         )
                     })?;
-                    Self::check_buffer_capacity(body.len(), chunk.len())?;
+                    Self::check_buffer_capacity(body.len(), chunk.len(), self.max_payload_size)?;
                     body.extend_from_slice(&chunk);
                     Self::check_json_worker_error(&body, "decode")?;
                 }
@@ -947,36 +1000,36 @@ impl PDRouter {
             tracked.mark_errored();
         }
         let decode_for_log = decode.clone();
+        let max_payload_size = self.max_payload_size;
         tokio::spawn(async move {
-            let mut events = bytes::BytesMut::new();
-            loop {
+            let mut events = SseEventBuffer::default();
+            'forwarding: loop {
                 tokio::select! {
                     biased;
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                let mut is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
-                                if Self::check_buffer_capacity(events.len(), chunk.len()).is_err() {
-                                    Metrics::record_worker_error(
-                                        metrics_labels::WORKER_DECODE,
-                                        metrics_labels::CONNECTION_HTTP,
-                                        error_type_from_status(StatusCode::BAD_GATEWAY),
-                                    );
-                                    tracked.mark_error_event(true);
-                                    let _ = tx.send(Ok(bytes::Bytes::from_static(
-                                        b"data: {\"error\":{\"message\":\"Worker SSE event exceeded the PD buffering limit\",\"code\":502}}\n\n",
-                                    )));
-                                    break;
-                                }
-                                events.extend_from_slice(&chunk);
+                                let mut is_done = false;
                                 let mut stream_error = false;
+                                let merge_logprobs = return_logprob && prefill_logprobs.is_some();
+                                let mut merged = bytes::BytesMut::new();
+                                let mut input = chunk.as_ref();
                                 loop {
-                                    let boundary = [
-                                        memmem::find(&events, b"\n\n").map(|i| (i, 2)),
-                                        memmem::find(&events, b"\r\n\r\n").map(|i| (i, 4)),
-                                    ].into_iter().flatten().min_by_key(|(i, _)| *i);
-                                    let Some((end, delimiter_len)) = boundary else { break };
-                                    let event = events.split_to(end + delimiter_len);
+                                    let event = match events.next_event(&mut input, max_payload_size) {
+                                        Ok(Some(event)) => event,
+                                        Ok(None) => break,
+                                        Err(_) => {
+                                            Metrics::record_worker_error(
+                                                metrics_labels::WORKER_DECODE,
+                                                metrics_labels::CONNECTION_HTTP,
+                                                error_type_from_status(StatusCode::BAD_GATEWAY),
+                                            );
+                                            tracked.mark_errored();
+                                            let _ = tx.send(Err("Worker SSE event exceeded the PD buffering limit".to_owned()));
+                                            break 'forwarding;
+                                        }
+                                    };
+                                    is_done |= Self::sse_data(&event).trim() == "[DONE]";
                                     if memmem::find(&event, b"\"error\"").is_some()
                                         || memmem::find(&event, b"\"abort\"").is_some()
                                         || memmem::find(&event, b"response.").is_some()
@@ -994,34 +1047,54 @@ impl PDRouter {
                                                 }
                                                 tracked.mark_error_event(response.status().is_server_error());
                                                 stream_error = true;
-                                                break;
                                             }
                                         }
                                     }
+                                    if merge_logprobs {
+                                        match Self::merge_streaming_logprobs(prefill_logprobs.as_ref(), &event) {
+                                            Ok(event) => merged.extend_from_slice(&event),
+                                            Err(()) => {
+                                                merged.extend_from_slice(&event);
+                                                merged.extend_from_slice(if event.ends_with(b"\r") { b"\r" } else { b"\n" });
+                                            }
+                                        }
+                                    }
+                                    if is_done || stream_error {
+                                        break;
+                                    }
                                 }
 
-                                let result = if return_logprob && prefill_logprobs.is_some() {
-                                    Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                        .unwrap_or(chunk)
+                                let result = if merge_logprobs {
+                                    merged.freeze()
                                 } else {
                                     chunk
                                 };
+                                let terminal_cr =
+                                    (is_done || stream_error) && result.ends_with(b"\r");
 
                                 // Mark the wrapper completed before the client
                                 // send: upstream finished cleanly regardless of
                                 // whether the client is still listening, and
                                 // the worker deserves the success tick either
                                 // way. `mark_completed` is a no-op once Errored
-                                // is set, so the synthetic-error path is unaffected.
+                                // is set, so the worker-error path is unaffected.
                                 if is_done || stream_error {
                                     tracked.mark_completed();
                                 }
 
-                                if tx.send(Ok(result)).is_err() {
+                                if !result.is_empty() && tx.send(Ok(result)).is_err() {
                                     tracing::debug!(
                                         "Receiver dropped (likely client disconnect), \
                                         cancelling upstream PD stream"
                                     );
+                                    break;
+                                }
+
+                                // The LF of a terminal CRLF may be in the next upstream chunk.
+                                // Complete it before dropping upstream so clients can dispatch it.
+                                if terminal_cr
+                                    && tx.send(Ok(bytes::Bytes::from_static(b"\n"))).is_err()
+                                {
                                     break;
                                 }
 
@@ -1149,7 +1222,7 @@ impl PDRouter {
             .is_some_and(|value| value.starts_with("text/event-stream"));
         let mut stream = prefill_response.bytes_stream();
         let mut body = bytes::BytesMut::new();
-        let mut event_start = 0;
+        let mut events = SseEventBuffer::default();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
                 rate_limited_log!(ERROR, prefill_url, error = ?e, "Failed to read prefill body");
@@ -1159,43 +1232,28 @@ impl PDRouter {
                     "Prefill worker response could not be read",
                 )
             })?;
-            Self::check_buffer_capacity(body.len(), chunk.len())?;
-            body.extend_from_slice(&chunk);
+            if !is_sse || return_logprob {
+                Self::check_buffer_capacity(body.len(), chunk.len(), self.max_payload_size)?;
+                body.extend_from_slice(&chunk);
+            }
             if is_sse {
-                // HTTP chunk boundaries need not coincide with SSE event boundaries.
-                loop {
-                    let rest = &body[event_start..];
-                    let boundary = [
-                        memmem::find(rest, b"\n\n").map(|i| (i, 2)),
-                        memmem::find(rest, b"\r\n\r\n").map(|i| (i, 4)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .min_by_key(|(i, _)| *i);
-                    let Some((end, delimiter_len)) = boundary else {
-                        break;
-                    };
-                    let done = Self::check_prefill_event(&rest[..end])?;
-                    event_start += end + delimiter_len;
-                    if done {
+                let mut input = chunk.as_ref();
+                while let Some(event) = events.next_event(&mut input, self.max_payload_size)? {
+                    if Self::check_prefill_event(&event)? {
                         return Ok((prefill_status, return_logprob.then(|| body.freeze())));
                     }
-                }
-                if !return_logprob && event_start > 0 {
-                    // Retain only an incomplete event when logprobs aren't requested.
-                    let _ = body.split_to(event_start);
-                    event_start = 0;
                 }
             } else {
                 Self::check_json_worker_error(&body, "prefill")?;
             }
         }
         if is_sse {
-            Self::check_prefill_event(&body[event_start..])?;
+            Self::check_prefill_event(&events.bytes)?;
         }
         Ok((prefill_status, return_logprob.then(|| body.freeze())))
     }
 
+    #[allow(clippy::result_large_err)]
     fn check_prefill_event(event: &[u8]) -> Result<bool, Response> {
         let data = Self::sse_data(event);
         if data.trim() == "[DONE]" {
@@ -1210,7 +1268,8 @@ impl PDRouter {
 
     fn sse_data(event: &[u8]) -> String {
         let text = String::from_utf8_lossy(event);
-        text.lines()
+        text.trim_start_matches('\u{feff}')
+            .split(['\r', '\n'])
             .filter_map(|line| line.strip_prefix("data:"))
             .map(|line| line.strip_prefix(' ').unwrap_or(line))
             .collect::<Vec<_>>()
@@ -1223,10 +1282,15 @@ impl PDRouter {
         if let Some(object) = payload.as_object_mut() {
             if !object.contains_key("type") {
                 if let Some(name) = String::from_utf8_lossy(event)
-                    .lines()
-                    .find_map(|line| line.strip_prefix("event:"))
+                    .trim_start_matches('\u{feff}')
+                    .split(['\r', '\n'])
+                    .filter_map(|line| line.strip_prefix("event:"))
+                    .next_back()
                 {
-                    object.insert("type".into(), Value::String(name.trim().to_owned()));
+                    object.insert(
+                        "type".into(),
+                        Value::String(name.strip_prefix(' ').unwrap_or(name).to_owned()),
+                    );
                 }
             }
         }
@@ -1240,6 +1304,7 @@ impl PDRouter {
         )
     }
 
+    #[allow(clippy::result_large_err)]
     fn check_worker_payload(payload: &Value, side: &str) -> Result<(), Response> {
         if let Some(items) = payload.as_array() {
             for item in items {
@@ -1297,6 +1362,7 @@ impl PDRouter {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn check_json_worker_error(body: &[u8], side: &str) -> Result<(), Response> {
         // Don't repeatedly parse large, incomplete logprob arrays on every chunk.
         if matches!(
@@ -1311,6 +1377,7 @@ impl PDRouter {
     }
 
     async fn prepare_decode_stream(
+        &self,
         response: reqwest::Response,
         mut prefill_ready: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<
@@ -1324,11 +1391,9 @@ impl PDRouter {
             .is_some_and(|value| value.starts_with("text/event-stream"));
         let mut stream = response.bytes_stream().boxed();
         let mut prefix = bytes::BytesMut::new();
-        let mut chunks = Vec::new();
-        let mut buffered_bytes = 0;
-        let mut event_start = 0;
+        let mut events = SseEventBuffer::default();
         let mut output_ready = false;
-        'reading: loop {
+        loop {
             // Keep polling decode until prefill completes, even after the first token.
             let next = tokio::select! {
                 biased;
@@ -1337,7 +1402,7 @@ impl PDRouter {
             };
             let Some(chunk) = next else {
                 if is_sse {
-                    output_ready |= Self::decode_event_ready(&prefix[event_start..])?;
+                    Self::decode_event_ready(&events.bytes)?;
                     if !output_ready {
                         rate_limited_log!(WARN, "Decode stream ended before any output");
                         return Err(error::bad_gateway(
@@ -1346,7 +1411,7 @@ impl PDRouter {
                         ));
                     }
                 }
-                return Ok(tokio_stream::iter(chunks.into_iter().map(Ok)).boxed());
+                return Ok(tokio_stream::once(Ok(prefix.freeze())).boxed());
             };
             let chunk = chunk.map_err(|e| {
                 rate_limited_log!(ERROR, error = ?e, "Decode stream failed before forwarding");
@@ -1356,48 +1421,29 @@ impl PDRouter {
                     "Decode worker response could not be read",
                 )
             })?;
-            if chunks.len() >= MAX_PENDING_DECODE_CHUNKS {
-                return Err(error::bad_gateway(
-                    "pd_response_buffer_limit",
-                    "Worker response exceeded the PD buffering limit",
-                ));
-            }
-            Self::check_buffer_capacity(buffered_bytes, chunk.len())?;
-            buffered_bytes += chunk.len();
-            prefix.extend_from_slice(&chunk);
-            chunks.push(chunk);
             if is_sse {
-                loop {
-                    let rest = &prefix[event_start..];
-                    let boundary = [
-                        memmem::find(rest, b"\n\n").map(|i| (i, 2)),
-                        memmem::find(rest, b"\r\n\r\n").map(|i| (i, 4)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .min_by_key(|(i, _)| *i);
-                    let Some((end, delimiter_len)) = boundary else {
-                        break;
-                    };
-                    output_ready |= Self::decode_event_ready(&rest[..end])?;
-                    event_start += end + delimiter_len;
+                let mut input = chunk.as_ref();
+                while let Some(event) = events.next_event(&mut input, self.max_payload_size)? {
+                    output_ready |= Self::decode_event_ready(&event)?;
                     if output_ready && prefill_ready.try_recv().is_ok() {
-                        break 'reading;
+                        return Ok(tokio_stream::iter([Ok(prefix.freeze()), Ok(chunk)])
+                            .chain(stream)
+                            .boxed());
                     }
                 }
-                if event_start > 0 {
-                    let _ = prefix.split_to(event_start);
-                    event_start = 0;
-                }
-            } else {
+            }
+            Self::check_buffer_capacity(prefix.len(), chunk.len(), self.max_payload_size)?;
+            prefix.extend_from_slice(&chunk);
+            if !is_sse {
                 Self::check_json_worker_error(&prefix, "decode")?;
             }
         }
-        Ok(tokio_stream::iter(chunks.into_iter().map(Ok))
+        Ok(tokio_stream::once(Ok(prefix.freeze()))
             .chain(stream)
             .boxed())
     }
 
+    #[allow(clippy::result_large_err)]
     fn decode_event_ready(event: &[u8]) -> Result<bool, Response> {
         let data = Self::sse_data(event);
         if data.trim() == "[DONE]" {
@@ -1501,46 +1547,34 @@ impl PDRouter {
         false
     }
 
-    // Simple helper to merge logprobs in streaming responses
-    // Optimized to reduce allocations in the merge path
     fn merge_streaming_logprobs(
-        prefill_logprobs: Option<Value>,
+        prefill_logprobs: Option<&Value>,
         decode_chunk: &[u8],
     ) -> Result<bytes::Bytes, ()> {
-        // Skip non-data chunks
-        let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
-        if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
+        if Self::sse_data(decode_chunk).trim() == "[DONE]" {
             return Err(());
         }
 
-        // Parse JSON from chunk
-        let json_str = chunk_str.trim_start_matches("data: ").trim();
-        let mut decode_json: Value = serde_json::from_str(json_str).map_err(|_| ())?;
+        let mut decode_json: Value =
+            serde_json::from_str(&Self::sse_data(decode_chunk)).map_err(|_| ())?;
 
-        // Merge prefill logprobs if available
-        if let Some(ref p_logprobs) = prefill_logprobs {
-            if let Some(meta) = decode_json.get_mut("meta_info") {
-                if let Some(d_logprobs) = meta.get_mut("input_token_logprobs") {
-                    if let Some(p_arr) = p_logprobs.as_array() {
-                        // Take ownership of decode array to avoid cloning it
-                        let decode_arr = std::mem::take(d_logprobs);
-                        if let Value::Array(d_vec) = decode_arr {
-                            // Pre-allocate merged array with exact capacity
-                            let mut merged = Vec::with_capacity(p_arr.len() + d_vec.len());
-                            merged.extend(p_arr.iter().cloned());
-                            merged.extend(d_vec);
-                            *d_logprobs = Value::Array(merged);
-                        }
-                    }
-                }
-            }
+        let prefill = prefill_logprobs.and_then(Value::as_array).ok_or(())?;
+        let decode = decode_json
+            .pointer_mut("/meta_info/input_token_logprobs")
+            .and_then(Value::as_array_mut)
+            .ok_or(())?;
+        drop(decode.splice(0..0, prefill.iter().cloned()));
+
+        let mut merged_str = String::new();
+        for line in String::from_utf8_lossy(decode_chunk)
+            .trim_start_matches('\u{feff}')
+            .split(['\r', '\n'])
+            .filter(|line| !line.is_empty() && !line.starts_with("data:"))
+        {
+            merged_str.push_str(line);
+            merged_str.push('\n');
         }
-
-        // Re-serialize
-        let merged_str = format!(
-            "data: {}\n\n",
-            serde_json::to_string(&decode_json).unwrap_or_default()
-        );
+        merged_str.push_str(&format!("data: {decode_json}\n\n"));
         Ok(bytes::Bytes::from(merged_str))
     }
 }
@@ -1886,6 +1920,7 @@ mod tests {
             policy_registry,
             client: Client::new(),
             request_timeout: Duration::from_secs(30),
+            max_payload_size: crate::config::RouterConfig::default().max_payload_size,
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
         }

@@ -4182,6 +4182,9 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        linker_candidates, linker_states = self._prepare_external_linker_admissions(
+            waiting_queue_prefetch_states
+        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4259,7 +4262,7 @@ class Scheduler(
                 continue
             if (
                 self.enable_unified_cache_external_linker
-                and self.tree_cache.prepare_external_linker_load(req) == "pending"
+                and not self._apply_external_linker_admission(req, linker_states)
             ):
                 self._log_waiting_queue_prefetch_event("wait_session")
                 self._trace_prefill_reqs("admission_wait", [req], reason="session")
@@ -4305,6 +4308,9 @@ class Scheduler(
                         req.kv.mamba_pool_idx = None
                 break
 
+        for req in linker_candidates:
+            if linker_states[req.rid] != "pending":
+                self.tree_cache.discard_external_linker_load_admission(req)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
@@ -5656,6 +5662,8 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    if not req.external_kv_abort_requested:
+                        req.external_kv_checkpoint_on_abort = True
                     if not isinstance(req.to_finish, FINISH_ABORT) and not isinstance(
                         req.finished_reason, FINISH_ABORT
                     ):
@@ -6094,9 +6102,8 @@ class Scheduler(
         - disagg_prefill_bootstrap_queue (bootstrapping)
         - result_queue (under overlap, not yet processed)
 
-        The original code only checked batch.reqs, running_batch.reqs, and chunked_req,
-        missing owners in other queues. This caused pool leaks when a failed linker
-        load's second owner was in one of those locations.
+        Waiting matches are candidates for invalidation; only requests with
+        allocated KV or a live cache lock own resources that require an abort.
         """
         groups = [batch.reqs]
 

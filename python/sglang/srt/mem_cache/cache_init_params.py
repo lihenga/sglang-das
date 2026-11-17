@@ -61,3 +61,4 @@ class CacheInitParams:
 
     # Attention-group-local TP ranks need the DP rank for storage isolation.
     dp_rank: int = dataclasses.field(default=0, kw_only=True)
+    enable_external_linker: bool = dataclasses.field(default=False, kw_only=True)

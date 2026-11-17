@@ -291,7 +291,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     shutdown_grace_period_secs: u64,
 
-    /// Maximum payload size in bytes
+    /// Maximum request body and HTTP PD response buffer size in bytes
     #[arg(long, default_value_t = 536870912, help_heading = "Request Handling")]
     max_payload_size: usize,
 

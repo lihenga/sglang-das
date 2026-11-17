@@ -550,6 +550,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
 
     def test_host_prefetch_submission_does_not_prepare_inline(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.session_lease_ttl_s = 30
         linker.host_prefetch_enabled = True
         linker.host_prefetch_limit = 8
         linker.host_prefetch_generation = 0

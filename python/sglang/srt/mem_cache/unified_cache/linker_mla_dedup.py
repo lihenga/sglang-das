@@ -63,6 +63,8 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
             group,
             src_global_rank,
         )
+        # CP shards have different sources even without DP attention.
+        self.is_src = torch.distributed.get_rank() == src_global_rank
         # A physical page cannot be split into smaller rows by _bcast_layer.
         max_row_bytes = max(
             buf.shape[1]

@@ -4,6 +4,7 @@ use std::{
 };
 
 use axum::{routing::post, Json, Router};
+use eventsource_stream::Eventsource;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -74,7 +75,18 @@ fn context(stream: bool) -> PDRequestContext<'static> {
 }
 
 async fn dispatch(p: &str, d: &str, stream: bool) -> Response {
-    let router = create_test_pd_router();
+    dispatch_with_limit(
+        p,
+        d,
+        stream,
+        crate::config::RouterConfig::default().max_payload_size,
+    )
+    .await
+}
+
+async fn dispatch_with_limit(p: &str, d: &str, stream: bool, limit: usize) -> Response {
+    let mut router = create_test_pd_router();
+    router.max_payload_size = limit;
     tokio::time::timeout(
         Duration::from_secs(2),
         router.execute_dual_dispatch_internal(
@@ -241,6 +253,7 @@ async fn worker_5xx_does_not_expose_internal_urls_or_wait_for_body() {
 
 #[tokio::test]
 async fn pending_decode_buffer_limit_cancels_pending_prefill() {
+    const LIMIT: usize = 8192;
     let (prefill, started, closed) = pending_peer().await;
     let decode = serve(Router::new().route(
         "/generate",
@@ -249,9 +262,9 @@ async fn pending_decode_buffer_limit_cancels_pending_prefill() {
             async move {
                 started.notified().await;
                 let event =
-                    bytes::Bytes::from(format!("data: {{\"text\":\"{}\"}}\n\n", "x".repeat(8192)));
+                    bytes::Bytes::from(format!("data: {{\"text\":\"{}\"}}\n\n", "x".repeat(128)));
                 let chunks = tokio_stream::iter(
-                    (0..1025).map(move |_| Ok::<_, std::io::Error>(event.clone())),
+                    (0..128).map(move |_| Ok::<_, std::io::Error>(event.clone())),
                 );
                 (
                     [(CONTENT_TYPE, "text/event-stream")],
@@ -261,7 +274,7 @@ async fn pending_decode_buffer_limit_cancels_pending_prefill() {
         }),
     ))
     .await;
-    let response = dispatch(&prefill.url, &decode.url, true).await;
+    let response = dispatch_with_limit(&prefill.url, &decode.url, true, LIMIT).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         error::extract_error_code_from_response(&response),
@@ -275,6 +288,7 @@ async fn pending_decode_buffer_limit_cancels_pending_prefill() {
 
 #[tokio::test]
 async fn buffered_worker_body_limit_cancels_the_other_worker() {
+    const LIMIT: usize = 8192;
     for failing_side in ["prefill", "decode"] {
         let (pending, started, closed) = pending_peer().await;
         let failed = serve(Router::new().route(
@@ -283,7 +297,7 @@ async fn buffered_worker_body_limit_cancels_the_other_worker() {
                 let started = started.clone();
                 async move {
                     started.notified().await;
-                    Body::from(vec![b'x'; MAX_PD_BUFFER_BYTES + 1])
+                    Body::from(vec![b'x'; LIMIT + 1])
                 }
             }),
         ))
@@ -293,7 +307,7 @@ async fn buffered_worker_body_limit_cancels_the_other_worker() {
         } else {
             (&pending.url, &failed.url)
         };
-        let response = dispatch(p, d, false).await;
+        let response = dispatch_with_limit(p, d, false, LIMIT).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -308,11 +322,14 @@ async fn buffered_worker_body_limit_cancels_the_other_worker() {
 
 #[tokio::test]
 async fn oversized_sse_event_after_headers_returns_error_and_closes() {
-    let router = create_test_pd_router();
+    let mut router = create_test_pd_router();
+    router.max_payload_size = 128;
     let chunks = tokio_stream::iter([
         Ok::<_, reqwest::Error>(bytes::Bytes::from_static(b"data: {\"text\":\"token\"}\n\n")),
-        Ok(bytes::Bytes::from(vec![b'x'; MAX_PD_BUFFER_BYTES + 1])),
+        Ok(bytes::Bytes::from_static(b"data: {\"text\":\"unfinished")),
+        Ok(bytes::Bytes::from(vec![b'x'; router.max_payload_size])),
     ]);
+    let decode = worker("http://decode", WorkerType::Decode);
     let response = router.create_streaming_response(
         chunks,
         StatusCode::OK,
@@ -325,21 +342,366 @@ async fn oversized_sse_event_after_headers_returns_error_and_closes() {
                 bootstrap_port: None,
             },
         ),
-        worker("http://decode", WorkerType::Decode),
+        decode.clone(),
         None,
     );
     assert_eq!(response.status(), StatusCode::OK);
-    let body = tokio::time::timeout(
-        Duration::from_secs(1),
-        axum::body::to_bytes(response.into_body(), usize::MAX),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("token"));
-    assert!(body.contains("buffering limit"));
-    assert!(body.contains("\"code\":502"));
+    let mut events = response.into_body().into_data_stream().eventsource();
+    let token = events.next().await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&token.data).unwrap()["text"],
+        "token"
+    );
+    let failure = tokio::time::timeout(Duration::from_secs(1), events.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        failure.is_err(),
+        "overflow must reach the SSE client as a transport error"
+    );
+    assert_eq!(decode.circuit_breaker().total_failures(), 1);
+    assert_eq!(decode.circuit_breaker().total_successes(), 0);
+}
+
+#[tokio::test]
+async fn sse_event_limit_is_independent_of_http_chunk_boundaries() {
+    for newline in ["\n", "\r\n", "\r"] {
+        let wire = format!(
+            "\u{feff}: comment{newline}id: 7{newline}event: message{newline}\
+             data: {{\"text\":{newline}data: \"data: [DONE] 你好\"}}{newline}{newline}\
+             data: {{\"text\":\"second\"}}{newline}{newline}\
+             data: [DONE]{newline}{newline}"
+        );
+        for chunk_size in [1, 11, wire.len()] {
+            let mut router = create_test_pd_router();
+            router.max_payload_size = 110;
+            assert!(wire.len() > router.max_payload_size);
+            let chunks: Vec<_> = wire
+                .as_bytes()
+                .chunks(chunk_size)
+                .map(|part| Ok::<_, reqwest::Error>(bytes::Bytes::copy_from_slice(part)))
+                .collect();
+            let stream = tokio_stream::iter(chunks).chain(futures_util::stream::pending());
+            let response = router.create_streaming_response(
+                stream,
+                StatusCode::OK,
+                None,
+                false,
+                None,
+                worker(
+                    "http://prefill",
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ),
+                worker("http://decode", WorkerType::Decode),
+                None,
+            );
+            // eventsource-stream 0.2.3 slices a leading BOM at byte 1 and panics.
+            // Check and strip only that BOM on the client side; keep all other boundaries.
+            let mut bom = "\u{feff}".as_bytes();
+            let client_stream = response.into_body().into_data_stream().map(move |chunk| {
+                chunk.map(|chunk| {
+                    let len = chunk.len().min(bom.len());
+                    assert_eq!(&chunk[..len], &bom[..len]);
+                    bom = &bom[len..];
+                    chunk.slice(len..)
+                })
+            });
+            let events = tokio::time::timeout(
+                Duration::from_secs(1),
+                client_stream.eventsource().collect::<Vec<_>>(),
+            )
+            .await
+            .expect("a split terminal event must close the stream");
+            let events: Vec<_> = events.into_iter().map(Result::unwrap).collect();
+            assert_eq!(
+                events.len(),
+                3,
+                "newline={newline:?}, chunk_size={chunk_size}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&events[0].data).unwrap()["text"],
+                "data: [DONE] 你好"
+            );
+            assert_eq!(events[0].id, "7");
+            assert_eq!(
+                serde_json::from_str::<Value>(&events[1].data).unwrap()["text"],
+                "second"
+            );
+            assert_eq!(events[2].data, "[DONE]");
+        }
+    }
+}
+
+#[test]
+fn split_bom_preserves_the_first_sse_data_field() {
+    for newline in ["\n", "\r\n", "\r"] {
+        let payload = json!({"text": "你好"});
+        let wire =
+            format!("\u{feff}data: {payload}{newline}{newline}data: [DONE]{newline}{newline}");
+        for chunk_size in [1, 2, wire.len()] {
+            let mut buffer = SseEventBuffer::default();
+            let mut events = Vec::new();
+            for mut chunk in wire.as_bytes().chunks(chunk_size) {
+                while let Some(event) = buffer.next_event(&mut chunk, wire.len()).unwrap() {
+                    events.push(event);
+                }
+            }
+            assert_eq!(
+                events.len(),
+                2,
+                "newline={newline:?}, chunk_size={chunk_size}"
+            );
+            assert!(events[0].starts_with("\u{feff}data:".as_bytes()));
+            assert_eq!(PDRouter::sse_payload(&events[0]).unwrap(), payload);
+            assert!(PDRouter::decode_event_ready(&events[0]).unwrap());
+            assert!(!PDRouter::check_prefill_event(&events[0]).unwrap());
+            assert_eq!(PDRouter::sse_data(&events[1]), "[DONE]");
+            assert!(PDRouter::decode_event_ready(&events[1]).unwrap());
+            assert!(PDRouter::check_prefill_event(&events[1]).unwrap());
+        }
+    }
+}
+
+#[tokio::test]
+async fn sse_event_limit_accumulates_across_chunks_and_accepts_exact_limit() {
+    let event = "data: {\"text\":\"token\"}\r\n";
+    let wire = format!("{event}\r\n");
+    for limit in [event.len() - 1, event.len()] {
+        for chunk_size in [1, wire.len()] {
+            let mut router = create_test_pd_router();
+            router.max_payload_size = limit;
+            let chunks: Vec<_> = wire
+                .as_bytes()
+                .chunks(chunk_size)
+                .map(|part| Ok::<_, reqwest::Error>(bytes::Bytes::copy_from_slice(part)))
+                .collect();
+            let response = router.create_streaming_response(
+                tokio_stream::iter(chunks),
+                StatusCode::OK,
+                None,
+                false,
+                None,
+                worker(
+                    "http://prefill",
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                ),
+                worker("http://decode", WorkerType::Decode),
+                None,
+            );
+            let mut events = response.into_body().into_data_stream().eventsource();
+            let event = events.next().await.unwrap();
+            assert_eq!(
+                event.is_ok(),
+                limit == wire.len() - 2,
+                "limit={limit}, chunk_size={chunk_size}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn ready_prefill_does_not_limit_the_size_of_a_decode_http_chunk() {
+    let wire = format!(
+        "{}data: [DONE]\n\n",
+        "data: {\"text\":\"token\"}\n\n".repeat(20)
+    );
+    let expected = wire.clone();
+    let decode = serve(Router::new().route(
+        "/generate",
+        post(move || {
+            let wire = wire.clone();
+            async move { ([(CONTENT_TYPE, "text/event-stream")], wire) }
+        }),
+    ))
+    .await;
+    let mut router = create_test_pd_router();
+    router.max_payload_size = 64;
+    let response = router
+        .client
+        .post(format!("{}/generate", decode.url))
+        .send()
+        .await
+        .unwrap();
+    let (ready, receiver) = oneshot::channel();
+    ready.send(()).unwrap();
+    let stream = router
+        .prepare_decode_stream(response, receiver)
+        .await
+        .expect("ready prefill must bypass the pending-output buffer limit");
+    let response = router.create_streaming_response(
+        stream,
+        StatusCode::OK,
+        None,
+        false,
+        None,
+        worker(
+            "http://prefill",
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ),
+        worker(&decode.url, WorkerType::Decode),
+        None,
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), expected.as_bytes());
+}
+
+#[tokio::test]
+async fn prefill_sse_limits_events_unless_logprobs_require_retaining_the_body() {
+    let wire = format!("{}data: [DONE]\n\n", "data: {\"text\":\"\"}\n\n".repeat(20));
+    let prefill = serve(Router::new().route(
+        "/generate",
+        post(move || {
+            let wire = wire.clone();
+            async move { ([(CONTENT_TYPE, "text/event-stream")], wire) }
+        }),
+    ))
+    .await;
+    let mut router = create_test_pd_router();
+    router.max_payload_size = 64;
+    for return_logprob in [false, true] {
+        let response = router
+            .client
+            .post(format!("{}/generate", prefill.url))
+            .send()
+            .await;
+        let result = router
+            .process_prefill_response(response, &prefill.url, return_logprob)
+            .await;
+        if return_logprob {
+            assert_eq!(result.unwrap_err().status(), StatusCode::BAD_GATEWAY);
+        } else {
+            assert_eq!(result.unwrap().0, StatusCode::OK);
+        }
+    }
+}
+
+#[tokio::test]
+async fn unterminated_sse_is_not_output_and_cancels_pending_prefill() {
+    for wire in ["data: [DONE]", "data: {\"text\":\"token\"}\n"] {
+        let (prefill, started, closed) = pending_peer().await;
+        let decode = serve(Router::new().route(
+            "/generate",
+            post(move || {
+                let started = started.clone();
+                async move {
+                    started.notified().await;
+                    ([(CONTENT_TYPE, "text/event-stream")], wire)
+                }
+            }),
+        ))
+        .await;
+        assert_eq!(
+            dispatch(&prefill.url, &decode.url, true).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn streaming_logprob_merge_preserves_sse_fields_and_chunk_independence() {
+    let wire = "id: 9\r\nevent: message\r\ndata: {\"text\":\"[DONE] 你好\",\r\n\
+                data: \"meta_info\":{\"input_token_logprobs\":[[0.2,2,\"d\"]]}}\r\n\r\n\
+                data: [DONE]\r\n\r\n";
+    for chunk_size in [1, wire.len()] {
+        let router = create_test_pd_router();
+        let chunks: Vec<_> = wire
+            .as_bytes()
+            .chunks(chunk_size)
+            .map(|part| Ok::<_, reqwest::Error>(bytes::Bytes::copy_from_slice(part)))
+            .collect();
+        let response = router.create_streaming_response(
+            tokio_stream::iter(chunks),
+            StatusCode::OK,
+            Some(json!([[0.1, 1, "p"]])),
+            true,
+            None,
+            worker(
+                "http://prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ),
+            worker("http://decode", WorkerType::Decode),
+            None,
+        );
+        let events: Vec<_> = response
+            .into_body()
+            .into_data_stream()
+            .eventsource()
+            .collect()
+            .await;
+        let events: Vec<_> = events.into_iter().map(Result::unwrap).collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "message");
+        assert_eq!(events[0].id, "9");
+        let payload: Value = serde_json::from_str(&events[0].data).unwrap();
+        assert_eq!(payload["text"], "[DONE] 你好");
+        assert_eq!(
+            payload["meta_info"]["input_token_logprobs"],
+            json!([[0.1, 1, "p"], [0.2, 2, "d"]])
+        );
+        assert!(payload.get("type").is_none());
+        assert_eq!(events[1].data, "[DONE]");
+    }
+}
+
+#[tokio::test]
+async fn default_limit_accepts_logprob_bodies_larger_than_eight_mib() {
+    let payload = Json(json!({
+        "text": "token", "padding": "x".repeat(8 * 1024 * 1024),
+        "meta_info": {"input_token_logprobs": [[0.1, 1, "p"]]}
+    }));
+    let prefill = serve(Router::new().route(
+        "/generate",
+        post(move || {
+            let payload = payload.clone();
+            async move { payload }
+        }),
+    ))
+    .await;
+    let router = create_test_pd_router();
+    let mut ctx = context(false);
+    ctx.return_logprob = true;
+    let response = router
+        .execute_dual_dispatch_internal(
+            None,
+            json!({"text":"prompt", "return_logprob":true}),
+            ctx,
+            worker(
+                &prefill.url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ),
+            worker(&prefill.url, WorkerType::Decode),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["meta_info"]["input_token_logprobs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -826,7 +1188,7 @@ async fn broken_body() -> TestServer {
     let task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = [0; 8192];
-        socket.read(&mut buf).await.unwrap();
+        assert!(socket.read(&mut buf).await.unwrap() > 0);
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
             .await

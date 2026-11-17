@@ -426,7 +426,10 @@ class MooncakePrefetchSchedulerMixin:
         prefetch_local = self._waiting_queue_prefetch_configured() and linker_prefetch
         # Forward ingress matches (and may split) radix nodes while the
         # forward runs; KV canary's sweep walks them from the forward thread.
-        ingress_local = str(get_observability().kv_canary).strip().lower() == "none"
+        ingress_local = (
+            str(get_observability().kv_canary).strip().lower() == "none"
+            and self.input_blocker is None
+        )
         final_poll_on, final_poll_valid = False, True
         final_poll_timeout_ms = 0.0
         if (
@@ -478,7 +481,7 @@ class MooncakePrefetchSchedulerMixin:
         if enabled and not forward_ingress:
             logger.info(
                 "Waiting-queue DFS prefetch runs without receiving requests "
-                "during forward because KV canary is enabled."
+                "during forward because KV canary or the input blocker is enabled."
             )
         return enabled, forward_ingress
 
@@ -677,6 +680,39 @@ class MooncakePrefetchSchedulerMixin:
             if req.external_kv_response_sent:
                 pending.pop(id(req), None)
 
+    def _prepare_external_linker_admissions(self, prefetch_states):
+        candidates = []
+        if self.enable_unified_cache_external_linker:
+            for req in self.waiting_queue:
+                if (
+                    prefetch_states is not None
+                    and prefetch_states.get(req.rid) == "pending"
+                ):
+                    continue
+                # Admission needs hashes only; allocation/COW stays with the adder.
+                req.init_next_round_input(self.tree_cache, cow_mamba=False)
+                candidates.append(req)
+                if len(candidates) == 64:
+                    break
+        states = (
+            self.tree_cache.prepare_external_linker_loads(candidates)
+            if candidates
+            else []
+        )
+        return candidates, {req.rid: state for req, state in zip(candidates, states)}
+
+    def _apply_external_linker_admission(self, req, states) -> bool:
+        """Keep a failed async verdict authoritative after the final rematch."""
+        state = states.get(req.rid, "pending")
+        if state == "pending":
+            return False
+        if state == "failed":
+            self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
+            req.host_hit_length = req.swa_host_hit_length = (
+                req.mamba_host_hit_length
+            ) = 0
+        return True
+
     def _all_reduce_mooncake_cleanup(self, tensor, op) -> None:
         if (
             not self._coordinated_kv_cleanup
@@ -689,7 +725,9 @@ class MooncakePrefetchSchedulerMixin:
                 torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _forward_with_waiting_queue_ingress(self, batch, **fwd_kwargs):
-        if not self._forward_ingress_enabled:
+        if not self._forward_ingress_enabled or not (
+            batch.forward_mode.is_extend() or batch.is_extend_in_batch
+        ):
             return self.model_worker.forward_batch_generation(batch, **fwd_kwargs)
 
         # Keep the scheduler as the sole owner of its sockets, requests, and

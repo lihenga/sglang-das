@@ -619,6 +619,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.external_kv_quarantined_reqs = Gauge(
+            name="sglang:external_kv_quarantined_reqs",
+            documentation="Requests retained after an unknown external KV cleanup result.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.decode_deferred_kv_release_seconds = Histogram(
             name="sglang:decode_deferred_kv_release_seconds",
             documentation="Histogram of time spent holding deferred decode KV releases.",
@@ -1457,6 +1463,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def set_external_kv_quarantined_reqs(self, count: int) -> None:
+        self.external_kv_quarantined_reqs.labels(**self.labels).set(count)
 
     def increment_decode_host_receive_reqs(self) -> None:
         self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)

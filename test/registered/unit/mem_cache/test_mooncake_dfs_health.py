@@ -6,6 +6,8 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from sglang.srt.environ import envs
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 _MODULE_PATH = (
     Path(__file__).parents[4]
@@ -38,10 +40,7 @@ class _FakeStore:
         return 0
 
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class MooncakeDfsHealthManagerTest(CustomTestCase):
@@ -103,6 +102,22 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "probe_timeout_s must be positive"):
             resolve_dfs_health_config()
 
+    def test_unknown_initial_native_policy_prevents_client_startup(self):
+        """Clients must not warm up unless native fail-closed setup is confirmed."""
+
+        class Store(_FakeStore):
+            def set_dfs_access_policy(self, read, write):
+                return -1
+
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                with self.assertRaisesRegex(
+                    RuntimeError, "set_dfs_access_policy failed"
+                ):
+                    MooncakeDfsHealthManager(
+                        Store([], []), defer_policy_application=deferred
+                    )
+
     def _manager(self, read_probes, write_probes):
         env = {
             "SGLANG_MOONCAKE_DFS_HEALTH_FAILURE_THRESHOLD": "2",
@@ -113,6 +128,17 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
             getattr(envs, name).set(value)
         store = _FakeStore(read_probes, write_probes)
         return store, MooncakeDfsHealthManager(store)
+
+    def _wait_for_policy(self, manager, policy):
+        with manager._policy_condition:
+            self.assertTrue(
+                manager._policy_condition.wait_for(
+                    lambda: manager._effective_policy == policy
+                    and not manager._policy_dirty,
+                    timeout=3,
+                ),
+                f"native policy did not converge to {policy}",
+            )
 
     def test_write_degrades_without_disabling_dfs_read(self):
         store, manager = self._manager(
@@ -161,6 +187,7 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
             },
             defer_policy_application=True,
         )
+        self.addCleanup(manager.close)
 
         snapshot = manager.probe_once()
         self.assertEqual(snapshot.read_state, AVAILABLE)
@@ -169,8 +196,121 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         self.assertEqual(store.policies, [(False, False)])
 
         manager.apply_effective_policy(True, False)
+        self._wait_for_policy(manager, (True, False))
         manager.apply_effective_policy(True, False)
         self.assertEqual(store.policies, [(False, False), (True, False)])
+
+    def test_deferred_stuck_policy_coalesces_updates_without_blocking_scheduler(self):
+        """A pending native call must not block polls or overwrite a newer target."""
+        entered = threading.Event()
+        release = threading.Event()
+        submitted = threading.Event()
+
+        class Store(_FakeStore):
+            def set_dfs_access_policy(self, read, write):
+                self.policies.append((read, write))
+                if (read, write) == (True, True):
+                    entered.set()
+                    release.wait()
+                return 0
+
+        store = Store([], [])
+        manager = MooncakeDfsHealthManager(store, defer_policy_application=True)
+        self.addCleanup(manager.close)
+        self.addCleanup(release.set)
+
+        def publish():
+            manager.apply_effective_policy(True, True)
+            submitted.set()
+
+        publisher = threading.Thread(target=publish, daemon=True)
+        publisher.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(submitted.wait(1), "scheduler waited for a native RPC")
+            worker = manager._policy_thread
+            for _ in range(10):
+                manager.apply_effective_policy(False, True)
+                manager.apply_effective_policy(True, False)
+            manager.apply_effective_policy(False, False)
+            self.assertIs(manager._policy_thread, worker)
+            self.assertEqual(store.policies, [(False, False), (True, True)])
+            # Rank-local probes remain independent of a pending policy RPC.
+            self.assertEqual(manager.local_policy(), (False, False))
+            release.set()
+            self._wait_for_policy(manager, (False, False))
+            self.assertEqual(
+                store.policies, [(False, False), (True, True), (False, False)]
+            )
+        finally:
+            release.set()
+            publisher.join(timeout=1)
+
+    def test_deferred_policy_retries_without_scheduler_or_probe_calls(self):
+        """A failed native update must recover even when no scheduler polls follow."""
+        failed = threading.Event()
+
+        class Store(_FakeStore):
+            def set_dfs_access_policy(self, read, write):
+                self.policies.append((read, write))
+                if len(self.policies) == 2:
+                    failed.set()
+                    raise RuntimeError("lost native reply")
+                return 0
+
+        store = Store([], [])
+        manager = MooncakeDfsHealthManager(
+            store, {"probe_interval_s": 1}, defer_policy_application=True
+        )
+        self.addCleanup(manager.close)
+        self.assertFalse(manager.apply_effective_policy(True, False))
+        self.assertTrue(failed.wait(1))
+        self._wait_for_policy(manager, (True, False))
+        self.assertEqual(store.policies, [(False, False), (True, False), (True, False)])
+
+    def test_deferred_close_is_bounded_with_a_stuck_native_policy(self):
+        """Closing must not join an uninterruptible native RPC indefinitely."""
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+
+        class Store(_FakeStore):
+            def set_dfs_access_policy(self, read, write):
+                self.policies.append((read, write))
+                if read:
+                    entered.set()
+                    release.wait()
+                return 0
+
+        store = Store([], [])
+        manager = MooncakeDfsHealthManager(store, defer_policy_application=True)
+        self.addCleanup(manager.close)
+        self.addCleanup(release.set)
+        publisher = threading.Thread(
+            target=lambda: manager.apply_effective_policy(True, True), daemon=True
+        )
+
+        def close():
+            manager.close()
+            closed.set()
+
+        closer = threading.Thread(target=close, daemon=True)
+        publisher.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            closer.start()
+            self.assertTrue(closed.wait(2), "close waited for a stuck native RPC")
+            self.assertFalse(release.is_set())
+            self.assertTrue(manager._policy_thread.is_alive())
+            self.assertFalse(manager.apply_effective_policy(False, False))
+        finally:
+            release.set()
+            publisher.join(timeout=1)
+            if closer.ident is not None:
+                closer.join(timeout=1)
+        manager._policy_thread.join(timeout=1)
+        self.assertFalse(manager._policy_thread.is_alive())
+        self.assertEqual(store.policies, [(False, False), (True, True)])
 
     def test_stuck_read_does_not_block_or_fail_write_probe(self):
         release_read = threading.Event()
@@ -337,26 +477,36 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         self,
     ):
         """A lost disable reply must not make re-enable skip its native update."""
-        store = _FakeStore([], [])
-        manager = MooncakeDfsHealthManager(store, defer_policy_application=True)
-        self.assertTrue(manager.apply_effective_policy(True, True))
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                disabled = threading.Event()
 
-        def lost_reply(read, write):
-            store.policies.append((read, write))
-            return -1
+                class Store(_FakeStore):
+                    def set_dfs_access_policy(self, read, write):
+                        self.policies.append((read, write))
+                        if not read and not write and len(self.policies) > 1:
+                            # The native side applied the disable, but its reply
+                            # was lost. Returning to the old target needs an RPC.
+                            disabled.set()
+                            return -1
+                        return 0
 
-        store.set_dfs_access_policy = lost_reply
-        with self.assertLogs(level="WARNING"):
-            self.assertFalse(manager.apply_effective_policy(False, False))
-        self.assertEqual(manager._effective_policy, (True, True))
-        self.assertTrue(manager._policy_dirty)
-        store.set_dfs_access_policy = lambda read, write: (
-            store.policies.append((read, write)),
-            0,
-        )[1]
-        self.assertTrue(manager.apply_effective_policy(True, True))
-        self.assertEqual(store.policies[-2:], [(False, False), (True, True)])
-        self.assertFalse(manager._policy_dirty)
+                store = Store([], [])
+                manager = MooncakeDfsHealthManager(
+                    store,
+                    {"probe_interval_s": 1},
+                    defer_policy_application=deferred,
+                )
+                self.addCleanup(manager.close)
+                manager.apply_effective_policy(True, True)
+                self._wait_for_policy(manager, (True, True))
+                self.assertFalse(manager.apply_effective_policy(False, False))
+                self.assertTrue(disabled.wait(1))
+                self.assertEqual(manager._effective_policy, (True, True))
+                self.assertTrue(manager._policy_dirty)
+                manager.apply_effective_policy(True, True)
+                self._wait_for_policy(manager, (True, True))
+                self.assertEqual(store.policies[-2:], [(False, False), (True, True)])
 
 
 if __name__ == "__main__":

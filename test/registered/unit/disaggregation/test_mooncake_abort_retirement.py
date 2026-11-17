@@ -4,6 +4,7 @@ import __future__
 
 import ast
 import logging
+import time
 import unittest
 from http import HTTPStatus
 from pathlib import Path
@@ -58,6 +59,7 @@ def _owner(calls, *, fail_release=False):
             "abort_external_kv_request",
             "handle_inflight_transfer_failure",
             "_quarantine_external_kv_request",
+            "_log_external_kv_cleanup_failure",
         }
     ]
 
@@ -89,6 +91,7 @@ def _owner(calls, *, fail_release=False):
         "maybe_release_metadata_buffer": lambda *args: calls.append("metadata"),
         "prepare_abort": Mock(),
         "logger": logging.getLogger(__name__),
+        "time": time,
     }
     exec(
         compile(
@@ -102,6 +105,9 @@ def _owner(calls, *, fail_release=False):
     owner = SimpleNamespace(
         _coordinated_kv_cleanup=True,
         _quarantined_external_kv_requests={},
+        _external_kv_quarantine_limit=4096,
+        _external_kv_cleanup_warning_at=float("-inf"),
+        _external_kv_cleanup_suppressed_warnings=0,
         _external_kv_chunked_abort_reqs={},
         waiting_queue=[],
         chunked_req=None,

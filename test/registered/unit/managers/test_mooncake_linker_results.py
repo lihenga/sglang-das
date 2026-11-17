@@ -58,6 +58,8 @@ class TestMooncakeLinkerResults(CustomTestCase):
         linker.load_queue = queue.Queue()
         linker.completed_loads = queue.Queue()
         linker.load_batch_futures = {}
+        linker.load_batch_cleanup_futures = {}
+        linker.follower_cleanup_outcomes = {}
         linker.broadcast_loads = {}
         linker.broadcast_outcomes, linker.broadcast_failed, linker.broadcast_events = (
             {},
@@ -255,6 +257,8 @@ class TestMooncakeLinkerResults(CustomTestCase):
                     to_finish=None,
                     finished_reason=FINISH_LENGTH(0),
                     disagg_kv_sender=Mock(),
+                    external_kv_abort_requested=False,
+                    external_kv_checkpoint_on_abort=False,
                 )
                 owner = Mock()
                 owner.chunked_req = owner.mm_receiver = owner.dllm_config = None
@@ -275,6 +279,7 @@ class TestMooncakeLinkerResults(CustomTestCase):
                         req.to_finish.status_code, HTTPStatus.SERVICE_UNAVAILABLE
                     )
                 req.disagg_kv_sender.abort.assert_called_once()
+                self.assertTrue(req.external_kv_checkpoint_on_abort)
 
 
 if __name__ == "__main__":

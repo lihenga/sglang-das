@@ -1,6 +1,7 @@
 """Metrics for --mooncake-enable-waiting-queue-dfs-prefetch only."""
 
 import threading
+import types
 import unittest
 from functools import partial
 from queue import Queue
@@ -124,6 +125,46 @@ class TestWaitingQueuePrefetchMetrics(CustomTestCase):
         self.linker.host_prefetch_enabled = False
         self.assertFalse(self.linker.submit_host_prefetch("other", self.transfers))
         self.assertEqual(self.sample("events_total", event="submitted"), 1)
+
+    def test_session_quarantine_retry_and_recovery_are_observable(self):
+        """A transient cleanup error is counted, retained, retried and recovered."""
+        del self.linker._abort_prepared_load_now
+        end = Mock(return_value=-1)
+        self.linker.storage = types.SimpleNamespace(
+            store=types.SimpleNamespace(batch_get_session_end=end)
+        )
+        self.linker.prepared_load_sessions["r"] = ["key"]
+        self.linker.session_refcounts["key"] = 1
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(self.linker._abort_prepared_load_now("r"))
+        state = self.linker.get_session_cleanup_state()
+        self.assertEqual(state["quarantined_requests"], 1)
+        self.assertEqual(state["quarantined_keys"], 1)
+        self.assertEqual(
+            self.sample("events_total", event="session_cleanup_quarantined"), 1
+        )
+        self.linker.host_prefetch_limit = 1
+        self.assertEqual(
+            self.linker.revalidate_load_async("other", self.transfers), "failed"
+        )
+        self.assertEqual(
+            self.sample("events_total", event="session_cleanup_backpressure"), 1
+        )
+        self.assertEqual(self.linker.prepared_load_sessions, {"r": ["key"]})
+        self.assertEqual(self.linker.session_refcounts, {"key": 1})
+        self.assertEqual(self.linker.session_jobs, {})
+        end.return_value = 0
+        self.assertTrue(self.linker._abort_prepared_load_now("r"))
+        state = self.linker.get_session_cleanup_state()
+        self.assertEqual(state["quarantined_requests"], 0)
+        self.assertEqual(state["quarantined_keys"], 0)
+        self.assertEqual(
+            (state["failures"], state["retries"], state["recovered"]), (1, 1, 1)
+        )
+        self.assertEqual(self.sample("events_total", event="session_cleanup_retry"), 1)
+        self.assertEqual(
+            self.sample("events_total", event="session_cleanup_recovered"), 1
+        )
 
     def test_release_of_dispatched_load_preserves_completion_metrics(self):
         self.linker.pending_loads = {}

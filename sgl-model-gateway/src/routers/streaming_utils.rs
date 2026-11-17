@@ -30,12 +30,13 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
+use futures_util::Stream;
+
 use crate::{
     core::Worker,
     observability::{logging::rate_limited_log, metrics::Metrics},
 };
-use bytes::Bytes;
-use futures_util::Stream;
 
 /// Retain a small probe for normal events and a bounded error line for logging.
 #[derive(Default)]

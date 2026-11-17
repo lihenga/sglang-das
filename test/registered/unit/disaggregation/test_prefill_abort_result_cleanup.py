@@ -316,6 +316,41 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
 
 
 class TestPrefillCompleteResult(CustomTestCase):
+    def test_unknown_cleanup_quarantine_cannot_grow_past_its_limit(self):
+        scheduler = _Scheduler()
+        scheduler._external_kv_quarantine_limit = 1
+        retained = _Req(inflight_middle_chunks=0)
+        scheduler._quarantined_external_kv_requests[id(retained)] = retained
+        req = _Req(inflight_middle_chunks=0)
+        with self.assertRaisesRegex(RuntimeError, "quarantine capacity"):
+            scheduler._quarantine_external_kv_request(req)
+        self.assertEqual(
+            scheduler._quarantined_external_kv_requests, {id(retained): retained}
+        )
+
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    def test_notification_backpressure_retains_cleanup_owner(self, release_kv_cache):
+        scheduler, req = _Scheduler(), _Req(inflight_middle_chunks=0)
+        req.disagg_kv_sender.notify_drained_abort.side_effect = [False, True]
+        self.assertFalse(
+            scheduler.abort_external_kv_request(
+                req, forward_drained=True, sender_terminal=True, emit_response=True
+            )
+        )
+        self.assertIs(scheduler._mooncake_cleanup_requests[id(req)], req)
+        self.assertFalse(req.external_kv_cleanup_done)
+        self.assertTrue(req.kv.holds_kv)
+        scheduler.output_streamer.stream_output.assert_not_called()
+        release_kv_cache.assert_not_called()
+        self.assertTrue(
+            scheduler.abort_external_kv_request(
+                req, forward_drained=True, sender_terminal=True, emit_response=True
+            )
+        )
+        self.assertTrue(req.external_kv_cleanup_done)
+        self.assertFalse(req.kv.holds_kv)
+        scheduler.output_streamer.stream_output.assert_called_once()
+
     def setUp(self):
         super().setUp()
         override = get_context().override_server_args(

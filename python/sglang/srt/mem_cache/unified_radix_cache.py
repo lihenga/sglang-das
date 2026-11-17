@@ -3529,19 +3529,24 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
-        self._sync_dfs_health_policy()
         if self.linker is not None:
+            policy_owner, local_policy = self._local_dfs_health_policy()
             self.linker.poll_session_cleanup()
             finish_counts = torch.tensor(
                 [
                     self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
+                    *(local_policy or ()),
                 ],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            load_count, offload_count = map(int, finish_counts[:2].tolist())
+            if local_policy is not None:
+                policy_owner.apply_dfs_health_policy(
+                    *(bool(value) for value in finish_counts[2:].tolist())
+                )
             self._collect_failed_linker_loads(load_count)
             self.retry_stranded_failed_linker_chains()
             local_successes = self.linker.take_completed_offloads(offload_count)
@@ -3553,6 +3558,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
+        self._sync_dfs_health_policy()
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
@@ -3861,19 +3867,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self.linker.disable_waiting_queue_prefetch()
 
-    def prefetch_external_linker_to_host(self, req) -> bool:
-        if self.linker is None:
-            return False
-        return self.linker.prefetch_to_host(req)
-
     def prepare_external_linker_prefetch(self, req) -> Optional[PreparedHostPrefetch]:
         if self.linker is None:
             return None
         return self.linker.prepare_host_prefetch(req)
 
-    def prepare_external_linker_load(self, req) -> str:
+    def prepare_external_linker_loads(self, reqs) -> list[str]:
         return (
-            "ready" if self.linker is None else self.linker.prepare_load_admission(req)
+            ["ready"] * len(reqs)
+            if self.linker is None
+            else self.linker.prepare_load_admissions(reqs)
         )
 
     def discard_external_linker_load_admission(self, req) -> None:
@@ -3888,10 +3891,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 job.cache_linker.cancel_host_prefetch(job.rid)
             return False
         return self.linker.complete_host_prefetch_submission(job, submitted)
-
-    def get_waiting_queue_prefetch_admission_state(self, rid: str) -> str:
-        """Return one rank-wide admission state for a queued DFS prefetch."""
-        return self.get_waiting_queue_prefetch_admission_states([rid])[rid]
 
     def get_waiting_queue_prefetch_admission_states(
         self, rids: Sequence[str] | None = None
@@ -3976,15 +3975,15 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self.linker.cancel_waiting_queue_prefetch(rid)
 
-    def _sync_dfs_health_policy(self) -> None:
-        """Apply one conservative DFS policy across all attention ranks."""
+    def _local_dfs_health_policy(self):
+        """Resolve health capability once before joining scheduler collectives."""
         owner = self.linker
         if owner is None and self.cache_controller is not None:
             owner = self.cache_controller.storage_backend
         getter = getattr(owner, "get_local_dfs_health_policy", None)
         apply_policy = getattr(owner, "apply_dfs_health_policy", None)
         if not callable(getter) or not callable(apply_policy):
-            return
+            return owner, None
         local_policy = getter()
         if self._dfs_policy_sync_enabled is None:
             available = int(local_policy is not None)
@@ -3996,14 +3995,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             self._dfs_policy_sync_enabled = bool(agreement[0])
         if not self._dfs_policy_sync_enabled:
-            return
+            return owner, None
         if local_policy is None:
             raise RuntimeError(
                 "Mooncake DFS health manager disappeared after startup agreement"
             )
-        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
-        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
-        apply_policy(*(bool(value) for value in effective.tolist()))
+        return owner, local_policy
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across all attention ranks."""
+        owner, local_policy = self._local_dfs_health_policy()
+        if local_policy is not None:
+            effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+            self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+            owner.apply_dfs_health_policy(
+                *(bool(value) for value in effective.tolist())
+            )
 
     def drain_linker_loads(self, *, wait_for_completion: bool = False) -> list[str]:
         """Retire finished linker loads and return the rids that must abort.
@@ -4108,7 +4115,7 @@ class UnifiedRadixCache(BasePrefixCache):
         This method provides a way to periodically retry the reclaim without
         waiting for a specific request to call cache_finished_req().
 
-        Called from the scheduler's idle loop or after processing disagg queues.
+        Called while draining HiCache events in each scheduler iteration.
         """
         if self.linker is None:
             return

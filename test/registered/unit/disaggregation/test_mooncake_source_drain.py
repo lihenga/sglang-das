@@ -7,9 +7,13 @@ import time
 import unittest
 from collections import OrderedDict, defaultdict
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common.conn import AbortAck, AbortNotification
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.mooncake.notifications import DrainedAbortNotifier
 from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -66,6 +70,76 @@ class TestMooncakeSourceDrain(CustomTestCase):
         tracker.publish(SimpleNamespace(room=9), work, lambda: False)
         self.assertTrue(work.empty())
         self.assertTrue(tracker.drained(9))
+
+    def test_abort_after_sender_retirement_retries_when_notifier_capacity_returns(self):
+        """A single late ABORT gets its ACK without a sender or chunk callback."""
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager._stopped = False
+        manager.deferred_bootstrap = None
+        manager.enable_deferred_decode_kv_release = True
+        manager.bootstrap_timeout = manager.waiting_timeout = 10
+        manager.request_status = {}
+        manager._staging_outstanding = {}
+        manager._source_drain = SourceDrainTracker()
+        manager._deferred_ack_targets = {}
+        manager._deferred_ack_poisoned_rooms = set()
+        manager._prefill_unique_rank = lambda: 0
+        entered, release, delivered = (threading.Event() for _ in range(3))
+        expected = tuple(AbortAck(9, 0, 17).to_zmq())
+        wire = []
+
+        class Socket:
+            def setsockopt(self, *args):
+                pass
+
+            def connect(self, endpoint):
+                pass
+
+            def close(self, **kwargs):
+                pass
+
+            def send_multipart(self, parts, flags):
+                message = tuple(parts)
+                wire.append(message)
+                if message == (b"blocker",):
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("test did not release the full queue")
+                if message == expected:
+                    delivered.set()
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.notifications.zmq.Context.instance",
+            return_value=SimpleNamespace(socket=lambda *_: Socket()),
+        ):
+            notifier = DrainedAbortNotifier(
+                capacity=1, retry_pending=manager._retry_pending_control_notifications
+            )
+            manager._drained_abort_notifier = notifier
+            try:
+                self.assertTrue(
+                    notifier.submit(
+                        1, "tcp://busy:1", False, [b"blocker"], float("inf")
+                    )
+                )
+                self.assertTrue(entered.wait(5))
+                self.assertTrue(
+                    manager._handle_abort_notification(
+                        AbortNotification(9, "peer", 8000, 17).to_zmq()
+                    )
+                )
+                self.assertEqual(
+                    manager._deferred_ack_targets[9][("peer", 8000)].generation, 17
+                )
+                self.assertEqual(len(notifier._pending), 1)
+                release.set()
+                self.assertTrue(delivered.wait(5))
+                self.assertNotIn(9, manager._deferred_ack_targets)
+            finally:
+                release.set()
+                notifier.close()
+        self.assertEqual(wire, [(b"blocker",), expected])
+        self.assertEqual(manager.request_status, {})
 
     def test_failed_write_waits_for_running_peers_without_deferred_decode_release(self):
         path = (
@@ -125,70 +199,25 @@ class TestMooncakeLateBootstrap(CustomTestCase):
     """A drained abort stays terminal when a delayed destination arrives."""
 
     def _make_room(self):
-        root = Path(__file__).parents[4] / "python/sglang/srt/disaggregation"
-        namespace = {
-            "KVPoll": KVPoll,
-            "time": time,
-            "logger": logging.getLogger(__name__),
-        }
-
-        def load(path, class_name, names):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            cls = next(
-                n
-                for n in tree.body
-                if isinstance(n, ast.ClassDef) and n.name == class_name
-            )
-            body = [
-                n
-                for n in cls.body
-                if isinstance(n, ast.FunctionDef) and n.name in names
-            ]
-            module = ast.Module(
-                body=[
-                    ast.ImportFrom(
-                        module="__future__",
-                        names=[ast.alias(name="annotations")],
-                        level=0,
-                    ),
-                    *body,
-                ],
-                type_ignores=[],
-            )
-            ast.fix_missing_locations(module)
-            exec(compile(module, str(path), "exec"), namespace)
-
-        methods = (
-            "_prune_drained_abort_rooms",
-            "finish_drained_abort",
-            "_register_bootstrap_transfer",
-            "_notify_drained_abort_target_if_needed",
-        )
-        load(root / "mooncake/conn.py", "MooncakeKVManager", methods)
-        load(root / "common/conn.py", "CommonKVManager", ("update_status",))
-        manager = SimpleNamespace(
-            _drained_abort_lock=threading.Lock(),
-            _drained_abort_rooms=OrderedDict(),
-            _drained_abort_capacity=4096,
-            bootstrap_timeout=30,
-            waiting_timeout=600,
-            request_status={9: KVPoll.Failed},
-            transfer_infos={},
-            req_to_decode_prefix_len={},
-            req_to_pd_hidden_meta={},
-            failure_lock=threading.Lock(),
-            failure_records={9: "original failure"},
-            deferred_bootstrap=None,
-            _deferred_ack_targets={},
-            _deferred_ack_poisoned_rooms=set(),
-            _staging_outstanding={},
-        )
-        for name in (*methods, "update_status"):
-            setattr(manager, name, MethodType(namespace[name], manager))
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager._drained_abort_lock = threading.Lock()
+        manager._drained_abort_rooms = OrderedDict()
+        manager._drained_abort_capacity = 4096
+        manager.bootstrap_timeout, manager.waiting_timeout = 30, 600
+        manager.request_status = {9: KVPoll.Failed}
+        manager.transfer_infos = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.req_to_pd_hidden_meta = {}
+        manager.failure_lock = threading.Lock()
+        manager.failure_records = {9: "original failure"}
+        manager.deferred_bootstrap = None
+        manager._deferred_ack_targets = {}
+        manager._deferred_ack_poisoned_rooms = set()
+        manager._staging_outstanding = {}
         tracker = SourceDrainTracker()
+        manager._source_drain = tracker
         manager.source_transfers_drained = tracker.drained
         manager.resolve_kv_replica_factor = lambda infos: None
-        manager._maybe_ack_drained_abort = lambda room: None
         notifications = []
 
         def send(**message):
@@ -210,16 +239,11 @@ class TestMooncakeLateBootstrap(CustomTestCase):
             return True
 
         manager.queue_drained_abort_notification = queue_notification
-        load(root / "mooncake/conn.py", "MooncakeKVSender", ("notify_drained_abort",))
-        load(root / "common/conn.py", "CommonKVSender", ("clear",))
-        sender = SimpleNamespace(
-            kv_mgr=manager, bootstrap_room=9, _drained_abort_targets=set()
-        )
-        sender.is_transfer_drained = lambda: tracker.drained(9)
-        sender.clear = MethodType(namespace["clear"], sender)
-        sender.notify_drained_abort = MethodType(
-            namespace["notify_drained_abort"], sender
-        )
+        sender = MooncakeKVSender.__new__(MooncakeKVSender)
+        sender.kv_mgr, sender.bootstrap_room = manager, 9
+        sender.conclude_state = KVPoll.Failed
+        sender._drained_abort_targets = set()
+        sender._drained_abort_notified_targets = set()
         return manager, sender, tracker, notifications
 
     @staticmethod
@@ -249,14 +273,8 @@ class TestMooncakeLateBootstrap(CustomTestCase):
         self.assertTrue(all(item["status"] == KVPoll.Failed for item in notifications))
 
     def test_reading_failure_cause_keeps_targets_for_the_drained_notification(self):
-        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
-
-        manager, _, tracker, notifications = self._make_room()
-        manager._source_drain = tracker
+        manager, sender, _, notifications = self._make_room()
         manager.transfer_infos[9] = {"session": self._info()}
-        sender = MooncakeKVSender.__new__(MooncakeKVSender)
-        sender.kv_mgr, sender.bootstrap_room = manager, 9
-        sender.conclude_state = KVPoll.Failed
         with self.assertRaisesRegex(Exception, "original failure"):
             sender.failure_exception()
         self.assertNotIn(9, manager.transfer_infos)
