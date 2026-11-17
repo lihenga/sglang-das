@@ -38,10 +38,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 DEFAULT_LOCAL_BUFFER_SIZE = int(
-    __import__("os").environ.get(
-        "SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE",
-        16 * 1024 * 1024
-    )
+    __import__("os").environ.get("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE", 16 * 1024 * 1024)
 )
 SETUP_TIMEOUT = 600  # 10min
 DFS_BATCH_PUT_TIMEOUT = -1606
@@ -126,7 +123,9 @@ def _get_service_endpoint(server_args) -> str:
     return NetworkAddress(str(address), port).to_host_port_str()
 
 
-def _get_mooncake_client_http_setup_kwargs(enable_client_http_server: bool) -> dict[str, Any]:
+def _get_mooncake_client_http_setup_kwargs(
+    enable_client_http_server: bool,
+) -> dict[str, Any]:
     if not enable_client_http_server:
         return {}
     return {
@@ -633,7 +632,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         else 0
                     )
                     self._client_metrics_reporter = start_client_metrics_reporter(
-                        self.store, get_server_args(), service_endpoint, rank
+                        self.store, service_endpoint, rank
                     )
                     if self._client_metrics_reporter is not None:
                         weakref.finalize(self, self._client_metrics_reporter.close)
@@ -1142,9 +1141,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(
-                host_indices
-            )
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             if len(ptr_list) != len(key_strs):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
@@ -1608,9 +1605,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            results = self.store.batch_put_from(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
+            results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
         if any(int(result) == DFS_BATCH_PUT_TIMEOUT for result in results):
             self._report_dfs_operation_timeout("write", DFS_BATCH_PUT_TIMEOUT)
         return results
@@ -1623,9 +1618,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_strs, buffer_ptrs, buffer_sizes
             )
         else:
-            results = self.store.batch_get_into(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         # -1608 is local BatchGet admission backpressure and must not disable
         # DFS reads. Only -1607 means admitted DFS I/O exceeded its deadline.
         if any(int(result) == DFS_BATCH_GET_TIMEOUT for result in results):

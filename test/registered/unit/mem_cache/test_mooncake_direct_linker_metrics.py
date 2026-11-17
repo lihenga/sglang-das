@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -16,6 +16,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 def test_load_reports_l4_metrics_per_request_without_double_counting(success):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.pending_load_tokens = {"first": 64, "second": 128}
+    linker.pending_load_started = {"first": 1.0, "second": 1.0}
     linker.storage = SimpleNamespace(store=Mock())
     collector = Mock(spec=StorageMetricsCollector)
     collector.labels = {}
@@ -34,7 +35,8 @@ def test_load_reports_l4_metrics_per_request_without_double_counting(success):
     )
     linker.storage_metrics_collector = collector
 
-    linker._finish_prefetch_metrics(["first", "second"], success, 0.25)
+    with patch("time.perf_counter", return_value=1.25):
+        linker._finish_prefetch_metrics(["first", "second"], success)
 
     assert not linker.pending_load_tokens
     assert collector.log_l4_prefetch.call_args_list == [
@@ -71,7 +73,7 @@ def test_metrics_failure_does_not_break_completed_load_cleanup():
         "metrics unavailable"
     )
 
-    linker._finish_prefetch_metrics(["first"], True, 0.25)
+    linker._finish_prefetch_metrics(["first"], True)
 
     assert not linker.pending_load_tokens
     linker.storage.store.record_prefetched_tokens.assert_called_once_with(64)

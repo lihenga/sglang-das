@@ -1003,6 +1003,8 @@ impl PDRouter {
         *response.status_mut() = status;
 
         let mut response_headers = headers.unwrap_or_default();
+        // Logprob merging or early termination can change the forwarded length.
+        response_headers.remove(CONTENT_LENGTH);
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
@@ -1716,7 +1718,6 @@ mod tests {
     }
 
     pub(super) fn create_test_pd_router() -> PDRouter {
-
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));

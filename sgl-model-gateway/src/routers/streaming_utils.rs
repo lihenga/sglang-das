@@ -51,7 +51,7 @@ impl ErrorEventScanner {
             return None;
         }
         // shortcut: inspect at most 32 bytes per line for the engine's first-key
-        // error envelope; use a streaming parser if other SSE formats are needed.
+        // error envelope and Responses failure event; use a streaming parser for other formats.
         const LINE_PROBE: usize = 32;
         const ERROR_LOG_LIMIT: usize = 4096;
         for segment in chunk.split_inclusive(|&b| b == b'\n') {
@@ -85,6 +85,12 @@ impl ErrorEventScanner {
     }
 
     fn is_error_line(line: &[u8]) -> bool {
+        if line
+            .strip_prefix(b"event:")
+            .is_some_and(|event| event.trim_ascii() == b"response.failed")
+        {
+            return true;
+        }
         line.strip_prefix(b"data:")
             .map(|p| p.trim_ascii_start())
             .and_then(|p| p.strip_prefix(b"{"))
@@ -488,6 +494,31 @@ mod tests {
         assert!(metrics.contains("backend_type=\"pd\""));
         assert!(metrics.contains("model=\"requested-model\""));
         assert!(metrics.contains("worker_url=\"http://test-worker\""));
+        assert_eq!(breaker_counters(&w), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn responses_failure_is_observed_without_changing_the_stream() {
+        let w = worker();
+        let chunks = vec![
+            Bytes::from_static(b"event: response.fai"),
+            Bytes::from_static(b"led\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n"),
+        ];
+        let inner = futures_util::stream::iter(
+            chunks
+                .iter()
+                .cloned()
+                .map(Ok::<_, TestErr>)
+                .collect::<Vec<_>>(),
+        );
+        let mut tracked = BreakerTrackedStream::new(inner, Arc::clone(&w), "u".into())
+            .with_metrics("regular", "test-model");
+        let mut received = Vec::new();
+        while let Some(chunk) = tracked.next().await {
+            received.push(chunk.unwrap());
+        }
+        assert_eq!(received, chunks);
+        assert_outcome(&drop_and_render_metrics(tracked), "stream_error_event");
         assert_eq!(breaker_counters(&w), (1, 0));
     }
 
