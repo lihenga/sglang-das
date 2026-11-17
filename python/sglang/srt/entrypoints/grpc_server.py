@@ -19,6 +19,7 @@ from aiohttp import web
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ async def _start_sidecar_server(host: str, port: int, app):
     return runner
 
 
-def _add_metrics_routes(app, server_args=None):
+def _add_metrics_routes(app):
     """Add Prometheus /metrics endpoint to the aiohttp app."""
     from prometheus_client import (
         CollectorRegistry,
@@ -80,8 +81,8 @@ def _add_metrics_routes(app, server_args=None):
             method=request.method,
             path=SNAPSHOT_PATH,
             authorization_header=request.headers.get("Authorization"),
-            api_key=getattr(server_args, "api_key", None),
-            admin_api_key=getattr(server_args, "admin_api_key", None),
+            api_key=get_serving().api_key,
+            admin_api_key=get_serving().admin_api_key,
             auth_level=AuthLevel.NORMAL,
         )
         if not decision.allowed:
@@ -229,7 +230,7 @@ async def serve_grpc(server_args, model_info=None):
 
             set_prometheus_multiproc_dir()
             enable_func_timer()
-            _add_metrics_routes(sidecar_app, server_args)
+            _add_metrics_routes(sidecar_app)
         except Exception as e:
             logger.error(
                 "Failed to set up metrics: %s. Continuing without metrics.",

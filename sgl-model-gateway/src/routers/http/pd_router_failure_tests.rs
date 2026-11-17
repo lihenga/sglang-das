@@ -517,6 +517,71 @@ fn streaming_error_closes_response_and_records_metrics_once() {
     }
 }
 
+#[tokio::test]
+async fn early_terminated_sse_has_valid_http_framing() {
+    const TOKEN: &[u8] = b"data: {\"text\":\"token\"}\n\n";
+    const TRAILER: &[u8] = b"data: [DONE]\n\n";
+    let terminal =
+        b"data: {\"error\":{\"code\":503,\"message\":\"generation failed\"}}\n\n".as_slice();
+    // Client/TLS setup belongs before the timed HTTP request, as in serving.
+    let router = Arc::new(create_test_pd_router());
+    let gateway = serve(Router::new().route(
+        "/generate",
+        post(move || {
+            let router = router.clone();
+            async move {
+                // Separate input chunks keep the suffix out of the terminal chunk.
+                let chunks = [TOKEN, terminal, TRAILER].map(bytes::Bytes::from_static);
+                let stream = tokio_stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>));
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    CONTENT_LENGTH,
+                    HeaderValue::from_str(
+                        &(TOKEN.len() + terminal.len() + TRAILER.len()).to_string(),
+                    )
+                    .unwrap(),
+                );
+                headers.insert("x-request-id", HeaderValue::from_static("framing-test"));
+                router.create_streaming_response(
+                    stream,
+                    StatusCode::OK,
+                    None,
+                    false,
+                    Some(headers),
+                    worker(
+                        "http://prefill",
+                        WorkerType::Prefill {
+                            bootstrap_port: None,
+                        },
+                    ),
+                    worker("http://decode", WorkerType::Decode),
+                    None,
+                )
+            }
+        }),
+    ))
+    .await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    // Use real HTTP: collecting an axum Body alone cannot detect a stale length.
+    let response = client
+        .post(format!("{}/generate", gateway.url))
+        .send()
+        .await
+        .expect("gateway must send a valid HTTP response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    assert!(!response.headers().contains_key(CONTENT_LENGTH));
+    assert_eq!(response.headers()["x-request-id"], "framing-test");
+    let body = response
+        .bytes()
+        .await
+        .expect("early SSE termination must not cause a Content-Length mismatch");
+    assert_eq!(body.as_ref(), [TOKEN, terminal].concat());
+}
+
 async fn broken_body() -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

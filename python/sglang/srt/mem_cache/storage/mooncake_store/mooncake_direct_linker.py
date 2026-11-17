@@ -1247,9 +1247,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
-                    self._finish_prefetch_metrics(
-                        list(pending), success is True
-                    )
+                    self._finish_prefetch_metrics(list(pending), success is True)
             finally:
                 self.load_queue.task_done()
 

@@ -22,14 +22,17 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class TestWaitingQueuePrefetchMetrics(CustomTestCase):
     def setUp(self):
         self.registry = CollectorRegistry()
-        with patch.object(
-            StorageMetricsCollector,
-            "_counter_cls",
-            partial(Counter, registry=self.registry),
-        ), patch.object(
-            StorageMetricsCollector,
-            "_histogram_cls",
-            partial(Histogram, registry=self.registry),
+        with (
+            patch.object(
+                StorageMetricsCollector,
+                "_counter_cls",
+                partial(Counter, registry=self.registry),
+            ),
+            patch.object(
+                StorageMetricsCollector,
+                "_histogram_cls",
+                partial(Histogram, registry=self.registry),
+            ),
         ):
             collector = StorageMetricsCollector(labels={"tp_rank": "0"})
         self.linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)

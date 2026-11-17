@@ -258,7 +258,9 @@ class TestMooncakeServiceMetrics(unittest.TestCase):
         self.assertEqual(
             _get_service_endpoint(
                 SimpleNamespace(
-                    host="10.0.0.21", port=30000, nnodes=2,
+                    host="10.0.0.21",
+                    port=30000,
+                    nnodes=2,
                     dist_init_addr="10.0.0.20:29500",
                 )
             ),

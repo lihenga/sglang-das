@@ -12,6 +12,8 @@ import time
 import uuid
 from pathlib import Path
 
+from sglang.srt.runtime_context import get_observability, get_serving
+
 logger = logging.getLogger(__name__)
 
 SNAPSHOT_PATH = "/internal/mooncake_client_metrics"
@@ -178,11 +180,13 @@ def add_snapshot_route(app):
 
 
 class MooncakeClientMetricsReporter:
-    def __init__(self, store, url, server_args, rank):
+    def __init__(self, store, url, rank):
         self._store = store
         self._url = url + SNAPSHOT_PATH
-        self._verify = server_args.ssl_verify()
-        self._api_key = server_args.api_key
+        from sglang.srt.arg_groups.serving_hook import ssl_verify_of
+
+        self._verify = ssl_verify_of(get_serving())
+        self._api_key = get_serving().api_key
         client_id = uuid.uuid4().hex
         self._labels = dict(
             zip(
@@ -281,8 +285,8 @@ class MooncakeClientMetricsReporter:
         self._thread.join()
 
 
-def start_client_metrics_reporter(store, server_args, service_endpoint, rank):
-    if not server_args.enable_metrics:
+def start_client_metrics_reporter(store, service_endpoint, rank):
+    if not get_observability().enable_metrics:
         return None
     if not callable(getattr(store, "get_client_metrics", None)):
         logger.warning(
@@ -290,14 +294,12 @@ def start_client_metrics_reporter(store, server_args, service_endpoint, rank):
             "get_client_metrics support; rebuild/install the matching package."
         )
         return None
-    scheme = "https" if server_args.ssl_certfile else "http"
-    if server_args.smg_grpc_mode or server_args.grpc_mode:
+    scheme = "https" if get_serving().ssl_certfile else "http"
+    if get_serving().smg_grpc_mode or get_serving().grpc_mode:
         from sglang.srt.utils.network import NetworkAddress
 
         endpoint = NetworkAddress.parse(service_endpoint)
-        port = server_args.smg_http_sidecar_port or server_args.port + 1
+        port = get_observability().smg_http_sidecar_port or get_serving().port + 1
         service_endpoint = NetworkAddress(endpoint.host, port).to_host_port_str()
         scheme = "http"
-    return MooncakeClientMetricsReporter(
-        store, f"{scheme}://{service_endpoint}", server_args, rank
-    )
+    return MooncakeClientMetricsReporter(store, f"{scheme}://{service_endpoint}", rank)

@@ -1940,6 +1940,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Note the unit change: milliseconds -> seconds.",
     ),
     # Removed without replacement.
+    "MOONCAKE_CLIENT_METRICS_PORT_BASE": _DeprecatedEnv(
+        note="Mooncake client HTTP ports are now assigned automatically; scrape the SGLang /metrics endpoint."
+    ),
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),

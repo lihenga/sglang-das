@@ -20,7 +20,9 @@ from sglang.srt.observability.mooncake_client_metrics import (
     receive_snapshot,
     start_client_metrics_reporter,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -51,7 +53,7 @@ def payload(index=1, sequence=1, metrics=METRICS):
     }
 
 
-class TestMooncakeClientMetrics(unittest.TestCase):
+class TestMooncakeClientMetrics(CustomTestCase):
     def test_successful_report_access_logs_are_silent_without_configuration(self):
         from sglang.srt.utils.common import (
             UvicornAccessLogFilter,
@@ -105,6 +107,14 @@ class TestMooncakeClientMetrics(unittest.TestCase):
         self.assertFalse(UvicornAccessLogFilter(["/metrics"]).filter(record))
 
     def setUp(self):
+        override = get_context().override_server_args(
+            enable_metrics=True,
+            api_key="test-key",
+            ssl_ca_certs=None,
+            ssl_certfile=None,
+        )
+        override.install()
+        self.addCleanup(override.restore)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.environment = patch.dict(
@@ -217,11 +227,8 @@ class TestMooncakeClientMetrics(unittest.TestCase):
     def test_reporter_retries_failure_and_sends_cumulative_snapshot(self):
         store = Mock()
         store.get_client_metrics.return_value = METRICS
-        args = SimpleNamespace(api_key="test-key", ssl_verify=lambda: True)
         with patch("threading.Thread"):
-            reporter = MooncakeClientMetricsReporter(
-                store, "http://127.0.0.1:1234", args, 7
-            )
+            reporter = MooncakeClientMetricsReporter(store, "http://127.0.0.1:1234", 7)
         reporter._stopped.wait = Mock(side_effect=[False, True])
         reporter._stopped.is_set = Mock(side_effect=[False, False, False, True])
         session = Mock()
@@ -250,11 +257,13 @@ class TestMooncakeClientMetrics(unittest.TestCase):
     def make_reporter(self):
         store = Mock()
         store.get_client_metrics.return_value = METRICS
-        args = SimpleNamespace(api_key="test-key", ssl_verify=lambda: "ca.pem")
-        with patch("threading.Thread"):
-            reporter = MooncakeClientMetricsReporter(
-                store, "https://127.0.0.1:1234", args, 7
-            )
+        with (
+            get_context().override_server_args(
+                api_key="test-key", ssl_ca_certs="ca.pem", ssl_certfile="cert.pem"
+            ),
+            patch("threading.Thread"),
+        ):
+            reporter = MooncakeClientMetricsReporter(store, "https://127.0.0.1:1234", 7)
         reporter._stopped.wait = Mock(return_value=False)
         session = Mock()
         session.headers = {}
@@ -442,25 +451,18 @@ class TestMooncakeClientMetrics(unittest.TestCase):
 
     def test_old_package_warns_without_starting_reporter(self):
         with self.assertLogs(level="WARNING"):
-            self.assertIsNone(
-                start_client_metrics_reporter(
-                    object(), SimpleNamespace(enable_metrics=True), "host:80", 0
-                )
-            )
+            self.assertIsNone(start_client_metrics_reporter(object(), "host:80", 0))
 
     def test_legacy_grpc_uses_http_sidecar(self):
-        args = SimpleNamespace(
-            enable_metrics=True,
-            ssl_certfile=None,
-            smg_grpc_mode=True,
-            grpc_mode=False,
-            smg_http_sidecar_port=30002,
-            port=30000,
-        )
-        with patch(
-            "sglang.srt.observability.mooncake_client_metrics.MooncakeClientMetricsReporter"
-        ) as reporter:
-            start_client_metrics_reporter(Mock(), args, "[::1]:30000", 0)
+        with (
+            get_context().override_server_args(
+                enable_metrics=True, smg_grpc_mode=True, smg_http_sidecar_port=30002
+            ),
+            patch(
+                "sglang.srt.observability.mooncake_client_metrics.MooncakeClientMetricsReporter"
+            ) as reporter,
+        ):
+            start_client_metrics_reporter(Mock(), "[::1]:30000", 0)
             self.assertEqual(reporter.call_args.args[1], "http://[::1]:30002")
 
     def test_grpc_sidecar_receives_authenticated_snapshots(self):
@@ -473,12 +475,12 @@ class TestMooncakeClientMetrics(unittest.TestCase):
 
         async def check():
             app = web.Application(client_max_size=MAX_SNAPSHOT_BYTES)
-            _add_metrics_routes(app, SimpleNamespace(api_key="key", admin_api_key=None))
+            _add_metrics_routes(app)
             async with TestClient(TestServer(app)) as client:
                 response = await client.get(SNAPSHOT_PATH)
                 self.assertEqual(response.status, 401)
                 response = await client.get(
-                    SNAPSHOT_PATH, headers={"Authorization": "Bearer key"}
+                    SNAPSHOT_PATH, headers={"Authorization": "Bearer test-key"}
                 )
                 self.assertEqual(response.status, 204)
                 self.assertEqual(
@@ -489,7 +491,7 @@ class TestMooncakeClientMetrics(unittest.TestCase):
                 response = await client.post(
                     SNAPSHOT_PATH,
                     json=payload(),
-                    headers={"Authorization": "Bearer key"},
+                    headers={"Authorization": "Bearer test-key"},
                 )
                 self.assertEqual(response.status, 204)
                 response = await client.get("/metrics")
