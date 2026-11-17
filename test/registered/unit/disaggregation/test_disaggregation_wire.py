@@ -527,6 +527,72 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertFalse(manager.session_failures)
         self.assertEqual(manager.state_layout_rejections, {"decode:42": reason})
 
+    def test_hidden_send_failure_and_ack_timeout_release_source_ownership(self):
+        for ack_timeout in (False, True):
+            with self.subTest(ack_timeout=ack_timeout):
+                manager = Mock(spec=MooncakeKVManager)
+                manager.enable_trace = manager.enable_staging = False
+                manager.enable_deferred_decode_kv_release = True
+                manager._staging_outstanding = defaultdict(int)
+                manager._deferred_ack_targets = {42: {("decode", 1234): object()}}
+                manager._maybe_ack_drained_abort.side_effect = (
+                    lambda room: CommonKVManager._maybe_ack_drained_abort(manager, room)
+                )
+                manager.pd_hidden_events = SimpleNamespace(
+                    inflight_lock=threading.Lock(), inflight_chunks={42: (0, 0)}
+                )
+                manager.request_status = {42: KVPoll.Transferring}
+                manager.check_status.side_effect = manager.request_status.get
+                manager.session_lock = threading.Lock()
+                manager.failed_sessions = set()
+                manager._get_dsa_cache_transfer_skip_flags.return_value = (False, False)
+                manager._has_pd_hidden_state.return_value = True
+                manager._pd_hidden_state_index.return_value = 0
+                req = SimpleNamespace(
+                    is_dummy=False,
+                    mooncake_session_id="decode",
+                    room=42,
+                    endpoint="127.0.0.1",
+                    dst_port=1234,
+                )
+                manager.transfer_infos = {42: {"decode": req}}
+                manager.decode_kv_args_table = {
+                    "decode": SimpleNamespace(registration_error=None)
+                }
+                manager.req_to_decode_prefix_len = {42: 0}
+                manager._send_pd_hidden_packet.return_value = (-1, False)
+                manager._mark_session_failed_and_sync.side_effect = (
+                    lambda **kwargs: manager.request_status.update({42: KVPoll.Failed})
+                )
+                chunk = TransferKVChunk(
+                    room=42,
+                    prefill_kv_indices=np.array([], dtype=np.int32),
+                    index_slice=slice(0, 0),
+                    is_last_chunk=True,
+                    prefill_aux_index=2,
+                    state_indices=[[2]],
+                )
+                chunk.pd_hidden_ack_timed_out = ack_timeout
+                if ack_timeout:
+                    chunk.pd_hidden_start = 0
+                    chunk.pd_hidden_ready_sent = True
+                tracker = SourceDrainTracker()
+                manager._complete_source_chunk.side_effect = tracker.complete
+                work = FastQueue()
+                tracker.publish(chunk, work, lambda: True)
+                work.put(None)
+                self.assertFalse(tracker.drained(42))
+                MooncakeKVManager.transfer_worker(manager, work, executor=None)
+                self.assertTrue(tracker.drained(42))
+                self.assertNotIn(42, manager._staging_outstanding)
+                manager._complete_source_chunk.assert_called_once_with(chunk)
+                manager._release_or_mark_pd_hidden_done.assert_called_once_with(chunk)
+                manager._send_abort_acks.assert_called_once()
+                if ack_timeout:
+                    manager._send_pd_hidden_packet.assert_not_called()
+                else:
+                    self.assertEqual(manager.request_status[42], KVPoll.Failed)
+
     def test_mooncake_probe_recovery_keeps_a_layout_rejection(self):
         """A probe clears the transport blacklist but not a layout rejection."""
         manager = object.__new__(MooncakeKVManager)

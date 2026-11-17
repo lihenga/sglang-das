@@ -175,6 +175,11 @@ class UnifiedCacheLinker(ABC):
     def wait_for_pending_loads(self) -> None:
         """Optional native-worker barrier; legacy backends wait through their layer counter."""
 
+    def wait_for_load_batch(self, index: int) -> None:
+        """Wait for one forward's load verdict; legacy backends use the full barrier."""
+        if index >= 0:
+            self.wait_for_pending_loads()
+
     def request_id(self, handle: CacheRequestHandle):
         """Backend ownership key; legacy backends retain the public request id."""
         return handle.rid
@@ -599,12 +604,16 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        prepared_transfers = self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
-        )
+        try:
+            prepared_transfers = self._update_load(
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+        except BaseException:
+            self.cache_linker.abort_prepared_load(self._backend_request_id(req.rid))
+            raise
 
         if cache.pp_size > 1:
             self._queue_load(
@@ -696,6 +705,7 @@ class UnifiedCacheLinkerWrapper:
         anchor: NodeId,
     ) -> None:
         if not transfers:
+            self.cache_linker.abort_prepared_load(self._backend_request_id(rid))
             return
         backend_id = self._backend_request_id(rid)
         assert backend_id not in self.pending_loads
@@ -705,10 +715,12 @@ class UnifiedCacheLinkerWrapper:
         except BaseException:
             self._detach_failed_chain(rid, node_id, anchor)
             self.cache.dec_lock_ref(node_id, lock_params)
+            self.cache_linker.abort_prepared_load(backend_id)
             raise
         if not queued:
             self._detach_failed_chain(rid, node_id, anchor)
             self.cache.dec_lock_ref(node_id, lock_params)
+            self.cache_linker.abort_prepared_load(backend_id)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
         self.pending_loads[backend_id] = (node_id, lock_params, anchor)
         if not hasattr(self, "load_request_rids"):
@@ -1290,6 +1302,9 @@ class UnifiedCacheLinkerWrapper:
 
     def wait_for_pending_loads(self) -> None:
         self.cache_linker.wait_for_pending_loads()
+
+    def wait_for_load_batch(self, index: int) -> None:
+        self.cache_linker.wait_for_load_batch(index)
 
     def _remember_request(self, req: Req) -> None:
         handle = getattr(req, "cache_request_handle", None)

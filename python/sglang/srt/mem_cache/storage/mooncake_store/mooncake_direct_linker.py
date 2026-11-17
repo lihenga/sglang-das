@@ -467,6 +467,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # (rids, success) per started load batch. Pushed from a finally so a
         # failed batch still releases the tree-side locks it pinned.
         self.completed_loads: Queue[tuple[list[str], bool]] = Queue()
+        self.load_batch_futures: dict[int, Future] = {}
         self.offload_queue: Queue[
             tuple[list[PoolTransfer], int, float, object] | None
         ] = Queue()
@@ -1235,6 +1236,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_queue.join()
         for event, _, _ in getattr(self, "broadcast_events", ()):
             event.synchronize()
+        self.load_batch_futures.clear()
+
+    def wait_for_load_batch(self, index: int) -> None:
+        if index < 0:
+            return
+        completed = self.load_batch_futures.get(index)
+        if completed is None:
+            return
+        event = completed.result()
+        if event is not None:
+            event.synchronize()
+        self.load_batch_futures.pop(index, None)
 
     def pop_completed_load(self) -> tuple[list[str], bool]:
         return self.completed_loads.get_nowait()
@@ -1270,6 +1283,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads = {}
 
         counter_index = self.layer_done_counter.update_producer()
+        self.load_batch_futures[counter_index] = Future()
         if broadcaster is not None:
             indices = {}
             for transfers in pending.values():
@@ -1329,6 +1343,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         self.broadcast_outcomes[counter_index] = success
                     else:
                         self.completed_loads.put((list(pending), success))
+                        self.load_batch_futures[counter_index].set_result(None)
             finally:
                 self.load_queue.task_done()
 
@@ -1795,6 +1810,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.broadcast_loads.clear()
         self.broadcast_outcomes.clear()
         self.broadcast_failed.clear()
+        self.load_batch_futures.clear()
         self.layer_done_counter.reset()
 
     def close(self) -> None:
@@ -1848,6 +1864,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             event = device_module.Event()
             event.record()
             self.broadcast_events.append((event, rids, success))
+            self.load_batch_futures[index].set_result(event)
             self.broadcast_failed.discard(index)
             del self.broadcast_loads[index]
         else:

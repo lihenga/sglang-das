@@ -30,6 +30,10 @@ class _Sender:
         assert not self.busy
         self.calls.append("notify")
 
+    def failure_exception(self):
+        self.calls.append("failure")
+        raise self.failure
+
 
 def _owner(calls, *, fail_release=False):
     path = Path(__file__).parents[4] / "python/sglang/srt/disaggregation/prefill.py"
@@ -40,11 +44,12 @@ def _owner(calls, *, fail_release=False):
         if isinstance(n, ast.ClassDef)
         and n.name == "SchedulerDisaggregationPrefillMixin"
     )
-    method = next(
+    methods = [
         n
         for n in cls.body
-        if isinstance(n, ast.FunctionDef) and n.name == "abort_external_kv_request"
-    )
+        if isinstance(n, ast.FunctionDef)
+        and n.name in {"abort_external_kv_request", "handle_inflight_transfer_failure"}
+    ]
 
     def release(req, cache, *, checkpoint):
         assert checkpoint is False
@@ -56,7 +61,15 @@ def _owner(calls, *, fail_release=False):
     namespace = {
         "FINISH_ABORT": FINISH_ABORT,
         "HTTPStatus": HTTPStatus,
-        "EXTERNAL_KV_LOAD_ERR_TYPE": "external_kv_load_error",
+        "EXTERNAL_KV_LOAD_ERR_TYPE": next(
+            ast.literal_eval(n.value)
+            for n in tree.body
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "EXTERNAL_KV_LOAD_ERR_TYPE"
+                for t in n.targets
+            )
+        ),
         "DisaggregationMode": DisaggregationMode,
         "CleanupOutcomeUnknown": CleanupOutcomeUnknown,
         "run_cleanup_step": run_cleanup_step,
@@ -67,7 +80,7 @@ def _owner(calls, *, fail_release=False):
     }
     exec(
         compile(
-            ast.Module(body=[method], type_ignores=[]),
+            ast.Module(body=methods, type_ignores=[]),
             str(path),
             "exec",
             flags=__future__.annotations.compiler_flag,
@@ -87,8 +100,12 @@ def _owner(calls, *, fail_release=False):
             stream_output=lambda *args: calls.append("response")
         ),
         prefill_abort_sender_terminal=lambda req: not req.disagg_kv_sender.busy,
+        prefill_abort_forward_drained=lambda req: True,
+        metrics_reporter=SimpleNamespace(enable_metrics=True),
+        metrics_collector=Mock(),
     )
-    owner.abort_external_kv_request = namespace[method.name].__get__(owner)
+    for method in methods:
+        setattr(owner, method.name, namespace[method.name].__get__(owner))
     return owner
 
 
@@ -121,6 +138,40 @@ def _request(calls, reason=None):
 
 
 class TestMooncakeAbortRetirement(CustomTestCase):
+    def test_transport_root_cause_is_reported_once_and_keeps_its_error_category(self):
+        for propagated in (False, True):
+            with self.subTest(propagated=propagated):
+                calls = []
+                owner, req = _owner(calls), _request(calls, FINISH_LENGTH(0))
+                req.bootstrap_room = 9
+                error = RuntimeError("RDMA disconnected")
+                error.is_from_another_rank = propagated
+                req.disagg_kv_sender.failure = error
+                with self.assertLogs(level="DEBUG") as logs:
+                    self.assertFalse(owner.handle_inflight_transfer_failure(req))
+                    self.assertFalse(owner.handle_inflight_transfer_failure(req))
+                    req.disagg_kv_sender.busy = False
+                    self.assertTrue(owner.handle_inflight_transfer_failure(req))
+                self.assertEqual(len(logs.records), 1)
+                self.assertEqual(
+                    logs.records[0].levelname, "DEBUG" if propagated else "WARNING"
+                )
+                self.assertEqual(calls.count("failure"), 1)
+                self.assertIn("RDMA disconnected", req.finished_reason.message)
+                self.assertIsNone(req.finished_reason.err_type)
+                owner.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+
+    def test_external_load_failure_retains_the_donor_error_type(self):
+        calls = []
+        owner, req = _owner(calls), _request(calls)
+        req.disagg_kv_sender.busy = False
+        self.assertTrue(
+            owner.abort_external_kv_request(
+                req, forward_drained=True, sender_terminal=True
+            )
+        )
+        self.assertEqual(req.finished_reason.err_type, "ExternalKVLoadError")
+
     def test_failed_transfer_overrides_an_earlier_prefill_length_finish(self):
         calls = []
         owner, req = _owner(calls), _request(calls, FINISH_LENGTH(0))

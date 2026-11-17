@@ -113,7 +113,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
-EXTERNAL_KV_LOAD_ERR_TYPE = "external_kv_load_error"
+EXTERNAL_KV_LOAD_ERR_TYPE = "ExternalKVLoadError"
 
 # TP=1 yield between polls of a pending result. An initial heuristic rather
 # than a tuned value: long enough that the bootstrap, transfer and cache
@@ -2132,9 +2132,25 @@ class SchedulerDisaggregationPrefillMixin:
             f"Prefill transfer failed for request {req.rid} room={req.bootstrap_room}"
         )
         if not req.external_kv_abort_requested:
+            exc = None
+            try:
+                req.disagg_kv_sender.failure_exception()
+            except Exception as error:
+                exc = error
+                message += f" with exception {error}"
+            if getattr(exc, "is_from_another_rank", False):
+                logger.debug(message)
+            else:
+                logger.warning(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             if self.metrics_reporter.enable_metrics:
                 self.metrics_collector.increment_transfer_failed_reqs()
+            if not isinstance(req.to_finish, FINISH_ABORT) and not isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                req.to_finish = FINISH_ABORT(
+                    message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
         return self.abort_external_kv_request(
             req,
             forward_drained=self.prefill_abort_forward_drained(req),

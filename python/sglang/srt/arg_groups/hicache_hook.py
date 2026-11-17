@@ -29,6 +29,11 @@ def handle_hicache(server_args: Any):
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
+        if cfg.disable_radix_cache:
+            raise ValueError(
+                "--enable-unified-cache-external-linker and "
+                "--disable-radix-cache are mutually exclusive."
+            )
         if cfg.enable_hierarchical_cache:
             raise ValueError(
                 "--enable-unified-cache-external-linker and "
@@ -108,7 +113,6 @@ def handle_hicache_ratio_default(server_args: Any):
 
 
 def resolve_hicache_dcp_compatibility(server_args: Any):
-
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return

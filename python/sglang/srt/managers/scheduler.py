@@ -4985,8 +4985,12 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if self.enable_unified_cache_external_linker:
-            failed = self.tree_cache.drain_linker_loads(wait_for_completion=True)
-            self._mark_failed_linker_loads(batch, failed_rids=set(failed))
+            if get_parallel().pp_size > 1:
+                failed = self.tree_cache.drain_linker_loads(wait_for_completion=True)
+                self._mark_failed_linker_loads(batch, failed_rids=set(failed))
+            elif batch.forward_mode.is_extend():
+                self.tree_cache.linker.wait_for_load_batch(batch.hicache_consumer_index)
+                self._mark_failed_linker_loads(batch)
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -5617,6 +5621,16 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    if not isinstance(req.to_finish, FINISH_ABORT) and not isinstance(
+                        req.finished_reason, FINISH_ABORT
+                    ):
+                        req.to_finish = (
+                            FINISH_ABORT(
+                                recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                            )
+                            if recv_req.abort_message
+                            else FINISH_ABORT("Aborted by AbortReq.")
+                        )
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 

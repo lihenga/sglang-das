@@ -235,6 +235,21 @@ class TestMooncakeLateBootstrap(CustomTestCase):
         )
         self.assertTrue(all(item["status"] == KVPoll.Failed for item in notifications))
 
+    def test_reading_failure_cause_keeps_targets_for_the_drained_notification(self):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
+
+        manager, _, tracker, notifications = self._make_room()
+        manager._source_drain = tracker
+        manager.transfer_infos[9] = {"session": self._info()}
+        sender = MooncakeKVSender.__new__(MooncakeKVSender)
+        sender.kv_mgr, sender.bootstrap_room = manager, 9
+        sender.conclude_state = KVPoll.Failed
+        with self.assertRaisesRegex(Exception, "original failure"):
+            sender.failure_exception()
+        self.assertNotIn(9, manager.transfer_infos)
+        sender.notify_drained_abort()
+        self.assertEqual(notifications[0]["targets"], [("decode", 8000)])
+
     def test_abort_waits_for_source_then_includes_late_target(self):
         manager, sender, tracker, notifications = self._make_room()
         chunk = SimpleNamespace(room=9)

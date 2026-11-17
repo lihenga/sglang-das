@@ -349,6 +349,24 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
 
 
 class TestLoadBackNoPrefetchNeeded(CustomTestCase):
+    def test_prepare_error_releases_the_claimed_prefetch_session(self):
+        cache = _Cache()
+        transfer = types.SimpleNamespace(name=PoolName.KV)
+        cache._components_tuple[
+            0
+        ].build_external_linker_transfer.return_value = transfer
+        backend = MagicMock()
+        backend.get_host_prefetch_status.return_value = "dfs_prefetched"
+        wrapper = _wrapper(cache, backend)
+        wrapper.request_ids = {"rid": "attempt"}
+        wrapper._update_load.side_effect = RuntimeError("prepare failed")
+        req = types.SimpleNamespace(rid="rid", last_node="node")
+        with self.assertRaisesRegex(RuntimeError, "prepare failed"):
+            wrapper.load_back(req)
+        backend.claim_ready_host_prefetch.assert_called_once_with("attempt")
+        backend.abort_prepared_load.assert_called_once_with("attempt")
+        self.assertNotIn("rid", wrapper.host_prefetch_hits)
+
     def test_enabled_normal_fallback_keeps_construction_consensus(self):
         cache = _Cache(peer_mins=[0])
         component = cache._components_tuple[0]

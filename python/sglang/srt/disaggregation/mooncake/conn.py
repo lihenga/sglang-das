@@ -3115,6 +3115,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 kv_chunk, hidden_inflight_key
                             )
                         elif kv_chunk.pd_hidden_ack_timed_out:
+                            with self.pd_hidden_events.inflight_lock:
+                                self.pd_hidden_events.inflight_chunks.pop(
+                                    kv_chunk.room, None
+                                )
+                            self._release_or_mark_pd_hidden_done(kv_chunk)
                             pd_hidden_failed = True
 
                     if not ack_ready and not waiting_for_ack:
@@ -3198,6 +3203,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             pd_hidden_done_count += 1
 
                     if pd_hidden_failed:
+                        self._complete_source_chunk(kv_chunk)
+                        self._staging_outstanding[kv_chunk.room] -= 1
+                        if self._staging_outstanding[kv_chunk.room] <= 0:
+                            self._staging_outstanding.pop(kv_chunk.room, None)
+                        if self.enable_deferred_decode_kv_release:
+                            self._maybe_ack_drained_abort(kv_chunk.room)
                         continue
                     if waiting_for_ack and not ack_ready:
                         # A parked chunk is only re-enqueued by ACK/abort/timeout.
@@ -4282,14 +4293,23 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
     def abort(self):
         with self.kv_mgr._source_drain.lock:
-            if not hasattr(self, "_drained_abort_targets"):
-                self._drained_abort_targets = set()
-                self._drained_abort_notified_targets = set()
-            self._drained_abort_targets.update(self._current_drained_abort_targets())
+            self._remember_drained_abort_targets()
             super().abort()
         self.kv_mgr._wake_pd_hidden_ack_waiters(self.bootstrap_room)
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
+
+    def failure_exception(self):
+        # The common implementation clears transfer_infos before raising the cause.
+        with self.kv_mgr._source_drain.lock:
+            self._remember_drained_abort_targets()
+            super().failure_exception()
+
+    def _remember_drained_abort_targets(self):
+        if not hasattr(self, "_drained_abort_targets"):
+            self._drained_abort_targets = set()
+            self._drained_abort_notified_targets = set()
+        self._drained_abort_targets.update(self._current_drained_abort_targets())
 
     def is_transfer_drained(self):
         return self.kv_mgr.source_transfers_drained(self.bootstrap_room)

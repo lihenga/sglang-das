@@ -87,6 +87,7 @@ class TestMooncakeFailedChain(CustomTestCase):
                 if raises:
                     backend.load.side_effect = RuntimeError("native enqueue failed")
                 wrapper.cache_linker = backend
+                wrapper.request_ids = {"rid": "attempt"}
 
                 def detach(endpoint, anchor):
                     events.append("detach")
@@ -101,6 +102,17 @@ class TestMooncakeFailedChain(CustomTestCase):
                     wrapper._queue_load("rid", 7, [object()], anchor=3)
                 self.assertEqual(events, ["detach", "unlock"])
                 self.assertEqual(wrapper.failed_chains["rid"], [7])
+                backend.abort_prepared_load.assert_called_once_with("attempt")
+
+    def test_empty_commit_releases_the_prepared_session_without_publishing(self):
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache_linker = Mock()
+        wrapper.cache = Mock()
+        wrapper.request_ids = {"rid": "attempt"}
+        wrapper._queue_load("rid", 7, [], anchor=3)
+        wrapper.cache_linker.abort_prepared_load.assert_called_once_with("attempt")
+        wrapper.cache_linker.load.assert_not_called()
+        wrapper.cache.inc_lock_ref.assert_not_called()
 
     def test_attempt_reuse_keeps_old_ack_and_release_away_from_new_prefetch(self):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)

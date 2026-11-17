@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -53,6 +54,7 @@ class TestMooncakeLinkerBroadcast(CustomTestCase):
         linker.broadcast_loads = {0: (1, {}, ["rid"], Mock())}
         linker.broadcast_failed = set()
         linker.broadcast_events = []
+        linker.load_batch_futures = {0: Future()}
         linker.num_layers = 2
         linker.tp_group = object()
         linker.mla_broadcaster = SimpleNamespace(
@@ -75,6 +77,9 @@ class TestMooncakeLinkerBroadcast(CustomTestCase):
         self.assertFalse(linker.pending_load_tokens)
         self.assertFalse(linker.pending_load_started)
         self.assertEqual(linker.broadcast_events, [(event, ["rid"], True)])
+        linker.wait_for_load_batch(0)
+        event.synchronize.assert_called_once()
+        self.assertFalse(linker.load_batch_futures)
 
 
 if __name__ == "__main__":
