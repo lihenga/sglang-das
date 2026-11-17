@@ -142,27 +142,57 @@ class MooncakeDfsHealthManager:
         self._apply_policy(False, False)
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(
-            target=self._run, name="mooncake-dfs-health", daemon=True
-        )
-        self._thread.start()
+        with self._probe_lock:
+            if self._stop.is_set():
+                raise RuntimeError("Mooncake DFS health manager is closing or closed")
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(
+                target=self._run, name="mooncake-dfs-health", daemon=True
+            )
+            self._thread.start()
 
     def close(self) -> None:
-        self._stop.set()
+        """Stop scheduling; refuse owner release until all native work drains.
+
+        Callers must retain this manager and its client on failure, refuse
+        re-attachment, and retry close after recovery (or restart the process).
+        Stopping health reporting does not confirm a native DFS disable.
+        """
+        with self._probe_lock:
+            self._stop.set()
+            threads = [self._thread]
+            threads.extend(
+                call.thread for call in self._probe_calls.values() if call is not None
+            )
         with self._policy_condition:
             self._policy_condition.notify_all()
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(1.0, float(self._interval_s) + 1.0))
-        self._thread = None
-        policy_thread = self._policy_thread
-        if (
-            policy_thread is not None
-            and policy_thread is not threading.current_thread()
-        ):
-            policy_thread.join(timeout=1.0)
+            threads.append(self._policy_thread)
+        with self._lock:
+            self._generation += int(self._read_state != UNKNOWN) + int(
+                self._write_state != UNKNOWN
+            )
+            self._read_state = self._write_state = UNKNOWN
+
+        deadline = time.monotonic() + 1.0
+        for thread in threads:
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        pending = [
+            thread.name
+            for thread in threads
+            if thread is not None and thread.is_alive()
+        ]
+        # Synchronous policy callers need an owner too, even without a worker.
+        if self._policy_apply_lock.acquire(blocking=False):
+            self._policy_apply_lock.release()
+        else:
+            pending.append("native policy application")
+        if pending:
+            raise RuntimeError(
+                "Mooncake DFS health close incomplete; retain the client and refuse "
+                "detach/reattach until native operations drain: " + ", ".join(pending)
+            )
 
     def snapshot(self) -> DfsHealthSnapshot:
         with self._lock:
@@ -181,6 +211,8 @@ class MooncakeDfsHealthManager:
     def local_policy(self) -> tuple[bool, bool]:
         """Return this rank's fail-closed policy candidate."""
         with self._lock:
+            if self._stop.is_set():
+                return False, False
             return (
                 self._read_state == AVAILABLE,
                 self._write_state == AVAILABLE,
@@ -279,6 +311,8 @@ class MooncakeDfsHealthManager:
         write_ok = write_error == 0
 
         with self._lock:
+            if self._stop.is_set():
+                return self.snapshot_unlocked()
             old_read = self._read_state
             old_write = self._write_state
             self._read_state, self._read_successes, self._read_failures = (
@@ -332,6 +366,8 @@ class MooncakeDfsHealthManager:
         self, capability: str, method_name: str
     ) -> _NativeProbeCall:
         with self._probe_lock:
+            if self._stop.is_set():
+                raise RuntimeError("Mooncake DFS health manager is closing or closed")
             existing = self._probe_calls[capability]
             if existing is not None:
                 return existing
@@ -449,6 +485,8 @@ class MooncakeDfsHealthManager:
             try:
                 self.probe_once()
             except Exception:
+                if self._stop.is_set():
+                    return
                 logger.exception("Mooncake DFS health probe failed")
             if self._stop.wait(self._interval_s):
                 break

@@ -100,12 +100,24 @@ failure. Before downstream headers, 5xx failures return immediately without
 reading the upstream error body. For 4xx, the router reads at most 4 KiB for at
 most 100 ms, preserving the status and any available diagnostic prefix. Router
 error messages redact HTTP(S) URLs; transport details remain in server logs.
-Buffered prefill/non-streaming bodies and pending decode output are limited to
-8 MiB each; pending decode also retains at most 8192 chunks. Crossing a limit
-returns 502 and cancels the paired request. Parsed pending-decode SSE events are
-discarded from the parser buffer while the original chunks await forwarding.
-After headers, an incomplete SSE event exceeding 8 MiB produces a 502 error event
-and closes the stream; it cannot change the already-sent HTTP status.
+HTTP PD buffering uses `RouterConfig.max_payload_size` / `--max-payload-size`
+(bytes, default `536870912`, or 512 MiB). It bounds each non-streaming worker body,
+prefill metadata retained for logprob merging, decode output held while prefill
+finishes, and each incomplete SSE event (excluding its empty separator line).
+There is no HTTP chunk-count limit. Complete events release their parsing buffer,
+so total stream length and an HTTP chunk containing many events may exceed this
+size. Crossing a limit before headers returns 502 and cancels the paired request.
+After headers, overflow terminates the body with a transport error; it does not
+append an SSE error event to partially sent data. Both logprob and ordinary
+streams stop at the terminal event, discarding any trailing data in the same
+HTTP chunk. Complete JSON worker errors are detected before EOF using an
+incremental boundary scan and a single JSON parse per body for error detection;
+logprob merging may separately parse the completed body.
+These are per-buffer limits, not a process-wide memory budget: simultaneous
+prefill/decode buffers, parsing/merging allocations, upstream HTTP chunks and
+the unbounded downstream forwarding queue also consume memory. `max_concurrent_requests`
+currently configures a refilling token bucket (disabled by default), so it is
+not a hard limit on live response bodies or total in-flight bytes.
 After streaming starts, the original
 error event is forwarded and the stream closes. Updating the Python Engine
 package alone does not install these gateway changes.

@@ -99,6 +99,59 @@ struct SseEventBuffer {
     after_cr: bool,
 }
 
+#[derive(Default)]
+struct JsonErrorDetector {
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    checked: bool,
+    #[cfg(test)]
+    parse_attempts: usize,
+}
+
+impl JsonErrorDetector {
+    // Scan new bytes only; nested logprob objects must not reparse the whole prefix.
+    #[allow(clippy::result_large_err)]
+    fn check(&mut self, chunk: &[u8], body: &[u8], side: &str) -> Result<(), Response> {
+        if self.checked {
+            return Ok(());
+        }
+        for byte in chunk {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if *byte == b'\\' {
+                    self.escaped = true;
+                } else if *byte == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        self.checked = true;
+                        #[cfg(test)]
+                        {
+                            self.parse_attempts += 1;
+                        }
+                        // serde remains responsible for JSON syntax and error classification.
+                        if let Ok(payload) = serde_json::from_slice::<Value>(body) {
+                            PDRouter::check_worker_payload(&payload, side)?;
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SseEventBuffer {
     // Keep the concrete HTTP error response used by the PD router's callers.
     #[allow(clippy::result_large_err)]
@@ -722,6 +775,7 @@ impl PDRouter {
                 let headers = header_utils::preserve_response_headers(response.headers());
                 let mut stream = response.bytes_stream();
                 let mut body = bytes::BytesMut::new();
+                let mut json_error = JsonErrorDetector::default();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk.map_err(|e| {
                         rate_limited_log!(ERROR, decode_url = decode.url(), error = ?e, "Failed to read decode body");
@@ -733,7 +787,7 @@ impl PDRouter {
                     })?;
                     Self::check_buffer_capacity(body.len(), chunk.len(), self.max_payload_size)?;
                     body.extend_from_slice(&chunk);
-                    Self::check_json_worker_error(&body, "decode")?;
+                    json_error.check(&chunk, &body, "decode")?;
                 }
                 decode.record_outcome(true);
                 Ok(DecodeResponse::Buffered(status, headers, body.freeze()))
@@ -991,10 +1045,13 @@ impl PDRouter {
         let mut tracked =
             BreakerTrackedStream::new(stream, Arc::clone(&decode), decode.url().to_string());
         if status.is_success() {
-            tracked = tracked.with_metrics(
-                metrics_labels::BACKEND_PD,
-                model_id.unwrap_or_else(|| decode.model_id()),
-            );
+            // The SSE parser below owns application errors, including the terminal boundary.
+            tracked = tracked
+                .with_metrics(
+                    metrics_labels::BACKEND_PD,
+                    model_id.unwrap_or_else(|| decode.model_id()),
+                )
+                .without_error_event_scanning();
         }
         if !(status.is_success() || status.is_client_error()) {
             tracked.mark_errored();
@@ -1066,6 +1123,9 @@ impl PDRouter {
 
                                 let result = if merge_logprobs {
                                     merged.freeze()
+                                } else if is_done || stream_error {
+                                    // Discard the suffix even when it shares the terminal HTTP chunk.
+                                    chunk.slice(..chunk.len() - input.len())
                                 } else {
                                     chunk
                                 };
@@ -1223,6 +1283,7 @@ impl PDRouter {
         let mut stream = prefill_response.bytes_stream();
         let mut body = bytes::BytesMut::new();
         let mut events = SseEventBuffer::default();
+        let mut json_error = JsonErrorDetector::default();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
                 rate_limited_log!(ERROR, prefill_url, error = ?e, "Failed to read prefill body");
@@ -1244,7 +1305,7 @@ impl PDRouter {
                     }
                 }
             } else {
-                Self::check_json_worker_error(&body, "prefill")?;
+                json_error.check(&chunk, &body, "prefill")?;
             }
         }
         if is_sse {
@@ -1362,20 +1423,6 @@ impl PDRouter {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
-    fn check_json_worker_error(body: &[u8], side: &str) -> Result<(), Response> {
-        // Don't repeatedly parse large, incomplete logprob arrays on every chunk.
-        if matches!(
-            body.iter().rfind(|byte| !byte.is_ascii_whitespace()),
-            Some(b'}' | b']')
-        ) {
-            if let Ok(payload) = serde_json::from_slice::<Value>(body) {
-                Self::check_worker_payload(&payload, side)?;
-            }
-        }
-        Ok(())
-    }
-
     async fn prepare_decode_stream(
         &self,
         response: reqwest::Response,
@@ -1392,6 +1439,7 @@ impl PDRouter {
         let mut stream = response.bytes_stream().boxed();
         let mut prefix = bytes::BytesMut::new();
         let mut events = SseEventBuffer::default();
+        let mut json_error = JsonErrorDetector::default();
         let mut output_ready = false;
         loop {
             // Keep polling decode until prefill completes, even after the first token.
@@ -1424,7 +1472,19 @@ impl PDRouter {
             if is_sse {
                 let mut input = chunk.as_ref();
                 while let Some(event) = events.next_event(&mut input, self.max_payload_size)? {
-                    output_ready |= Self::decode_event_ready(&event)?;
+                    let (ready, terminal) = Self::decode_event_ready(&event)?;
+                    output_ready |= ready;
+                    if terminal {
+                        let chunk = chunk.slice(..chunk.len() - input.len());
+                        if prefill_ready.try_recv().is_err() {
+                            Self::check_buffer_capacity(
+                                prefix.len(),
+                                chunk.len(),
+                                self.max_payload_size,
+                            )?;
+                        }
+                        return Ok(tokio_stream::iter([Ok(prefix.freeze()), Ok(chunk)]).boxed());
+                    }
                     if output_ready && prefill_ready.try_recv().is_ok() {
                         return Ok(tokio_stream::iter([Ok(prefix.freeze()), Ok(chunk)])
                             .chain(stream)
@@ -1435,7 +1495,7 @@ impl PDRouter {
             Self::check_buffer_capacity(prefix.len(), chunk.len(), self.max_payload_size)?;
             prefix.extend_from_slice(&chunk);
             if !is_sse {
-                Self::check_json_worker_error(&prefix, "decode")?;
+                json_error.check(&chunk, &prefix, "decode")?;
             }
         }
         Ok(tokio_stream::once(Ok(prefix.freeze()))
@@ -1443,56 +1503,66 @@ impl PDRouter {
             .boxed())
     }
 
+    // Returns (has output, is terminal), including before prefill has completed.
     #[allow(clippy::result_large_err)]
-    fn decode_event_ready(event: &[u8]) -> Result<bool, Response> {
+    fn decode_event_ready(event: &[u8]) -> Result<(bool, bool), Response> {
         let data = Self::sse_data(event);
         if data.trim() == "[DONE]" {
-            return Ok(true);
+            return Ok((true, true));
         }
         if data.is_empty() {
-            return Ok(false);
+            return Ok((false, false));
         }
         let payload = Self::sse_payload(event).map_err(|e| {
             rate_limited_log!(WARN, error = %e, "Decode returned an invalid SSE event");
             error::bad_gateway("decode_stream_invalid", e.to_string())
         })?;
         Self::check_worker_payload(&payload, "decode")?;
+        if Self::responses_event_completed(&payload) {
+            return Ok((true, true));
+        }
         if matches!(
             payload.get("type").and_then(Value::as_str),
             Some("response.created" | "response.queued" | "response.in_progress")
         ) {
-            return Ok(false);
+            return Ok((false, false));
         }
         if let Some(choices) = payload.get("choices").and_then(Value::as_array) {
-            return Ok(choices.iter().any(|choice| {
-                choice
-                    .get("finish_reason")
-                    .is_some_and(|value| !value.is_null())
-                    || choice
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
-                    || choice
-                        .get("delta")
-                        .and_then(Value::as_object)
-                        .is_some_and(|delta| {
-                            delta.iter().any(|(key, value)| {
-                                key != "role"
-                                    && !value.is_null()
-                                    && value.as_str() != Some("")
-                                    && value.as_array().is_none_or(|items| !items.is_empty())
+            return Ok((
+                choices.iter().any(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .is_some_and(|value| !value.is_null())
+                        || choice
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                        || choice
+                            .get("delta")
+                            .and_then(Value::as_object)
+                            .is_some_and(|delta| {
+                                delta.iter().any(|(key, value)| {
+                                    key != "role"
+                                        && !value.is_null()
+                                        && value.as_str() != Some("")
+                                        && value.as_array().is_none_or(|items| !items.is_empty())
+                                })
                             })
-                        })
-            }));
+                }),
+                false,
+            ));
         }
         // Native /generate can send metadata before the first generated token.
-        Ok(payload
-            .get("text")
-            .and_then(Value::as_str)
-            .is_none_or(|text| !text.is_empty())
-            || payload
-                .pointer("/meta_info/finish_reason")
-                .is_some_and(|value| !value.is_null()))
+        Ok((
+            payload
+                .get("text")
+                .and_then(Value::as_str)
+                .is_none_or(|text| !text.is_empty())
+                || payload
+                    .pointer("/meta_info/finish_reason")
+                    .is_some_and(|value| !value.is_null()),
+            false,
+        ))
     }
 
     fn build_post_with_headers(

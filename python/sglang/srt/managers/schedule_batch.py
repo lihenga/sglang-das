@@ -873,6 +873,7 @@ class MultimodalInputs:
         return image_tokens, audio_tokens, video_tokens
 
     def merge(self, other: MultimodalInputs):
+
         # args needed to be merged
         optional_args = [
             "mm_items",

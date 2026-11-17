@@ -511,6 +511,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.init_external_kv_cleanup(coordinated=False)
+        scheduler.tree_cache = SimpleNamespace(linker=None)
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
         scheduler.chunked_req = None

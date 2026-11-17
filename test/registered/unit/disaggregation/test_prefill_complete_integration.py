@@ -112,6 +112,7 @@ class TestAllocationIntegration(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         self.wire = deque()
+        self._flushing_control = False
         self.prefill = self.manager("prefill", 1)
         self.decode = self.manager("decode", 2)
         self.endpoints = {("prefill", 1): self.prefill, ("decode", 2): self.decode}
@@ -123,6 +124,11 @@ class TestAllocationIntegration(CustomTestCase):
         mgr._drained_abort_lock = threading.Lock()
         mgr._drained_abort_rooms = OrderedDict()
         mgr._drained_abort_capacity = 4096
+        mgr._control_notification_lock = threading.RLock()
+        mgr._control_rooms = OrderedDict()
+        mgr._pending_control_notifications = OrderedDict()
+        mgr._deferred_ack_deadlines = OrderedDict()
+        mgr._stopped = False
         mgr.pd_hidden_events = PDHiddenEventManager(mgr)
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.request_status = {}
@@ -150,13 +156,26 @@ class TestAllocationIntegration(CustomTestCase):
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(
             (endpoint, msg)
         )
-        mgr._queue_control_notification = lambda room, ip, port, parts: (
-            self.wire.append((f"tcp://{ip}:{port}", parts)) or True
+        mgr._drained_abort_notifier = SimpleNamespace(
+            submit=lambda room, endpoint, ipv6, parts, deadline: (
+                self.wire.append((endpoint, parts)) or True
+            )
         )
         return mgr
 
     def flush(self):
-        while self.wire:
+        while True:
+            # A submit hook may dispatch its frame and immediately reuse the
+            # room. Do not recursively resubmit the not-yet-returned task.
+            if not self._flushing_control:
+                self._flushing_control = True
+                try:
+                    for manager in (self.prefill, self.decode):
+                        manager._retry_pending_control_notifications()
+                finally:
+                    self._flushing_control = False
+            if not self.wire:
+                return
             endpoint, msg = self.wire.popleft()
             if endpoint == "tcp://prefill:1":
                 self.prefill._handle_bootstrap_message(msg)
@@ -646,10 +665,10 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(sender.poll(), KVPoll.Success)
         self.prefill.req_to_decode_prefix_len[1] = 0
         self.prefill.transfer_infos[1] = {}
-        enqueue = self.prefill._queue_control_notification
+        enqueue = self.prefill._drained_abort_notifier.submit
         next_transfer = []
 
-        def success(room, endpoint, port, parts):
+        def success(room, endpoint, ipv6, parts, deadline):
             self.assertEqual(room, 1)
             self.assertEqual(
                 self.decode.parse_kv_status_message(parts)[1], KVPoll.Success
@@ -659,9 +678,10 @@ class TestAllocationIntegration(CustomTestCase):
                 self.prefill.request_status,
                 self.prefill.req_to_decode_prefix_len,
                 self.prefill.transfer_infos,
+                self.prefill._control_rooms,
             ):
                 self.assertNotIn(1, table)
-            enqueue(room, endpoint, port, parts)
+            enqueue(room, endpoint, ipv6, parts, deadline)
             self.flush()
             self.assertEqual(receiver.poll(), KVPoll.Success)
             receiver.clear()
@@ -671,10 +691,11 @@ class TestAllocationIntegration(CustomTestCase):
             next_transfer.extend((new_sender, new_receiver))
             return True
 
-        self.prefill._queue_control_notification = Mock(side_effect=success)
+        self.prefill._drained_abort_notifier.submit = Mock(side_effect=success)
         sender.clear()
         sender.clear()
-        self.prefill._queue_control_notification.assert_called_once()
+        self.flush()
+        self.prefill._drained_abort_notifier.submit.assert_called_once()
         new_sender, new_receiver = next_transfer
         self.assertIs(self.prefill.deferred_bootstrap.rooms[1].owner, new_sender)
         self.assertEqual(new_receiver.poll(), KVPoll.Bootstrapping)
@@ -813,17 +834,27 @@ class TestAllocationIntegration(CustomTestCase):
     def test_slow_status_delivery_does_not_hold_bootstrap_lock(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
+        submit = self.prefill._drained_abort_notifier.submit
+        delivered = []
 
         def send(*args, **kwargs):
             acquired = self.prefill.deferred_bootstrap.lock.acquire(blocking=False)
             self.assertTrue(acquired)
             if acquired:
                 self.prefill.deferred_bootstrap.lock.release()
+            delivered.append(args[3])
+            return submit(*args, **kwargs)
 
-        self.prefill.send_kv_status_message = send
+        self.prefill._drained_abort_notifier.submit = send
         sender.mark_prefill_complete()
+        self.flush()
         sender.abort()
         sender.clear()
+        self.flush()
+        self.assertEqual(
+            [self.decode.parse_kv_status_message(parts)[1] for parts in delivered],
+            [KVPoll.WaitingForInput, KVPoll.Failed],
+        )
 
     def test_rebootstrap_dispatch_precedes_ready_without_allocating(self):
         receiver = self.receiver()

@@ -97,7 +97,7 @@ impl ErrorEventScanner {
 struct StreamMetrics {
     backend_type: &'static str,
     model: String,
-    scanner: ErrorEventScanner,
+    scanner: Option<ErrorEventScanner>,
     error_event: bool,
 }
 
@@ -154,9 +154,17 @@ impl<E> BreakerTrackedStream<E> {
         self.metrics = Some(StreamMetrics {
             backend_type,
             model: model.to_owned(),
-            scanner: ErrorEventScanner::default(),
+            scanner: Some(ErrorEventScanner::default()),
             error_event: false,
         });
+        self
+    }
+
+    /// Use the caller's complete-event parser instead of probing raw HTTP chunks.
+    pub fn without_error_event_scanning(mut self) -> Self {
+        if let Some(metrics) = self.metrics.as_mut() {
+            metrics.scanner = None;
+        }
         self
     }
 
@@ -166,7 +174,7 @@ impl<E> BreakerTrackedStream<E> {
         } else if self
             .metrics
             .as_ref()
-            .is_some_and(|m| m.error_event || m.scanner.saw_error)
+            .is_some_and(|m| m.error_event || m.scanner.as_ref().is_some_and(|s| s.saw_error))
         {
             "stream_error_event"
         } else if self.terminal == Terminal::Active {
@@ -218,7 +226,11 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(b))) => {
                 if let Some(metrics) = self.metrics.as_mut() {
-                    if let Some(event) = metrics.scanner.feed(&b) {
+                    if let Some(event) = metrics
+                        .scanner
+                        .as_mut()
+                        .and_then(|scanner| scanner.feed(&b))
+                    {
                         rate_limited_log!(ERROR, worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
                     }
                 }
@@ -248,7 +260,11 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
 impl<E> Drop for BreakerTrackedStream<E> {
     fn drop(&mut self) {
         if let Some(metrics) = self.metrics.as_mut() {
-            if let Some(event) = metrics.scanner.take_error() {
+            if let Some(event) = metrics
+                .scanner
+                .as_mut()
+                .and_then(ErrorEventScanner::take_error)
+            {
                 rate_limited_log!(ERROR, worker_url = %self.log_url, error_event = %event, "Upstream stream error event");
             }
         }

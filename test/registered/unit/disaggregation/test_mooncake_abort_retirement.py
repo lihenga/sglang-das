@@ -18,7 +18,11 @@ from sglang.srt.managers.scheduler_components.mooncake_prefetch import (
     MooncakePrefetchSchedulerMixin,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-from sglang.srt.mem_cache.cleanup import CleanupOutcomeUnknown, run_cleanup_step
+from sglang.srt.mem_cache.cleanup import (
+    CleanupOutcomeUnknown,
+    QuarantinedKVResources,
+    run_cleanup_step,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -86,6 +90,7 @@ def _owner(calls, *, fail_release=False):
         ),
         "DisaggregationMode": DisaggregationMode,
         "CleanupOutcomeUnknown": CleanupOutcomeUnknown,
+        "QuarantinedKVResources": QuarantinedKVResources,
         "run_cleanup_step": run_cleanup_step,
         "release_kv_cache": release,
         "maybe_release_metadata_buffer": lambda *args: calls.append("metadata"),
@@ -145,6 +150,8 @@ def _request(calls, reason=None):
         skip_radix_cache_insert=False,
         return_logprob=False,
         kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+        lock=None,
+        metadata_buffer_index=-1,
         disagg_kv_sender=_Sender(calls),
         time_stats=Mock(),
         external_kv_cleanup_steps={},
@@ -310,7 +317,7 @@ class TestMooncakeAbortRetirement(CustomTestCase):
         with self.assertLogs(level="ERROR"):
             MooncakePrefetchSchedulerMixin._process_mooncake_cleanup_requests(owner)
         self.assertNotIn(id(req), owner._mooncake_cleanup_requests)
-        self.assertIn(id(req), owner._quarantined_external_kv_requests)
+        self.assertIn(req.cache_request_handle, owner._quarantined_external_kv_requests)
         self.assertEqual(calls.count("response"), 1)
         self.assertEqual(calls.count("kv"), 1)
 

@@ -775,6 +775,13 @@ class UnifiedTreeCoreInterface(ABC):
             "External load recovery requires a supporting TreeCore"
         )
 
+    def is_on_pending_external_load_chain(
+        self, node_id: NodeId, loads: Sequence[tuple[NodeId, NodeId]]
+    ) -> bool:
+        raise NotImplementedError(
+            "External load publication requires a supporting TreeCore"
+        )
+
     def is_on_detached_chain(self, node_id: NodeId) -> bool:
         raise NotImplementedError(
             "External load recovery requires a supporting TreeCore"

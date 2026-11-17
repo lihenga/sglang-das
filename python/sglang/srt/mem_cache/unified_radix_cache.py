@@ -1106,6 +1106,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if self.linker is not None and self.is_on_failed_linker_chain(req.last_node):
+            # Completion polling precedes the next overlap chunk's stash.
+            req.skip_radix_cache_insert = True
+            return
+        if self.linker is not None and not self.linker.can_checkpoint(req):
+            return
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
@@ -1113,6 +1119,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
+        if self.linker is not None and self.is_on_failed_linker_chain(req.last_node):
+            req.skip_radix_cache_insert = True
+            return
+        if self.linker is not None and not self.linker.can_checkpoint(req):
+            return
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
@@ -3558,7 +3569,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
-        self._sync_dfs_health_policy()
+        # Detach may retain a native owner on only some ranks. All ranks have
+        # disabled storage, so none may enter owner-dependent policy collectives.
+        if self.enable_storage:
+            self._sync_dfs_health_policy()
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash

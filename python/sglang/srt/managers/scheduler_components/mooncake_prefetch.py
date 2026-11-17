@@ -55,6 +55,8 @@ def trace_disagg_prefill(event: str, rid, bootstrap_room, rank, **state) -> None
 
 class MooncakePrefetchSchedulerMixin:
     BG_PREFETCH_JOIN_GRACE_EPOCHS = 4
+    FORWARD_DEFERRED_HIGH_WATER = 1024
+    FORWARD_RECV_LIMIT = 128
     enable_waiting_queue_dfs_prefetch = False
     _forward_ingress_enabled = False
     _mooncake_final_poll_timeout_ms = 0.0
@@ -680,30 +682,9 @@ class MooncakePrefetchSchedulerMixin:
             if req.external_kv_response_sent:
                 pending.pop(id(req), None)
 
-    def _prepare_external_linker_admissions(self, prefetch_states):
-        candidates = []
-        if self.enable_unified_cache_external_linker:
-            for req in self.waiting_queue:
-                if (
-                    prefetch_states is not None
-                    and prefetch_states.get(req.rid) == "pending"
-                ):
-                    continue
-                # Admission needs hashes only; allocation/COW stays with the adder.
-                req.init_next_round_input(self.tree_cache, cow_mamba=False)
-                candidates.append(req)
-                if len(candidates) == 64:
-                    break
-        states = (
-            self.tree_cache.prepare_external_linker_loads(candidates)
-            if candidates
-            else []
-        )
-        return candidates, {req.rid: state for req, state in zip(candidates, states)}
-
-    def _apply_external_linker_admission(self, req, states) -> bool:
-        """Keep a failed async verdict authoritative after the final rematch."""
-        state = states.get(req.rid, "pending")
+    def _apply_external_linker_admission(self, req) -> bool:
+        # The adder has reached and matched this request after its capacity gates.
+        state = self.tree_cache.prepare_external_linker_loads([req])[0]
         if state == "pending":
             return False
         if state == "failed":
@@ -763,16 +744,39 @@ class MooncakePrefetchSchedulerMixin:
 
             # Every rank that shares a receive broadcast must enter the same
             # number of them, even when its model launch finishes earlier.
-            active = torch.tensor([int(not future.done())], dtype=torch.int)
+            active = torch.tensor(
+                [
+                    int(not future.done()),
+                    int(
+                        len(self._forward_deferred_reqs) + len(deferred_reqs)
+                        >= self.FORWARD_DEFERRED_HIGH_WATER
+                    ),
+                ],
+                dtype=torch.int,
+            )
             for group in sync_groups:
                 torch.distributed.all_reduce(
                     active, op=torch.distributed.ReduceOp.MAX, group=group
                 )
-            if not int(active.item()):
+            if not int(active[0].item()):
                 break
+            # All receive peers pause together, while still joining forward polls.
+            if int(active[1].item()):
+                wait([future], timeout=0.001)
+                continue
 
             with self.device_module.StreamContext(self.schedule_stream):
-                recv_reqs = self.request_receiver.recv_requests(defer_mm=True)
+                receiver = self.request_receiver
+                previous_limit = receiver.max_recv_per_poll
+                receiver.max_recv_per_poll = (
+                    min(previous_limit, self.FORWARD_RECV_LIMIT)
+                    if previous_limit >= 0
+                    else self.FORWARD_RECV_LIMIT
+                )
+                try:
+                    recv_reqs = receiver.recv_requests(defer_mm=True)
+                finally:
+                    receiver.max_recv_per_poll = previous_limit
                 self._trace_prefill_reqs(
                     "scheduler_receive", recv_reqs, ingress="forward"
                 )

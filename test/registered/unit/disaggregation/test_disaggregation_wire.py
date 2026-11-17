@@ -1,7 +1,7 @@
 import struct
 import threading
 import unittest
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
+from sglang.srt.disaggregation.common.conn import AbortAck, AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -31,6 +31,7 @@ from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
@@ -76,6 +77,50 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def _registration_info(**overrides):
+    values = dict(
+        room="42",
+        endpoint="127.0.0.1",
+        dst_port=1234,
+        mooncake_session_id="decode",
+        dst_kv_ptrs=[],
+        dst_aux_ptrs=[],
+        dst_state_data_ptrs=[],
+        dst_tp_rank=0,
+        dst_attn_tp_size=1,
+        dst_kv_item_len=0,
+        dst_state_item_lens=[],
+        dst_state_dim_per_tensor=[],
+        dst_kv_layer_ids=[],
+        dst_state_layer_ids=[],
+    )
+    values.update(overrides)
+    return KVArgsRegisterInfo(**values)
+
+
+def _init_notification_state(manager):
+    manager.cp_cache_layer_split = False
+    manager.bootstrap_timeout = manager.waiting_timeout = 10
+    manager._deferred_ack_targets = {}
+    manager._deferred_ack_deadlines = OrderedDict()
+    manager._deferred_ack_poisoned_rooms = set()
+    manager._drained_abort_capacity = 4096
+    manager._control_notification_lock = threading.RLock()
+    manager._control_rooms = OrderedDict()
+    manager._pending_control_notifications = OrderedDict()
+    manager.deferred_bootstrap = None
+    manager._stopped = False
+    manager.pd_hidden_pool = None
+    manager.pd_hidden_events = PDHiddenEventManager(manager)
+    # Preserve wire assertions at the external delivery boundary, while the
+    # manager still owns status encoding, admission and outbox transitions.
+    manager._drained_abort_notifier = SimpleNamespace(
+        submit=lambda room, endpoint, ipv6, parts, deadline: (
+            manager._send_multipart_locked(endpoint, list(parts), is_ipv6=ipv6) or True
+        )
+    )
 
 
 class TestMixedSWAKVBlockScales(CustomTestCase):
@@ -139,6 +184,7 @@ class TestDisaggregationWire(unittest.TestCase):
             for outcome in ("mismatch", "cleared", "transport_failure"):
                 with self.subTest(layer_ids=layer_ids, outcome=outcome):
                     manager = object.__new__(MooncakeKVManager)
+                    _init_notification_state(manager)
                     manager.kv_args = SimpleNamespace(
                         kv_data_ptrs=[],
                         state_types=[StateType.SWA, StateType.DSA],
@@ -189,7 +235,9 @@ class TestDisaggregationWire(unittest.TestCase):
                         )
                         manager.transfer_infos[room] = {req.mooncake_session_id: req}
                         manager.decode_kv_args_table[req.mooncake_session_id] = (
-                            SimpleNamespace(
+                            _registration_info(
+                                mooncake_session_id=req.mooncake_session_id,
+                                dst_state_types=[StateType.SWA, StateType.DSA],
                                 requires_dcp_relayout=False,
                                 dst_state_data_ptrs=[[0x2000], [0x4000]],
                                 dst_state_item_lens=[
@@ -238,6 +286,7 @@ class TestDisaggregationWire(unittest.TestCase):
                         ),
                     ):
                         manager.transfer_worker(queue, executor=None)
+                        manager._retry_pending_control_notifications()
 
                     self.assertEqual(
                         manager.request_status.get(42),
@@ -330,8 +379,9 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.is_mla_backend = True
                     manager.is_hybrid_mla_backend = False
                     manager.pp_size = 1
-                    registration_info = SimpleNamespace(
+                    registration_info = _registration_info(
                         mooncake_session_id="decode",
+                        dst_state_types=[StateType.SWA, StateType.MAMBA],
                         dst_state_data_ptrs=[[0x2000], [0x4000]],
                         # Mamba disagrees too, but ships on its own path.
                         dst_state_item_lens=[[dst_item_len], [999]],
@@ -378,8 +428,9 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.decode_kv_args_table = {}
 
         def register(dst_item_len):
-            info = SimpleNamespace(
+            info = _registration_info(
                 mooncake_session_id="decode",
+                dst_state_types=[StateType.SWA],
                 dst_state_data_ptrs=[[0x2000]],
                 dst_state_item_lens=[[dst_item_len]],
                 dst_state_layer_ids=[[]],
@@ -415,8 +466,9 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.pp_size = 1
-        registration_info = SimpleNamespace(
+        registration_info = _registration_info(
             mooncake_session_id="decode",
+            dst_state_types=[StateType.SWA],
             dst_state_data_ptrs=[[0x2000]],
             dst_state_item_lens=[],
             dst_state_layer_ids=[[]],
@@ -468,6 +520,7 @@ class TestDisaggregationWire(unittest.TestCase):
         transport blacklist."""
         manager = object.__new__(MooncakeKVManager)
         manager.kv_args = SimpleNamespace(kv_data_ptrs=[], state_types=[StateType.SWA])
+        _init_notification_state(manager)
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.attn_tp_size = manager.attn_cp_size = manager.pp_size = 1
@@ -501,7 +554,9 @@ class TestDisaggregationWire(unittest.TestCase):
             is_dummy=False,
         )
         manager.transfer_infos = {42: {"decode:42": req}}
-        manager.decode_kv_args_table = {}
+        manager.decode_kv_args_table = {
+            "decode:42": _registration_info(mooncake_session_id="decode:42")
+        }
         manager._send_multipart_locked = Mock()
         manager._transfer_data = Mock(return_value=0)
         queue = FastQueue()
@@ -518,6 +573,7 @@ class TestDisaggregationWire(unittest.TestCase):
         )
         queue.put(None)
         manager.transfer_worker(queue, executor=None)
+        manager._retry_pending_control_notifications()
 
         self.assertEqual(manager.request_status[42], KVPoll.Failed)
         self.assertEqual(manager.failure_records[42], reason)
@@ -556,9 +612,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     dst_port=1234,
                 )
                 manager.transfer_infos = {42: {"decode": req}}
-                manager.decode_kv_args_table = {
-                    "decode": SimpleNamespace(registration_error=None)
-                }
+                manager.decode_kv_args_table = {"decode": _registration_info()}
                 manager.req_to_decode_prefix_len = {42: 0}
                 manager._send_pd_hidden_packet.return_value = (-1, False)
                 manager._mark_session_failed_and_sync.side_effect = (
@@ -663,6 +717,23 @@ class TestDisaggregationWire(unittest.TestCase):
         manager = object.__new__(MooncakeKVManager)
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
+        manager._source_drain = SourceDrainTracker()
+        manager._drained_abort_lock = threading.Lock()
+        manager._drained_abort_rooms = OrderedDict()
+        manager._drained_abort_capacity = 4096
+        manager._control_notification_lock = threading.RLock()
+        manager._pending_control_notifications = OrderedDict()
+        manager._control_rooms = OrderedDict()
+        manager._deferred_ack_deadlines = OrderedDict()
+        manager._deferred_ack_poisoned_rooms = set()
+        manager.deferred_bootstrap = None
+        manager.bootstrap_timeout = manager.waiting_timeout = 10
+        manager._stopped = False
+        manager._prefill_unique_rank = lambda: 0
+        manager.req_to_pd_hidden_meta = {}
+        sender.conclude_state = KVPoll.Failed
+        sender._drained_abort_targets = set()
+        manager._reserve_control_room(42, active=True)
         target = AckTarget("127.0.0.1", 1234, 7)
         for outstanding in (0, 1):
             with self.subTest(outstanding=outstanding):
@@ -670,16 +741,27 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.req_to_decode_prefix_len = {}
                 manager.transfer_infos = {}
                 manager._staging_outstanding = {42: outstanding}
-                manager._deferred_ack_targets = {42: {(target.ip, target.port): target}}
-                with patch.object(manager, "_send_abort_ack") as ack:
-                    sender.clear()
-                    if outstanding:
-                        ack.assert_not_called()
-                        manager._staging_outstanding[42] = 0
-                        manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once_with(42, target)
+                manager._deferred_ack_targets = {}
+                manager.register_deferred_ack_target(42, target)
+                wire = []
+                manager._drained_abort_notifier = SimpleNamespace(
+                    submit=lambda room, endpoint, ipv6, parts, deadline: (
+                        wire.append(tuple(parts)) or True
+                    )
+                )
+                sender.clear()
+                manager._retry_pending_control_notifications()
+                if outstanding:
+                    self.assertEqual(wire, [])
+                    self.assertIn(42, manager._deferred_ack_targets)
+                    manager._staging_outstanding[42] = 0
                     manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once()
+                    manager._retry_pending_control_notifications()
+                self.assertEqual(wire, [tuple(AbortAck(42, 0, 7).to_zmq())])
+                self.assertNotIn(42, manager._deferred_ack_targets)
+                manager._maybe_ack_drained_abort(42)
+                manager._retry_pending_control_notifications()
+                self.assertEqual(len(wire), 1)
 
     def test_mooncake_registration_staging_fields(self):
         msg = [
@@ -946,6 +1028,7 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 layer_split=layer_split,
             ):
                 manager = object.__new__(CommonKVManager)
+                manager.cp_cache_layer_split = False
                 manager.attn_cp_size = cp_size
                 manager.attn_cp_rank = cp_rank
                 with get_context().override_server_args(
@@ -958,6 +1041,8 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
 
     def test_mooncake_uses_common_cp_state_policy(self):
         manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = KVArgs()
+        manager.cp_cache_layer_split = False
         manager.attn_cp_size = 8
         manager.attn_cp_rank = 3
         manager.is_hybrid_mla_backend = False
@@ -975,6 +1060,7 @@ class TestQwen4StateWire(unittest.TestCase):
     @staticmethod
     def _qsa_pool(layer_id: int):
         pool = object.__new__(QSATokenToKVPool)
+        pool.mamba_pool = SimpleNamespace(use_hcu_kda=False)
         pool.full_kv_pool = object()
         pool.get_state_buf_infos = lambda: ([10], [100], [20])
         pool.get_state_dim_per_tensor = lambda: [4]
@@ -1048,6 +1134,7 @@ class TestQwen4StateWire(unittest.TestCase):
 
     def test_qsa_stage_without_qsa_layers_does_not_register_rope_ring(self):
         pool = object.__new__(QSATokenToKVPool)
+        pool.mamba_pool = SimpleNamespace(use_hcu_kda=False)
         pool.full_kv_pool = object()
         pool.get_state_buf_infos = lambda: ([10], [100], [20])
         pool.get_state_dim_per_tensor = lambda: [4]
@@ -1089,6 +1176,7 @@ class TestQwen4StateWire(unittest.TestCase):
 
     def _qsa_compressed_manager(self, *, src_item_len):
         manager = object.__new__(MooncakeKVManager)
+        manager.cp_cache_layer_split = False
         manager.request_status = {42: KVPoll.Transferring}
         manager.attn_tp_size = 4
         manager.pp_size = 1
@@ -1113,7 +1201,8 @@ class TestQwen4StateWire(unittest.TestCase):
         req = SimpleNamespace(
             room=42, mooncake_session_id="session", dst_state_indices=[[3]]
         )
-        decode_info = SimpleNamespace(
+        decode_info = _registration_info(
+            dst_state_types=[StateType.QSA_COMPRESSED],
             dst_attn_tp_size=4,
             dst_state_data_ptrs=[[2000]],
             dst_state_item_lens=[[16]],
@@ -1386,6 +1475,14 @@ class TestMooncakePPStaging(unittest.TestCase):
 
 
 class TestEagleDsaSeedTransfer(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # These CPU wire cases model the explicit CUDA/HIP/other branches below.
+        # Avoid the host HCU probe entering unrelated model configuration loading.
+        platform = patch("sglang.srt.utils.is_hcu", return_value=False)
+        platform.start()
+        self.addCleanup(platform.stop)
+
     @staticmethod
     def _make_req(
         seed,

@@ -79,7 +79,11 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
-from sglang.srt.mem_cache.cleanup import CleanupOutcomeUnknown, run_cleanup_step
+from sglang.srt.mem_cache.cleanup import (
+    CleanupOutcomeUnknown,
+    QuarantinedKVResources,
+    run_cleanup_step,
+)
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     kv_to_page_indices,
@@ -1150,6 +1154,20 @@ class SchedulerDisaggregationPrefillMixin:
             exc_info=True,
         )
         self._external_kv_cleanup_suppressed_warnings = 0
+
+    def has_retained_external_kv_resources(self) -> bool:
+        """Retained device/request/metadata owners prevent idle and cache reset."""
+        return any(
+            req.kv.holds_kv
+            or req.kv.holds_mamba
+            or req.lock is not None
+            or req.metadata_buffer_index >= 0
+            for owners in (
+                self._mooncake_cleanup_requests,
+                self._quarantined_external_kv_requests,
+            )
+            for req in owners.values()
+        )
 
     def _observe_grammar_first_mask_fill(self: Scheduler, req: Req) -> None:
         # GLM NOTE: the prefill engine samples exactly one token per request,
@@ -2896,7 +2914,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _quarantine_external_kv_request(self: Scheduler, req: Req) -> None:
         if (
-            id(req) not in self._quarantined_external_kv_requests
+            req.cache_request_handle not in self._quarantined_external_kv_requests
             and len(self._quarantined_external_kv_requests)
             >= self._external_kv_quarantine_limit
         ):
@@ -2904,7 +2922,17 @@ class SchedulerDisaggregationPrefillMixin:
         if isinstance(req.to_finish, FINISH_ABORT):
             req.finished_reason, req.to_finish = req.to_finish, None
         self._mooncake_cleanup_requests.pop(id(req), None)
-        self._quarantined_external_kv_requests[id(req)] = req
+        self._quarantined_external_kv_requests[req.cache_request_handle] = (
+            QuarantinedKVResources(
+                rid=req.rid,
+                kv=req.kv,
+                lock=req.lock,
+                metadata_buffer_index=req.metadata_buffer_index,
+                sender=req.disagg_kv_sender,
+                cache_request_handle=req.cache_request_handle,
+                cleanup_steps=req.external_kv_cleanup_steps,
+            )
+        )
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.set_external_kv_quarantined_reqs(
                 len(self._quarantined_external_kv_requests)

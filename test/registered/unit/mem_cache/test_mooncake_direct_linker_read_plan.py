@@ -198,6 +198,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker.host_prefetch_enabled = False
         linker.tp_rank = 0
         linker.load_with_read_plan = Mock()
+        linker.broadcast_outcomes = {}
 
         success = linker.load_layer_wise(7, [])
 
@@ -206,6 +207,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
 
     def _read_plan_linker(self, *, prefetch):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.broadcast_outcomes = {}
         linker.read_plan_enabled = True
         linker.host_prefetch_enabled = prefetch
         linker.read_plan_reuse_ranges = False

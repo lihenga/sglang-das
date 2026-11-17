@@ -644,6 +644,37 @@ Storage/linker policy wrappers currently discard the manager's confirmation
 result, and loads do not gate on pending policy application. Deferred application
 alone therefore does not provide fail-closed load admission during that window.
 
+Health-manager shutdown stops new probes and policy submissions and changes its
+local read/write candidates to `UNKNOWN` (deny both). It waits at most one second
+in total for its tracked workers. A pending native read, write or policy call
+makes `close()` raise instead of reporting completion; synchronous policy callers
+are included. The manager retains the client and worker handles. Repeated close
+attempts cannot start replacements, and late successful probes cannot restore
+availability after shutdown. After the native calls drain, retry close before
+creating a replacement manager, whose initial native deny policy must succeed.
+An indefinitely blocked native call requires retaining the old owner until
+recovery or restarting the process. No native thread is cancelled or client freed
+while an operation is using it.
+
+The controller disables storage work and retains the backend and synchronization
+groups if shutdown fails, including rollback after a partially failed attach.
+`MooncakeStore.close()` retains its health manager when close raises. A retained
+backend blocks all new attachments, including same-backend policy updates.
+Explicit detach retries release it only after workers and native calls drain;
+shutdown also retries retained backends with storage already disabled. No worker
+is automatically restarted. A retained-owner detach failure raises through the
+attachment entry point so the admin handler cannot report success merely because
+storage was already disabled. Stopping health workers does not confirm that native
+DFS access was disabled: existing or unconfirmed native permissions can remain in
+effect. Refused shutdown is not a healthy attachment that can safely resume
+storage traffic.
+
+After detach, disabled ranks skip DFS-policy polling even if only some retain
+their native owner. Before a new attach, attention ranks collectively check for
+retained backends; any pending cleanup refuses attachment on every rank before
+client creation. A locally completed detach therefore cannot let that rank
+reattach ahead of a peer whose native call is still pending.
+
 ### Observability and validation
 
 With `--enable-metrics`, each embedded client reports cumulative native metrics
@@ -678,8 +709,12 @@ Master for CPU/TCP native ReadLayout/ReadPlan/session smoke.
 `test_wheel_swap.py` checks multi-pool SGLang writes/reads against a matching
 wheel; choose `MATRIX_DEVICES=cpu` for CPU checks. These tests do not substitute
 for DeepSeek 4.1 output-consistency, HCU, RDMA, DFS fault, or performance runs.
-The DeepSeek linker test also includes an injected-read-failure arm, reusing
-its model/launch configuration. It requires an observed linker abort followed
+The existing `test_unified_cache_linker_kl_dsv4.py` targets **DeepSeek-V4-Flash**
+on CUDA; its injected-read-failure arm is not DeepSeek V4.1 or HCU acceptance.
+Do not substitute that model or add an unvalidated HCU registration to claim
+V4.1 coverage. A V4.1 service-level run requires the actual V4.1 checkpoint,
+launch configuration and allocated accelerators. The Flash test requires an
+observed linker abort followed
 by a successful request, live health, nonzero remote-load exposure, and the
 existing GSM8K accuracy threshold after warm/flush/re-read. This service-level
 test needs the model and accelerator environment; CPU unit results do not

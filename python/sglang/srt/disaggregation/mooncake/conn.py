@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
 from sglang.srt.disaggregation.mooncake.notifications import (
     DRAINED_ABORT_REJECTIONS,
+    ControlRoomOwner,
     DrainedAbortNotifier,
 )
 from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
@@ -332,6 +333,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._drained_abort_lock = threading.Lock()
             self._drained_abort_rooms = OrderedDict()
             self._drained_abort_capacity = 4096
+            self._control_notification_lock = threading.RLock()
+            self._pending_control_notifications = OrderedDict()
+            self._control_rooms = OrderedDict()
+            self._deferred_ack_deadlines = OrderedDict()
+            if self.deferred_bootstrap is not None:
+                self.deferred_bootstrap.capacity = self._drained_abort_capacity
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             self._transfer_completion_condition = threading.Condition()
             self._final_poll_enabled = (
@@ -667,6 +674,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         notifier = getattr(self, "_drained_abort_notifier", None)
         if notifier is not None:
             notifier.close()
+            with self._control_notification_lock:
+                self._pending_control_notifications.clear()
+                self._control_rooms.clear()
+            with self._source_drain.lock:
+                self._deferred_ack_deadlines.clear()
+                self._deferred_ack_targets.clear()
 
         # Stop the failed-session probe loop (PREFILL role) if running.
         probe_shutdown = getattr(self, "_failed_session_probe_shutdown", None)
@@ -4015,12 +4028,148 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._drained_abort_rooms[room] = time.monotonic() + ttl
             return targets
 
-    def _queue_control_notification(self, room, endpoint, port, parts) -> bool:
+    def _prune_control_rooms(self, now):
+        for room, state in list(self._control_rooms.items()):
+            if (
+                not state.active
+                and state.deadline <= now
+                and room not in self.request_status
+                and not any(
+                    deadline > now
+                    for _, pending in state.targets.values()
+                    for _, deadline in pending.values()
+                )
+            ):
+                del self._control_rooms[room]
+
+    def _control_credits_used(self):
+        return sum(max(2, len(state.targets)) for state in self._control_rooms.values())
+
+    def _reserve_control_room(self, room, *, active=False) -> bool:
+        with self._control_notification_lock:
+            now = time.monotonic()
+            self._prune_control_rooms(now)
+            state = self._control_rooms.get(room)
+            if state is None:
+                if self._control_credits_used() + 2 > self._drained_abort_capacity:
+                    DRAINED_ABORT_REJECTIONS.labels("control_room_capacity").inc()
+                    return False
+                state = ControlRoomOwner(
+                    now + max(300, self.bootstrap_timeout, self.waiting_timeout)
+                )
+                self._control_rooms[room] = state
+            if active:
+                if state.closed:
+                    return False
+                state.active = True
+            return True
+
+    def _admit_control_target(self, room, endpoint, port) -> bool:
         na = NetworkAddress(endpoint, port)
-        ttl = max(300, self.bootstrap_timeout, self.waiting_timeout)
-        return self._drained_abort_notifier.submit(
-            room, na.to_tcp(), na.is_ipv6, parts, time.monotonic() + ttl
+        with self._control_notification_lock:
+            if not self._reserve_control_room(room):
+                return False
+            state = self._control_rooms[room]
+            key = na.to_tcp()
+            if key in state.targets:
+                return True
+            if (
+                len(state.targets) >= 2
+                and self._control_credits_used() >= self._drained_abort_capacity
+            ):
+                DRAINED_ABORT_REJECTIONS.labels("control_target_capacity").inc()
+                return False
+            state.targets[key] = (na.is_ipv6, OrderedDict())
+            return True
+
+    def _close_control_room(self, room, *, failed, deadline=None):
+        with self._control_notification_lock:
+            state = self._control_rooms.get(room)
+            if state is None:
+                return
+            state.closed = True
+            state.failed = failed
+            state.active = False
+            if deadline is not None:
+                state.deadline = deadline
+
+    def _queue_control_notification(
+        self, room, endpoint, port, parts, *, deadline=None
+    ) -> bool:
+        """Retain admitted statuses in pre-reserved room/endpoint credits."""
+        na = NetworkAddress(endpoint, port)
+        parts = tuple(parts)
+        now = time.monotonic()
+        if deadline is None:
+            deadline = now + max(300, self.bootstrap_timeout, self.waiting_timeout)
+        key = (room, na.to_tcp(), parts)
+        if parts and parts[0] == ABORT_ACK_TAG:
+            # ACKs have their own bounded pre-drain owner and original deadline.
+            with self._control_notification_lock:
+                if key in self._pending_control_notifications or deadline <= now:
+                    return True
+                self._prune_control_notifications(now)
+                if (
+                    len(self._pending_control_notifications)
+                    >= self._drained_abort_capacity
+                ):
+                    return False
+                self._pending_control_notifications[key] = (na.is_ipv6, deadline)
+                return True
+        with self._control_notification_lock:
+            if not self._admit_control_target(room, endpoint, port):
+                return False
+            if key in self._pending_control_notifications or deadline <= now:
+                return True
+            _, pending = self._control_rooms[room].targets[na.to_tcp()]
+            # Reasons cannot expand the reserved endpoint's status budget.
+            pending.setdefault(parts[1], (parts, deadline))
+            return True
+
+    def _prune_control_notifications(self, now):
+        for key, (_, deadline) in list(self._pending_control_notifications.items()):
+            if deadline <= now:
+                del self._pending_control_notifications[key]
+                DRAINED_ABORT_REJECTIONS.labels("control_owner_expired").inc()
+
+    def _move_reserved_control_notifications(self):
+        with self._control_notification_lock:
+            now = time.monotonic()
+            self._prune_control_notifications(now)
+            self._prune_control_rooms(now)
+            for room, state in list(self._control_rooms.items()):
+                for endpoint, (ipv6, pending) in state.targets.items():
+                    for status, (parts, deadline) in list(pending.items()):
+                        if deadline <= now:
+                            del pending[status]
+                            DRAINED_ABORT_REJECTIONS.labels(
+                                "control_owner_expired"
+                            ).inc()
+                            continue
+                        key = (room, endpoint, parts)
+                        if key not in self._pending_control_notifications:
+                            if (
+                                len(self._pending_control_notifications)
+                                >= self._drained_abort_capacity
+                            ):
+                                continue
+                            self._pending_control_notifications[key] = (ipv6, deadline)
+                        del pending[status]
+                if (
+                    state.closed
+                    and not state.failed
+                    and not any(pending for _, pending in state.targets.values())
+                ):
+                    del self._control_rooms[room]
+
+    def send_kv_status_message(
+        self, *, targets, bootstrap_room, status, failure_reason=None
+    ) -> None:
+        parts = self._encode_kv_status_message(
+            bootstrap_room=bootstrap_room, status=status, failure_reason=failure_reason
         )
+        for endpoint, port in targets:
+            self._queue_control_notification(bootstrap_room, endpoint, port, parts)
 
     def queue_drained_abort_notification(self, room, endpoint, port) -> bool:
         parts = self._encode_kv_status_message(
@@ -4035,10 +4184,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return
         endpoint, failed = notification
         if failed:
-            self._queue_bootstrap_notification(room, notification)
+            accepted = self._queue_bootstrap_notification(room, notification)
+            with self.deferred_bootstrap.lock:
+                state = self.deferred_bootstrap.rooms.get(room)
+                if state is not None and state.endpoint == endpoint:
+                    state.failed_notified = accepted
             return
         # DeferredBootstrap marks readiness before handing it to the backend.
-        # Keep retry ownership in its room table until the bounded queue accepts.
+        # Keep retry ownership in its room table until the bounded outbox accepts.
         with self.deferred_bootstrap.lock:
             state = self.deferred_bootstrap.rooms.get(room)
             if state is None or state.failed or state.endpoint != endpoint:
@@ -4072,43 +4225,106 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     for room, state in bootstrap.rooms.items()
                     if state.ready and not state.failed and not state.ready_notified
                 ]
+                failed_rooms = [
+                    (room, state.endpoint)
+                    for room, state in bootstrap.rooms.items()
+                    if state.failed
+                    and state.endpoint is not None
+                    and not state.failed_notified
+                ]
             for room, owner in ready_rooms:
                 self._notify_bootstrap(room, bootstrap.complete(room, owner))
+            for room, endpoint in failed_rooms:
+                self._notify_bootstrap(room, (endpoint, True))
         # ABORT can arrive after the sender and its last chunk have retired.
         with self._source_drain.lock:
+            self._prune_deferred_ack_targets()
             rooms = list(self._deferred_ack_targets)
         for room in rooms:
             self._maybe_ack_drained_abort(room)
+        self._move_reserved_control_notifications()
+        with self._control_notification_lock:
+            notifications = list(self._pending_control_notifications.items())
+        for key, task in notifications:
+            room, endpoint, parts = key
+            ipv6, deadline = task
+            if parts and parts[0] == ABORT_ACK_TAG:
+                with self._source_drain.lock:
+                    if (
+                        room in self._deferred_ack_poisoned_rooms
+                        or not self._source_drain.drained(room)
+                    ):
+                        continue
+            if self._drained_abort_notifier.submit(
+                room, endpoint, ipv6, parts, deadline
+            ):
+                with self._control_notification_lock:
+                    if self._pending_control_notifications.get(key) is task:
+                        del self._pending_control_notifications[key]
+
+    def _prune_deferred_ack_targets(self):
+        now = time.monotonic()
+        for key, deadline in list(self._deferred_ack_deadlines.items()):
+            room, ip, port = key
+            targets = self._deferred_ack_targets.get(room)
+            if deadline <= now or not targets or (ip, port) not in targets:
+                self._deferred_ack_deadlines.pop(key)
+                if targets and deadline <= now:
+                    targets.pop((ip, port), None)
+                    if not targets:
+                        self._deferred_ack_targets.pop(room, None)
+                    DRAINED_ABORT_REJECTIONS.labels("ack_owner_expired").inc()
 
     def register_deferred_ack_target(self, room, target) -> None:
         with self._source_drain.lock:
+            self._prune_deferred_ack_targets()
+            if room in self._deferred_ack_poisoned_rooms:
+                return
+            key = (room, target.ip, target.port)
+            if key not in self._deferred_ack_deadlines:
+                if len(self._deferred_ack_deadlines) >= self._drained_abort_capacity:
+                    DRAINED_ABORT_REJECTIONS.labels("ack_owner_capacity").inc()
+                    return
+                self._deferred_ack_deadlines[key] = time.monotonic() + max(
+                    300, self.bootstrap_timeout, self.waiting_timeout
+                )
             super().register_deferred_ack_target(room, target)
 
     def _maybe_ack_drained_abort(self, room: int) -> bool:
         with self._source_drain.lock:
+            self._prune_deferred_ack_targets()
             if self._staging_outstanding.get(room, 0) > 0:
                 return False
             targets = self._deferred_ack_targets.get(room)
             if not targets:
                 return True
-            if not self._source_drain.drained(room):
+            if (
+                room in self._deferred_ack_poisoned_rooms
+                or not self._source_drain.drained(room)
+            ):
                 return False
-            remaining = dict(targets)
-            for key, target in targets.items():
-                if self._queue_control_notification(
-                    room,
-                    target.ip,
-                    target.port,
-                    AbortAck(
-                        room, self._prefill_unique_rank(), target.generation
-                    ).to_zmq(),
-                ):
-                    remaining.pop(key)
-            if remaining:
-                self._deferred_ack_targets[room] = remaining
-                return False
-            self._deferred_ack_targets.pop(room, None)
-            return True
+            snapshot = list(targets.items())
+            deadlines = {
+                key: self._deferred_ack_deadlines[(room, *key)] for key, _ in snapshot
+            }
+        # No queue submission or producer encoding under source ownership.
+        for key, target in snapshot:
+            if self._queue_control_notification(
+                room,
+                target.ip,
+                target.port,
+                AbortAck(room, self._prefill_unique_rank(), target.generation).to_zmq(),
+                deadline=deadlines[key],
+            ):
+                with self._source_drain.lock:
+                    targets = self._deferred_ack_targets.get(room)
+                    if targets and targets.get(key) is target:
+                        del targets[key]
+                        self._deferred_ack_deadlines.pop((room, *key), None)
+                        if not targets:
+                            self._deferred_ack_targets.pop(room, None)
+        with self._source_drain.lock:
+            return not self._deferred_ack_targets.get(room)
 
     def _register_bootstrap_transfer(
         self,
@@ -4117,6 +4333,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         transfer_info: TransferInfo,
         required_dst_info_num: int,
     ) -> None:
+        # Admit reply ownership before accepting pointers or enabling writes.
+        if not transfer_info.is_dummy and not self._admit_control_target(
+            room, transfer_info.endpoint, transfer_info.dst_port
+        ):
+            return
         with self._drained_abort_lock:
             self._prune_drained_abort_rooms()
             if (
@@ -4274,6 +4495,15 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             bootstrap_room,
             req_has_disagg_prefill_dp_rank,
         )
+        # A rejected bootstrap open owns no room and must not activate credits.
+        if self._owns_bootstrap_room and not mgr._reserve_control_room(
+            bootstrap_room, active=True
+        ):
+            mgr.record_failure(
+                bootstrap_room, "Mooncake control room capacity exhausted"
+            )
+            mgr.update_status(bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
         self.init_time = time.time()
         self._source_event = None
         self._pd_hidden_chunk_meta = None
@@ -4428,6 +4658,16 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         with self.kv_mgr._source_drain.lock:
             if self.kv_mgr.deferred_bootstrap is not None:
                 if not self._owns_bootstrap_room:
+                    with self.kv_mgr.deferred_bootstrap.lock:
+                        if (
+                            self.bootstrap_room
+                            not in self.kv_mgr.deferred_bootstrap.rooms
+                        ):
+                            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+                            with self.kv_mgr.failure_lock:
+                                self.kv_mgr.failure_records.pop(
+                                    self.bootstrap_room, None
+                                )
                     return
             failed = (
                 self.conclude_state == KVPoll.Failed
@@ -4464,20 +4704,24 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
             self._bootstrap_room_cleared = True
         self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
-        if notification is not None:
-            (endpoint, port), bootstrap_failed = notification
-            self.kv_mgr._queue_control_notification(
-                self.bootstrap_room,
-                endpoint,
-                port,
-                self.kv_mgr._encode_kv_status_message(
-                    bootstrap_room=self.bootstrap_room,
-                    status=KVPoll.Failed if bootstrap_failed else KVPoll.Success,
-                    failure_reason=(
-                        "Prefill bootstrap failed" if bootstrap_failed else None
+        # Publish terminal status and close its reservation atomically: the
+        # worker cannot deliver Success and admit a reused room between them.
+        with self.kv_mgr._control_notification_lock:
+            if notification is not None:
+                (endpoint, port), bootstrap_failed = notification
+                self.kv_mgr._queue_control_notification(
+                    self.bootstrap_room,
+                    endpoint,
+                    port,
+                    self.kv_mgr._encode_kv_status_message(
+                        bootstrap_room=self.bootstrap_room,
+                        status=KVPoll.Failed if bootstrap_failed else KVPoll.Success,
+                        failure_reason=(
+                            "Prefill bootstrap failed" if bootstrap_failed else None
+                        ),
                     ),
-                ),
-            )
+                )
+            self.kv_mgr._close_control_room(self.bootstrap_room, failed=failed)
 
     def _remember_drained_abort_targets(self):
         self._drained_abort_targets.update(self._current_drained_abort_targets())
@@ -4570,6 +4814,11 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             ttl = max(300, self.kv_mgr.bootstrap_timeout, self.kv_mgr.waiting_timeout)
             self.kv_mgr._drained_abort_rooms[self.bootstrap_room] = (
                 time.monotonic() + ttl
+            )
+            self.kv_mgr._close_control_room(
+                self.bootstrap_room,
+                failed=True,
+                deadline=self.kv_mgr._drained_abort_rooms[self.bootstrap_room],
             )
             self.kv_mgr._drained_abort_rooms.move_to_end(self.bootstrap_room)
             self.kv_mgr.request_status.pop(self.bootstrap_room, None)

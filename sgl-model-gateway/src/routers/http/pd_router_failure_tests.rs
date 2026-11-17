@@ -456,10 +456,16 @@ fn split_bom_preserves_the_first_sse_data_field() {
             );
             assert!(events[0].starts_with("\u{feff}data:".as_bytes()));
             assert_eq!(PDRouter::sse_payload(&events[0]).unwrap(), payload);
-            assert!(PDRouter::decode_event_ready(&events[0]).unwrap());
+            assert_eq!(
+                PDRouter::decode_event_ready(&events[0]).unwrap(),
+                (true, false)
+            );
             assert!(!PDRouter::check_prefill_event(&events[0]).unwrap());
             assert_eq!(PDRouter::sse_data(&events[1]), "[DONE]");
-            assert!(PDRouter::decode_event_ready(&events[1]).unwrap());
+            assert_eq!(
+                PDRouter::decode_event_ready(&events[1]).unwrap(),
+                (true, true)
+            );
             assert!(PDRouter::check_prefill_event(&events[1]).unwrap());
         }
     }
@@ -726,6 +732,67 @@ async fn nonstream_decode_json_error_cancels_pending_prefill() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn json_error_detection_parses_each_body_once() {
+    // Every fragment ends in a nested closing brace: the former suffix heuristic
+    // reparsed the growing logprob prefix for every one of these fragments.
+    let item = json!({"token": "escaped \\\" quote, slash \\, braces } ] { [ 你好"});
+    for side in ["prefill", "decode"] {
+        for split_at_braces in [false, true] {
+            let wire = serde_json::to_vec(&json!({"logprobs": vec![item.clone(); 1024]})).unwrap();
+            let mut detector = JsonErrorDetector::default();
+            let mut body = Vec::new();
+            let chunks: Vec<_> = if split_at_braces {
+                wire.split_inclusive(|byte| matches!(byte, b'}' | b']'))
+                    .collect()
+            } else {
+                wire.chunks(1).collect()
+            };
+            for chunk in chunks {
+                body.extend_from_slice(chunk);
+                detector.check(chunk, &body, side).unwrap();
+                assert_eq!(
+                    detector.parse_attempts,
+                    usize::from(body.len() == wire.len())
+                );
+            }
+            for chunk in [b" ".as_slice(), b"\n\t", b" "] {
+                body.extend_from_slice(chunk);
+                detector.check(chunk, &body, side).unwrap();
+                assert_eq!(detector.parse_attempts, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn json_error_detection_preserves_nested_errors_and_invalid_json_fallback() {
+    for (wire, status) in [
+        (
+            r#"[{"response":{"error":{"code":503,"message":"failed"}}}]"#,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+        ),
+        (
+            r#"{"meta_info":{"finish_reason":{"type":"abort"}}}"#,
+            Some(StatusCode::from_u16(499).unwrap()),
+        ),
+        (r#"{"broken":]}"#, None),
+        (r#"{"incomplete":[{}"#, None),
+    ] {
+        let mut detector = JsonErrorDetector::default();
+        let mut body = Vec::new();
+        let mut error_status = None;
+        for chunk in wire.as_bytes().chunks(1) {
+            body.extend_from_slice(chunk);
+            if let Err(response) = detector.check(chunk, &body, "decode") {
+                error_status = Some(response.status());
+            }
+        }
+        assert_eq!(error_status, status, "{wire}");
+        assert!(detector.parse_attempts <= 1);
+    }
 }
 
 #[tokio::test]
@@ -1179,6 +1246,186 @@ async fn early_terminated_sse_has_valid_http_framing() {
             .await
             .expect("early SSE termination must not cause a Content-Length mismatch");
         assert_eq!(body.as_ref(), [TOKEN, terminal].concat());
+    }
+}
+
+#[tokio::test]
+async fn terminal_sse_discards_coalesced_and_split_trailing_junk() {
+    for terminal in [
+        "data: [DONE]\n\n",
+        "event: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n",
+        "event: response.incomplete\ndata: {\"response\":{\"status\":\"incomplete\"}}\n\n",
+        "data: {\"error\":{\"code\":503}}\n\n",
+        "data: {\"meta_info\":{\"finish_reason\":{\"type\":\"abort\"}}}\n\n",
+        "event: response.failed\ndata: {\"response\":{\"status\":\"failed\"}}\n\n",
+        "event: error\ndata: {\"code\":400}\n\n",
+    ] {
+        for newline in ["\n", "\r\n", "\r"] {
+            let token = "data: {\"text\":\"token\",\"meta_info\":{\"input_token_logprobs\":[[0.2,2,\"d\"]]}}\n\n"
+                .replace('\n', newline);
+            let terminal = terminal.replace('\n', newline);
+            let wire = format!("{token}{terminal}data: trailing-junk{newline}{newline}");
+            for chunk_size in [1, 2, wire.len()] {
+                for (return_logprob, prefill_logprobs) in [
+                    (false, None),
+                    (true, None),
+                    (true, Some(json!([[0.1, 1, "p"]]))),
+                    (true, Some(Value::Null)),
+                ] {
+                    let merges = prefill_logprobs.as_ref().is_some_and(Value::is_array);
+                    let chunks: Vec<_> = wire
+                        .as_bytes()
+                        .chunks(chunk_size)
+                        .map(|part| Ok::<_, reqwest::Error>(bytes::Bytes::copy_from_slice(part)))
+                        .collect();
+                    let response = create_test_pd_router().create_streaming_response(
+                        tokio_stream::iter(chunks).chain(futures_util::stream::pending()),
+                        StatusCode::OK,
+                        prefill_logprobs,
+                        return_logprob,
+                        None,
+                        worker(
+                            "http://prefill",
+                            WorkerType::Prefill {
+                                bootstrap_port: None,
+                            },
+                        ),
+                        worker("http://decode", WorkerType::Decode),
+                        None,
+                    );
+                    let body = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        axum::body::to_bytes(response.into_body(), usize::MAX),
+                    )
+                    .await
+                    .expect("terminal must close without EOF")
+                    .unwrap();
+                    assert!(!String::from_utf8_lossy(&body).contains("trailing-junk"));
+                    if !return_logprob {
+                        let mut expected = format!("{token}{terminal}");
+                        if expected.ends_with('\r') {
+                            expected.push('\n');
+                        }
+                        assert_eq!(body.as_ref(), expected.as_bytes());
+                    }
+                    let events: Vec<_> = tokio_stream::once(Ok::<_, std::io::Error>(body))
+                        .eventsource()
+                        .collect()
+                        .await;
+                    let events: Vec<_> = events.into_iter().map(Result::unwrap).collect();
+                    assert_eq!(events.len(), 2, "newline={newline:?}, chunk={chunk_size}");
+                    let token: Value = serde_json::from_str(&events[0].data).unwrap();
+                    assert_eq!(
+                        token["meta_info"]["input_token_logprobs"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        if merges { 2 } else { 1 }
+                    );
+                    assert_eq!(
+                        events[1].data,
+                        PDRouter::sse_data(terminal.as_bytes()).trim_end()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_decode_before_prefill_ready_ignores_trailing_junk() {
+    for terminal in [
+        "data: [DONE]\n\n",
+        "event: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n",
+    ] {
+        let wire = format!("{terminal}data: invalid-json\n\n");
+        let decode = serve(Router::new().route(
+            "/generate",
+            post(move || {
+                let wire = wire.clone();
+                async move {
+                    let chunks =
+                        tokio_stream::once(Ok::<_, std::io::Error>(bytes::Bytes::from(wire)))
+                            .chain(futures_util::stream::pending());
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(chunks),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let router = create_test_pd_router();
+        let response = router
+            .client
+            .post(format!("{}/generate", decode.url))
+            .send()
+            .await
+            .unwrap();
+        let (_ready, receiver) = oneshot::channel();
+        let stream = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.prepare_decode_stream(response, receiver),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let chunks: Vec<_> = stream.collect().await;
+        let body: Vec<_> = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.unwrap().to_vec())
+            .collect();
+        assert_eq!(body, terminal.as_bytes());
+    }
+}
+
+#[test]
+fn error_after_terminal_does_not_change_stream_outcome() {
+    let wire = b"data: [DONE]\n\ndata: {\"error\":{\"code\":503}}\n\n";
+    for chunk_size in [1, wire.len()] {
+        let decode = worker("http://decode", WorkerType::Decode);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let chunks: Vec<_> = wire
+                    .chunks(chunk_size)
+                    .map(|chunk| Ok::<_, reqwest::Error>(bytes::Bytes::copy_from_slice(chunk)))
+                    .collect();
+                let response = create_test_pd_router().create_streaming_response(
+                    tokio_stream::iter(chunks),
+                    StatusCode::OK,
+                    None,
+                    false,
+                    None,
+                    worker(
+                        "http://prefill",
+                        WorkerType::Prefill {
+                            bootstrap_port: None,
+                        },
+                    ),
+                    decode.clone(),
+                    None,
+                );
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+            })
+        });
+        let metrics = handle.render();
+        assert_eq!(body.as_ref(), b"data: [DONE]\n\n");
+        let outcomes: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("smg_router_stream_outcome_total{"))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "{metrics}");
+        assert!(outcomes[0].contains("outcome=\"ok\""), "{metrics}");
+        assert_eq!(decode.circuit_breaker().total_failures(), 0);
+        assert_eq!(decode.circuit_breaker().total_successes(), 1);
     }
 }
 

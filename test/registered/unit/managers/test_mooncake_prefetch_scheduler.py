@@ -145,7 +145,7 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
             return []
 
         owner.request_receiver = SimpleNamespace(
-            ingress_sync_groups=lambda: [], recv_requests=receive
+            ingress_sync_groups=lambda: [], recv_requests=receive, max_recv_per_poll=-1
         )
         with patch(
             "sglang.srt.managers.scheduler_components.mooncake_prefetch.time.sleep",
@@ -185,6 +185,64 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
             owner._run_bg_prefetch_round()
         self.assertNotEqual(old.rid, new.rid)
         self.assertEqual(backend.submitted, [new.rid])
+
+    def test_forward_deferred_watermark_pauses_all_receive_peers_and_preserves_order(
+        self,
+    ):
+        for peer_full in (False, True):
+            with self.subTest(peer_full=peer_full):
+                owner = MooncakePrefetchSchedulerMixin()
+                owner._forward_ingress_enabled = True
+                owner.FORWARD_DEFERRED_HIGH_WATER = 2
+                owner.FORWARD_RECV_LIMIT = 1
+                future = Future()
+                owner._forward_launch_executor = SimpleNamespace(
+                    submit=lambda *args: future
+                )
+                owner._bg_error = None
+                owner._forward_deferred_reqs = []
+                owner.forward_ct = 1
+                owner.device_module = SimpleNamespace(
+                    StreamContext=lambda stream: nullcontext()
+                )
+                owner.schedule_stream, owner.forward_stream = Mock(), Mock()
+                owner._trace_prefill_reqs = Mock()
+                received, limits = [], []
+                paused = []
+
+                def receive(**kwargs):
+                    item = object()
+                    received.append(item)
+                    limits.append(owner.request_receiver.max_recv_per_poll)
+                    if len(received) > 2:
+                        future.set_result("overflow")
+                    return [item]
+
+                def reduce(active, **kwargs):
+                    # A peer reaching its bound must pause this rank too.
+                    if active.numel() == 2 and (peer_full or active[1].item()):
+                        active[1] = 1
+                        paused.append(True)
+                        if not future.done():
+                            future.set_result("finished")
+
+                owner.request_receiver = SimpleNamespace(
+                    ingress_sync_groups=lambda: [object()],
+                    recv_requests=receive,
+                    max_recv_per_poll=-1,
+                )
+                with patch("torch.distributed.all_reduce", side_effect=reduce):
+                    result = owner._forward_with_waiting_queue_ingress(
+                        SimpleNamespace(
+                            forward_mode=SimpleNamespace(is_extend=lambda: True)
+                        )
+                    )
+                self.assertEqual(result, "finished")
+                self.assertTrue(paused)
+                self.assertEqual(len(received), 0 if peer_full else 2)
+                self.assertEqual(owner._forward_deferred_reqs, received)
+                self.assertEqual(limits, [] if peer_full else [1, 1])
+                self.assertEqual(owner.request_receiver.max_recv_per_poll, -1)
 
     def setUp(self):
         super().setUp()
@@ -231,7 +289,8 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
         owner = MooncakePrefetchSchedulerMixin()
         hits = {"rid": object()}
         owner.tree_cache = SimpleNamespace(
-            cancel_waiting_queue_prefetch=lambda rid: hits.pop(rid, None)
+            cancel_waiting_queue_prefetch=lambda rid: hits.pop(rid, None),
+            prepare_external_linker_loads=lambda reqs: ["failed"],
         )
         # The final match finds keys even though the asynchronous refresh failed.
         req = SimpleNamespace(
@@ -240,7 +299,7 @@ class TestMooncakePrefetchScheduler(CustomTestCase):
             swa_host_hit_length=32,
             mamba_host_hit_length=0,
         )
-        self.assertTrue(owner._apply_external_linker_admission(req, {"rid": "failed"}))
+        self.assertTrue(owner._apply_external_linker_admission(req))
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
         self.assertFalse(hits)
 

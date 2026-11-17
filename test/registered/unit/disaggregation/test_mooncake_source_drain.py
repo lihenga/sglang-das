@@ -82,6 +82,11 @@ class TestMooncakeSourceDrain(CustomTestCase):
         manager._staging_outstanding = {}
         manager._source_drain = SourceDrainTracker()
         manager._deferred_ack_targets = {}
+        manager._deferred_ack_deadlines = OrderedDict()
+        manager._drained_abort_capacity = 4096
+        manager._control_notification_lock = threading.RLock()
+        manager._pending_control_notifications = OrderedDict()
+        manager._control_rooms = OrderedDict()
         manager._deferred_ack_poisoned_rooms = set()
         manager._prefill_unique_rank = lambda: 0
         entered, release, delivered = (threading.Event() for _ in range(3))
@@ -128,9 +133,8 @@ class TestMooncakeSourceDrain(CustomTestCase):
                         AbortNotification(9, "peer", 8000, 17).to_zmq()
                     )
                 )
-                self.assertEqual(
-                    manager._deferred_ack_targets[9][("peer", 8000)].generation, 17
-                )
+                self.assertNotIn(9, manager._deferred_ack_targets)
+                self.assertEqual(len(manager._pending_control_notifications), 1)
                 self.assertEqual(len(notifier._pending), 1)
                 release.set()
                 self.assertTrue(delivered.wait(5))
@@ -212,6 +216,10 @@ class TestMooncakeLateBootstrap(CustomTestCase):
         manager.failure_records = {9: "original failure"}
         manager.deferred_bootstrap = None
         manager._deferred_ack_targets = {}
+        manager._deferred_ack_deadlines = OrderedDict()
+        manager._control_notification_lock = threading.RLock()
+        manager._pending_control_notifications = OrderedDict()
+        manager._control_rooms = OrderedDict()
         manager._deferred_ack_poisoned_rooms = set()
         manager._staging_outstanding = {}
         tracker = SourceDrainTracker()
@@ -244,6 +252,7 @@ class TestMooncakeLateBootstrap(CustomTestCase):
         sender.conclude_state = KVPoll.Failed
         sender._drained_abort_targets = set()
         sender._drained_abort_notified_targets = set()
+        manager._reserve_control_room(9, active=True)
         return manager, sender, tracker, notifications
 
     @staticmethod

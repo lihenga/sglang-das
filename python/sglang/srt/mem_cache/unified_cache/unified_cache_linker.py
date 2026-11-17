@@ -244,6 +244,7 @@ class UnifiedCacheLinkerWrapper:
     _load_admissions = None
     _admitted_loads = None
     _pending_session_cleanup = None
+    _prepared_session_owners = None
 
     def __init__(
         self,
@@ -319,6 +320,18 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def can_checkpoint(self, req: Req) -> bool:
+        """Keep computed continuations private until their prefix load succeeds."""
+        if not self.pending_loads:
+            return True
+        backend_id = self.request_ids.get(req.rid)
+        if backend_id in self.pending_loads:
+            return False
+        return not self.cache.tree_core.is_on_pending_external_load_chain(
+            req.last_node,
+            [(node, anchor) for node, _lock, anchor in self.pending_loads.values()],
+        )
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -499,7 +512,7 @@ class UnifiedCacheLinkerWrapper:
             for req, (mode, _state, backend_id), (pending, failed) in zip(
                 batch, local, verdict.tolist()
             ):
-                if pending:
+                if pending and not failed:
                     states.append("pending")
                     continue
                 if (failed or mode is None) and self._load_admissions is not None:
@@ -531,11 +544,15 @@ class UnifiedCacheLinkerWrapper:
             self._admitted_loads.pop(req.rid, None)
         hit = self.hit_markers.get(req.rid)
         if hit is None:
-            if (
+            preparing = (
                 self._load_admissions is not None
                 and self._load_admissions.pop(req.rid, None) is not None
+            )
+            if preparing or (
+                self._prepared_session_owners is not None
+                and backend_id in self._prepared_session_owners
             ):
-                self._abort_prepared_session(self._backend_request_id(req.rid))
+                self._abort_prepared_session(backend_id)
             return None, "ready", backend_id
         if self._load_admissions is None:
             self._load_admissions, self._admitted_loads = {}, {}
@@ -574,6 +591,15 @@ class UnifiedCacheLinkerWrapper:
                     if self._waiting_queue_prefetch_enabled
                     else None
                 )
+                if self._waiting_queue_prefetch_enabled and status not in {
+                    "admission_timeout",
+                    "dfs_prefetched",
+                }:
+                    # Native preparation owns a session independently of its
+                    # short-lived admission proof, including after budget rejection.
+                    if self._prepared_session_owners is None:
+                        self._prepared_session_owners = set()
+                    self._prepared_session_owners.add(backend_id)
                 if status == "admission_timeout":
                     # Fail admission, then cancel without reclaiming the
                     # active native worker's host buffers or bounded credit.
@@ -613,16 +639,16 @@ class UnifiedCacheLinkerWrapper:
         )
         if self._load_admissions is not None:
             self._load_admissions.pop(req.rid, None)
-        if mode == "dfs_prefetched":
+        if mode is not None:
             self.cache_linker.discard_load_admission(self._backend_request_id(req.rid))
-        elif mode is not None:
-            self._abort_prepared_session(self._backend_request_id(req.rid))
 
     def _abort_prepared_session(self, backend_id: str) -> None:
         if not self.cache_linker.abort_prepared_load_async(backend_id):
             if self._pending_session_cleanup is None:
                 self._pending_session_cleanup = set()
             self._pending_session_cleanup.add(backend_id)
+        if self._prepared_session_owners is not None:
+            self._prepared_session_owners.discard(backend_id)
 
     def poll_session_cleanup(self) -> None:
         if self._pending_session_cleanup:
@@ -949,6 +975,8 @@ class UnifiedCacheLinkerWrapper:
             self._abort_prepared_session(backend_id)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
         self.pending_loads[backend_id] = (node_id, lock_params, anchor)
+        if self._prepared_session_owners is not None:
+            self._prepared_session_owners.discard(backend_id)
         if not hasattr(self, "load_request_rids"):
             self.load_request_rids = {}
         self.load_request_rids[backend_id] = rid
@@ -1129,6 +1157,8 @@ class UnifiedCacheLinkerWrapper:
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
+        if self._prepared_session_owners is not None:
+            self._prepared_session_owners.clear()
         if self._load_admissions is not None:
             self._load_admissions.clear()
             self._admitted_loads.clear()
@@ -1165,7 +1195,14 @@ class UnifiedCacheLinkerWrapper:
             self._admitted_loads is not None
             and self._admitted_loads.pop(rid, None) is not None
         )
-        if preparing or admitted:
+        if (
+            preparing
+            or admitted
+            or (
+                self._prepared_session_owners is not None
+                and backend_id in self._prepared_session_owners
+            )
+        ):
             self._abort_prepared_session(backend_id)
         # failed_chains is deliberately untouched: the chain outlives the
         # request's linker state, and cache_finished_req is what frees it.
@@ -1550,7 +1587,14 @@ class UnifiedCacheLinkerWrapper:
                 self._admitted_loads is not None
                 and self._admitted_loads.pop(req.rid, None) is not None
             )
-            if preparing or admitted:
+            if (
+                preparing
+                or admitted
+                or (
+                    self._prepared_session_owners is not None
+                    and previous in self._prepared_session_owners
+                )
+            ):
                 self._abort_prepared_session(previous)
             self.cancel_waiting_queue_prefetch(req.rid)
         self.request_ids[req.rid] = backend_id

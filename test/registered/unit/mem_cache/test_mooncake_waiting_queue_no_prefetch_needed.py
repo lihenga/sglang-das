@@ -405,7 +405,7 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         backend.revalidate_load_async.assert_called_once()
         backend.abort_prepared_load_async.assert_called_once_with("rid")
 
-    def test_rejected_admission_recomputes_while_native_cleanup_remains_owned(self):
+    def test_budget_rejected_admission_revalidates_without_cancelling_its_owner(self):
         wrapper, backend, _, req = self._admission()
         backend.revalidate_load_async.return_value = "ready"
         backend.abort_prepared_load_async.return_value = False
@@ -414,15 +414,11 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         wrapper.discard_load_admission(req)
         self.assertFalse(wrapper._admitted_loads)
         wrapper.hit_markers[req.rid] = hit
-        self.assertEqual(wrapper.prepare_load_admission(req), "failed")
-        self.assertEqual(req.host_hit_length, 0)
-        self.assertNotIn(req.rid, wrapper.hit_markers)
-        self.assertEqual(wrapper._pending_session_cleanup, {"rid"})
-        backend.revalidate_load_async.assert_called_once()
-        backend.abort_prepared_load_async.return_value = True
-        wrapper.poll_session_cleanup()
-        wrapper.hit_markers[req.rid] = hit
         self.assertEqual(wrapper.prepare_load_admission(req), "ready")
+        self.assertEqual(req.host_hit_length, 1)
+        self.assertIs(wrapper.hit_markers[req.rid], hit)
+        self.assertFalse(wrapper._pending_session_cleanup)
+        backend.abort_prepared_load_async.assert_not_called()
 
     def test_admitted_claim_failure_is_a_miss_without_synchronous_retry(self):
         cache = _Cache()

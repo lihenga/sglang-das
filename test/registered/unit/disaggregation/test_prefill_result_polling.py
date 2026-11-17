@@ -1706,6 +1706,7 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                     canonical[2:] = torch.tensor([88, 92], dtype=raw.dtype)
                 cache = SimpleNamespace(
                     disable=False,
+                    linker=None,
                     req_to_token_pool=SimpleNamespace(
                         req_to_token=raw,
                         write=lambda index, value: raw.__setitem__(index, value),

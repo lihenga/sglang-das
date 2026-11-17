@@ -5,6 +5,7 @@ import threading
 import time
 from collections import OrderedDict
 
+import msgspec
 import zmq
 from prometheus_client import Counter
 
@@ -15,6 +16,16 @@ DRAINED_ABORT_REJECTIONS = Counter(
     "Rejected Mooncake terminal markers or asynchronous control notifications.",
     ["reason"],
 )
+
+
+class ControlRoomOwner(msgspec.Struct):
+    deadline: float
+    active: bool = False
+    closed: bool = False
+    failed: bool = False
+    # Reserve bootstrap and first destination credits before their addresses
+    # are known. Each endpoint has one payload per status, not per error string.
+    targets: dict = msgspec.field(default_factory=dict)
 
 
 class DrainedAbortNotifier:
@@ -102,7 +113,7 @@ class DrainedAbortNotifier:
                                 sockets[endpoint] = sock
                                 sock.setsockopt(zmq.LINGER, 0)
                                 sock.setsockopt(zmq.IMMEDIATE, 1)
-                                sock.setsockopt(zmq.SNDHWM, 1)
+                                sock.setsockopt(zmq.SNDHWM, 1000)
                                 if ipv6:
                                     sock.setsockopt(zmq.IPV6, 1)
                                 sock.connect(endpoint)
@@ -112,13 +123,14 @@ class DrainedAbortNotifier:
                             retry_at.pop(endpoint, None)
                             retry_delay.pop(endpoint, None)
                         except zmq.Again:
-                            pass
+                            # IMMEDIATE also reports Again during connection
+                            # setup and ordinary HWM pressure, not peer failure.
+                            retry_at[endpoint] = time.monotonic() + 0.001
                         except Exception:
                             failures += 1
                             sock = sockets.pop(endpoint, None)
                             if sock is not None:
                                 sock.close(linger=0)
-                        if not sent:
                             delay = min(5.0, retry_delay.get(endpoint, 0.025) * 2)
                             retry_delay[endpoint] = delay
                             retry_at[endpoint] = time.monotonic() + delay

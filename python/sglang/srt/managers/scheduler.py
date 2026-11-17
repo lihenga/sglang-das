@@ -4182,9 +4182,6 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
-        linker_candidates, linker_states = self._prepare_external_linker_admissions(
-            waiting_queue_prefetch_states
-        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4262,7 +4259,7 @@ class Scheduler(
                 continue
             if (
                 self.enable_unified_cache_external_linker
-                and not self._apply_external_linker_admission(req, linker_states)
+                and not self._apply_external_linker_admission(req)
             ):
                 self._log_waiting_queue_prefetch_event("wait_session")
                 self._trace_prefill_reqs("admission_wait", [req], reason="session")
@@ -4308,9 +4305,6 @@ class Scheduler(
                         req.kv.mamba_pool_idx = None
                 break
 
-        for req in linker_candidates:
-            if linker_states[req.rid] != "pending":
-                self.tree_cache.discard_external_linker_load_admission(req)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
@@ -5339,6 +5333,7 @@ class Scheduler(
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
         if not for_health_check:
+            idle &= not self.has_retained_external_kv_resources()
             linker = getattr(self.tree_cache, "linker", None)
             if linker is not None:
                 idle &= not linker.has_pending_operations()

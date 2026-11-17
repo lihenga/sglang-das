@@ -6,7 +6,7 @@ Only the transfer worker can send that ACK after its write has drained.
 
 import threading
 import unittest
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -50,6 +50,14 @@ def _manager(
     manager.enable_deferred_decode_kv_release = enabled
     manager.request_status = {} if status is None else {ROOM: status}
     manager._deferred_ack_targets = {}
+    manager._deferred_ack_deadlines = OrderedDict()
+    manager._drained_abort_capacity = 4096
+    manager._control_notification_lock = threading.RLock()
+    manager._control_rooms = OrderedDict()
+    manager._pending_control_notifications = OrderedDict()
+    manager.bootstrap_timeout = manager.waiting_timeout = 10
+    manager.deferred_bootstrap = None
+    manager._stopped = False
     manager._deferred_ack_poisoned_rooms = set()
     manager._staging_outstanding = {}
     manager.check_status = lambda room: manager.request_status[room]
@@ -60,7 +68,7 @@ def _manager(
     manager._send_abort_ack = lambda *args: manager._sent.append(args)
     manager._prefill_unique_rank = lambda: 0
 
-    def enqueue_ack(room, endpoint, port, parts):
+    def enqueue_ack(room, endpoint, port, parts, *, deadline=None):
         ack = AbortAck.from_zmq(parts)
         manager._sent.append((room, AckTarget(endpoint, port, ack.generation)))
         return True

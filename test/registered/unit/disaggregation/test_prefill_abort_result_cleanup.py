@@ -37,6 +37,7 @@ class _Req:
         self.metadata_buffer_index = 7 if allocated else -1
         self.pending_bootstrap = allocated
         self.disagg_kv_sender = Mock()
+        self.lock = None
         self.disagg_kv_sender.poll.return_value = KVPoll.Failed
         self.external_kv_cleanup_steps = {}
         for flag in (
@@ -316,16 +317,51 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
 
 
 class TestPrefillCompleteResult(CustomTestCase):
+    def test_quarantine_keeps_resource_handles_without_token_payload(self):
+        scheduler, req = _Scheduler(), _Req(inflight_middle_chunks=0)
+        scheduler.waiting_queue = [req]
+        scheduler.disagg_prefill_bootstrap_queue = None
+        req.output_ids = list(range(1000))
+        scheduler._quarantine_external_kv_request(req)
+        resources = scheduler._quarantined_external_kv_requests[
+            req.cache_request_handle
+        ]
+        self.assertIsNot(resources, req)
+        self.assertIs(resources.kv, req.kv)
+        self.assertEqual(resources.metadata_buffer_index, req.metadata_buffer_index)
+        self.assertFalse(hasattr(resources, "output_ids"))
+        self.assertTrue(scheduler.has_retained_external_kv_resources())
+
+    def test_quarantine_keys_preserve_distinct_lifecycles_after_request_release(self):
+        scheduler = _Scheduler()
+        scheduler.waiting_queue = []
+        scheduler.disagg_prefill_bootstrap_queue = None
+        first, second = _Req(inflight_middle_chunks=0), _Req(inflight_middle_chunks=0)
+        first.cache_request_handle = CacheRequestHandle(first.rid, 0, 1)
+        second.cache_request_handle = CacheRequestHandle(second.rid, 0, 2)
+        scheduler._quarantine_external_kv_request(first)
+        first_handle, first_kv = first.cache_request_handle, first.kv
+        del first
+        scheduler._quarantine_external_kv_request(second)
+        self.assertEqual(len(scheduler._quarantined_external_kv_requests), 2)
+        self.assertIs(
+            scheduler._quarantined_external_kv_requests[first_handle].kv, first_kv
+        )
+
     def test_unknown_cleanup_quarantine_cannot_grow_past_its_limit(self):
         scheduler = _Scheduler()
         scheduler._external_kv_quarantine_limit = 1
         retained = _Req(inflight_middle_chunks=0)
-        scheduler._quarantined_external_kv_requests[id(retained)] = retained
+        scheduler._quarantined_external_kv_requests[retained.cache_request_handle] = (
+            retained
+        )
         req = _Req(inflight_middle_chunks=0)
+        req.cache_request_handle = CacheRequestHandle(req.rid, 0, 2)
         with self.assertRaisesRegex(RuntimeError, "quarantine capacity"):
             scheduler._quarantine_external_kv_request(req)
         self.assertEqual(
-            scheduler._quarantined_external_kv_requests, {id(retained): retained}
+            scheduler._quarantined_external_kv_requests,
+            {retained.cache_request_handle: retained},
         )
 
     @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)

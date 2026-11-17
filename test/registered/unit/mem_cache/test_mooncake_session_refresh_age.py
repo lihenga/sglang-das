@@ -18,11 +18,14 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    LayerWiseLoadCounter,
     MooncakeDirectLinker,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.components import LinkerTransferPhase
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
@@ -798,6 +801,71 @@ class TestAsyncSessionAdmission(CustomTestCase):
 
 
 class TestAdmissionResourceRecovery(CustomTestCase):
+    def test_close_retry_keeps_storage_without_restarting_or_requeueing_stopped_workers(
+        self,
+    ):
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+
+        class HealthOwner:
+            drained = False
+
+            def close(self):
+                if not self.drained:
+                    raise RuntimeError("health close incomplete")
+
+        health, client = HealthOwner(), object()
+        storage = MooncakeStore.__new__(MooncakeStore)
+        storage.store = client
+        storage._client_metrics_reporter = None
+        storage._dfs_health_manager = health
+        linker.storage = storage
+        linker._close_workers_stopped = linker._closed = False
+        linker.host_prefetch_threads = []
+        (
+            linker.pending_loads,
+            linker.pending_load_tokens,
+            linker.pending_load_started,
+        ) = {}, {}, {}
+        linker.load_queue, linker.offload_queue = Queue(), Queue()
+        linker.offload_results, linker.completed_loads = Queue(), Queue()
+        linker.broadcast_events = []
+        linker.broadcast_loads, linker.broadcast_outcomes = {}, {}
+        linker.broadcast_failed = set()
+        linker.load_batch_futures = {}
+        linker.layer_done_counter = LayerWiseLoadCounter(1)
+        linker.mla_broadcaster = None
+        linker.stats = {}
+        linker.load_thread = threading.Thread(
+            target=linker.load_thread_func, daemon=True
+        )
+        linker.offload_thread = threading.Thread(
+            target=linker.offload_thread_func, daemon=True
+        )
+        linker.load_thread.start()
+        linker.offload_thread.start()
+        try:
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "close incomplete"):
+                    linker.close()
+                self.assertTrue(linker._close_workers_stopped)
+                self.assertFalse(linker._closed)
+                self.assertIs(linker.storage, storage)
+                self.assertIs(storage.store, client)
+                self.assertIs(storage._dfs_health_manager, health)
+                self.assertFalse(linker.load_thread.is_alive())
+                self.assertFalse(linker.offload_thread.is_alive())
+                self.assertEqual(linker.load_queue.unfinished_tasks, 0)
+                self.assertEqual(linker.offload_queue.unfinished_tasks, 0)
+        finally:
+            health.drained = True
+            linker.close()
+        self.assertTrue(linker._closed)
+        self.assertIsNone(storage._dfs_health_manager)
+        linker.close()
+        self.assertEqual(linker.load_queue.unfinished_tasks, 0)
+        self.assertEqual(linker.offload_queue.unfinished_tasks, 0)
+
     def _wrapper(self, linker):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
         wrapper.cache_linker = linker
@@ -831,7 +899,9 @@ class TestAdmissionResourceRecovery(CustomTestCase):
 
     def _ready(self, wrapper, req, kind):
         state = wrapper.prepare_load_admission(req)
-        job = wrapper.cache_linker.session_jobs[(kind, req.rid)]
+        job = wrapper.cache_linker.session_jobs[
+            (kind, wrapper._backend_request_id(req.rid))
+        ]
         self.assertTrue(job.result(timeout=5))
         if state != "ready":
             state = wrapper.prepare_load_admission(req)
@@ -978,6 +1048,234 @@ class TestAdmissionResourceRecovery(CustomTestCase):
         self.assertEqual(linker.failed_session_cleanups, set())
         self.assertFalse(wrapper._pending_session_cleanup)
         self.assertTrue(linker._prepare_expanded_load("same", [transfer]))
+
+    def test_budget_discard_preserves_prepared_session_without_a_dfs_prefetch(self):
+        linker = _linker(age_s=0.0)
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        wrapper = self._wrapper(linker)
+        req = types.SimpleNamespace(rid="r", last_node="node", host_hit_length=1)
+        hit = ExternalCacheHitMarker(None, ["key"], 0)
+        wrapper.hit_markers["r"] = hit
+        for _ in range(3):
+            self._ready(wrapper, req, "prepare")
+            wrapper.discard_load_admission(req)
+            self.assertEqual(linker.prepared_load_sessions, {"r": ["key"]})
+            self.assertEqual(linker.session_refcounts, {"key": 1})
+            self.assertEqual(linker.session_jobs, {})
+            self.assertFalse(wrapper._pending_session_cleanup)
+            self.assertIs(wrapper.hit_markers["r"], hit)
+            self.assertEqual(req.host_hit_length, 1)
+        self.assertEqual(
+            linker.storage.store.batch_get_session_start_with_sources.call_count, 1
+        )
+        self.assertTrue(linker.abort_prepared_load("r"))
+        self.assertEqual(linker.prepared_load_sessions, {})
+        self.assertEqual(linker.session_refcounts, {})
+
+    def test_discarded_prepared_proof_still_releases_its_owner_on_cancellation(self):
+        for status in (None, "no_prefetch_needed"):
+            for action in ("cancel", "match_miss", "replace_lifecycle"):
+                with self.subTest(status=status, action=action):
+                    linker = _linker(age_s=0.0)
+                    self.addCleanup(linker.session_executor.shutdown, wait=True)
+                    linker.pending_loads = {}
+                    wrapper = self._wrapper(linker)
+                    handle = CacheRequestHandle("r", 0, 1)
+                    req = types.SimpleNamespace(
+                        rid="r",
+                        last_node="node",
+                        host_hit_length=1,
+                        cache_request_handle=handle,
+                    )
+                    wrapper._remember_request(req)
+                    backend_id = linker.request_id(handle)
+                    hit = ExternalCacheHitMarker(None, ["key"], 0)
+                    wrapper.hit_markers["r"] = hit
+                    if status is not None:
+                        # The prefetch worker ended its generation session;
+                        # admission starts another owner under the request ID.
+                        generation_id = linker._host_prefetch_session_rid(backend_id, 7)
+                        self.assertNotEqual(generation_id, backend_id)
+                        linker.host_prefetch_entries[backend_id] = {
+                            "state": status,
+                            "session_rid": generation_id,
+                            "no_prefetch_keys": ["key"],
+                        }
+                        wrapper.host_prefetch_hits["r"] = hit
+                        linker.revalidate_no_prefetch_needed_async(backend_id)
+                        self.assertTrue(
+                            linker.session_jobs[("refresh", backend_id)].result(
+                                timeout=5
+                            )
+                        )
+                    self._ready(wrapper, req, "prepare")
+                    wrapper.discard_load_admission(req)
+                    self.assertEqual(wrapper._load_admissions, {})
+                    self.assertEqual(wrapper._admitted_loads, {})
+                    self.assertEqual(linker.session_jobs, {})
+                    self.assertEqual(
+                        linker.prepared_load_sessions, {backend_id: ["key"]}
+                    )
+                    entered, release = threading.Event(), threading.Event()
+                    self.addCleanup(release.set)
+
+                    def end(keys):
+                        self.assertEqual(keys, ["key"])
+                        entered.set()
+                        if not release.wait(5):
+                            raise TimeoutError("session end was not released")
+                        return 0
+
+                    linker.storage.store.batch_get_session_end.side_effect = end
+                    try:
+                        if action == "cancel":
+                            wrapper.release_request(handle)
+                        elif action == "match_miss":
+                            wrapper.hit_markers.pop("r")
+                            req.host_hit_length = 0
+                            self.assertEqual(
+                                wrapper.prepare_load_admission(req), "ready"
+                            )
+                            wrapper.discard_load_admission(req)
+                        else:
+                            replacement = types.SimpleNamespace(
+                                rid="r",
+                                cache_request_handle=CacheRequestHandle("r", 0, 2),
+                            )
+                            wrapper._remember_request(replacement)
+                            self.assertEqual(
+                                wrapper.request_ids["r"],
+                                linker.request_id(replacement.cache_request_handle),
+                            )
+                            wrapper.release_request(handle)
+                        self.assertTrue(
+                            entered.wait(1),
+                            "discard lost the prepared session's cancellation owner",
+                        )
+                        self.assertEqual(linker.ending_load_sessions, {backend_id})
+                        self.assertEqual(linker.session_refcounts, {"key": 1})
+                        self.assertIn(backend_id, wrapper._pending_session_cleanup)
+                        end_job = linker.session_jobs[("end", backend_id)]
+                        self.assertFalse(end_job.done())
+                        release.set()
+                        self.assertTrue(end_job.result(timeout=5))
+                        wrapper.poll_session_cleanup()
+                        linker._poll_cancelled_load_sessions()
+                    finally:
+                        release.set()
+                    self.assertEqual(linker.prepared_load_sessions, {})
+                    self.assertEqual(linker.session_refcounts, {})
+                    self.assertEqual(linker.session_jobs, {})
+                    self.assertEqual(linker.ending_load_sessions, set())
+                    self.assertFalse(wrapper._pending_session_cleanup)
+                    self.assertFalse(wrapper._prepared_session_owners)
+
+    def test_admission_without_a_job_expires_while_another_native_start_is_stuck(self):
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        wrapper = self._wrapper(linker)
+        linker.host_prefetch_limit = 1
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def start(keys):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("start was not released")
+            return [0] * len(keys), ["dfs"] * len(keys)
+
+        linker.storage.store.batch_get_session_start_with_sources.side_effect = start
+        first, second = [
+            types.SimpleNamespace(rid=rid, last_node="node", host_hit_length=1)
+            for rid in ("first", "second")
+        ]
+        for req in (first, second):
+            wrapper.hit_markers[req.rid] = ExternalCacheHitMarker(None, [req.rid], 0)
+        clock = _Clock()
+        with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
+            self.assertEqual(wrapper.prepare_load_admission(first), "pending")
+            self.assertTrue(entered.wait(5))
+            self.assertEqual(wrapper.prepare_load_admission(second), "pending")
+            self.assertNotIn(("prepare", "second"), linker.session_jobs)
+            clock.now += linker.session_lease_ttl_s + 0.1
+            with self.assertLogs(level="WARNING"):
+                self.assertEqual(wrapper.prepare_load_admission(second), "failed")
+            self.assertEqual(second.host_hit_length, 0)
+            self.assertNotIn("second", wrapper.hit_markers)
+            self.assertFalse(linker.session_jobs[("prepare", "first")].done())
+            self.assertEqual(len(linker.session_jobs), 1)
+            release.set()
+            linker.session_jobs[("prepare", "first")].result(timeout=5)
+            wrapper._abort_prepared_session("first")
+            with linker.session_lock:
+                end = linker.session_jobs.get(("end", "first"))
+            if end is not None:
+                end.result(timeout=5)
+            wrapper.poll_session_cleanup()
+        self.assertEqual(linker.session_jobs, {})
+        self.assertEqual(linker.prepared_load_sessions, {})
+
+    def test_peer_pending_cannot_hide_a_failed_read_admission(self):
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        linker.host_prefetch_enabled = False
+        wrapper = self._wrapper(linker)
+        linker.storage._batch_exist = lambda keys: [0] * len(keys)
+        req = types.SimpleNamespace(rid="r", last_node="node", host_hit_length=1)
+        wrapper.hit_markers["r"] = ExternalCacheHitMarker(None, ["key"], 0)
+        linker.revalidate_load_async(
+            "r", [types.SimpleNamespace(name=PoolName.KV, keys=["key"])]
+        )
+        self.assertFalse(linker.session_jobs[("refresh", "r")].result(timeout=5))
+        # The peer has no job credit: MAX must keep both failure and pending bits.
+        wrapper.cache._all_reduce_attn_groups.side_effect = (
+            lambda value, op: value.__setitem__((0, 0), 1)
+        )
+        self.assertEqual(wrapper.prepare_load_admission(req), "failed")
+        self.assertEqual(req.host_hit_length, 0)
+        self.assertFalse(wrapper.hit_markers)
+        self.assertFalse(wrapper._admitted_loads)
+
+    def test_cleanup_retries_back_off_and_recover_the_retained_owner(self):
+        linker = _linker()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        transfer = types.SimpleNamespace(keys=["key"])
+        self.assertTrue(linker._prepare_expanded_load("r", [transfer]))
+        linker.storage.store.batch_get_session_end.return_value = -1
+        clock = _Clock()
+        with (
+            mock.patch.object(mooncake_direct_linker.time, "monotonic", clock),
+            mock.patch.object(mooncake_direct_linker.logger, "warning") as warning,
+        ):
+            self.assertFalse(linker._abort_prepared_load_now("r"))
+            for delay in (1, 2, 4, 8, 16, 30):
+                retry_at = linker.session_cleanup_retry_at["r"]
+                self.assertEqual(retry_at - clock.now, delay)
+                self.assertEqual(linker.prepared_load_sessions, {"r": ["key"]})
+                self.assertEqual(linker.session_refcounts, {"key": 1})
+                clock.now = retry_at - 0.01
+                before = linker.storage.store.batch_get_session_end.call_count
+                self.assertFalse(linker.abort_prepared_load_async("r"))
+                self.assertEqual(
+                    linker.storage.store.batch_get_session_end.call_count, before
+                )
+                clock.now = retry_at
+                linker.abort_prepared_load_async("r")
+                self.assertFalse(linker.session_jobs[("end", "r")].result(timeout=5))
+            self.assertEqual(linker.session_cleanup_retry_delay["r"], 30)
+            # The first failure and periodic summaries replace per-retry traces.
+            self.assertLess(
+                warning.call_count, linker.session_cleanup_stats["failures"]
+            )
+            clock.now = linker.session_cleanup_retry_at["r"]
+            linker.storage.store.batch_get_session_end.return_value = 0
+            if not linker.abort_prepared_load_async("r"):
+                self.assertTrue(linker.session_jobs[("end", "r")].result(timeout=5))
+            self.assertTrue(linker.abort_prepared_load_async("r"))
+        self.assertEqual(linker.prepared_load_sessions, {})
+        self.assertEqual(linker.session_refcounts, {})
+        self.assertEqual(linker.failed_session_cleanups, set())
+        self.assertEqual(linker.session_cleanup_retry_delay, {})
 
     def test_batched_admission_bounds_collectives_and_keeps_hits_under_backpressure(
         self,

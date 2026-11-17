@@ -6,7 +6,21 @@ is quarantined; only explicitly side-effect-free failures may be retried.
 
 from typing import Callable, TypeVar
 
+import msgspec
+
 T = TypeVar("T")
+
+
+class QuarantinedKVResources(msgspec.Struct, frozen=True, kw_only=True):
+    """Keep opaque resource owners without retaining a request's token payload."""
+
+    rid: str
+    kv: object
+    lock: object
+    metadata_buffer_index: int
+    sender: object
+    cache_request_handle: object
+    cleanup_steps: dict
 
 
 class RetryableCleanupError(RuntimeError):

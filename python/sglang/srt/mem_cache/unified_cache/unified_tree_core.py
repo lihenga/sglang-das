@@ -3478,11 +3478,26 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         becomes a device leaf once its child is gone.
         """
         ids: list[NodeId] = []
+        seen: set[NodeId] = set()
         node = self._node_arena.get(endpoint_id)
         top: Optional[UnifiedTreeNode] = None
         while node is not None and node is not self.root_node and node.id != anchor_id:
-            node.detached = True
-            ids.append(node.id)
+            # A chunk can checkpoint descendants before the verdict arrives.
+            # Reclaim those pages too, leaves first, after their owners unlock.
+            stack = [(node, False)]
+            while stack:
+                descendant, visited = stack.pop()
+                if descendant.id in seen:
+                    continue
+                if not visited:
+                    stack.append((descendant, True))
+                    stack.extend(
+                        (child, False) for child in descendant.children.values()
+                    )
+                else:
+                    seen.add(descendant.id)
+                    descendant.detached = True
+                    ids.append(descendant.id)
             top = node
             node = node.parent
         if top is None:
@@ -3506,6 +3521,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         what keeps the retry list from growing without bound.
         """
         return node_id in self._node_arena
+
+    def is_on_pending_external_load_chain(
+        self, node_id: NodeId, loads: Sequence[tuple[NodeId, NodeId]]
+    ) -> bool:
+        """Whether a published load owns any prefix read by this node."""
+        prefix = set()
+        node = self._node_arena.get(node_id)
+        while node is not None and node is not self.root_node:
+            prefix.add(node.id)
+            node = node.parent
+        for endpoint, anchor in loads:
+            node = self._node_arena.get(endpoint)
+            while node is not None and node is not self.root_node and node.id != anchor:
+                if node.id in prefix:
+                    return True
+                node = node.parent
+        return False
 
     def is_on_detached_chain(self, node_id: NodeId) -> bool:
         """Whether node_id hangs off a chain a failed load left cut out.

@@ -21,17 +21,19 @@ class BootstrapRoom:
     ready: bool = False
     ready_notified: bool = False
     failed: bool = False
+    failed_notified: bool = False
     expires_at: float = 0.0
 
 
 class DeferredBootstrap:
-    def __init__(self, timeout: float):
+    def __init__(self, timeout: float, capacity: int | None = None):
         self.timeout = timeout
+        self.capacity = capacity
         self.rooms: dict[int, BootstrapRoom] = {}
         self.lock = threading.Lock()
         self._next_cleanup = 0.0
 
-    def _room(self, room: int) -> BootstrapRoom:
+    def _room(self, room: int) -> BootstrapRoom | None:
         now = time.monotonic()
         if now >= self._next_cleanup:
             # Active senders own their lifetime. Unmatched endpoints and closed
@@ -42,12 +44,17 @@ class DeferredBootstrap:
                 if state.owner is not None or state.expires_at > now
             }
             self._next_cleanup = now + min(1.0, self.timeout)
-        return self.rooms.setdefault(room, BootstrapRoom(expires_at=now + self.timeout))
+        if room not in self.rooms:
+            if self.capacity is not None and len(self.rooms) >= self.capacity:
+                return None
+            self.rooms[room] = BootstrapRoom(expires_at=now + self.timeout)
+        return self.rooms[room]
 
     @staticmethod
     def _notification(state: BootstrapRoom) -> BootstrapNotification:
         if state.endpoint is not None:
             if state.failed:
+                state.failed_notified = False
                 return state.endpoint, True
             if state.ready and not state.ready_notified:
                 # One readiness message per transfer. Decode must consume it
@@ -60,7 +67,7 @@ class DeferredBootstrap:
     def open(self, room: int, owner: object) -> BootstrapRoom | None:
         with self.lock:
             state = self._room(room)
-            if state.owner is not None:
+            if state is None or state.owner is not None:
                 return None
             state.owner = owner
             return state
@@ -68,6 +75,8 @@ class DeferredBootstrap:
     def register(self, room: int, endpoint: tuple[str, int]) -> BootstrapNotification:
         with self.lock:
             state = self._room(room)
+            if state is None:
+                return None
             if state.endpoint is not None and state.endpoint != endpoint:
                 # A room identifies one request, not a reusable allocation slot.
                 # Reject another receiver without replacing the first endpoint.
@@ -86,7 +95,7 @@ class DeferredBootstrap:
     def fail(self, room: int) -> BootstrapNotification:
         with self.lock:
             state = self._room(room)
-            if state.failed:
+            if state is None or state.failed:
                 return None
             state.failed = True
             return self._notification(state)

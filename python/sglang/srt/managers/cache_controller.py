@@ -547,6 +547,11 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if self.storage_backend is not None:
+            raise RuntimeError(
+                "Cannot attach storage backend: previous backend cleanup is incomplete; "
+                "retry detach before attaching again."
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -631,40 +636,26 @@ class HiCacheController:
             self.storage_stop_event.clear()
             self._start_storage_threads()
         except Exception:
-            # Best-effort cleanup for partial init.
+            # Rollback has the same ownership rules as an explicit detach.
             try:
-                self._stop_storage_threads()
-            except Exception:
-                pass
-            self._destroy_sync_groups(self.prefetch_hits_sync_groups)
-            self._destroy_sync_groups(self.prefetch_completion_sync_groups)
-            self.prefetch_hits_sync_groups = []
-            self.prefetch_completion_sync_groups = []
-            try:
-                if (
-                    hasattr(self, "storage_backend")
-                    and self.storage_backend is not None
-                ):
-                    if hasattr(self.storage_backend, "close"):
-                        self.storage_backend.close()
-            except Exception:
-                pass
-            self.storage_backend = None
-            self.storage_backend_type = None
-            self.enable_storage = False
-            self.page_get_func = self._generic_page_get
-            self.page_set_func = self._generic_page_set
+                self.detach_storage_backend()
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    "Storage backend attach failed and cleanup is incomplete; "
+                    "backend retained. Retry detach before attaching again."
+                ) from cleanup_error
             raise
 
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
 
-        Requirement: no in-flight requests. This will stop storage threads and release
-        the backend instance (best-effort close).
+        Requirement: no in-flight requests. Failed shutdown retains the disabled
+        backend and its process groups for an explicit detach retry.
         """
         # Idempotent cleanup: even if `enable_storage` is already False,
         # we may still have leftover resources (threads/backend/process group) from a
         # previous partial detach. We attempt cleanup whenever possible.
+        self.enable_storage = False
         try:
             self._stop_storage_threads()
         except Exception as e:
@@ -672,27 +663,27 @@ class HiCacheController:
             # fully stopped; otherwise still-alive threads may touch released state.
             # Caller can retry detach.
             logger.exception("Stop storage threads failed: %s", e)
-            # IMPORTANT: Do not silently succeed. Upper layers rely on exceptions here
-            # to avoid flipping `enable_storage` flags while threads are still alive.
+            # Keep the backend and groups alive until a retry drains the workers.
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
-        # Best-effort destroy process groups created for storage ops.
+        # Close refusal must preserve the last owner of any native operations.
+        try:
+            if self.storage_backend is not None and hasattr(
+                self.storage_backend, "close"
+            ):
+                self.storage_backend.close()
+        except Exception as e:
+            logger.exception("Failed to close storage backend cleanly.")
+            raise RuntimeError(
+                "Storage backend close incomplete; backend retained. "
+                "Retry detach after native operations drain."
+            ) from e
+
         self._destroy_sync_groups(
             self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
         )
         self.prefetch_hits_sync_groups = []
         self.prefetch_completion_sync_groups = []
-
-        # Best-effort close (some backends rely on GC/destructor).
-        try:
-            if (
-                hasattr(self, "storage_backend")
-                and self.storage_backend is not None
-                and hasattr(self.storage_backend, "close")
-            ):
-                self.storage_backend.close()
-        except Exception:
-            logger.exception("Failed to close storage backend cleanly.")
 
         self.storage_backend = None
         self.storage_backend_type = None
