@@ -22,6 +22,17 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
     loaded. Read completion, failure coordination and scheduling stay outside.
     """
 
+    @classmethod
+    def build(cls, device_pool, tp_group, attn_tp_group):
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        base_group = attn_tp_group if attn_tp_group is not None else tp_group
+        ranks = torch.distributed.get_process_group_ranks(base_group)
+        group = create_custom_parallel_group(list(ranks), backend="nccl")
+        broadcaster = cls(device_pool, group, src_global_rank=ranks[0])
+        broadcaster._warmup_group()
+        return broadcaster
+
     def __init__(self, pool_group, group, src_global_rank):
         if not pool_group.rank_replicated:
             raise ValueError("Linker broadcasts require rank-replicated pools.")
@@ -52,6 +63,8 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
             group,
             src_global_rank,
         )
+        # CP shards have different sources even without DP attention.
+        self.is_src = torch.distributed.get_rank() == src_global_rank
         # A physical page cannot be split into smaller rows by _bcast_layer.
         max_row_bytes = max(
             buf.shape[1]
@@ -79,7 +92,13 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
             indices, _ = prepared[name]
             if indices.is_cuda:
                 indices.record_stream(device_module.current_stream())
+            layers = (layer,) if isinstance(layer, int) else tuple(layer)
             for buffers in self.buffers[name]:
-                self._bcast_layer(
-                    buffers, self.kv_staging, indices, buffers[layer].shape[1], layer
-                )
+                for mapped in layers:
+                    self._bcast_layer(
+                        buffers,
+                        self.kv_staging,
+                        indices,
+                        buffers[mapped].shape[1],
+                        mapped,
+                    )

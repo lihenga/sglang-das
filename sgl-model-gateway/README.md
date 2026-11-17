@@ -160,6 +160,32 @@ The `--version` (or `-V`) flag displays the version string. Use `--version-verbo
   ```
 Prefill entries accept an optional bootstrap port. PD mode merges prefill metadata with decode outputs and streams results back to the client.
 
+HTTP PD response buffering uses the existing `--max-payload-size` option (bytes,
+default `536870912`, or 512 MiB), also exposed as `RouterConfig.max_payload_size`
+and the Python launcher's `--max-payload-size`. This bounds each non-streaming
+prefill/decode body, prefill metadata retained for logprob merging, decode output
+held while prefill finishes, and each incomplete SSE event (excluding its empty
+separator line). Complete SSE events release their parsing buffer, so a long
+stream or one HTTP chunk containing many events can exceed this size in total.
+The limit does not depend on the number of HTTP chunks. Increase it for large
+logprob responses, for example `--max-payload-size 1073741824` for 1 GiB.
+Exceeding it before streaming returns HTTP 502 and cancels the paired request;
+after response headers have been sent, the gateway terminates the body with a
+transport error, without appending an SSE error event to partially sent data.
+Terminal events end forwarding at the event boundary in both ordinary and
+logprob streams, including when trailing data shares the same HTTP chunk.
+Complete JSON worker errors are detected before EOF with an incremental boundary
+scan and one full JSON parse per body for error detection, rather than reparsing
+each chunk prefix. Logprob merging may separately parse a completed body.
+
+These limits bound individual byte buffers, not total process memory. Prefill,
+decode and SSE buffers can coexist; JSON parsing/logprob merging, upstream HTTP
+chunks and the downstream forwarding queue require additional memory. The
+forwarding queue is unbounded. `--max-concurrent-requests` is disabled by default
+and currently configures a refilling token bucket, so it does not impose a hard
+cap on live response bodies or aggregate in-flight bytes. Choose the payload
+limit with the deployment's actual concurrency and memory headroom in mind.
+
 ### Multi-Model Inference Gateway
 Enable IGW mode to route multiple models through a single router while applying per-model policies:
 ```bash

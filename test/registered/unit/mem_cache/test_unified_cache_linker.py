@@ -146,8 +146,12 @@ class _FakeExternalTreeCore:
 def _cache_for_wrapper(**kwargs):
     defaults = {
         "_components_tuple": (),
+        "_all_reduce_attn_groups": lambda value, op: None,
         "components": {},
-        "tree_core": SimpleNamespace(enable_external_cache_linker=False),
+        "tree_core": SimpleNamespace(
+            enable_external_cache_linker=False,
+            detach_external_load_chain=lambda endpoint, anchor: [endpoint],
+        ),
         "tree_components": (ComponentType.FULL,),
         "write_through_threshold": 256,
         "pp_size": 1,
@@ -856,7 +860,7 @@ def test_async_load_pins_node_until_completion():
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
 
-    wrapper._queue_load("rid", node_id, [object()])
+    wrapper._queue_load("rid", node_id, [object()], anchor=node_id)
 
     assert locks == [node_id]
     assert not unlocks
@@ -876,7 +880,7 @@ def test_release_request_cancels_queued_load():
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
     wrapper.hit_markers["rid"] = object()
-    wrapper.pending_loads["rid"] = (7, lock_params)
+    wrapper.pending_loads["rid"] = (7, lock_params, 0)
     linker.queued_loads["rid"] = [object()]
 
     wrapper.release_request("rid")
@@ -968,7 +972,7 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id)),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper._queue_load("rid", node.id, [object()])
+    wrapper._queue_load("rid", node.id, [object()], anchor=node.id)
     wrapper.offload_nodes([node.id])
 
     wrapper.reset()
@@ -993,7 +997,7 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id))
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.pending_loads["rid"] = (7, object())
+    wrapper.pending_loads["rid"] = (7, object(), 0)
 
     wrapper.close()
 
@@ -1006,8 +1010,12 @@ def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.linker = SimpleNamespace(
+        poll_session_cleanup=lambda: None,
         num_completed_loads=lambda: 1,
-        drain_loads=lambda count: committed.append(("load", count)),
+        take_completed_loads=lambda count: [True] * count,
+        commit_completed_loads=lambda values: (
+            committed.append(("load", values)) or []
+        ),
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
@@ -1025,10 +1033,12 @@ def test_check_hicache_events_commits_common_rank_results():
             value.fill_(0)
 
     cache._all_reduce_attn_groups = reduce_to_common_state
+    cache._stranded_linker_nodes = []
+    cache._failed_linker_rids = []
 
     cache.check_hicache_events()
 
-    assert committed == [("load", 1), [False]]
+    assert committed == [("load", [False]), [False]]
 
 
 def test_component_commit_keeps_only_adopted_pages():
@@ -1142,9 +1152,12 @@ def full_linker_component():
     return SimpleNamespace(
         component_type=ComponentType.FULL,
         build_external_linker_transfer=MagicMock(side_effect=build_transfer),
-        update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
-            transfer
-        ),
+        update_external_linker_load=lambda phase,
+        req,
+        full_transfer,
+        transfer,
+        prefix_len,
+        **kwargs: (transfer),
     )
 
 

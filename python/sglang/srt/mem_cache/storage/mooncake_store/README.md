@@ -301,7 +301,7 @@ You can enable it in any of the three supported configuration methods:
       --model-path [model_path]
   ```
 
-> **Note:** `enable_ssd_offload` requires a Mooncake version that supports the `enable_ssd_offload` parameter in `MooncakeDistributedStore.setup()`. If the installed version does not support it, SGLang will automatically fall back to the old behavior and print a warning.
+> **Note:** `enable_ssd_offload` requires a Mooncake version that supports the `enable_ssd_offload` parameter in `MooncakeDistributedStore.setup()`. If the installed version does not support an explicitly requested SSD option, startup fails with a compatibility error; SGLang does not silently remove storage configuration.
 
 **Mooncake Group Semantics (`enable_group_semantics`):**
 
@@ -505,3 +505,284 @@ python3 [path of test_mooncake_store.py]
 ```
 
 If all tests pass, the message "✅ All tests passed" will be printed at the end.
+
+## DeepSeek 4.1 direct Mooncake L3/L4
+
+This port is based on HYGON `feat/20260920_deepseek-v4.1` at
+`7888b28e77` and brings the Mooncake direct-cache behavior from
+`lihenga/sglang-das` `feature/optimize_main` at `61321c04df`.
+The 4.1 C1/C2 KV, indexer payload/scale, SWA, CP layer ownership and packed
+DSpark draft mappings remain the target implementation.
+
+### Enable the direct path
+
+Add these options to the model's existing supported launch configuration:
+
+```bash
+--enable-unified-cache-external-linker \
+--unified-cache-external-linker-backend mooncake \
+--schedule-policy fcfs \
+--mooncake-enable-page-wise-load \
+--mooncake-enable-waiting-queue-dfs-prefetch \
+--mooncake-waiting-queue-dfs-prefetch-workers 1 \
+--mooncake-waiting-queue-dfs-prefetch-max-requests 12
+```
+
+Do not combine direct linking with `--enable-hierarchical-cache` or
+`--hicache-storage-backend`. DeepSeek 4.1 currently rejects PP > 1 and
+encoder SWA bounded replay together with the external linker. This port does
+not remove those model compatibility gates. The unified radix tree is already
+the default; `SGLANG_ENABLE_UNIFIED_RADIX_TREE` is obsolete.
+
+The added runtime options are opt-in. Keep the existing layer-wise path to
+establish a baseline before enabling page-wise/ReadPlan and queued prefetch.
+For a supporting embedded L4 client, the relevant settings are:
+
+```bash
+export SGLANG_MOONCAKE_READ_PLAN=1
+export SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES=0
+export SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE=1073741824
+export MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE=1
+
+# Example per-embedded-client buffer budget; size for the actual model/load.
+export MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES=12884901888
+export MC_STORE_DFS_PREFETCH_CAPACITY_RATIO=0.5
+```
+
+ReadPlan page-wise reads pass the mode directly to native code. The ordinary
+range path uses `--mooncake-page-wise-load-threshold` (default 10 expanded keys).
+ReadLayout is selected when supported; otherwise session range reads remain
+available. Address reuse is incompatible with page-wise mode.
+
+Queued prefetch reads DFS objects into the native pinned session cache before
+GPU admission. It requires FCFS, a non-PD or prefill role, PP=1, all-rank API
+support and an available native arena. If any attention rank lacks these,
+all ranks disable it before traffic. Distinct Gloo groups isolate background
+prefetch and input reception from model-forward collectives. Unsupported input
+such as multimodal/control/grammar work is deferred in receive order until the
+forward returns; shared-memory materialization stays on the scheduler thread.
+
+The background state uses attempt-scoped backend IDs, so an old submission ACK
+or cleanup cannot cancel a newer request attempt with the same public RID.
+Session references are shared by physical key; failures, cancellations and
+shutdown retain buffers until the owning I/O has drained. The Python TreeCore
+owns failed-chain detachment/reclamation; selecting Rust with this direct path
+uses the existing compatibility fallback to Python (already HCU's default).
+
+### L3/L4 package compatibility
+
+Optional APIs are negotiated through declared capabilities and callable
+methods, without parsing wheel version strings. Community, HYGON L3 and DAS L4
+packages keep their baseline setup/session reads. Unsupported ReadPlan falls
+back to ReadLayout or session ranges; unsupported queued DFS prefetch disables
+that feature. Storage placement and tenant options are never silently dropped.
+Both the older extension module and the newer `mooncake.store` facade are
+supported for ReadLayout types. This matches the compatibility behavior from
+the donor's community/HYGON L3/L4 integration PR, adapted to this branch's
+resolved RuntimeContext config bags.
+
+Direct-linker storage suffixes now include the pool group's layout tag. This
+changes L3/L4 keys: existing untagged caches are cold after this upgrade, and
+prefill workers running different key layouts cannot share those entries.
+
+For standalone mode, use matching Python/client-daemon packages and matching
+Client/Master RPC protocols. A callable Python method does not establish daemon
+support; current L4 declares ReadPlan, ReadLayout and queued DFS prefetch for
+embedded clients. No transport performance or driver compatibility follows
+from successful Python API negotiation.
+
+### DFS deployment and lease settings
+
+Keep the working Mooncake master/client DFS configuration for the shared root,
+bucket allocator/alignment/capacity, offload and replica placement. SGLang's
+per-rank SSD subdirectories apply to local-disk backends; a distributed backend
+retains its shared root and can start with L3 while that mount is unavailable.
+The mounted root and actual DFS capacity/permissions still require deployment
+validation.
+
+`SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S=0` refreshes reused sessions
+unconditionally. A positive age skips refresh only for a private, sufficiently
+fresh session. Declare the real master TTL in seconds through
+`SGLANG_MOONCAKE_LEASE_TTL_S`; for master `--default_kv_lease_ttl=30000`, use `30`.
+Grouped or shared keys use conservative refresh behavior. Admission, queueing,
+synchronization and actual reads still consume the lease; this is an RPC-saving
+optimization, not a guarantee for arbitrary read duration.
+
+The current `v0.3.14_dev_l4` native configuration uses the unified DFS buffer
+and prefetch-capacity ratio. The old `MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES`,
+`MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`,
+`MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES`, and
+`MC_STORE_DFS_WRITE_ARENA_COUNT` should not be used to calculate its capacity.
+Read and write chunks use `MC_STORE_DFS_READ_CHUNK_SIZE_BYTES` and
+`MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES`. Count embedded clients/processes when
+budgeting memory; an external storage client has a separate budget.
+
+DFS health has independent read/write probes and fail-closed policy before
+warmup. Configure interval, failure/success thresholds and timeout with the
+`--mooncake-dfs-health-*` options, or corresponding
+`SGLANG_MOONCAKE_DFS_HEALTH_*` environment variables. Attention ranks apply a
+common conservative policy. Recovery does not promise backfill of every write
+made while DFS was unavailable.
+
+Initial fail-closed setup must succeed synchronously before any client warms up.
+In deferred mode, only scheduler-coordinated policies reach a single background
+worker; pending updates coalesce to the latest target. Failed updates retry at
+the probe interval without scheduler polling. Non-deferred clients keep
+synchronous policy application. An unconfirmed native reply stays dirty when the
+target returns to the last confirmed policy. A hung call occupies the one worker
+until it returns; it is neither cancelled nor replaced by concurrent RPCs.
+Embedded RealClient policy updates are local atomic stores. Standalone
+DummyClient updates synchronously call the external RealClient by RPC. Before
+using deferred policy application with standalone storage, verify that the
+installed Mooncake build releases the Python GIL in its policy binding;
+otherwise its RPC can still stall the scheduler from the background worker.
+The `dfs_health` capability only checks API availability and does not certify
+GIL release. No minimum fixed wheel version is established by these checks.
+An unconfirmed disable cannot guarantee that the native client stopped DFS
+access; the last confirmed policy is not proof of its current permissions.
+Storage/linker policy wrappers currently discard the manager's confirmation
+result, and loads do not gate on pending policy application. Deferred application
+alone therefore does not provide fail-closed load admission during that window.
+
+Health-manager shutdown stops new probes and policy submissions and changes its
+local read/write candidates to `UNKNOWN` (deny both). It waits at most one second
+in total for its tracked workers. A pending native read, write or policy call
+makes `close()` raise instead of reporting completion; synchronous policy callers
+are included. The manager retains the client and worker handles. Repeated close
+attempts cannot start replacements, and late successful probes cannot restore
+availability after shutdown. After the native calls drain, retry close before
+creating a replacement manager, whose initial native deny policy must succeed.
+An indefinitely blocked native call requires retaining the old owner until
+recovery or restarting the process. No native thread is cancelled or client freed
+while an operation is using it.
+
+The controller disables storage work and retains the backend and synchronization
+groups if shutdown fails, including rollback after a partially failed attach.
+`MooncakeStore.close()` retains its health manager when close raises. A retained
+backend blocks all new attachments, including same-backend policy updates.
+Explicit detach retries release it only after workers and native calls drain;
+shutdown also retries retained backends with storage already disabled. No worker
+is automatically restarted. A retained-owner detach failure raises through the
+attachment entry point so the admin handler cannot report success merely because
+storage was already disabled. Stopping health workers does not confirm that native
+DFS access was disabled: existing or unconfirmed native permissions can remain in
+effect. Refused shutdown is not a healthy attachment that can safely resume
+storage traffic.
+
+After detach, disabled ranks skip DFS-policy polling even if only some retain
+their native owner. Before a new attach, attention ranks collectively check for
+retained backends; any pending cleanup refuses attachment on every rank before
+client creation. A locally completed detach therefore cannot let that rank
+reattach ahead of a peer whose native call is still pending.
+
+### Observability and validation
+
+With `--enable-metrics`, each embedded client reports cumulative native metrics
+to its SGLang service; HTTP and gRPC sidecar receivers expose them through
+`/metrics`. Reports wait for receiver startup, retain authentication/TLS
+settings and omit successful snapshot traffic from access logs. Queue events,
+worker outcome/duration and ready-to-claim lead time are separate from actual
+load completion. Direct `l4_*` counters cover successful external-store loads
+or writes; the metric name alone does not prove every object came from DFS.
+
+Snapshot ingestion is mounted only on the main HTTP service and the authenticated
+gRPC HTTP sidecar, not on non-primary dummy health servers. It follows the
+service's configured API-key policy; a service without an API key remains open.
+The shared receiver retains at most 1024 client snapshots and 256 MiB of snapshot
+files, including temporary files during replacement; quota exhaustion returns
+HTTP 429. A replacement needs room for both the old and new file. Snapshots expire
+after 300 seconds, with a background sweep every 30 seconds and another sweep
+before publication, independently of Prometheus scraping.
+
+Waiting-queue prefetch metrics do not establish end-to-end request tracing.
+Background reads, session operations and drain/cleanup work are not guaranteed
+to inherit the original request's trace context. Existing transfer spans remain
+useful, but this port does not add complete tracing. The waiting-queue event
+counter records `wait_prefetch` and `wait_session` admission observations (not
+request counts or elapsed time); opt-in `DAS_PREFETCH_TRACE` logs correlate these
+reasons with request IDs and bootstrap rooms.
+
+CPU-only tests live under `test/registered/unit/{mem_cache,managers,disaggregation,observability}`.
+`test/manual/mooncake/test_package_compatibility.py` exercises package negotiation
+without native allocation. `test_native_read_plan.py` uses a private in-process
+Master for CPU/TCP native ReadLayout/ReadPlan/session smoke.
+`test_wheel_swap.py` checks multi-pool SGLang writes/reads against a matching
+wheel; choose `MATRIX_DEVICES=cpu` for CPU checks. These tests do not substitute
+for DeepSeek 4.1 output-consistency, HCU, RDMA, DFS fault, or performance runs.
+The existing `test_unified_cache_linker_kl_dsv4.py` targets **DeepSeek-V4-Flash**
+on CUDA; its injected-read-failure arm is not DeepSeek V4.1 or HCU acceptance.
+Do not substitute that model or add an unvalidated HCU registration to claim
+V4.1 coverage. A V4.1 service-level run requires the actual V4.1 checkpoint,
+launch configuration and allocated accelerators. The Flash test requires an
+observed linker abort followed
+by a successful request, live health, nonzero remote-load exposure, and the
+existing GSM8K accuracy threshold after warm/flush/re-read. This service-level
+test needs the model and accelerator environment; CPU unit results do not
+establish that it passes.
+
+### Implementation batches and evidence
+
+The functional changes are grouped as Store/API compatibility and diagnostics;
+read/session plans plus queued prefetch and tree ownership; scheduler/PD
+lifetime integration; then regression coverage and deployment notes. Existing
+4.1 pool/model code remains authoritative. External linker deployments reject streaming sessions because their virtual session nodes do not expose external-load ownership for failure recovery. Other-model-specific GLM/Mamba
+features are outside this DeepSeek 4.1 port. Existing PP > 1 and encoder bounded
+replay restrictions remain in force.
+
+Validation in the supplied `sglang0518_0920_yb` container uses an isolated task
+directory and leaves its installed Mooncake package untouched. A matching
+`v0.3.14_dev_l4` wheel was built with SHCA, HIP/HYGON and etcd via
+`scripts/variant_build.sh --shca --hip --etcd`. The script enables fake HIP RPC
+compatibility; this build does not establish HIP fabric RPC functionality.
+Native CPU/TCP ReadLayout/ReadPlan/session checks and multi-pool SGLang
+round-trips passed. The container has Python 3.10, which satisfies this branch's
+Python >= 3.10 requirement. Component tests still do not establish a working full
+serving installation with the model and native dependencies.
+
+### Port review follow-ups
+
+The port also validates direct lookup against the target Store signature and
+registers a batch's request IDs atomically, so a later duplicate or state-creation
+failure leaves no partial request registration. Drained PD aborts retain bounded
+terminal room records to reject late bootstrap destinations; failure notices use
+the target status-message API and preserve its generation-tagged drain ACKs.
+
+The donor's untagged two-frame `ABORT_ACK` is not a replacement for the target
+protocol. A drained prefill abort sends `KVPoll.Failed` using the target status
+channel; decode's drain handshake retains `ABORT_ACK` with the room, prefill rank
+and matching generation. Generation-less drain ACKs cannot authorize release.
+For device destinations, decode can release after
+`SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT` (default 30 seconds)
+even without complete drain ACKs. That timeout is not proof that remote writes
+stopped. Host-staged destinations remain held until drain consensus; the device
+timeout fallback does not apply to them.
+
+Terminal-room or notification capacity exhaustion retains a scheduler cleanup
+owner for retry. Local transport maps are cleared independently of successful
+notification handoff; Failed guards and target snapshots survive backpressure.
+Notifications use a bounded worker with endpoint backoff and aggregated logs.
+`sglang:mooncake_drained_abort_rejections_total` counts rejected handoffs.
+
+Unknown allocator cleanup outcomes retain request resources instead of repeating
+an unsafe free. `sglang:external_kv_quarantined_reqs` reports this quarantine;
+4096 retained requests exhaust its capacity and stop the scheduler rather than
+grow without bound. Recover these opaque allocator failures by restarting the
+worker. This differs from native get-session cleanup, which retains bounded
+credits and retries its idempotent end operation without preventing idle/flush.
+Inflight user cancellation preserves a computed prefix when no external KV
+failure has already made it unsafe to cache.
+
+Forward ingress runs only when the synchronized batch contains extend work,
+and is disabled when the input blocker or KV canary is active. Direct-linker
+health policy shares the completion-count reduction. Cleanup presence and
+inflight retirement still require rank consensus; a locally empty queue cannot
+safely gate these operations. No throughput or TTFT A/B is established here.
+
+The accompanying `sgl-model-gateway` changes add HTTP stream outcomes, SSE/JSON
+error detection, paired PD cancellation with one shared deadline, and failure-log
+rate limiting. HTTP PD requests are dispatched once without replay; regular HTTP,
+external OpenAI and gRPC retries retain their existing behavior. The target
+Responses API, bootstrap metadata and logprob merging remain supported. Build and
+install the gateway wheel separately to use these changes; updating the Engine
+package alone does not install them. See `sgl-model-gateway/bindings/python/README.md`
+for the metric definitions and scope.

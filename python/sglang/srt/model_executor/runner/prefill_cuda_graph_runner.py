@@ -2223,10 +2223,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
 
+    def _wait_for_external_kv_restore(self) -> None:
+        if get_memory().enable_unified_cache_external_linker:
+            counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
+            if counter is not None:
+                counter.wait_until(counter.num_layers - 1)
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
         self._validate_capture_hidden_mode(forward_batch)
+        # Captured attention bypasses Python layer waits; eager forwards keep them.
+        self._wait_for_external_kv_restore()
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)

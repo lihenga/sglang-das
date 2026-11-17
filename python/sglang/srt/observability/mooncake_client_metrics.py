@@ -1,0 +1,379 @@
+"""Forward embedded Mooncake metrics to the serving process, including remote ranks."""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import socket
+import tempfile
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+SNAPSHOT_PATH = "/internal/mooncake_client_metrics"
+REPORT_INTERVAL = 5
+REPORT_TIMEOUT = 30
+RECEIVER_CHECK_INTERVAL = 1
+RECEIVER_STARTUP_GRACE = 300
+MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+MAX_SNAPSHOT_CLIENTS = 1024
+MAX_SNAPSHOT_TOTAL_BYTES = 256 * 1024 * 1024
+SNAPSHOT_TTL = 300
+SNAPSHOT_EXPIRY_INTERVAL = 30
+CLIENT_LABELS = ("mooncake_client", "mooncake_host", "mooncake_pid", "mooncake_rank")
+
+
+def _snapshot_directory():
+    # All HTTP/tokenizer workers already share this per-server directory.
+    directory = Path(os.environ["PROMETHEUS_MULTIPROC_DIR"]) / "mooncake_clients"
+    directory.mkdir(exist_ok=True)
+    return directory
+
+
+def _parse_metrics(text):
+    from prometheus_client.parser import text_string_to_metric_families
+
+    metrics = list(text_string_to_metric_families(text))
+    for metric in metrics:
+        if not metric.name.startswith("mooncake_"):
+            raise ValueError("Expected Mooncake client metric names")
+        for sample in metric.samples:
+            if any(label in sample.labels for label in CLIENT_LABELS):
+                raise ValueError("Client metric uses a reserved source label")
+    return metrics
+
+
+class SnapshotQuotaExceeded(ValueError):
+    pass
+
+
+def _snapshot_quota_exceeded(directory, target, incoming_bytes):
+    clients = list(directory.glob("*.json"))
+    files = clients + list(directory.glob("tmp*"))
+    # Include the old target and the new temporary file at their peak size.
+    return (
+        (not target.exists() and len(clients) >= MAX_SNAPSHOT_CLIENTS)
+        or len(files) + 1 > MAX_SNAPSHOT_CLIENTS + 1
+        or sum(path.stat().st_size for path in files) + incoming_bytes
+        > MAX_SNAPSHOT_TOTAL_BYTES
+    )
+
+
+def _expire_snapshots_locked(directory):
+    """The same lock serializes expiry, quota accounting, and publication."""
+    now = time.monotonic()
+    for path in directory.glob("*.json"):
+        try:
+            expired = now - json.loads(path.read_text())["received"] > SNAPSHOT_TTL
+        except (ValueError, KeyError, TypeError):
+            expired = True
+        if expired:
+            path.unlink(missing_ok=True)
+    for path in directory.glob("tmp*"):
+        if time.time() - path.stat().st_mtime > SNAPSHOT_TTL:
+            path.unlink(missing_ok=True)
+
+
+def expire_snapshots():
+    import fcntl
+
+    directory = _snapshot_directory()
+    with (directory / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _expire_snapshots_locked(directory)
+
+
+@asynccontextmanager
+async def snapshot_expiry():
+    async def expire_periodically():
+        while True:
+            try:
+                await asyncio.to_thread(expire_snapshots)
+            except OSError:
+                logger.exception("Cannot expire Mooncake client metrics snapshots")
+            await asyncio.sleep(SNAPSHOT_EXPIRY_INTERVAL)
+
+    task = asyncio.create_task(expire_periodically())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def receive_snapshot(payload):
+    """Validate before atomically publishing to other HTTP workers."""
+    client_id = payload.get("client_id")
+    if not isinstance(client_id, str) or not re.fullmatch(r"[0-9a-f]{32}", client_id):
+        raise ValueError("Invalid client ID")
+    sequence = payload.get("sequence")
+    if type(sequence) is not int or sequence <= 0:
+        raise ValueError("Invalid snapshot sequence")
+    labels = payload.get("labels")
+    if (
+        not isinstance(labels, dict)
+        or set(labels) != set(CLIENT_LABELS)
+        or labels["mooncake_client"] != client_id
+        or any(
+            not isinstance(value, str) or len(value) > 256 for value in labels.values()
+        )
+    ):
+        raise ValueError("Invalid client labels")
+    text = payload.get("metrics")
+    if text is not None:
+        if not isinstance(text, str) or len(text.encode()) > MAX_SNAPSHOT_BYTES:
+            raise ValueError("Invalid client metrics")
+        _parse_metrics(text)
+    snapshot = {
+        "labels": labels,
+        "metrics": text,
+        "received": time.monotonic(),
+        "timestamp": time.time(),
+        "sequence": sequence,
+    }
+    import fcntl
+
+    data = json.dumps(snapshot).encode("utf-8")
+    directory = _snapshot_directory()
+    with (directory / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        target = directory / f"{client_id}.json"
+        if target.exists():
+            try:
+                previous = json.loads(target.read_text())
+                expired = time.monotonic() - previous["received"] > SNAPSHOT_TTL
+            except (ValueError, KeyError, TypeError):
+                expired = True
+            if expired:
+                target.unlink()
+            else:
+                if previous["sequence"] >= sequence:
+                    return
+                if previous["labels"] != labels:
+                    raise ValueError("Client identity changed")
+        if _snapshot_quota_exceeded(directory, target, len(data)):
+            _expire_snapshots_locked(directory)
+            if _snapshot_quota_exceeded(directory, target, len(data)):
+                raise SnapshotQuotaExceeded("Mooncake client metrics quota exceeded")
+        fd, temporary = tempfile.mkstemp(dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+class MooncakeClientCollector:
+    def collect(self):
+        from prometheus_client.core import GaugeMetricFamily
+
+        up = GaugeMetricFamily(
+            "sglang:mooncake_client_up",
+            "Embedded client metrics available and reported within 30 seconds",
+            labels=CLIENT_LABELS,
+        )
+        reported = GaugeMetricFamily(
+            "sglang:mooncake_client_last_report_timestamp_seconds",
+            "Time the serving process last received a client metrics snapshot",
+            labels=CLIENT_LABELS,
+        )
+        families = {}
+        for path in _snapshot_directory().glob("*.json"):
+            try:
+                snapshot = json.loads(path.read_text())
+                age = time.monotonic() - snapshot["received"]
+                if age > SNAPSHOT_TTL:
+                    continue
+                labels = snapshot["labels"]
+                values = [labels[name] for name in CLIENT_LABELS]
+                available = age <= REPORT_TIMEOUT and snapshot["metrics"] is not None
+                metrics = _parse_metrics(snapshot["metrics"]) if available else []
+                if any(
+                    metric.name in families
+                    and families[metric.name].type != metric.type
+                    for metric in metrics
+                ):
+                    raise ValueError("Conflicting client metric types")
+                up.add_metric(values, int(available))
+                reported.add_metric(values, snapshot["timestamp"])
+                for metric in metrics:
+                    metric.samples = [
+                        sample._replace(labels={**sample.labels, **labels})
+                        for sample in metric.samples
+                    ]
+                    if metric.name in families:
+                        families[metric.name].samples.extend(metric.samples)
+                    else:
+                        families[metric.name] = metric
+            except (OSError, ValueError, KeyError, TypeError):
+                logger.warning("Cannot read Mooncake client metrics snapshot %s", path)
+        yield up
+        yield reported
+        yield from families.values()
+
+
+def add_snapshot_route(app):
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    async def receive(request: Request):
+        if request.method in ("GET", "HEAD"):
+            return Response(status_code=204)
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > MAX_SNAPSHOT_BYTES:
+                return Response(status_code=413)
+            body.extend(chunk)
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a snapshot object")
+            await asyncio.to_thread(receive_snapshot, payload)
+        except SnapshotQuotaExceeded:
+            return Response(status_code=429)
+        except (ValueError, TypeError):
+            return Response(status_code=400)
+        return Response(status_code=204)
+
+    app.add_route(SNAPSHOT_PATH, receive, methods=["GET", "POST"])
+
+
+class MooncakeClientMetricsReporter:
+    def __init__(self, store, url, server_args, rank):
+        from sglang.srt.arg_groups.serving_hook import ssl_verify_of
+        from sglang.srt.runtime_context import get_serving
+
+        self._store = store
+        self._url = url + SNAPSHOT_PATH
+        self._verify = ssl_verify_of(get_serving())
+        self._api_key = get_serving().api_key
+        client_id = uuid.uuid4().hex
+        self._labels = dict(
+            zip(
+                CLIENT_LABELS,
+                (client_id, socket.gethostname(), str(os.getpid()), str(rank)),
+            )
+        )
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="mooncake-client-metrics", daemon=True
+        )
+        self._thread.start()
+
+    def _wait_for_receiver(self, session):
+        import requests
+
+        deadline = time.monotonic() + RECEIVER_STARTUP_GRACE
+        next_warning = 0.0
+        while not self._stopped.is_set():
+            try:
+                response = session.get(
+                    self._url,
+                    timeout=(2, 5),
+                    verify=self._verify,
+                    allow_redirects=False,
+                )
+                if response.status_code == 204:
+                    return True
+                raise RuntimeError(f"HTTP {response.status_code}")
+            except Exception as error:
+                # A receiver cannot listen until scheduler initialization finishes.
+                starting = isinstance(
+                    error, (requests.ConnectionError, requests.Timeout)
+                ) and not isinstance(error, requests.exceptions.SSLError)
+                now = time.monotonic()
+                if (not starting or now >= deadline) and now >= next_warning:
+                    logger.warning(
+                        "Waiting for SGLang HTTP metrics receiver %s: %s",
+                        self._url,
+                        error,
+                    )
+                    next_warning = now + 12 * REPORT_INTERVAL
+                if self._stopped.wait(
+                    RECEIVER_CHECK_INTERVAL if starting else REPORT_INTERVAL
+                ):
+                    return False
+        return False
+
+    def _run(self):
+        import requests
+
+        with requests.Session() as session:
+            session.trust_env = False
+            if self._api_key:
+                session.headers["Authorization"] = f"Bearer {self._api_key}"
+            if not self._wait_for_receiver(session):
+                return
+            failures = 0
+            sequence = 0
+            while not self._stopped.is_set():
+                try:
+                    metrics = self._store.get_client_metrics()
+                    sequence += 1
+                    response = session.post(
+                        self._url,
+                        json={
+                            "client_id": self._labels["mooncake_client"],
+                            "labels": self._labels,
+                            "metrics": metrics,
+                            "sequence": sequence,
+                        },
+                        timeout=(2, 5),
+                        verify=self._verify,
+                        allow_redirects=False,
+                    )
+                    if response.status_code != 204:
+                        raise RuntimeError(f"HTTP {response.status_code}")
+                    if failures:
+                        logger.info(
+                            "Mooncake client metrics reporting recovered after %d failures",
+                            failures,
+                        )
+                    elif sequence == 1:
+                        logger.info("Mooncake client metrics reporting started")
+                    failures = 0
+                except Exception as error:
+                    failures += 1
+                    if failures == 1 or failures % 12 == 0:
+                        logger.warning(
+                            "Mooncake client metrics report failed: %s", error
+                        )
+                self._stopped.wait(REPORT_INTERVAL)
+
+    def close(self):
+        self._stopped.set()
+        self._thread.join()
+
+
+def start_client_metrics_reporter(store, server_args, service_endpoint, rank):
+    from sglang.srt.runtime_context import get_observability, get_serving
+
+    if not get_observability().enable_metrics:
+        return None
+    if not callable(getattr(store, "get_client_metrics", None)):
+        logger.warning(
+            "Embedded Mooncake metrics forwarding needs a Mooncake package with "
+            "get_client_metrics support; rebuild/install the matching package."
+        )
+        return None
+    scheme = "https" if get_serving().ssl_certfile else "http"
+    if get_serving().smg_grpc_mode or get_serving().grpc_mode:
+        from sglang.srt.utils.network import NetworkAddress
+
+        endpoint = NetworkAddress.parse(service_endpoint)
+        port = get_observability().smg_http_sidecar_port or get_serving().port + 1
+        service_endpoint = NetworkAddress(endpoint.host, port).to_host_port_str()
+        scheme = "http"
+    return MooncakeClientMetricsReporter(
+        store, f"{scheme}://{service_endpoint}", server_args, rank
+    )

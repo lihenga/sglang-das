@@ -21,6 +21,7 @@ pub struct RouterConfig {
     pub policy: PolicyConfig,
     pub host: String,
     pub port: u16,
+    /// Maximum request body and HTTP PD response buffer size in bytes.
     pub max_payload_size: usize,
     pub request_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,

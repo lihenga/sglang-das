@@ -4,7 +4,9 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -35,6 +37,25 @@ class _Req:
         self.metadata_buffer_index = 7 if allocated else -1
         self.pending_bootstrap = allocated
         self.disagg_kv_sender = Mock()
+        self.lock = None
+        self.disagg_kv_sender.poll.return_value = KVPoll.Failed
+        self.external_kv_cleanup_steps = {}
+        for flag in (
+            "abort_requested",
+            "pending_chunk_cleared",
+            "linker_released",
+            "sender_abort_requested",
+            "metadata_released",
+            "cache_released",
+            "finish_state_applied",
+            "response_sent",
+            "abort_response_via_chunked",
+            "cleanup_done",
+            "cleanup_quarantined",
+            "checkpoint_on_abort",
+        ):
+            setattr(self, "external_kv_" + flag, False)
+        self.skip_radix_cache_insert = False
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.return_logprob = False
@@ -59,6 +80,11 @@ class _Req:
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self):
+        self.init_external_kv_cleanup(coordinated=False)
+        self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=None)
+        self.result_queue = []
+        self._pending_chunked_abort_req = None
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
             move_logprobs_to_cpu=Mock(),
@@ -70,11 +96,16 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
-        self.metrics_reporter = SimpleNamespace(report_prefill_stats=Mock())
+        self.metrics_reporter = SimpleNamespace(
+            report_prefill_stats=Mock(), enable_metrics=False
+        )
         self.maybe_send_health_check_signal = Mock()
         self.req_to_metadata_buffer_idx_allocator = Mock()
         self.enable_hicache_storage = True
         self.chunked_req = None
+
+    def _release_aborted_request(self, req):
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
 
 def _batch(req):
@@ -242,8 +273,12 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
 ):
     """A failed sender notification must not leak ownership or lose the API error."""
     scheduler = _Scheduler()
-    scheduler.batch_result_processor.get_sampling_mask_finish_reason = lambda **kwargs: (
-        SchedulerBatchResultProcessor.get_sampling_mask_finish_reason(None, **kwargs)
+    scheduler.batch_result_processor.get_sampling_mask_finish_reason = (
+        lambda **kwargs: (
+            SchedulerBatchResultProcessor.get_sampling_mask_finish_reason(
+                None, **kwargs
+            )
+        )
     )
     req = _Req(inflight_middle_chunks=0)
     req.to_finish = None
@@ -282,6 +317,76 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
 
 
 class TestPrefillCompleteResult(CustomTestCase):
+    def test_quarantine_keeps_resource_handles_without_token_payload(self):
+        scheduler, req = _Scheduler(), _Req(inflight_middle_chunks=0)
+        scheduler.waiting_queue = [req]
+        scheduler.disagg_prefill_bootstrap_queue = None
+        req.output_ids = list(range(1000))
+        scheduler._quarantine_external_kv_request(req)
+        resources = scheduler._quarantined_external_kv_requests[
+            req.cache_request_handle
+        ]
+        self.assertIsNot(resources, req)
+        self.assertIs(resources.kv, req.kv)
+        self.assertEqual(resources.metadata_buffer_index, req.metadata_buffer_index)
+        self.assertFalse(hasattr(resources, "output_ids"))
+        self.assertTrue(scheduler.has_retained_external_kv_resources())
+
+    def test_quarantine_keys_preserve_distinct_lifecycles_after_request_release(self):
+        scheduler = _Scheduler()
+        scheduler.waiting_queue = []
+        scheduler.disagg_prefill_bootstrap_queue = None
+        first, second = _Req(inflight_middle_chunks=0), _Req(inflight_middle_chunks=0)
+        first.cache_request_handle = CacheRequestHandle(first.rid, 0, 1)
+        second.cache_request_handle = CacheRequestHandle(second.rid, 0, 2)
+        scheduler._quarantine_external_kv_request(first)
+        first_handle, first_kv = first.cache_request_handle, first.kv
+        del first
+        scheduler._quarantine_external_kv_request(second)
+        self.assertEqual(len(scheduler._quarantined_external_kv_requests), 2)
+        self.assertIs(
+            scheduler._quarantined_external_kv_requests[first_handle].kv, first_kv
+        )
+
+    def test_unknown_cleanup_quarantine_cannot_grow_past_its_limit(self):
+        scheduler = _Scheduler()
+        scheduler._external_kv_quarantine_limit = 1
+        retained = _Req(inflight_middle_chunks=0)
+        scheduler._quarantined_external_kv_requests[retained.cache_request_handle] = (
+            retained
+        )
+        req = _Req(inflight_middle_chunks=0)
+        req.cache_request_handle = CacheRequestHandle(req.rid, 0, 2)
+        with self.assertRaisesRegex(RuntimeError, "quarantine capacity"):
+            scheduler._quarantine_external_kv_request(req)
+        self.assertEqual(
+            scheduler._quarantined_external_kv_requests,
+            {retained.cache_request_handle: retained},
+        )
+
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    def test_notification_backpressure_retains_cleanup_owner(self, release_kv_cache):
+        scheduler, req = _Scheduler(), _Req(inflight_middle_chunks=0)
+        req.disagg_kv_sender.notify_drained_abort.side_effect = [False, True]
+        self.assertFalse(
+            scheduler.abort_external_kv_request(
+                req, forward_drained=True, sender_terminal=True, emit_response=True
+            )
+        )
+        self.assertIs(scheduler._mooncake_cleanup_requests[id(req)], req)
+        self.assertFalse(req.external_kv_cleanup_done)
+        self.assertTrue(req.kv.holds_kv)
+        scheduler.output_streamer.stream_output.assert_not_called()
+        release_kv_cache.assert_not_called()
+        self.assertTrue(
+            scheduler.abort_external_kv_request(
+                req, forward_drained=True, sender_terminal=True, emit_response=True
+            )
+        )
+        self.assertTrue(req.external_kv_cleanup_done)
+        self.assertFalse(req.kv.holds_kv)
+        scheduler.output_streamer.stream_output.assert_called_once()
+
     def setUp(self):
         super().setUp()
         override = get_context().override_server_args(

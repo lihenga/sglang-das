@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
@@ -127,17 +129,9 @@ class DevicePoolEntry:
         return self._rows(indices)
 
     def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
-        mapped = self.layer_mapping.get(layer)
-        if mapped is None:
+        items = self.get_layer_range_components(layer)
+        if items is None:
             return None
-        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
-
-        items = []
-        for component, offsets in zip(self.buffer_meta, self._component_offsets):
-            for buffer_index in buffer_indices:
-                base_ptr, row_stride, size = component[buffer_index]
-                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
-
         ptrs, sizes, offsets = [], [], []
         for row in locations:
             row_ptrs = [
@@ -155,6 +149,19 @@ class DevicePoolEntry:
                 offsets.extend([[value] for value in row_offsets])
         return ptrs, sizes, offsets
 
+    def get_layer_range_components(self, layer: int):
+        mapped = self.layer_mapping.get(layer)
+        if mapped is None:
+            return None
+        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
+
+        items = []
+        for component, offsets in zip(self.buffer_meta, self._component_offsets):
+            for buffer_index in buffer_indices:
+                base_ptr, row_stride, size = component[buffer_index]
+                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+        return items
+
 
 class DevicePoolGroup:
     """Physical device pools sharing one logical linker layer range."""
@@ -166,6 +173,7 @@ class DevicePoolGroup:
         page_size: int,
         *,
         rank_replicated: bool = False,
+        storage_layout_tag: str = "",
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -175,6 +183,7 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
+        self.storage_layout_tag = storage_layout_tag
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -257,6 +266,44 @@ def _with_packed_draft_mapping(
         draft = target_device_layer_num + depth
         result[depth] = (target, draft) if target is not None else draft
     return result
+
+
+def _device_pool_storage_tag(kvcache, entries, page_size):
+    geometry = {
+        "model_pool": type(kvcache).__name__,
+        "stage": [
+            getattr(kvcache, "start_layer", None),
+            getattr(kvcache, "end_layer", None),
+        ],
+        "sources_by_ratio": getattr(kvcache, "sources_by_ratio", {}),
+        "swa_page_size": getattr(kvcache, "swa_page_size", None),
+        "page_size": page_size,
+        "cp_size": getattr(kvcache, "cp_size", 1),
+        "pools": [
+            {
+                "name": str(e.name),
+                "layers": e.layer_mapping,
+                "packed": e.packed,
+                "buffers": [
+                    [
+                        (
+                            str(b.dtype),
+                            list(b.shape[1:]),
+                            list(b.stride()[1:]),
+                            b.stride(0),
+                        )
+                        for b in group
+                    ]
+                    for group in e.components
+                ],
+            }
+            for e in entries
+        ],
+    }
+    digest = hashlib.sha256(json.dumps(geometry, sort_keys=True).encode()).hexdigest()[
+        :16
+    ]
+    return f"dsv41_v1_{digest}"
 
 
 def _build_deepseek_v41_device_pool_group(
@@ -407,7 +454,13 @@ def _build_deepseek_v41_device_pool_group(
             add(name, index_pool, views, index_mapping)
     # C2's request-scoped pending pair is empty at even FULL-page boundaries.
     # It must not be addressed or restored using token-page indices.
-    return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+    return DevicePoolGroup(
+        entries,
+        num_layers,
+        page_size,
+        rank_replicated=True,
+        storage_layout_tag=_device_pool_storage_tag(kvcache, entries, page_size),
+    )
 
 
 def _build_deepseek_v4_device_pool_group(

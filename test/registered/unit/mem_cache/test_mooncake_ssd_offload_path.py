@@ -149,6 +149,39 @@ def _make_store(
 
 
 class TestMooncakeSsdOffloadPath(CustomTestCase):
+    def test_hicache_factory_disables_unused_native_dfs_prefetch_arena(self):
+        """HiCache must not reserve the direct linker's waiting-queue arena."""
+        from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
+
+        class PrefetchStore(_fake_store_class()):
+            def dfs_prefetch_arena_available(self):
+                return self.setup_kwargs.get("enable_dfs_prefetch", True)
+
+        fake_store_cls = PrefetchStore
+        with (
+            tempfile.TemporaryDirectory() as base,
+            patch.dict(
+                "sys.modules",
+                {
+                    **_fake_mooncake_modules(fake_store_cls),
+                    **_fake_host_pool_modules(),
+                },
+            ),
+        ):
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
+            )
+
+            cfg = _make_config(tp_rank=0, pp_rank=0, ssd_offload_path=base)
+            backend = StorageBackendFactory.create_backend("mooncake", cfg, None)
+            self.assertIsInstance(backend, MooncakeStore)
+            self.assertIs(
+                fake_store_cls.instances[-1].setup_kwargs["enable_dfs_prefetch"], False
+            )
+            self.assertFalse(
+                fake_store_cls.instances[-1].dfs_prefetch_arena_available()
+            )
+
     def test_each_rank_gets_private_subdirectory(self):
         with tempfile.TemporaryDirectory() as base:
             for tp_rank in (0, 3):
@@ -196,6 +229,19 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
                 for cp_rank in range(4)
             }
             self.assertEqual(len(paths), 8)
+
+    def test_distributed_backend_retains_shared_root_without_creating_a_mount(self):
+        with tempfile.TemporaryDirectory() as base:
+            shared_root = os.path.join(base, "offline-shared-root")
+            with patch.dict(
+                os.environ,
+                {
+                    "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR": "distributed_storage_backend"
+                },
+            ):
+                client = _make_store(tp_rank=3, pp_rank=0, ssd_offload_path=shared_root)
+            self.assertEqual(client.setup_kwargs["ssd_offload_path"], shared_root)
+            self.assertFalse(os.path.exists(shared_root))
 
 
 if __name__ == "__main__":

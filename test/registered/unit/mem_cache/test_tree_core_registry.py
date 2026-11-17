@@ -351,6 +351,10 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
 
 
 class TreeCoreDefaultCompatibilityTest(CustomTestCase):
+    def test_linker_fallback_does_not_require_published_runtime_config(self):
+        params = _cache_init_params(enable_external_linker=True)
+        self.assertEqual(resolve_tree_core_backend("rust", params), "python")
+
     def setUp(self):
         hcu_patcher = mock.patch.object(tree_core_registry, "_is_hcu", False)
         hcu_patcher.start()

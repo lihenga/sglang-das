@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from http import HTTPStatus
 from typing import (
     Annotated,
@@ -297,6 +297,9 @@ async def lifespan(fast_api_app: FastAPI):
     # Add prometheus middleware
     if get_observability().enable_metrics:
         add_prometheus_middleware(app)
+        from sglang.srt.observability.mooncake_client_metrics import add_snapshot_route
+
+        add_snapshot_route(fast_api_app)
         enable_func_timer()
 
     # Init tracing
@@ -425,11 +428,16 @@ async def lifespan(fast_api_app: FastAPI):
             report(False)
         raise
 
+    metrics_cleanup = AsyncExitStack()
     # Start the native gRPC server and warmup inside the try so a failure in
     # either still runs the finally cleanup below. Native gRPC is enabled via
     # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
     # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        if get_observability().enable_metrics:
+            from sglang.srt.observability.mooncake_client_metrics import snapshot_expiry
+
+            await metrics_cleanup.enter_async_context(snapshot_expiry())
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
             and get_serving().grpc_port is not None
@@ -465,6 +473,7 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        await metrics_cleanup.aclose()
         if sidecar is not None:
             try:
                 sidecar.stop()

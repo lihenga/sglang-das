@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -45,7 +46,30 @@ class TestPPSyncDrain(unittest.TestCase):
         self.assertEqual(holder.work_list, [])
 
 
-class TestUnifiedPPSyncBatching(unittest.TestCase):
+class TestUnifiedPPSyncBatching(CustomTestCase):
+    def test_linker_health_policy_uses_the_completion_count_consensus(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache._dfs_policy_sync_enabled = True
+        cache.linker = SimpleNamespace(
+            get_local_dfs_health_policy=lambda: (True, False),
+            apply_dfs_health_policy=MagicMock(),
+            poll_session_cleanup=lambda: None,
+            num_completed_loads=lambda: 0,
+            num_completed_offloads=lambda: 0,
+            take_completed_offloads=lambda count: [],
+        )
+        cache._collect_failed_linker_loads = lambda count: None
+        cache.retry_stranded_failed_linker_chains = lambda: None
+
+        def conservative_peer_policy(counts, op):
+            self.assertEqual(counts.tolist(), [0, 0, 1, 0])
+            counts[2] = 0
+
+        cache._all_reduce_attn_groups = MagicMock(side_effect=conservative_peer_policy)
+        cache.check_hicache_events()
+        cache._all_reduce_attn_groups.assert_called_once()
+        cache.linker.apply_dfs_health_policy.assert_called_once_with(False, False)
+
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(
@@ -64,6 +88,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.writing_check = MagicMock()
         cache.loading_check = MagicMock()
         cache.cache_controller = SimpleNamespace(
+            storage_backend=None,
             start_writing=MagicMock(),
             ack_write_queue=[
                 SimpleNamespace(

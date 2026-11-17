@@ -619,6 +619,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.external_kv_quarantined_reqs = Gauge(
+            name="sglang:external_kv_quarantined_reqs",
+            documentation="Requests retained after an unknown external KV cleanup result.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.decode_deferred_kv_release_seconds = Histogram(
             name="sglang:decode_deferred_kv_release_seconds",
             documentation="Histogram of time spent holding deferred decode KV releases.",
@@ -1364,6 +1370,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ],
         )
 
+        self.waiting_queue_prefetch_events_total = Counter(
+            name="sglang:waiting_queue_prefetch_scheduler_events_total",
+            documentation="Waiting-queue DFS prefetch scheduler events per rank.",
+            labelnames=[*labels.keys(), "event"],
+        )
+
     @classmethod
     def init_new(
         cls,
@@ -1451,6 +1463,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def set_external_kv_quarantined_reqs(self, count: int) -> None:
+        self.external_kv_quarantined_reqs.labels(**self.labels).set(count)
 
     def increment_decode_host_receive_reqs(self) -> None:
         self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
@@ -2319,6 +2334,95 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                 **self.labels, reason=reason
             )
 
+        l4_source_labels = [*labels.keys(), "source"]
+        l4_result_labels = [*l4_source_labels, "result"]
+        self.l4_prefetched_tokens_total = Counter(
+            name="sglang:l4_prefetched_tokens_total",
+            documentation="Number of tokens prefetched from L4 by source.",
+            labelnames=l4_source_labels,
+        )
+        self.l4_backuped_tokens_total = Counter(
+            name="sglang:l4_backuped_tokens_total",
+            documentation="Number of tokens backed up to L4 by source.",
+            labelnames=l4_source_labels,
+        )
+        token_buckets = [
+            1,
+            16,
+            64,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            32768,
+            65536,
+            131072,
+            262144,
+        ]
+        self.l4_prefetched_tokens_per_request = Histogram(
+            name="sglang:l4_prefetched_tokens_per_request",
+            documentation="Tokens successfully prefetched from L4 per request.",
+            labelnames=l4_source_labels,
+            buckets=token_buckets,
+        )
+        self.l4_backuped_tokens_per_operation = Histogram(
+            name="sglang:l4_backuped_tokens_per_operation",
+            documentation="Tokens successfully backed up to L4 per operation.",
+            labelnames=l4_source_labels,
+            buckets=token_buckets,
+        )
+        duration_buckets = [
+            0.0001,
+            0.00025,
+            0.0005,
+            0.001,
+            0.0025,
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1,
+            2.5,
+            5,
+            10,
+            20,
+        ]
+        self.l4_prefetch_duration_seconds = Histogram(
+            name="sglang:l4_prefetch_duration_seconds",
+            documentation="L4 prefetch wall-clock duration in seconds.",
+            labelnames=l4_result_labels,
+            buckets=duration_buckets,
+        )
+        self.waiting_queue_prefetch_events_total = Counter(
+            name="sglang:waiting_queue_prefetch_events_total",
+            documentation="Waiting-queue DFS prefetch task events per rank.",
+            labelnames=[*labels.keys(), "event"],
+        )
+        self.waiting_queue_prefetch_duration_seconds = Histogram(
+            name="sglang:waiting_queue_prefetch_duration_seconds",
+            documentation="Time from host-prefetch submission to worker outcome.",
+            labelnames=[*labels.keys(), "result"],
+            buckets=duration_buckets,
+        )
+        self.waiting_queue_prefetch_ready_lead_seconds = Histogram(
+            name="sglang:waiting_queue_prefetch_ready_lead_seconds",
+            documentation="Time from DFS prefetch readiness to request claim.",
+            labelnames=labels.keys(),
+            buckets=duration_buckets,
+        )
+        self.l4_backup_duration_seconds = Histogram(
+            name="sglang:l4_backup_duration_seconds",
+            documentation="L4 backup wall-clock duration in seconds.",
+            labelnames=l4_result_labels,
+            buckets=duration_buckets,
+        )
+
         self.backup_dropped_tokens_total = Counter(
             name="sglang:hicache_backup_dropped_tokens_total",
             documentation="Buffer-mode backup tokens that never reached L3 "
@@ -2443,6 +2547,52 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+    def log_waiting_queue_prefetch_event(self, event: str) -> None:
+        self.waiting_queue_prefetch_events_total.labels(
+            **self.labels, event=event
+        ).inc()
+
+    def log_waiting_queue_prefetch_result(
+        self, result: str, duration_seconds: float
+    ) -> None:
+        self.waiting_queue_prefetch_duration_seconds.labels(
+            **self.labels, result=result
+        ).observe(duration_seconds)
+
+    def log_waiting_queue_prefetch_claim(self, lead_seconds: float) -> None:
+        self.log_waiting_queue_prefetch_event("claimed")
+        self.waiting_queue_prefetch_ready_lead_seconds.labels(**self.labels).observe(
+            lead_seconds
+        )
+
+    def log_l4_prefetch(
+        self, source: str, tokens: int, duration_seconds: float, success: bool
+    ) -> None:
+        source_labels = {**self.labels, "source": source}
+        self.l4_prefetch_duration_seconds.labels(
+            **source_labels, result="success" if success else "failure"
+        ).observe(duration_seconds)
+        if success and tokens > 0:
+            self.log_prefetched_tokens(tokens)
+            self.l4_prefetched_tokens_total.labels(**source_labels).inc(tokens)
+            self.l4_prefetched_tokens_per_request.labels(**source_labels).observe(
+                tokens
+            )
+
+    def log_l4_backup(
+        self, source: str, tokens: int, duration_seconds: float, success: bool
+    ) -> None:
+        source_labels = {**self.labels, "source": source}
+        self.l4_backup_duration_seconds.labels(
+            **source_labels, result="success" if success else "failure"
+        ).observe(duration_seconds)
+        if success and tokens > 0:
+            self.log_backuped_tokens(tokens)
+            self.l4_backuped_tokens_total.labels(**source_labels).inc(tokens)
+            self.l4_backuped_tokens_per_operation.labels(**source_labels).observe(
+                tokens
+            )
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):

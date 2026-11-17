@@ -122,7 +122,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.disaggregation.prefill." "poll_and_all_reduce_attn_cp_tp_group",
+            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
             return_value=[
                 KVPoll.Failed,
                 KVPoll.WaitingForInput,
@@ -166,7 +166,7 @@ class TestPPPDConsensus(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.disaggregation.prefill." "poll_and_all_reduce_attn_cp_tp_group",
+            "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
             return_value=[
                 KVPoll.WaitingForInput,
                 KVPoll.Failed,
@@ -191,6 +191,8 @@ class TestPPPDConsensus(CustomTestCase):
         handle_failure = Mock()
         scheduler = SimpleNamespace(
             disagg_prefill_inflight_queue=[req],
+            _coordinated_kv_cleanup=True,
+            _all_reduce_mooncake_cleanup=Mock(),
             attn_cp_cpu_group=object(),
             attn_tp_cpu_group=object(),
             ps=SimpleNamespace(pp_rank=1),
@@ -199,6 +201,8 @@ class TestPPPDConsensus(CustomTestCase):
             req_to_metadata_buffer_idx_allocator=object(),
             scheduler_stage_metrics=None,
         )
+        req.external_kv_abort_requested = False
+        req.external_kv_response_sent = False
 
         def mark_abort(target_req, message, status_code):
             del message, status_code

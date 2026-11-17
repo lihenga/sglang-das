@@ -70,15 +70,25 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    ingress_attn_cp_cpu_group: Any = None
+    ingress_attn_tp_cpu_group: Any = None
+    ingress_tp_cpu_group: Any = None
 
-    def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        if self.max_recv_per_poll < 0:
-            return False
-        return num_recv_reqs >= self.max_recv_per_poll
+    def recv_limit_reached(
+        self, num_recv_reqs: int, *, max_recv_per_poll: Optional[int] = None
+    ) -> bool:
+        limit = (
+            self.max_recv_per_poll if max_recv_per_poll is None else max_recv_per_poll
+        )
+        return limit >= 0 and num_recv_reqs >= limit
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
-        self, local_reqs: Optional[List[AbortReq]] = None
+        self,
+        local_reqs: Optional[List[AbortReq]] = None,
+        *,
+        defer_mm: bool = False,
+        max_recv_per_poll: Optional[int] = None,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks.
 
@@ -93,7 +103,7 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
-        recv_reqs = self._pull_raw_reqs()
+        recv_reqs = self._pull_raw_reqs(max_recv_per_poll=max_recv_per_poll)
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
@@ -103,13 +113,17 @@ class SchedulerRequestReceiver:
         if get_parallel().pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
 
-        recv_reqs = self._apply_mm_receiver(recv_reqs)
-
-        self._finalize_shm_features(recv_reqs)
+        if not defer_mm:
+            recv_reqs = self.prepare_deferred_requests(recv_reqs)
 
         return recv_reqs
 
-    def _pull_raw_reqs(self) -> Optional[List]:
+    def _pull_raw_reqs(
+        self, *, max_recv_per_poll: Optional[int] = None
+    ) -> Optional[List]:
+        limit = (
+            self.max_recv_per_poll if max_recv_per_poll is None else max_recv_per_poll
+        )
         if get_parallel().pp_rank == 0:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 recv_reqs = []
@@ -118,14 +132,14 @@ class SchedulerRequestReceiver:
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
                 # non-blocking, msgpack-decoded contract as the zmq path below.
                 if envs.SGLANG_RUST_SERVER.get():
-                    recv_reqs.extend(
-                        self.recv_from_tokenizer.drain(self.max_recv_per_poll)
-                    )
+                    recv_reqs.extend(self.recv_from_tokenizer.drain(limit))
                     return recv_reqs
 
                 while True:
                     try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                        if self.recv_limit_reached(
+                            len(recv_reqs), max_recv_per_poll=limit
+                        ):
                             break
                         recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
                     except zmq.ZMQError:
@@ -134,7 +148,9 @@ class SchedulerRequestReceiver:
 
                 while True:
                     try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                        if self.recv_limit_reached(
+                            len(recv_reqs), max_recv_per_poll=limit
+                        ):
                             break
                         recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:
@@ -176,7 +192,7 @@ class SchedulerRequestReceiver:
                 work_reqs = None
                 control_reqs = None
 
-            work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
+            work_reqs = self._broadcast_attn_ingress(work_reqs)
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -188,13 +204,13 @@ class SchedulerRequestReceiver:
                 or get_exec().moe.is_ep_scale_joiner
             )
             if _local_ctrl:
-                control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
+                control_reqs = self._broadcast_attn_ingress(control_reqs)
             elif get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     tp_group.rank,
-                    tp_group.cpu_group,
+                    self.ingress_tp_cpu_group or tp_group.cpu_group,
                     src=tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
@@ -206,7 +222,7 @@ class SchedulerRequestReceiver:
                 recv_reqs = broadcast_pyobj(
                     recv_reqs,
                     tp_group.rank,
-                    tp_group.cpu_group,
+                    self.ingress_tp_cpu_group or tp_group.cpu_group,
                     src=tp_group.ranks[0],
                 )
         return recv_reqs
@@ -335,3 +351,57 @@ class SchedulerRequestReceiver:
             )
         ]
         return work_reqs, control_reqs
+
+    def prepare_deferred_requests(self, recv_reqs):
+        recv_reqs = self._apply_mm_receiver(recv_reqs)
+        self._finalize_shm_features(recv_reqs)
+        return recv_reqs
+
+    def _broadcast_attn_ingress(self, data):
+        if (
+            self.ingress_attn_tp_cpu_group is None
+            and self.ingress_attn_cp_cpu_group is None
+        ):
+            return attn_cp_tp_broadcast_pyobj(data)
+        parallel = get_parallel()
+        for coordinator, group in (
+            (parallel.attn_tp_group, self.ingress_attn_tp_cpu_group),
+            (parallel.attn_cp_group, self.ingress_attn_cp_cpu_group),
+        ):
+            if coordinator.world_size > 1:
+                data = broadcast_pyobj(
+                    data,
+                    coordinator.rank,
+                    group or coordinator.cpu_group,
+                    src=coordinator.ranks[0],
+                )
+        return data
+
+    def ingress_sync_groups(self):
+        parallel = get_parallel()
+        local_control = (
+            parallel.enable_dp_attention_local_control_broadcast
+            or get_exec().moe.is_ep_scale_joiner
+        )
+        if parallel.attn_dp_enabled and local_control:
+            return [
+                group
+                for size, group in (
+                    (
+                        parallel.attn_tp_size,
+                        self.ingress_attn_tp_cpu_group
+                        or parallel.attn_tp_group.cpu_group,
+                    ),
+                    (
+                        parallel.attn_cp_size,
+                        self.ingress_attn_cp_cpu_group
+                        or parallel.attn_cp_group.cpu_group,
+                    ),
+                )
+                if size > 1
+            ]
+        return (
+            [self.ingress_tp_cpu_group or parallel.tp_group.cpu_group]
+            if parallel.tp_size > 1
+            else []
+        )

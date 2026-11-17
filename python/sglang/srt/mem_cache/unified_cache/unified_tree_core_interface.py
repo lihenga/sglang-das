@@ -762,3 +762,34 @@ class UnifiedTreeCoreInterface(ABC):
     def pretty_print(self) -> None:
         """Print the tree structure for debugging."""
         ...
+
+    def detach_external_load_chain(
+        self, endpoint_id: NodeId, anchor_id: NodeId
+    ) -> list[NodeId]:
+        raise NotImplementedError(
+            "External load recovery requires a supporting TreeCore"
+        )
+
+    def holds_detached_node(self, node_id: NodeId) -> bool:
+        raise NotImplementedError(
+            "External load recovery requires a supporting TreeCore"
+        )
+
+    def is_on_pending_external_load_chain(
+        self, node_id: NodeId, loads: Sequence[tuple[NodeId, NodeId]]
+    ) -> bool:
+        raise NotImplementedError(
+            "External load publication requires a supporting TreeCore"
+        )
+
+    def is_on_detached_chain(self, node_id: NodeId) -> bool:
+        raise NotImplementedError(
+            "External load recovery requires a supporting TreeCore"
+        )
+
+    def invalidate_external_load_chain(
+        self, node_id: NodeId
+    ) -> DropSubtreeNoHostResult:
+        raise NotImplementedError(
+            "External load recovery requires a supporting TreeCore"
+        )

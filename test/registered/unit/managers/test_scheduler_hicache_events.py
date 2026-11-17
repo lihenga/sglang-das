@@ -23,6 +23,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
     def setUp(self):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
+        s.init_external_kv_cleanup(coordinated=False)
         s.scheduler_stage_metrics = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False

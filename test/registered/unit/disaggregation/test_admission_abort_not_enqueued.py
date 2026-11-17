@@ -282,11 +282,13 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req.set_finish_with_abort(ERROR_MSG)
         sched = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.NULL,
+            _cache_request_lifecycle_seq=0,
             waiting_queue=[],
             processed_tokens_counter=0,
             _set_or_validate_priority=MagicMock(return_value=True),
             _abort_on_queued_limit=MagicMock(return_value=False),
             _prefetch_kvcache=MagicMock(),
+            _prefetch_external_kvcache=MagicMock(),
         )
         Scheduler._add_request_to_queue(sched, req)
         self.assertEqual(sched.waiting_queue, [req])

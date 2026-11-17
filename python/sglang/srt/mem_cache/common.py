@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     zero_match_result,
 )
+from sglang.srt.mem_cache.cleanup import run_cleanup_step
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -230,7 +231,8 @@ def match_kv_cache(
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
-            return_full_match=return_full_match or bool(tree_cache.swa_reprefill_tail_tokens()),
+            return_full_match=return_full_match
+            or bool(tree_cache.swa_reprefill_tail_tokens()),
             cow_mamba=cow_mamba,
             req=req,
         )
@@ -404,12 +406,16 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.kv.holds_mamba:
-            tree_cache.req_to_token_pool.mamba_allocator.free(
-                req.kv.mamba_pool_idx.unsqueeze(-1)
+            run_cleanup_step(
+                req,
+                "kv.mamba",
+                lambda: tree_cache.req_to_token_pool.mamba_allocator.free(
+                    req.kv.mamba_pool_idx.unsqueeze(-1)
+                ),
             )
             req.kv.mamba_pool_idx = None
         return
-    if tree_cache.claim_kv_row(req):
+    if run_cleanup_step(req, "kv.claim", lambda: tree_cache.claim_kv_row(req)):
         # A streaming session detached the kv record to keep the row.
         assert not req.kv.holds_kv
         return
@@ -424,20 +430,40 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         )
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
-        tree_cache.checkpoint(req, up_to=owned_kv_len)
+        run_cleanup_step(
+            req, "kv.checkpoint", lambda: tree_cache.checkpoint(req, up_to=owned_kv_len)
+        )
     # The protected prefix is not this req's to free.
-    tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-    tree_cache.unlock(req.lock)
-    req.lock = None
-    _release_overallocated_kv_indices(
-        req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
+    run_cleanup_step(
+        req,
+        "kv.free_row",
+        lambda: tree_cache.free_kv_row(
+            req.kv, [(req.kv.cache_protected_len, owned_kv_len)]
+        ),
     )
-    tree_cache.on_release(req, checkpointed=checkpoint)
+    run_cleanup_step(req, "kv.unlock", lambda: tree_cache.unlock(req.lock))
+    req.lock = None
+    run_cleanup_step(
+        req,
+        "kv.overallocated",
+        lambda: _release_overallocated_kv_indices(
+            req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
+        ),
+    )
+    run_cleanup_step(
+        req,
+        "kv.on_release",
+        lambda: tree_cache.on_release(req, checkpointed=checkpoint),
+    )
 
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
-    _release_donated_swa_slots(req, tree_cache)
-    tree_cache.req_to_token_pool.free(req)
+    run_cleanup_step(
+        req, "kv.donated_swa", lambda: _release_donated_swa_slots(req, tree_cache)
+    )
+    run_cleanup_step(
+        req, "kv.token_row", lambda: tree_cache.req_to_token_pool.free(req)
+    )
     req.kv.mark_kv_released()
 
 

@@ -49,10 +49,21 @@ def _add_metrics_routes(app):
         generate_latest,
     )
 
+    from sglang.srt.observability.mooncake_client_metrics import (
+        MAX_SNAPSHOT_BYTES,
+        SNAPSHOT_PATH,
+        MooncakeClientCollector,
+        SnapshotQuotaExceeded,
+        receive_snapshot,
+        snapshot_expiry,
+    )
+    from sglang.srt.runtime_context import get_serving
+
     async def metrics_handler(request):
         try:
             registry = CollectorRegistry()
             multiprocess.MultiProcessCollector(registry)
+            registry.register(MooncakeClientCollector())
             data = generate_latest(registry)
             return web.Response(
                 body=data,
@@ -63,6 +74,48 @@ def _add_metrics_routes(app):
             return web.Response(status=500, text="Failed to generate metrics")
 
     app.router.add_get("/metrics", metrics_handler)
+
+    async def snapshot_handler(request):
+        import asyncio
+
+        from sglang.srt.utils.auth import AuthLevel, decide_request_auth
+
+        decision = decide_request_auth(
+            method=request.method,
+            path=SNAPSHOT_PATH,
+            authorization_header=request.headers.get("Authorization"),
+            api_key=get_serving().api_key,
+            admin_api_key=get_serving().admin_api_key,
+            auth_level=AuthLevel.NORMAL,
+        )
+        if not decision.allowed:
+            return web.Response(status=decision.error_status_code)
+        if request.method in ("GET", "HEAD"):
+            return web.Response(status=204)
+        body = bytearray()
+        async for chunk in request.content.iter_chunked(64 * 1024):
+            if len(body) + len(chunk) > MAX_SNAPSHOT_BYTES:
+                return web.Response(status=413)
+            body.extend(chunk)
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a snapshot object")
+            await asyncio.to_thread(receive_snapshot, payload)
+        except SnapshotQuotaExceeded:
+            return web.Response(status=429)
+        except (ValueError, TypeError):
+            return web.Response(status=400)
+        return web.Response(status=204)
+
+    app.router.add_post(SNAPSHOT_PATH, snapshot_handler)
+    app.router.add_get(SNAPSHOT_PATH, snapshot_handler)
+
+    async def snapshot_cleanup(app):
+        async with snapshot_expiry():
+            yield
+
+    app.cleanup_ctx.append(snapshot_cleanup)
 
 
 def _check_communicator_results(results, action):
@@ -173,7 +226,9 @@ async def serve_grpc(server_args, model_info=None):
     # declarations for what it needs before the engine exists.
     cfg = resolving_view(server_args)
 
-    sidecar_app = web.Application()
+    from sglang.srt.observability.mooncake_client_metrics import MAX_SNAPSHOT_BYTES
+
+    sidecar_app = web.Application(client_max_size=MAX_SNAPSHOT_BYTES)
     sidecar_runner = None
     sidecar_port = (
         cfg.smg_http_sidecar_port

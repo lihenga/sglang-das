@@ -122,7 +122,6 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -1386,6 +1385,19 @@ class Req(ReqDllmMixin):
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        self.external_kv_abort_requested = False
+        self.external_kv_pending_chunk_cleared = False
+        self.external_kv_linker_released = False
+        self.external_kv_sender_abort_requested = False
+        self.external_kv_metadata_released = False
+        self.external_kv_cache_released = False
+        self.external_kv_finish_state_applied = False
+        self.external_kv_response_sent = False
+        self.external_kv_abort_response_via_chunked = False
+        self.external_kv_cleanup_done = False
+        self.external_kv_cleanup_quarantined = False
+        self.external_kv_checkpoint_on_abort = False
+        self.external_kv_cleanup_steps = {}
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank

@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 class CacheRequestHandle:
     rid: str
     attempt_id: int
+    lifecycle_id: int = 0
 
 
 class CacheRequestOutcome(Enum):

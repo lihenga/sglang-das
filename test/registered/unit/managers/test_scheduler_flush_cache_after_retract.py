@@ -1,5 +1,6 @@
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -8,7 +9,9 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -19,7 +22,7 @@ def _make_req(is_retracted: bool) -> MagicMock:
     return req
 
 
-class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
+class TestSchedulerFlushCacheAfterRetract(CustomTestCase):
     """Regression coverage for flush_cache() no-oping while the engine is paused.
 
     With generation paused and running_batch drained, nothing in waiting_queue
@@ -32,6 +35,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.init_external_kv_cleanup(coordinated=False)
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.last_batch = None
@@ -48,14 +52,43 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_waiting_queue_dfs_prefetch = False
         scheduler.enable_lmcache = False
         scheduler.enable_hisparse = False
         scheduler.tree_cache = MagicMock()
+        scheduler.tree_cache.linker = None
         scheduler.req_to_token_pool = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.draft_worker = None
         scheduler.metrics_reporter = MagicMock()
         return scheduler
+
+    def test_retained_abort_resources_block_idle_and_flush_until_released(self):
+        for quarantine in (False, True):
+            for kind in ("kv", "metadata", "tree_lock"):
+                with self.subTest(quarantine=quarantine, kind=kind):
+                    scheduler = self._new_scheduler()
+                    req = SimpleNamespace(
+                        kv=ReqKvInfo(req_pool_idx=1 if kind == "kv" else None),
+                        lock=object() if kind == "tree_lock" else None,
+                        metadata_buffer_index=3 if kind == "metadata" else -1,
+                    )
+                    owners = (
+                        scheduler._quarantined_external_kv_requests
+                        if quarantine
+                        else scheduler._mooncake_cleanup_requests
+                    )
+                    owners[id(req)] = req
+                    self.assertFalse(scheduler.is_fully_idle())
+                    self.assertFalse(scheduler.is_fully_idle(ignore_waiting=True))
+                    self.assertFalse(scheduler.flush_cache())
+                    scheduler.tree_cache.reset.assert_not_called()
+                    req.kv.req_pool_idx, req.lock, req.metadata_buffer_index = (
+                        None,
+                        None,
+                        -1,
+                    )
+                    self.assertTrue(scheduler.is_fully_idle())
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):
         scheduler = self._new_scheduler()

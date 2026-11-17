@@ -3,7 +3,7 @@
 import threading
 import time
 import unittest
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -16,11 +16,13 @@ from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServe
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -110,19 +112,33 @@ class TestAllocationIntegration(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         self.wire = deque()
+        self._flushing_control = False
         self.prefill = self.manager("prefill", 1)
         self.decode = self.manager("decode", 2)
         self.endpoints = {("prefill", 1): self.prefill, ("decode", 2): self.decode}
 
     def manager(self, ip, port):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr._source_drain = SourceDrainTracker()
+        mgr._transfer_completion_condition = threading.Condition()
+        mgr._drained_abort_lock = threading.Lock()
+        mgr._drained_abort_rooms = OrderedDict()
+        mgr._drained_abort_capacity = 4096
+        mgr._control_notification_lock = threading.RLock()
+        mgr._control_rooms = OrderedDict()
+        mgr._pending_control_notifications = OrderedDict()
+        mgr._deferred_ack_deadlines = OrderedDict()
+        mgr._stopped = False
+        mgr.pd_hidden_events = PDHiddenEventManager(mgr)
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.request_status = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
         mgr.waiting_timeout = 5
         mgr.bootstrap_timeout = 3
+        mgr.bootstrap_port = port
         mgr.req_to_decode_prefix_len = {}
+        mgr.req_to_pd_hidden_meta = {}
         mgr.transfer_infos = {}
         mgr._deferred_ack_targets = {}
         mgr._deferred_ack_poisoned_rooms = set()
@@ -140,10 +156,27 @@ class TestAllocationIntegration(CustomTestCase):
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(
             (endpoint, msg)
         )
+        mgr._drained_abort_notifier = SimpleNamespace(
+            wake=lambda: None,
+            submit=lambda room, endpoint, ipv6, parts, deadline: (
+                self.wire.append((endpoint, parts)) or True
+            ),
+        )
         return mgr
 
     def flush(self):
-        while self.wire:
+        while True:
+            # A submit hook may dispatch its frame and immediately reuse the
+            # room. Do not recursively resubmit the not-yet-returned task.
+            if not self._flushing_control:
+                self._flushing_control = True
+                try:
+                    for manager in (self.prefill, self.decode):
+                        manager._retry_pending_control_notifications()
+                finally:
+                    self._flushing_control = False
+            if not self.wire:
+                return
             endpoint, msg = self.wire.popleft()
             if endpoint == "tcp://prefill:1":
                 self.prefill._handle_bootstrap_message(msg)
@@ -317,6 +350,8 @@ class TestAllocationIntegration(CustomTestCase):
         sender = self.sender()
         self.assertEqual(sender.poll(), KVPoll.Failed)
         sender.clear()
+        self.assertEqual(self.prefill.request_status[1], KVPoll.Failed)
+        self.assertTrue(sender.notify_drained_abort())
         self.assertNotIn(1, self.prefill.request_status)
 
     def test_readiness_timeout_aborts_before_allocation(self):
@@ -531,6 +566,9 @@ class TestAllocationIntegration(CustomTestCase):
                     try:
                         req = Mock(finished_reason=None, to_finish=None)
                         scheduler = SimpleNamespace(
+                            disagg_prefill_bootstrap_queue=SimpleNamespace(
+                                _requires_pd_hidden_transfer=Mock(return_value=False)
+                            ),
                             chunked_req=req,
                             tree_cache=Mock(),
                             enable_overlap=overlap,
@@ -570,14 +608,17 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         # Decode may reserve KV now, but prefill still has no destination indices.
         self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
-        req = SimpleNamespace(
-            rid="parked",
-            disagg_kv_sender=sender,
-            pending_bootstrap=True,
-            prefill_attempt_count=1,
-            skip_radix_cache_insert=False,
-        )
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        req = Req("parked", "", [1, 2], SamplingParams())
+        req.disagg_kv_sender = sender
+        req.pending_bootstrap = True
+        req.prefill_attempt_count = 1
         scheduler = SchedulerDisaggregationPrefillMixin()
+        scheduler.init_external_kv_cleanup(coordinated=True)
+        scheduler._all_reduce_mooncake_cleanup = Mock()
+        scheduler.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=None)
         scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
         scheduler.disagg_prefill_inflight_queue = [req]
@@ -625,19 +666,23 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(sender.poll(), KVPoll.Success)
         self.prefill.req_to_decode_prefix_len[1] = 0
         self.prefill.transfer_infos[1] = {}
-        send = self.prefill.send_kv_status_message
+        enqueue = self.prefill._drained_abort_notifier.submit
         next_transfer = []
 
-        def success(**kwargs):
-            self.assertEqual(kwargs["status"], KVPoll.Success)
+        def success(room, endpoint, ipv6, parts, deadline):
+            self.assertEqual(room, 1)
+            self.assertEqual(
+                self.decode.parse_kv_status_message(parts)[1], KVPoll.Success
+            )
             for table in (
                 self.prefill.deferred_bootstrap.rooms,
                 self.prefill.request_status,
                 self.prefill.req_to_decode_prefix_len,
                 self.prefill.transfer_infos,
+                self.prefill._control_rooms,
             ):
                 self.assertNotIn(1, table)
-            send(**kwargs)
+            enqueue(room, endpoint, ipv6, parts, deadline)
             self.flush()
             self.assertEqual(receiver.poll(), KVPoll.Success)
             receiver.clear()
@@ -645,11 +690,13 @@ class TestAllocationIntegration(CustomTestCase):
             new_sender, new_receiver = self.sender(), self.receiver()
             self.flush()
             next_transfer.extend((new_sender, new_receiver))
+            return True
 
-        self.prefill.send_kv_status_message = Mock(side_effect=success)
+        self.prefill._drained_abort_notifier.submit = Mock(side_effect=success)
         sender.clear()
         sender.clear()
-        self.prefill.send_kv_status_message.assert_called_once()
+        self.flush()
+        self.prefill._drained_abort_notifier.submit.assert_called_once()
         new_sender, new_receiver = next_transfer
         self.assertIs(self.prefill.deferred_bootstrap.rooms[1].owner, new_sender)
         self.assertEqual(new_receiver.poll(), KVPoll.Bootstrapping)
@@ -668,7 +715,9 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.state_strides_validated = set()
         mgr.enable_deferred_decode_kv_release = True
         mgr.decode_kv_args_table = {
-            "session": SimpleNamespace(requires_dcp_relayout=False, dst_aux_ptrs=[])
+            "session": SimpleNamespace(
+                requires_dcp_relayout=False, dst_aux_ptrs=[], registration_error=None
+            )
         }
         mgr._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
         mgr.send_aux = Mock(return_value=0)
@@ -786,17 +835,27 @@ class TestAllocationIntegration(CustomTestCase):
     def test_slow_status_delivery_does_not_hold_bootstrap_lock(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
+        submit = self.prefill._drained_abort_notifier.submit
+        delivered = []
 
         def send(*args, **kwargs):
             acquired = self.prefill.deferred_bootstrap.lock.acquire(blocking=False)
             self.assertTrue(acquired)
             if acquired:
                 self.prefill.deferred_bootstrap.lock.release()
+            delivered.append(args[3])
+            return submit(*args, **kwargs)
 
-        self.prefill.send_kv_status_message = send
+        self.prefill._drained_abort_notifier.submit = send
         sender.mark_prefill_complete()
+        self.flush()
         sender.abort()
         sender.clear()
+        self.flush()
+        self.assertEqual(
+            [self.decode.parse_kv_status_message(parts)[1] for parts in delivered],
+            [KVPoll.WaitingForInput, KVPoll.Failed],
+        )
 
     def test_rebootstrap_dispatch_precedes_ready_without_allocating(self):
         receiver = self.receiver()

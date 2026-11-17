@@ -151,16 +151,13 @@ mod pd_routing_tests {
 
     /// Test PD mode handles worker failures gracefully
     #[tokio::test]
-    async fn test_pd_mode_with_failing_decode_worker() {
+    async fn test_pd_mode_returns_failing_decode_without_retry() {
         use smg::config::RetryConfig;
 
         let config = RouterConfig::builder()
             .prefill_decode_mode(
                 vec![("http://127.0.0.1:19820".to_string(), None)],
-                vec![
-                    "http://127.0.0.1:19821".to_string(),
-                    "http://127.0.0.1:19822".to_string(),
-                ],
+                vec!["http://127.0.0.1:19821".to_string()],
             )
             .round_robin_policy()
             .host("127.0.0.1")
@@ -190,14 +187,13 @@ mod pd_routing_tests {
                     response_delay_ms: 0,
                     fail_rate: 1.0, // Failing decode worker
                 },
-                TestWorkerConfig::decode(19822), // Healthy decode worker
             ],
         )
         .await;
 
         let app = ctx.create_app().await;
 
-        // Request should succeed via retry to healthy decode worker
+        // HTTP PD dispatches once even when retry configuration is enabled.
         let payload = json!({
             "text": "Test with failing decode worker",
             "stream": false
@@ -213,8 +209,8 @@ mod pd_routing_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::OK,
-            "Request should succeed via retry to healthy decode worker"
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Return the selected pair's failure without replaying"
         );
 
         ctx.shutdown().await;
@@ -228,7 +224,7 @@ mod pd_responses_routing_tests {
     use axum::routing::post;
     use http_body_util::BodyExt;
     use smg::{
-        config::{PolicyConfig, RetryConfig},
+        config::PolicyConfig,
         core::{
             BasicWorkerBuilder, DPAwareWorkerBuilder, Worker, WorkerRegistry,
             WorkerType as CoreWorkerType,
@@ -318,7 +314,8 @@ mod pd_responses_routing_tests {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             client: reqwest::Client::new(),
-            retry_config: RetryConfig::default(),
+            request_timeout: Duration::from_secs(30),
+            max_payload_size: RouterConfig::default().max_payload_size,
             api_key: None,
             enable_igw: false,
         }
@@ -490,7 +487,7 @@ mod pd_responses_routing_tests {
     }
 
     #[tokio::test]
-    async fn test_pd_responses_decode_error_is_valid_sse() {
+    async fn test_pd_responses_decode_http_error_returns_before_streaming() {
         let (prefill_url, prefill_task) = spawn_capture_worker(
             Arc::new(Mutex::new(Vec::new())),
             WorkerReply::Json(StatusCode::OK, "{}"),
@@ -509,26 +506,74 @@ mod pd_responses_routing_tests {
         let body = timeout(Duration::from_secs(5), async {
             let response = router.route_responses(None, &request, None).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
-            assert!(!response.headers().contains_key("content-length"));
+            assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+            assert_eq!(
+                response.headers()["x-smg-error-code"],
+                "decode_server_error"
+            );
             response.into_body().collect().await.unwrap().to_bytes()
         })
         .await
         .expect("decode error must complete");
-        let body = std::str::from_utf8(&body).unwrap();
-        let data = body
-            .strip_suffix("\n\n")
-            .expect("SSE event delimiter")
-            .strip_prefix("data: ")
-            .unwrap();
-        let data: serde_json::Value = serde_json::from_str(data).unwrap();
-        assert_eq!(data["error"]["status"], 400);
-        assert_eq!(
-            data["error"]["message"],
-            serde_json::from_str::<serde_json::Value>(STORE_ERROR).unwrap()
-        );
+        let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(data["error"]["code"], "decode_server_error");
         prefill_task.abort();
         decode_task.abort();
+    }
+
+    /// Responses errors can be nested in an HTTP 200 response or SSE event.
+    /// Both workers must be validated before committing the downstream status.
+    #[tokio::test]
+    async fn test_pd_responses_2xx_errors_are_terminal() {
+        for (reply, stream, status) in [
+            (
+                WorkerReply::Json(StatusCode::OK, r#"{"id":"resp_failed","status":"failed","error":{"code":"server_error","message":"generation failed"}}"#),
+                false,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                WorkerReply::Stream("event: response.failed\ndata: {\"response\":{\"status\":\"failed\",\"error\":{\"code\":503,\"message\":\"generation failed\"}}}\n\n"),
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                WorkerReply::Stream("data: {\"type\":\"error\",\"code\":400,\"message\":\"invalid request\"}\n\n"),
+                true,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            for side in ["prefill", "decode"] {
+                let healthy = WorkerReply::Json(StatusCode::OK, "{}");
+                let (prefill_url, prefill_task) = spawn_capture_worker(
+                    Arc::new(Mutex::new(Vec::new())),
+                    if side == "prefill" { reply } else { healthy },
+                )
+                .await;
+                let (decode_url, decode_task) = spawn_capture_worker(
+                    Arc::new(Mutex::new(Vec::new())),
+                    if side == "decode" { reply } else { healthy },
+                )
+                .await;
+                let router = make_pd_router();
+                register_workers(&router, prefill_url, decode_url);
+                let request = responses_request(json!({
+                    "model":"mock-model", "input":"hi", "stream":stream
+                }));
+                let response = timeout(
+                    Duration::from_secs(5),
+                    router.route_responses(None, &request, None),
+                )
+                .await
+                .expect("Responses application failure must converge");
+                assert_eq!(response.status(), status, "{side}");
+                assert_eq!(
+                    response.headers()["x-smg-error-code"].to_str().unwrap(),
+                    format!("{side}_response_error")
+                );
+                prefill_task.abort();
+                decode_task.abort();
+            }
+        }
     }
 
     /// Read the gateway's fixed-length JSON POST without an HTTP server that
@@ -665,12 +710,12 @@ mod pd_responses_routing_tests {
                 "prefill admission error must finish routing and disconnect decode promptly",
             );
             assert_eq!(status, StatusCode::BAD_REQUEST, "{param}, stream={stream}");
-            assert_eq!(error_code.unwrap(), "prefill_bad_request");
+            assert_eq!(error_code.unwrap(), "prefill_server_error");
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert!(body["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains(&admission_error.to_string()));
+                .contains("400 Bad Request"));
             assert_eq!(prefill_body[param], value);
             assert_eq!(decode_body[param], value);
             assert!(prefill_body["bootstrap_room"].is_u64());

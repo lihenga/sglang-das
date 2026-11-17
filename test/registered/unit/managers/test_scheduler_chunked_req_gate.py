@@ -57,6 +57,7 @@ def _make_tree_cache() -> BasePrefixCache:
 
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
+    s.init_external_kv_cleanup(coordinated=False)
     s.scheduler_stage_metrics = None
     s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None

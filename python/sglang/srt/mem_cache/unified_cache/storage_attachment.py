@@ -14,6 +14,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+import torch
+
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -73,6 +76,32 @@ class StorageAttachment:
                 False,
                 "HiCache is not initialized (no cache controller); "
                 "launch with --enable-hierarchical-cache to attach a backend.",
+            )
+
+        cleanup_pending = torch.tensor(
+            [
+                int(
+                    controller.storage_backend is not None
+                    and (not cache.enable_storage or not controller.enable_storage)
+                )
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        # Custom storage groups are created collectively over WORLD, including PP
+        # stages outside this rank's attention groups.
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                cleanup_pending,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_world_group().cpu_group,
+            )
+        if int(cleanup_pending[0]):
+            return (
+                False,
+                "Previous HiCache storage backend cleanup is incomplete on a "
+                "world rank; "
+                "retry detach before attaching again.",
             )
 
         # Write-back can retain auxiliary host rows without FULL, or backed
@@ -162,7 +191,19 @@ class StorageAttachment:
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
             )
-            return False, f"Failed to attach storage backend '{storage_backend}': {e}"
+            cleanup_error = ""
+            # Hybrid host-pool registration can fail after controller attach.
+            if controller.enable_storage:
+                try:
+                    controller.detach_storage_backend()
+                except Exception as close_error:
+                    logger.exception("Storage attach rollback is incomplete.")
+                    cleanup_error = f"; cleanup incomplete: {close_error}"
+            return (
+                False,
+                f"Failed to attach storage backend '{storage_backend}': {e}"
+                f"{cleanup_error}",
+            )
 
         self.apply_runtime_config(
             storage_backend=storage_backend,
@@ -204,9 +245,17 @@ class StorageAttachment:
             controller.detach_storage_backend()
         except Exception as e:
             logger.exception("Failed to detach storage backend.")
-            # Never crash the server for an admin operation. The controller raises
-            # while its threads are still alive, so leave `ongoing_*` untouched --
-            # a retry must still be able to match their acks.
+            # Ownership survives shutdown refusal, but new storage work must not
+            # resume on stopped workers. Keep ongoing bookkeeping for the retry.
+            cache.enable_storage = False
+            cache.enable_storage_metrics = False
+            if controller.storage_backend is not None:
+                # The scheduler treats (False, ...) as success when already
+                # disabled. An owned backend is still an incomplete detach.
+                raise RuntimeError(
+                    "HiCache storage detach incomplete; backend retained. "
+                    "Retry detach after native operations drain."
+                ) from e
             return False, f"Failed to detach HiCache storage backend: {e}"
 
         try:
@@ -226,7 +275,10 @@ class StorageAttachment:
         via CLI args or via the admin API is detached on exit.
         """
         try:
-            if self._cache.enable_storage:
+            controller = self._cache.cache_controller
+            if self._cache.enable_storage or (
+                controller is not None and controller.storage_backend is not None
+            ):
                 self.detach()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")

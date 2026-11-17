@@ -391,7 +391,11 @@ class PDHiddenEventManager:
         if not release_indices:
             return kv_chunk.state_indices
         idx = self.state_index()
-        if idx is None or not kv_chunk.state_indices or idx >= len(kv_chunk.state_indices):
+        if (
+            idx is None
+            or not kv_chunk.state_indices
+            or idx >= len(kv_chunk.state_indices)
+        ):
             return kv_chunk.state_indices
         ret = list(kv_chunk.state_indices)
         ret[idx] = [int(x) for x in release_indices]
@@ -452,10 +456,9 @@ class PDHiddenEventManager:
         self.owner.record_failure(kv_chunk.room, failure_reason)
         self.owner.update_status(kv_chunk.room, KVPoll.Failed)
         self.wake_ack_waiters(kv_chunk.room)
-        self.owner.sync_status_to_decode_endpoint(
-            req.endpoint,
-            req.dst_port,
-            req.room,
-            KVPoll.Failed,
-            prefill_unique_rank,
+        self.owner.send_kv_status_message(
+            targets=[(req.endpoint, req.dst_port)],
+            bootstrap_room=req.room,
+            status=KVPoll.Failed,
+            failure_reason=failure_reason,
         )
