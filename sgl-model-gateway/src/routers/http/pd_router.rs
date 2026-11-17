@@ -53,6 +53,11 @@ use crate::{
     },
 };
 
+const MAX_PD_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_DECODE_CHUNKS: usize = 8192;
+const MAX_WORKER_ERROR_BYTES: usize = 4096;
+const WORKER_ERROR_TIMEOUT: Duration = Duration::from_millis(100);
+
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
@@ -89,6 +94,72 @@ struct PDRequestContext<'a> {
 }
 
 impl PDRouter {
+    fn check_buffer_capacity(current: usize, incoming: usize) -> Result<(), Response> {
+        if incoming > MAX_PD_BUFFER_BYTES.saturating_sub(current) {
+            return Err(error::bad_gateway(
+                "pd_response_buffer_limit",
+                "Worker response exceeded the PD buffering limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn sanitize_worker_message(message: &str) -> String {
+        let mut end = message.len().min(MAX_WORKER_ERROR_BYTES);
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut rest = &message[..end];
+        let mut result = String::new();
+        while let Some(start) = [rest.find("http://"), rest.find("https://")]
+            .into_iter()
+            .flatten()
+            .min()
+        {
+            result.push_str(&rest[..start]);
+            let end = rest[start..]
+                .find(|ch: char| {
+                    ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+                })
+                .map_or(rest.len(), |end| start + end);
+            result.push_str("[upstream]");
+            rest = &rest[end..];
+        }
+        result.push_str(rest);
+        let mut end = result.len().min(MAX_WORKER_ERROR_BYTES);
+        while !result.is_char_boundary(end) {
+            end -= 1;
+        }
+        result.truncate(end);
+        result
+    }
+
+    async fn worker_http_error(response: reqwest::Response, side: &str) -> Response {
+        let status = response.status();
+        let mut reason = bytes::BytesMut::new();
+        // 5xx failures converge immediately; 4xx get one bounded diagnostic read.
+        if status.is_client_error() {
+            let mut stream = response.bytes_stream();
+            let _ = tokio::time::timeout(WORKER_ERROR_TIMEOUT, async {
+                while reason.len() < MAX_WORKER_ERROR_BYTES {
+                    let Some(Ok(chunk)) = stream.next().await else {
+                        break;
+                    };
+                    let take = chunk.len().min(MAX_WORKER_ERROR_BYTES - reason.len());
+                    reason.extend_from_slice(&chunk[..take]);
+                }
+            })
+            .await;
+        }
+        let reason = Self::sanitize_worker_message(&String::from_utf8_lossy(&reason));
+        let message = if reason.trim().is_empty() {
+            format!("{side} worker returned {status}")
+        } else {
+            format!("{side} worker returned {status}: {reason}")
+        };
+        error::create_error(status, format!("{side}_server_error"), message)
+    }
+
     fn worker_transport_status(error: &reqwest::Error) -> StatusCode {
         if error.is_timeout() {
             StatusCode::GATEWAY_TIMEOUT
@@ -562,7 +633,7 @@ impl PDRouter {
                     return Err(error::create_error(
                         Self::worker_transport_status(&e),
                         "decode_server_error",
-                        format!("{e:#}"),
+                        "Decode worker request failed",
                     ));
                 }
             };
@@ -570,11 +641,7 @@ impl PDRouter {
             if !status.is_success() {
                 // Return the failure before committing downstream stream headers.
                 rate_limited_log!(WARN, decode_url = decode.url(), %status, "Decode returned an HTTP error");
-                return Err(error::create_error(
-                    status,
-                    "decode_server_error",
-                    format!("Decode {} returned {status}", decode.url()),
-                ));
+                return Err(Self::worker_http_error(response, "decode").await);
             }
             if context.is_stream {
                 let headers = header_utils::preserve_response_headers(response.headers());
@@ -608,9 +675,10 @@ impl PDRouter {
                         error::create_error(
                             Self::worker_transport_status(&e),
                             "decode_read_failed",
-                            format!("{e:#}"),
+                            "Decode worker response could not be read",
                         )
                     })?;
+                    Self::check_buffer_capacity(body.len(), chunk.len())?;
                     body.extend_from_slice(&chunk);
                     Self::check_json_worker_error(&body, "decode")?;
                 }
@@ -888,6 +956,18 @@ impl PDRouter {
                         match chunk_result {
                             Some(Ok(chunk)) => {
                                 let mut is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                                if Self::check_buffer_capacity(events.len(), chunk.len()).is_err() {
+                                    Metrics::record_worker_error(
+                                        metrics_labels::WORKER_DECODE,
+                                        metrics_labels::CONNECTION_HTTP,
+                                        error_type_from_status(StatusCode::BAD_GATEWAY),
+                                    );
+                                    tracked.mark_error_event(true);
+                                    let _ = tx.send(Ok(bytes::Bytes::from_static(
+                                        b"data: {\"error\":{\"message\":\"Worker SSE event exceeded the PD buffering limit\",\"code\":502}}\n\n",
+                                    )));
+                                    break;
+                                }
                                 events.extend_from_slice(&chunk);
                                 let mut stream_error = false;
                                 loop {
@@ -958,7 +1038,7 @@ impl PDRouter {
                                 // BreakerTrackedStream already logged the error
                                 // and marked the terminal state as Errored so
                                 // the worker's circuit breaker will tick on drop.
-                                let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                let _ = tx.send(Err("Decode worker stream failed".to_owned()));
                                 break;
                             }
                             None => break,
@@ -1049,7 +1129,7 @@ impl PDRouter {
                 return Err(error::create_error(
                     Self::worker_transport_status(&e),
                     "prefill_server_error",
-                    format!("Prefill server error: {e:#}"),
+                    "Prefill worker request failed",
                 ));
             }
         };
@@ -1059,11 +1139,7 @@ impl PDRouter {
 
         if !prefill_status.is_success() {
             rate_limited_log!(WARN, prefill_url, status = %prefill_status, "Prefill returned an HTTP error");
-            return Err(error::create_error(
-                prefill_status,
-                "prefill_server_error",
-                format!("Prefill {prefill_url} returned {prefill_status}"),
-            ));
+            return Err(Self::worker_http_error(prefill_response, "prefill").await);
         }
 
         let is_sse = prefill_response
@@ -1080,9 +1156,10 @@ impl PDRouter {
                 error::create_error(
                     Self::worker_transport_status(&e),
                     "prefill_read_failed",
-                    format!("Prefill {prefill_url}: {e:#}"),
+                    "Prefill worker response could not be read",
                 )
             })?;
+            Self::check_buffer_capacity(body.len(), chunk.len())?;
             body.extend_from_slice(&chunk);
             if is_sse {
                 // HTTP chunk boundaries need not coincide with SSE event boundaries.
@@ -1214,7 +1291,7 @@ impl PDRouter {
             return Err(error::create_error(
                 status,
                 format!("{side}_response_error"),
-                message,
+                Self::sanitize_worker_message(&message),
             ));
         }
         Ok(())
@@ -1248,6 +1325,7 @@ impl PDRouter {
         let mut stream = response.bytes_stream().boxed();
         let mut prefix = bytes::BytesMut::new();
         let mut chunks = Vec::new();
+        let mut buffered_bytes = 0;
         let mut event_start = 0;
         let mut output_ready = false;
         'reading: loop {
@@ -1275,9 +1353,17 @@ impl PDRouter {
                 error::create_error(
                     Self::worker_transport_status(&e),
                     "decode_read_failed",
-                    format!("{e:#}"),
+                    "Decode worker response could not be read",
                 )
             })?;
+            if chunks.len() >= MAX_PENDING_DECODE_CHUNKS {
+                return Err(error::bad_gateway(
+                    "pd_response_buffer_limit",
+                    "Worker response exceeded the PD buffering limit",
+                ));
+            }
+            Self::check_buffer_capacity(buffered_bytes, chunk.len())?;
+            buffered_bytes += chunk.len();
             prefix.extend_from_slice(&chunk);
             chunks.push(chunk);
             if is_sse {
@@ -1298,6 +1384,10 @@ impl PDRouter {
                     if output_ready && prefill_ready.try_recv().is_ok() {
                         break 'reading;
                     }
+                }
+                if event_start > 0 {
+                    let _ = prefix.split_to(event_start);
+                    event_start = 0;
                 }
             } else {
                 Self::check_json_worker_error(&prefix, "decode")?;
@@ -1769,6 +1859,22 @@ mod failure_convergence;
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+
+    #[test]
+    fn test_worker_message_bounds_input_before_redacting_long_urls() {
+        let message = format!(
+            "https://private-worker/{} diagnostic beyond input limit",
+            "x".repeat(MAX_WORKER_ERROR_BYTES * 32)
+        );
+        // Redacting the full URL first would incorrectly retain the distant tail.
+        assert_eq!(PDRouter::sanitize_worker_message(&message), "[upstream]");
+
+        let prefix = "é".repeat(MAX_WORKER_ERROR_BYTES / 2 - 1);
+        assert_eq!(
+            PDRouter::sanitize_worker_message(&format!("{prefix}😃 hidden tail")),
+            prefix
+        );
+    }
 
     pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());

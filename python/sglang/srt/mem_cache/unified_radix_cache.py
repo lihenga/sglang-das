@@ -393,6 +393,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.reset()
         self._failed_linker_rids = []
         self._stranded_linker_nodes = []
+        self._quarantined_linker_nodes = []
+        self._dfs_policy_sync_enabled = None
         self.session_refs.reset()
 
         # Reset Controller.
@@ -1089,12 +1091,14 @@ class UnifiedRadixCache(BasePrefixCache):
         claimed = self.session.try_cache_finished_req(req)
         if claimed and self.linker is not None:
             self.linker.release_request(req.cache_request_handle)
+            self._reclaim_failed_linker_chain(req.rid)
         return claimed
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
         if self.linker is not None:
             self.linker.release_request(req.cache_request_handle)
+            self._reclaim_failed_linker_chain(req.rid)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -3527,6 +3531,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Called per scheduler step to poll async HiCache events."""
         self._sync_dfs_health_policy()
         if self.linker is not None:
+            self.linker.poll_session_cleanup()
             finish_counts = torch.tensor(
                 [
                     self.linker.num_completed_loads(),
@@ -3866,6 +3871,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.linker.prepare_host_prefetch(req)
 
+    def prepare_external_linker_load(self, req) -> str:
+        return (
+            "ready" if self.linker is None else self.linker.prepare_load_admission(req)
+        )
+
+    def discard_external_linker_load_admission(self, req) -> None:
+        if self.linker is not None:
+            self.linker.discard_load_admission(req)
+
     def complete_external_linker_prefetch(
         self, job: PreparedHostPrefetch, submitted: bool
     ) -> bool:
@@ -3880,7 +3894,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.get_waiting_queue_prefetch_admission_states([rid])[rid]
 
     def get_waiting_queue_prefetch_admission_states(
-        self, rids: Sequence[str]
+        self, rids: Sequence[str] | None = None
     ) -> dict[str, str]:
         """Resolve variable local request lists in one fixed-shape collective round.
 
@@ -3895,6 +3909,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if not groups and self.tp_world_size > 1:
             groups.append(self.tp_group)
 
+        if rids is None:
+            rids = (
+                () if self.linker is None else self.linker.tracked_host_prefetch_rids()
+            )
         all_rids = list(dict.fromkeys(rids))
         has_rids = torch.tensor([int(bool(all_rids))], dtype=torch.int)
         self._all_reduce_attn_groups(has_rids, torch.distributed.ReduceOp.MAX)
@@ -3968,8 +3986,21 @@ class UnifiedRadixCache(BasePrefixCache):
         if not callable(getter) or not callable(apply_policy):
             return
         local_policy = getter()
-        if local_policy is None:
+        if self._dfs_policy_sync_enabled is None:
+            available = int(local_policy is not None)
+            agreement = torch.tensor([available, -available], dtype=torch.int)
+            self._all_reduce_attn_groups(agreement, torch.distributed.ReduceOp.MIN)
+            if int(agreement[0]) != -int(agreement[1]):
+                raise ValueError(
+                    "Mooncake DFS health capability/configuration differs across attention ranks"
+                )
+            self._dfs_policy_sync_enabled = bool(agreement[0])
+        if not self._dfs_policy_sync_enabled:
             return
+        if local_policy is None:
+            raise RuntimeError(
+                "Mooncake DFS health manager disappeared after startup agreement"
+            )
         effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
         self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
         apply_policy(*(bool(value) for value in effective.tolist()))
@@ -4045,9 +4076,15 @@ class UnifiedRadixCache(BasePrefixCache):
         pending = list(dict.fromkeys(pending))
         self._stranded_linker_nodes = []
         stranded: list[NodeId] = []
-        for node_id in pending:
-            result = self.tree_core.invalidate_external_load_chain(node_id)
-            self._free_values(result.device_frees, result.host_frees)
+        for index, node_id in enumerate(pending):
+            result = None
+            try:
+                result = self.tree_core.invalidate_external_load_chain(node_id)
+                self._free_values(result.device_frees, result.host_frees)
+            except BaseException:
+                self._quarantined_linker_nodes.append((node_id, result))
+                self._stranded_linker_nodes = stranded + pending[index + 1 :]
+                raise
             if result.is_dropped:
                 continue
             if not self.tree_core.holds_detached_node(node_id):

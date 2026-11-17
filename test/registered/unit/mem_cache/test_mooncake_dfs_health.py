@@ -326,10 +326,37 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
 
         store = Store([0, 0], [0, 0])
         manager = MooncakeDfsHealthManager(store, {"success_threshold": 1})
-        with self.assertRaises(RuntimeError):
+        with self.assertLogs(level="WARNING"):
             manager.probe_once()
+        self.assertTrue(manager._policy_dirty)
         manager.probe_once()
+        self.assertFalse(manager._policy_dirty)
         self.assertEqual(store.policies[-2:], [(True, True), (True, True)])
+
+    def test_coordinated_failed_reply_reapplies_even_when_target_returns_to_old_policy(
+        self,
+    ):
+        """A lost disable reply must not make re-enable skip its native update."""
+        store = _FakeStore([], [])
+        manager = MooncakeDfsHealthManager(store, defer_policy_application=True)
+        self.assertTrue(manager.apply_effective_policy(True, True))
+
+        def lost_reply(read, write):
+            store.policies.append((read, write))
+            return -1
+
+        store.set_dfs_access_policy = lost_reply
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(manager.apply_effective_policy(False, False))
+        self.assertEqual(manager._effective_policy, (True, True))
+        self.assertTrue(manager._policy_dirty)
+        store.set_dfs_access_policy = lambda read, write: (
+            store.policies.append((read, write)),
+            0,
+        )[1]
+        self.assertTrue(manager.apply_effective_policy(True, True))
+        self.assertEqual(store.policies[-2:], [(False, False), (True, True)])
+        self.assertFalse(manager._policy_dirty)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,6 +23,32 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestMooncakeFailedChain(CustomTestCase):
+    def test_failed_free_retains_the_remaining_nodes_without_retrying_the_unknown_one(
+        self,
+    ):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.linker = Mock()
+        cache.linker.take_failed_chain.return_value = []
+        cache._stranded_linker_nodes, cache._quarantined_linker_nodes = [1, 2, 3], []
+        cache.tree_core = Mock()
+        cache.tree_core.invalidate_external_load_chain.return_value = Mock(
+            is_dropped=True
+        )
+        cache._free_values = Mock(side_effect=RuntimeError("unknown allocator result"))
+        with self.assertRaisesRegex(RuntimeError, "unknown allocator"):
+            cache._reclaim_failed_linker_chain("rid")
+        self.assertEqual(cache._stranded_linker_nodes, [2, 3])
+        self.assertEqual(cache._quarantined_linker_nodes[0][0], 1)
+        cache._free_values.side_effect = None
+        cache._reclaim_failed_linker_chain("rid")
+        self.assertEqual(
+            [
+                call.args[0]
+                for call in cache.tree_core.invalidate_external_load_chain.call_args_list
+            ],
+            [1, 2, 3],
+        )
+
     def make_core(self):
         core = UnifiedTreeCore.__new__(UnifiedTreeCore)
         root, child = [UnifiedTreeNode((ComponentType.FULL,)) for _ in range(2)]
@@ -102,7 +129,7 @@ class TestMooncakeFailedChain(CustomTestCase):
                     wrapper._queue_load("rid", 7, [object()], anchor=3)
                 self.assertEqual(events, ["detach", "unlock"])
                 self.assertEqual(wrapper.failed_chains["rid"], [7])
-                backend.abort_prepared_load.assert_called_once_with("attempt")
+                backend.abort_prepared_load_async.assert_called_once_with("attempt")
 
     def test_empty_commit_releases_the_prepared_session_without_publishing(self):
         wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
@@ -110,7 +137,9 @@ class TestMooncakeFailedChain(CustomTestCase):
         wrapper.cache = Mock()
         wrapper.request_ids = {"rid": "attempt"}
         wrapper._queue_load("rid", 7, [], anchor=3)
-        wrapper.cache_linker.abort_prepared_load.assert_called_once_with("attempt")
+        wrapper.cache_linker.abort_prepared_load_async.assert_called_once_with(
+            "attempt"
+        )
         wrapper.cache_linker.load.assert_not_called()
         wrapper.cache.inc_lock_ref.assert_not_called()
 

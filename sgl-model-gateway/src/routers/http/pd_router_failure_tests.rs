@@ -141,10 +141,205 @@ async fn decode_transport_failure_does_not_wait_for_prefill() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let absent = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
+    let response = dispatch(&prefill.url, &absent, true).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains(&absent));
+}
+
+#[tokio::test]
+async fn http_error_diagnostics_are_bounded_and_hide_worker_urls() {
+    for failing_side in ["prefill", "decode"] {
+        for large in [false, true] {
+            let (pending, started, closed) = pending_peer().await;
+            let failed = serve(Router::new().route(
+                "/generate",
+                post(move || {
+                    let started = started.clone();
+                    async move {
+                        started.notified().await;
+                        let mut text =
+                            "Invalid parameter é at http://private-worker:30000/generate: detail "
+                                .to_owned();
+                        if large {
+                            text.push_str(&"é".repeat(MAX_WORKER_ERROR_BYTES));
+                        }
+                        let chunks =
+                            tokio_stream::once(Ok::<_, std::io::Error>(bytes::Bytes::from(text)))
+                                .chain(futures_util::stream::pending());
+                        (StatusCode::BAD_REQUEST, Body::from_stream(chunks))
+                    }
+                }),
+            ))
+            .await;
+            let (p, d) = if failing_side == "prefill" {
+                (&failed.url, &pending.url)
+            } else {
+                (&pending.url, &failed.url)
+            };
+            let response = tokio::time::timeout(Duration::from_secs(1), dispatch(p, d, true))
+                .await
+                .expect("a stalled 4xx body must not delay paired cancellation");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let message = payload["error"]["message"].as_str().unwrap();
+            assert!(message.contains("Invalid parameter é"), "{message}");
+            assert!(message.contains("detail"), "{message}");
+            assert!(!message.contains("private-worker"));
+            assert!(!message.contains(&failed.url));
+            assert!(message.len() <= MAX_WORKER_ERROR_BYTES + 100);
+            tokio::time::timeout(Duration::from_secs(1), closed)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_5xx_does_not_expose_internal_urls_or_wait_for_body() {
+    for failing_side in ["prefill", "decode"] {
+        let (pending, started, closed) = pending_peer().await;
+        let failed = serve(Router::new().route(
+            "/generate",
+            post(move || {
+                let started = started.clone();
+                async move {
+                    started.notified().await;
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Body::from_stream(futures_util::stream::pending::<
+                            Result<bytes::Bytes, std::io::Error>,
+                        >()),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let (p, d) = if failing_side == "prefill" {
+            (&failed.url, &pending.url)
+        } else {
+            (&pending.url, &failed.url)
+        };
+        let response = dispatch(p, d, true).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains(&failed.url));
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn pending_decode_buffer_limit_cancels_pending_prefill() {
+    let (prefill, started, closed) = pending_peer().await;
+    let decode = serve(Router::new().route(
+        "/generate",
+        post(move || {
+            let started = started.clone();
+            async move {
+                started.notified().await;
+                let event =
+                    bytes::Bytes::from(format!("data: {{\"text\":\"{}\"}}\n\n", "x".repeat(8192)));
+                let chunks = tokio_stream::iter(
+                    (0..1025).map(move |_| Ok::<_, std::io::Error>(event.clone())),
+                );
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(chunks),
+                )
+            }
+        }),
+    ))
+    .await;
+    let response = dispatch(&prefill.url, &decode.url, true).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
-        dispatch(&prefill.url, &absent, true).await.status(),
-        StatusCode::BAD_GATEWAY
+        error::extract_error_code_from_response(&response),
+        "pd_response_buffer_limit"
     );
+    tokio::time::timeout(Duration::from_secs(1), closed)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn buffered_worker_body_limit_cancels_the_other_worker() {
+    for failing_side in ["prefill", "decode"] {
+        let (pending, started, closed) = pending_peer().await;
+        let failed = serve(Router::new().route(
+            "/generate",
+            post(move || {
+                let started = started.clone();
+                async move {
+                    started.notified().await;
+                    Body::from(vec![b'x'; MAX_PD_BUFFER_BYTES + 1])
+                }
+            }),
+        ))
+        .await;
+        let (p, d) = if failing_side == "prefill" {
+            (&failed.url, &pending.url)
+        } else {
+            (&pending.url, &failed.url)
+        };
+        let response = dispatch(p, d, false).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "pd_response_buffer_limit"
+        );
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn oversized_sse_event_after_headers_returns_error_and_closes() {
+    let router = create_test_pd_router();
+    let chunks = tokio_stream::iter([
+        Ok::<_, reqwest::Error>(bytes::Bytes::from_static(b"data: {\"text\":\"token\"}\n\n")),
+        Ok(bytes::Bytes::from(vec![b'x'; MAX_PD_BUFFER_BYTES + 1])),
+    ]);
+    let response = router.create_streaming_response(
+        chunks,
+        StatusCode::OK,
+        None,
+        false,
+        None,
+        worker(
+            "http://prefill",
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ),
+        worker("http://decode", WorkerType::Decode),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(1),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("token"));
+    assert!(body.contains("buffering limit"));
+    assert!(body.contains("\"code\":502"));
 }
 
 #[tokio::test]

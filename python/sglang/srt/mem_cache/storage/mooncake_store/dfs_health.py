@@ -121,6 +121,8 @@ class MooncakeDfsHealthManager:
         self._read_error = 0
         self._write_error = 0
         self._effective_policy = (False, False)
+        self._policy_dirty = False
+        self._policy_warning_at = float("-inf")
 
         for method in (
             "probe_dfs_read",
@@ -173,15 +175,28 @@ class MooncakeDfsHealthManager:
                 self._write_state == AVAILABLE,
             )
 
-    def apply_effective_policy(self, allow_read: bool, allow_write: bool) -> None:
+    def apply_effective_policy(self, allow_read: bool, allow_write: bool) -> bool:
         """Apply a scheduler-coordinated policy to this rank's native client."""
         policy = (bool(allow_read), bool(allow_write))
         with self._policy_lock:
-            if policy == self._effective_policy:
-                return
+            if policy == self._effective_policy and not self._policy_dirty:
+                return True
             old_policy = self._effective_policy
-            self._apply_policy(*policy)
+            try:
+                self._apply_policy(*policy)
+            except Exception:
+                # A failed reply cannot tell us whether the native side applied it.
+                self._policy_dirty = True
+                now = time.monotonic()
+                if now - self._policy_warning_at >= self._interval_s:
+                    self._policy_warning_at = now
+                    logger.warning(
+                        "Mooncake DFS policy application failed; retrying next poll",
+                        exc_info=True,
+                    )
+                return False
             self._effective_policy = policy
+            self._policy_dirty = False
         logger.warning(
             "Mooncake DFS effective policy transition: "
             "old_read=%s old_write=%s new_read=%s new_write=%s",
@@ -190,6 +205,7 @@ class MooncakeDfsHealthManager:
             policy[0],
             policy[1],
         )
+        return True
 
     def probe_once(self) -> DfsHealthSnapshot:
         # Launch both operations before waiting for either one. Each operation has

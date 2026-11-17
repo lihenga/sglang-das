@@ -2887,11 +2887,9 @@ def add_prometheus_middleware(app):
     multiprocess.MultiProcessCollector(registry)
     from sglang.srt.observability.mooncake_client_metrics import (
         MooncakeClientCollector,
-        add_snapshot_route,
     )
 
     registry.register(MooncakeClientCollector())
-    add_snapshot_route(app)
     metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
 
     # Workaround for 307 Redirect for /metrics

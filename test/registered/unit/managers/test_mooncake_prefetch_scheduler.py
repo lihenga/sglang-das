@@ -6,7 +6,10 @@ import socket
 import threading
 import time
 import unittest
+from concurrent.futures import Future
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
@@ -15,6 +18,10 @@ import torch.multiprocessing as mp
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.mooncake_prefetch import (
     MooncakePrefetchSchedulerMixin,
+)
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import PreparedHostPrefetch
 from sglang.srt.runtime_context import get_context
@@ -103,6 +110,77 @@ def _round_worker(rank, port):
 
 
 class TestMooncakePrefetchScheduler(CustomTestCase):
+    def test_idle_iteration_does_not_request_a_background_epoch(self):
+        owner = MooncakePrefetchSchedulerMixin()
+        owner.enable_waiting_queue_dfs_prefetch = True
+        owner._drain_bg_prefetch_acks = Mock()
+        owner._request_bg_prefetch_epoch = Mock()
+        owner._begin_scheduler_iteration()
+        owner._request_bg_prefetch_epoch.assert_not_called()
+
+    def test_noncoordinated_empty_cleanup_does_not_enter_a_collective(self):
+        owner = MooncakePrefetchSchedulerMixin()
+        owner._coordinated_kv_cleanup = False
+        owner._mooncake_cleanup_requests = {}
+        owner._all_reduce_mooncake_cleanup = Mock()
+        owner._process_mooncake_cleanup_requests()
+        owner._all_reduce_mooncake_cleanup.assert_not_called()
+
+    def test_forward_completion_wakes_an_empty_ingress_poll(self):
+        owner = MooncakePrefetchSchedulerMixin()
+        owner._forward_ingress_enabled = True
+        future = Future()
+        owner._forward_launch_executor = SimpleNamespace(submit=lambda *args: future)
+        owner._bg_error = None
+        owner._forward_deferred_reqs = []
+        owner.forward_ct = 1
+        owner.device_module = SimpleNamespace(
+            StreamContext=lambda stream: nullcontext()
+        )
+        owner.schedule_stream, owner.forward_stream = Mock(), Mock()
+        owner._trace_prefill_reqs = Mock()
+
+        def receive(**kwargs):
+            future.set_result("finished")
+            return []
+
+        owner.request_receiver = SimpleNamespace(
+            ingress_sync_groups=lambda: [], recv_requests=receive
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.mooncake_prefetch.time.sleep",
+            side_effect=AssertionError("fixed sleep after forward completion"),
+        ):
+            self.assertEqual(
+                owner._forward_with_waiting_queue_ingress(object()), "finished"
+            )
+
+    def test_cancelled_old_lifecycle_does_not_swallow_the_new_job(self):
+        owner = MooncakePrefetchSchedulerMixin()
+        owner._bg_completed_epoch = 0
+        owner._bg_prefetch_jobs, owner._bg_prefetch_acks = queue.Queue(), queue.Queue()
+        owner._bg_pending_prefetch_jobs, owner._bg_prefetch_join_age = {}, {}
+        owner._bg_attn_cp_cpu_group = owner._bg_attn_tp_cpu_group = None
+        backend = _Backend()
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        old, new = [
+            PreparedHostPrefetch(
+                linker.request_id(CacheRequestHandle("rid", 0, lifecycle)),
+                True,
+                (),
+                backend,
+                threading.Event(),
+            )
+            for lifecycle in (1, 2)
+        ]
+        old.cancelled.set()
+        owner._bg_prefetch_jobs.put(old)
+        owner._bg_prefetch_jobs.put(new)
+        with patch("torch.distributed.get_rank", return_value=0):
+            owner._run_bg_prefetch_round()
+        self.assertNotEqual(old.rid, new.rid)
+        self.assertEqual(backend.submitted, [new.rid])
+
     def setUp(self):
         super().setUp()
         scope = get_context().override_server_args(

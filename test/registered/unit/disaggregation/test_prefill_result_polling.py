@@ -33,6 +33,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.mooncake_prefetch import (
+    MooncakePrefetchSchedulerMixin,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -76,9 +79,24 @@ class _Event:
         self.ready = True
 
 
+def _sender(*, poll, **kwargs):
+    fields = dict(
+        poll=poll,
+        conclude_state=None,
+        set_source_event=Mock(),
+        set_pd_hidden_chunk_meta=Mock(),
+        send=Mock(),
+    )
+    fields.update(kwargs)
+    return SimpleNamespace(**fields)
+
+
 def _batch(forward_iter, reqs=None):
     if reqs is None:
         reqs = [Req(str(forward_iter), "", [1, 2, 3, 4], SamplingParams())]
+    for req in reqs:
+        if req.disagg_kv_sender is None:
+            req.disagg_kv_sender = _sender(poll=lambda: KVPoll.Transferring)
     return ScheduleBatch(
         reqs=reqs,
         forward_iter=forward_iter,
@@ -114,7 +132,7 @@ def _input(batch):
     )
 
 
-class _Scheduler(SchedulerDisaggregationPrefillMixin):
+class _Scheduler(SchedulerDisaggregationPrefillMixin, MooncakePrefetchSchedulerMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
@@ -130,6 +148,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         resume_at=None,
         pause_mode="in_place",
     ):
+        self.init_external_kv_cleanup(coordinated=False)
+        self.enable_unified_cache_external_linker = False
+        self.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=None)
         self.arrivals = arrivals
         self.batches = {b.forward_iter: b for b in arrivals if b is not None}
         self.results = results
@@ -170,7 +191,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_staging = False
         self.enable_overlap = True
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda: []
+            pop_bootstrapped=lambda: [],
+            queue=[],
+            _requires_pd_hidden_transfer=Mock(return_value=False),
         )
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
@@ -194,6 +217,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             ]
         )
         self.metrics_reporter.current_scheduler_metrics_enabled = False
+        self.metrics_reporter.enable_metrics = False
         self.kv_events_publisher = Mock(spec=["publish_kv_events"])
         self.publish_load_snapshot = Mock()
         self.load_publisher = Mock(spec=["publish_load_stat"])
@@ -327,6 +351,7 @@ def _run_loop(scheduler, enabled=True, **topology):
         published_topology(**topology),
         envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(enabled),
         patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
+        patch("sglang.srt.disaggregation.prefill.torch.cuda.Event", _Event),
     ):
         scheduler.tp_size = get_parallel().tp_size
         try:
@@ -456,6 +481,8 @@ class TestPrefillResultPolling(CustomTestCase):
                         side_effect=[prefix + suffix, *[[req] for req in newer]]
                     )
                     scheduler = SimpleNamespace(
+                        _begin_scheduler_iteration=Mock(),
+                        _forward_ingress_enabled=False,
                         _deferred_input_requests=[],
                         _poll_timeout_aborts=Mock(return_value=[]),
                         request_receiver=SimpleNamespace(recv_requests=receiver),
@@ -570,9 +597,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 for req in (head, paced):
                     req.origin_input_ids = array("q", req.origin_input_ids)
                     req.pending_bootstrap = False
-                    req.disagg_kv_sender = SimpleNamespace(
-                        poll=lambda: KVPoll.WaitingForInput
-                    )
+                    req.disagg_kv_sender = _sender(poll=lambda: KVPoll.WaitingForInput)
                 scheduler.waiting_queue = [head, paced]
                 retries.poll_miss(paced.rid)
 
@@ -681,13 +706,15 @@ class TestPrefillResultPolling(CustomTestCase):
                     if readiness_source == "grammar":
                         scheduler.grammar_future = Future()
                         scheduler.compiled_grammar = Mock(
-                            spec=["copy", "accept_token", "finished"]
+                            spec=["copy", "accept_token", "finished", "grammar_stats"]
                         )
+                        scheduler.compiled_grammar.grammar_stats = None
                         with published_topology(skip_tokenizer_init=True):
                             scheduler.grammar_manager = GrammarManager(
                                 SimpleNamespace(
                                     server_args=SimpleNamespace(),
                                     dp_tp_cpu_group=None,
+                                    attn_cp_cpu_group=None,
                                     dp_tp_group=SimpleNamespace(
                                         world_size=1, first_rank=0, is_first_rank=True
                                     ),
@@ -733,7 +760,7 @@ class TestPrefillResultPolling(CustomTestCase):
         second = _batch(2)
         req = second.reqs[0]
         req.pending_bootstrap = False
-        req.disagg_kv_sender = SimpleNamespace(poll=lambda: KVPoll.WaitingForInput)
+        req.disagg_kv_sender = _sender(poll=lambda: KVPoll.WaitingForInput)
         scheduler = _Scheduler(
             [_batch(1)] + [None] * 7,
             {1: _result(), 2: _result()},
@@ -792,7 +819,7 @@ class TestPrefillResultPolling(CustomTestCase):
         prior.metadata_buffer_index = allocator.alloc()
         prior.pending_bootstrap = False
         prior.bootstrap_host = FAKE_BOOTSTRAP_HOST
-        prior.disagg_kv_sender = SimpleNamespace(
+        prior.disagg_kv_sender = _sender(
             poll=lambda: (
                 KVPoll.Success if scheduler.iteration >= 3 else KVPoll.Transferring
             ),
@@ -802,7 +829,7 @@ class TestPrefillResultPolling(CustomTestCase):
         first.reqs[0].metadata_buffer_index = allocator.alloc()
         for req in (first.reqs[0], second.reqs[0]):
             req.pending_bootstrap = False
-            req.disagg_kv_sender = SimpleNamespace(poll=lambda: KVPoll.Transferring)
+            req.disagg_kv_sender = _sender(poll=lambda: KVPoll.Transferring)
         with (
             _single_rank_gloo_group(),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release_kv,
@@ -1320,13 +1347,11 @@ class TestPrefillResultPolling(CustomTestCase):
                 req.pending_bootstrap = True
                 req.kv.req_pool_idx = 1
                 req.kv.kv_allocated_len = 8
-                req.disagg_kv_sender = SimpleNamespace(
-                    poll=lambda: KVPoll.Bootstrapping
-                )
+                req.disagg_kv_sender = _sender(poll=lambda: KVPoll.Bootstrapping)
                 chunk_count = 1 if yield_before_pause else depth
                 chunks = [_batch(end, [req]) for end in (4, 8)[:chunk_count]]
                 other = _batch(100)
-                other.reqs[0].disagg_kv_sender = SimpleNamespace(
+                other.reqs[0].disagg_kv_sender = _sender(
                     poll=lambda: KVPoll.WaitingForInput
                 )
 
@@ -1422,7 +1447,6 @@ class TestPrefillResultPolling(CustomTestCase):
                         process.join(timeout=5)
 
 
-
 class TestPrefillPageIndexPrefetch(CustomTestCase):
     def _fixture(self, dtype=torch.int32):
         req = Req("cached-pages", "", [1, 2, 3, 4], SamplingParams())
@@ -1457,12 +1481,22 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         module = "sglang.srt.disaggregation.prefill."
         with (
             patch(module + "is_hcu", return_value=True),
-            patch(module + "get_parallel", return_value=SimpleNamespace(enable_cp_cache_layer_split=True)),
-            patch(module + "get_memory", return_value=SimpleNamespace(enable_unified_memory=memory.get("unified", False))),
+            patch(
+                module + "get_parallel",
+                return_value=SimpleNamespace(enable_cp_cache_layer_split=True),
+            ),
+            patch(
+                module + "get_memory",
+                return_value=SimpleNamespace(
+                    enable_unified_memory=memory.get("unified", False)
+                ),
+            ),
             patch(module + "DeepSeekV4TokenToKVPool", type(pool)),
             patch(module + "torch.empty_like", side_effect=allocate),
         ):
-            SchedulerDisaggregationPrefillMixin.prefetch_disagg_page_indices(scheduler, req)
+            SchedulerDisaggregationPrefillMixin.prefetch_disagg_page_indices(
+                scheduler, req
+            )
 
     def _pages(self, scheduler, req, start, end, **kwargs):
         return SchedulerDisaggregationPrefillMixin.cached_disagg_page_indices(
@@ -1477,7 +1511,9 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
                 self.assertEqual(self._pages(scheduler, req, 0, 3).tolist(), [20, 24])
                 self.assertEqual(self._pages(scheduler, req, 2, 4).tolist(), [24])
-                self.assertEqual(self._pages(scheduler, req, 2, 4, swa=True).tolist(), [28])
+                self.assertEqual(
+                    self._pages(scheduler, req, 2, 4, swa=True).tolist(), [28]
+                )
                 self.assertEqual(req.disagg_page_indices["ready"].records, 1)
                 self.assertEqual(req.disagg_page_indices["ready"].synchronizations, 1)
 
@@ -1494,7 +1530,9 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 self._prefetch(scheduler, req, pool)
                 self.assertIsNotNone(req.disagg_page_indices)
                 self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
-                self.assertEqual(self._pages(scheduler, req, 2, 4, swa=True).tolist(), [28])
+                self.assertEqual(
+                    self._pages(scheduler, req, 2, 4, swa=True).tolist(), [28]
+                )
                 self.assertEqual(req.disagg_page_indices["host"].dtype, torch.int64)
 
     def test_out_of_range_and_changed_slot_fall_back(self):
@@ -1526,8 +1564,10 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                         self.assertIsNotNone(req.disagg_page_indices)
                         self.assertEqual(req.disagg_page_indices["end"], end)
                         self.assertIsNone(req.disagg_page_indices["swa_start"])
-                        self.assertEqual(self._pages(scheduler, req, 0, end).tolist(),
-                                         (raw[0, :end:2] // 2).tolist())
+                        self.assertEqual(
+                            self._pages(scheduler, req, 0, end).tolist(),
+                            (raw[0, :end:2] // 2).tolist(),
+                        )
                         self.assertIsNone(self._pages(scheduler, req, 0, end, swa=True))
                         swa.assert_not_called()
 
@@ -1554,7 +1594,9 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         scheduler.req_to_token_pool.req_to_token = torch.arange(40, 72, 4).reshape(1, 8)
         scheduler.disagg_prefill_pending_chunk_rids = set()
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[StateType.SWA]))
+            kv_manager=SimpleNamespace(
+                kv_args=SimpleNamespace(state_types=[StateType.SWA])
+            )
         )
         scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=Mock())
         scheduler.cached_disagg_page_indices = lambda *args, **kwargs: (
@@ -1569,7 +1611,10 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         )
         req.disagg_kv_sender = sender
         module = "sglang.srt.disaggregation.prefill."
-        with patch(module + "kv_to_page_indices", side_effect=AssertionError("blocking page fallback")):
+        with patch(
+            module + "kv_to_page_indices",
+            side_effect=AssertionError("blocking page fallback"),
+        ):
             for end in (3, 6, 8):
                 req.extend_end = end
                 self._prefetch(scheduler, req, pool)
@@ -1593,7 +1638,14 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         sender.set_source_event.assert_not_called()
 
     def test_guarded_paths_do_not_allocate(self):
-        for mode in ("staging", "no-overlap", "pending", "unified", "request-window", "unified-kv"):
+        for mode in (
+            "staging",
+            "no-overlap",
+            "pending",
+            "unified",
+            "request-window",
+            "unified-kv",
+        ):
             with self.subTest(mode=mode):
                 scheduler, req, raw, pool = self._fixture()
                 if mode == "staging":
@@ -1617,9 +1669,10 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         req.reset_for_retract()
         self.assertIsNone(req.disagg_page_indices)
 
-
     def test_checkpoint_invalidates_only_canonical_page_rebind(self):
-        from sglang.srt.mem_cache.unified_cache.components.base import BASE_COMPONENT_TYPE
+        from sglang.srt.mem_cache.unified_cache.components.base import (
+            BASE_COMPONENT_TYPE,
+        )
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         for dedup_len in (2, 4):
@@ -1630,9 +1683,15 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                     finished=lambda: False,
                     full_untruncated_fill_ids=[1, 2, 3, 4],
                     origin_input_ids=[1, 2, 3, 4],
-                    kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=2, cache_inserted_len=2),
-                    priority=0, session_id=None, kv_rotation_base=None,
-                    extra_key=None, cache_salt=None, lock=None,
+                    kv=SimpleNamespace(
+                        req_pool_idx=0, cache_protected_len=2, cache_inserted_len=2
+                    ),
+                    priority=0,
+                    session_id=None,
+                    kv_rotation_base=None,
+                    extra_key=None,
+                    cache_salt=None,
+                    lock=None,
                     disagg_page_indices=original_req.disagg_page_indices,
                 )
                 comp = SimpleNamespace(
@@ -1652,12 +1711,15 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                         write=lambda index, value: raw.__setitem__(index, value),
                     ),
                     _components_tuple=(comp,),
-                    tree_core=SimpleNamespace(is_eagle=False), page_size=2,
+                    tree_core=SimpleNamespace(is_eagle=False),
+                    page_size=2,
                     insert=lambda params: SimpleNamespace(
-                        rotation_tail_declined=False, prefix_len=dedup_len),
+                        rotation_tail_declined=False, prefix_len=dedup_len
+                    ),
                     _match_tree=lambda params: SimpleNamespace(last_device_node=1),
                     path_device_indices=lambda node: canonical,
-                    unlock=Mock(), lock=lambda *args, **kwargs: object(),
+                    unlock=Mock(),
+                    lock=lambda *args, **kwargs: object(),
                     enable_session_radix_cache=False,
                 )
                 UnifiedRadixCache.checkpoint_into_tree(cache, req, up_to=4)
@@ -1666,9 +1728,9 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                     self.assertEqual(raw[0].tolist(), [40, 44, 88, 92])
                 else:
                     self.assertIsNotNone(req.disagg_page_indices)
-                    self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [20, 24])
-
-
+                    self.assertEqual(
+                        self._pages(scheduler, req, 0, 4).tolist(), [20, 24]
+                    )
 
     def test_ready_snapshot_does_not_synchronize(self):
         scheduler, req, raw, pool = self._fixture()
@@ -1680,8 +1742,12 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
     def test_early_send_readiness_preserves_final_page_coverage(self):
         mixin = SchedulerDisaggregationPrefillMixin
         for ready, hcu in (
-            (False, False), (True, False), (None, False),
-            (False, True), (True, True), (None, True),
+            (False, False),
+            (True, False),
+            (None, False),
+            (False, True),
+            (True, True),
+            (None, True),
         ):
             with self.subTest(snapshot_ready=ready, hcu=hcu):
                 scheduler, req, raw, pool = self._fixture()
@@ -1710,7 +1776,9 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                     get_max_transfer_tokens=lambda: None,
                     should_send_kv_chunk=lambda num_pages, last: num_pages > 0 or last,
                 )
-                sender.set_source_event = lambda event: setattr(sender, "_source_event", event)
+                sender.set_source_event = lambda event: setattr(
+                    sender, "_source_event", event
+                )
 
                 def send(pages, states, **kwargs):
                     sent.append(pages.tolist())
@@ -1720,7 +1788,11 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 req.disagg_kv_sender = sender
                 module = "sglang.srt.disaggregation.prefill."
                 with (
-                    patch.object(envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX, "get", return_value=True),
+                    patch.object(
+                        envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX,
+                        "get",
+                        return_value=True,
+                    ),
                     patch(module + "is_hcu", return_value=hcu),
                     patch(module + "torch.cuda.Event", side_effect=lambda: Mock()),
                 ):
@@ -1736,9 +1808,9 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 self.assertEqual([page for chunk in sent for page in chunk], [20, 24])
                 self.assertEqual(req.start_send_idx, 4)
                 self.assertNotIn(req.rid, scheduler.disagg_prefill_pending_chunk_rids)
-                self.assertEqual(event.blocking_synchronizations, 1 if ready is False else 0)
-
-
+                self.assertEqual(
+                    event.blocking_synchronizations, 1 if ready is False else 0
+                )
 
     def test_nonblocking_page_lookup_does_not_wait(self):
         scheduler, req, raw, pool = self._fixture()
@@ -1747,7 +1819,9 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
         self.assertIsNone(self._pages(scheduler, req, 0, 4, wait=False))
         self.assertEqual(event.synchronizations, 0)
         event.ready = True
-        self.assertEqual(self._pages(scheduler, req, 0, 4, wait=False).tolist(), [20, 24])
+        self.assertEqual(
+            self._pages(scheduler, req, 0, 4, wait=False).tolist(), [20, 24]
+        )
         self.assertEqual(event.synchronizations, 0)
 
     def test_hcu_early_send_invalid_snapshot_does_not_fall_back(self):
@@ -1773,11 +1847,17 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 scheduler.send_kv_chunk = Mock()
                 module = "sglang.srt.disaggregation.prefill."
                 with (
-                    patch.object(envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX, "get", return_value=True),
+                    patch.object(
+                        envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX,
+                        "get",
+                        return_value=True,
+                    ),
                     patch(module + "is_hcu", return_value=True),
                     patch(module + "torch.cuda.Event", side_effect=lambda: Mock()),
                 ):
-                    SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(scheduler, req)
+                    SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(
+                        scheduler, req
+                    )
                 scheduler.send_kv_chunk.assert_not_called()
                 self.assertEqual(req.start_send_idx, 0)
                 self.assertEqual(cached["ready"].synchronizations, 0)

@@ -96,8 +96,17 @@ background requests. Both workers are checked for nested `response.error`,
 `response.failed`, flat error events, and failed response objects, including
 when HTTP status is 200. Completed/incomplete Responses events are successful
 stream termination signals; length-limited incomplete output is not a worker
-failure. Before downstream headers, failures return HTTP errors without
-waiting for the upstream error body. After streaming starts, the original
+failure. Before downstream headers, 5xx failures return immediately without
+reading the upstream error body. For 4xx, the router reads at most 4 KiB for at
+most 100 ms, preserving the status and any available diagnostic prefix. Router
+error messages redact HTTP(S) URLs; transport details remain in server logs.
+Buffered prefill/non-streaming bodies and pending decode output are limited to
+8 MiB each; pending decode also retains at most 8192 chunks. Crossing a limit
+returns 502 and cancels the paired request. Parsed pending-decode SSE events are
+discarded from the parser buffer while the original chunks await forwarding.
+After headers, an incomplete SSE event exceeding 8 MiB produces a 502 error event
+and closes the stream; it cannot change the already-sent HTTP status.
+After streaming starts, the original
 error event is forwarded and the stream closes. Updating the Python Engine
 package alone does not install these gateway changes.
 

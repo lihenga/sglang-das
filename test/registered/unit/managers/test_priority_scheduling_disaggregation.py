@@ -27,11 +27,15 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
@@ -50,6 +54,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
     def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler._cache_request_lifecycle_seq = 0
         scheduler.disaggregation_mode = disaggregation_mode
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = False
@@ -72,6 +77,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = MagicMock()
         req.priority = priority
         req.rid = "req"
+        req.cache_request_handle = CacheRequestHandle("req", 0)
         req.output_ids = []
         req.weight_version_events = []
         req.time_stats = MagicMock()
@@ -200,24 +206,22 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         component.prepare_for_caching_req.return_value = None
         cache._components_tuple = (component,)
         cache.insert = MagicMock()
-        req = SimpleNamespace(
-            rid="req",
-            get_fill_ids=lambda: [1, 2, 3, 4],
-            kv=SimpleNamespace(
-                req_pool_idx=1,
-                cache_protected_len=2,
-            ),
-            prefix_len=2,
-            priority=3,
-            extra_key=None,
-            cache_salt=None,
-            kv_rotation_base=None,
-            last_node=object(),
-        )
+        req = Req("req", "", [1, 2, 3, 4], SamplingParams())
+        req.get_fill_ids = lambda: [1, 2, 3, 4]
+        req.kv = SimpleNamespace(req_pool_idx=1, cache_protected_len=2)
+        req.prefix_len, req.priority, req.last_node = 2, 3, object()
         return cache, component, req
 
     def _pop_bootstrapping_swa_branch(self, write_policy):
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock(
+            available_size=lambda: 100
+        )
+        queue.kv_manager = SimpleNamespace(
+            req_to_decode_prefix_len={},
+            req_to_pd_hidden_meta={},
+            kv_args=SimpleNamespace(state_types=[]),
+        )
         queue.scheduler_stage_metrics = None
         queue.pp_size = 1
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
@@ -231,6 +235,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         queue.ensure_metadata_buffer = MagicMock(return_value=True)
         req = SimpleNamespace(
             rid="req",
+            bootstrap_room=7,
             disagg_kv_sender=object(),
             prefill_attempt_count=0,
             is_retracted=False,
@@ -245,10 +250,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
                 return_value=[KVPoll.Bootstrapping],
             ),
-            patch(
-                "sglang.srt.disaggregation.prefill.get_disagg",
-                return_value=SimpleNamespace(optimistic_prefill_attempts=2),
-            ),
+            get_context().override_server_args(optimistic_prefill_attempts=2),
+            patch("torch.distributed.all_reduce"),
         ):
             result = queue.pop_bootstrapped()
 
@@ -305,15 +308,37 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req.kv.holds_kv = True
         req.kv.holds_mamba = False
         cache.finish = MagicMock()
-        scheduler = SimpleNamespace(
-            tree_cache=cache,
-            clear_pending_chunk_send=MagicMock(),
-            ps=SimpleNamespace(tp_rank=0),
-            req_to_metadata_buffer_idx_allocator=MagicMock(),
-            output_streamer=MagicMock(),
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
-            enable_hicache_storage=False,
-        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.init_external_kv_cleanup(coordinated=False)
+        scheduler.tree_cache = cache
+        scheduler.clear_pending_chunk_send = MagicMock()
+        scheduler.req_to_metadata_buffer_idx_allocator = MagicMock()
+        scheduler.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=None)
+        scheduler.output_streamer = MagicMock()
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.result_queue = []
+        scheduler._pending_chunked_abort_req = None
+        req.to_finish, req.finished_reason = FINISH_ABORT("bootstrap failed"), None
+        req.inflight_middle_chunks = 0
+        req.external_kv_cleanup_steps = {}
+        for flag in (
+            "abort_requested",
+            "pending_chunk_cleared",
+            "linker_released",
+            "sender_abort_requested",
+            "metadata_released",
+            "cache_released",
+            "finish_state_applied",
+            "response_sent",
+            "abort_response_via_chunked",
+            "cleanup_done",
+            "cleanup_quarantined",
+            "checkpoint_on_abort",
+        ):
+            setattr(req, "external_kv_" + flag, False)
+        req.skip_radix_cache_insert = False
+        req.disagg_kv_sender.poll.return_value = KVPoll.Failed
 
         with (
             envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True),
@@ -377,18 +402,22 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.checkpoint_disagg_prefill.assert_called_once_with(req)
 
     def test_waiting_abort_releases_without_insert(self):
-        scheduler = SimpleNamespace(
-            tree_cache=MagicMock(),
-            req_to_metadata_buffer_idx_allocator=MagicMock(),
-            clear_pending_chunk_send=MagicMock(),
-        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.init_external_kv_cleanup(coordinated=False)
+        scheduler.tree_cache = MagicMock()
+        scheduler.req_to_metadata_buffer_idx_allocator = MagicMock()
+        scheduler.clear_pending_chunk_send = MagicMock()
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.result_queue = []
+        scheduler._pending_chunked_abort_req = None
         sender = MagicMock()
-        req = SimpleNamespace(
-            disagg_kv_sender=sender,
-            metadata_buffer_index=3,
-            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
-            pending_bootstrap=True,
-        )
+        sender.poll.return_value = KVPoll.Failed
+        req = Req("waiting-abort", "", [1, 2], SamplingParams())
+        req.disagg_kv_sender = sender
+        req.metadata_buffer_index = 3
+        req.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
+        req.pending_bootstrap = True
+        req.to_finish = FINISH_ABORT()
 
         with patch(
             "sglang.srt.disaggregation.prefill.release_kv_cache"
@@ -442,6 +471,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
     def _new_decode_req(self, rid: str, priority: int, *, failed: bool = False):
         req = SimpleNamespace(
             rid=rid,
+            bootstrap_host=None,
             priority=priority,
             origin_input_ids=[1, 2, 3],
             output_ids=[],
@@ -500,7 +530,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()
-        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.transfer_queue = SimpleNamespace(
+            queue=[], enable_staging=False, _release_pd_hidden_rows=MagicMock()
+        )
         queue.kv_manager = SimpleNamespace(
             kv_args=SimpleNamespace(state_types=[]),
         )
@@ -516,6 +548,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.waiting_queue = []
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
+        scheduler._release_pd_hidden_rows = MagicMock()
         queue.scheduler = scheduler
         return queue
 

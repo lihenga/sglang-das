@@ -1244,7 +1244,12 @@ class SWAComponent(TreeComponent):
             transfer.device_indices = allocator.alloc(num_tokens)
             if transfer.device_indices is None:
                 return None
-            transfer.device_indices = transfer.device_indices.to(torch.int64)
+            slots = transfer.device_indices
+            try:
+                transfer.device_indices = slots.to(torch.int64)
+            except BaseException:
+                allocator.free(slots)
+                raise
         return transfer
 
     def update_external_linker_load(

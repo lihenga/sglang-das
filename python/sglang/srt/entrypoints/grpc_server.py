@@ -38,7 +38,7 @@ async def _start_sidecar_server(host: str, port: int, app):
     return runner
 
 
-def _add_metrics_routes(app, server_args=None):
+def _add_metrics_routes(app):
     """Add Prometheus /metrics endpoint to the aiohttp app."""
     from prometheus_client import (
         CollectorRegistry,
@@ -50,9 +50,12 @@ def _add_metrics_routes(app, server_args=None):
     )
 
     from sglang.srt.observability.mooncake_client_metrics import (
+        MAX_SNAPSHOT_BYTES,
         SNAPSHOT_PATH,
         MooncakeClientCollector,
+        SnapshotQuotaExceeded,
         receive_snapshot,
+        snapshot_expiry,
     )
     from sglang.srt.runtime_context import get_serving
 
@@ -89,17 +92,30 @@ def _add_metrics_routes(app, server_args=None):
             return web.Response(status=decision.error_status_code)
         if request.method in ("GET", "HEAD"):
             return web.Response(status=204)
+        body = bytearray()
+        async for chunk in request.content.iter_chunked(64 * 1024):
+            if len(body) + len(chunk) > MAX_SNAPSHOT_BYTES:
+                return web.Response(status=413)
+            body.extend(chunk)
         try:
-            payload = await request.json()
+            payload = json.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("Expected a snapshot object")
             await asyncio.to_thread(receive_snapshot, payload)
+        except SnapshotQuotaExceeded:
+            return web.Response(status=429)
         except (ValueError, TypeError):
             return web.Response(status=400)
         return web.Response(status=204)
 
     app.router.add_post(SNAPSHOT_PATH, snapshot_handler)
     app.router.add_get(SNAPSHOT_PATH, snapshot_handler)
+
+    async def snapshot_cleanup(app):
+        async with snapshot_expiry():
+            yield
+
+    app.cleanup_ctx.append(snapshot_cleanup)
 
 
 def _check_communicator_results(results, action):

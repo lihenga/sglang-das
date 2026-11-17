@@ -209,16 +209,18 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker.read_plan_enabled = True
         linker.host_prefetch_enabled = prefetch
         linker.read_plan_reuse_ranges = False
+        linker.read_layout_enabled = False
         linker.enable_page_wise_load = False
         linker.tp_rank = 0
         linker.num_layers = 1
         linker.pools = {}
         linker.storage = types.SimpleNamespace(store=Mock())
+        linker.storage.store.batch_get_session_end.return_value = 0
         linker._prepare_read_plan_layouts = Mock(return_value=[])
         linker._prepare_expanded_load = Mock(
             side_effect=AssertionError("unexpected Python session preparation")
         )
-        linker.abort_prepared_load = Mock()
+        linker.abort_prepared_load = Mock(return_value=True)
         linker.layer_done_counter = ReadPlanLoadCounter(num_layers=1)
         linker.layer_done_counter.update_producer()
         return linker
@@ -333,7 +335,10 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
                 store.batch_get_into_multi_buffer_ranges.return_value = [8, 8]
                 linker.layer_done_counter = Mock()
                 events = []
-                store.batch_get_session_end.side_effect = lambda _: events.append("end")
+                store.batch_get_session_end.side_effect = lambda _: (
+                    events.append("end"),
+                    0,
+                )[1]
                 linker.layer_done_counter.complete.side_effect = (
                     lambda *_: events.append("complete")
                 )
@@ -363,6 +368,8 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker = self._read_plan_linker(prefetch=False)
         linker.read_plan_enabled = False
         linker.storage.store = store
+        store.batch_get_session_end.return_value = 0
+        linker.read_layout_enabled = False
         linker.pools = {
             name: types.SimpleNamespace(prepare_locations=lambda indices: list(indices))
             for name in (PoolName.KV, PoolName.SWA)
@@ -387,11 +394,14 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
                     if keys == ["earlier"]:
                         sessions.add("earlier")
                         return [0]
+                    if keys == ["missing"]:
+                        return [-702]
                     sessions.add("present")
                     return [0, -702]
 
                 def end(keys):
                     sessions.difference_update(keys)
+                    return 0
 
                 store.batch_get_session_start.side_effect = start
                 store.batch_get_session_end.side_effect = end
@@ -425,9 +435,9 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
 
                 self.assertEqual(sessions, set())
                 expected_start_batches = (
-                    [["earlier"], ["present", "missing"], ["present", "missing"]]
+                    [["earlier"], ["present", "missing"], ["missing"]]
                     if include_earlier
-                    else [["present", "missing"], ["present", "missing"]]
+                    else [["present", "missing"], ["missing"]]
                 )
                 self.assertEqual(
                     store.batch_get_session_start.call_args_list,
@@ -462,9 +472,10 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
             raise retry_error
 
         store.batch_get_session_start.side_effect = start
-        store.batch_get_session_end.side_effect = (
-            lambda keys: sessions.difference_update(keys)
-        )
+        store.batch_get_session_end.side_effect = lambda keys: (
+            sessions.difference_update(keys),
+            0,
+        )[1]
         linker = self._legacy_load_linker(store)
         transfers = [
             [
@@ -484,7 +495,7 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
 
         self.assertEqual(sessions, set())
         store.batch_get_session_start.assert_has_calls(
-            [call(["present", "missing"])] * 2
+            [call(["present", "missing"]), call(["missing"])]
         )
         store.batch_get_session_end.assert_called_once_with(["present", "missing"])
         linker.storage.failed_get_cache.update_batch.assert_not_called()
@@ -569,6 +580,57 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
             self.assertFalse(linker.load_layer_wise(0, transfers))
         store.batch_get_into_multi_buffer_ranges.assert_not_called()
         store.batch_get_session_end.assert_called_once_with(["key"])
+
+    def test_read_plan_injection_fails_before_binding_and_waiter_is_released(self):
+        from sglang.srt.environ import envs
+
+        linker = self._read_plan_linker(prefetch=False)
+        with (
+            envs.SGLANG_TEST_LINKER_LOAD_FAILURE_PROB.override(1.0),
+            self.assertLogs(level="ERROR"),
+        ):
+            self.assertFalse(
+                linker.load_layer_wise(
+                    0, [[PoolTransfer(name=PoolName.KV, keys=["page"])]]
+                )
+            )
+        self.assertTrue(linker.layer_done_counter.plans[0].done())
+        with self.assertRaises(RuntimeError):
+            linker.layer_done_counter.plans[0].result()
+        linker.storage.store.create_read_plan.assert_not_called()
+
+    def test_read_layout_final_verdict_includes_session_end_failure(self):
+        for result in (-1, RuntimeError("end failed")):
+            with self.subTest(result=result):
+                linker, transfers, native = self._layout_linker()
+                end = linker.storage.store.batch_get_session_end
+                if isinstance(result, Exception):
+                    end.side_effect = result
+                else:
+                    end.return_value = result
+                with (
+                    patch.dict("sys.modules", {"mooncake.store": native}),
+                    self.assertLogs(level="ERROR"),
+                ):
+                    self.assertFalse(linker.load_layer_wise(0, transfers))
+                # The read succeeded: only cleanup is allowed to flip the verdict.
+                self.assertEqual(
+                    linker.storage.store.batch_get_into_layouts.call_count, 2
+                )
+                linker.storage.store.batch_get_session_end.assert_called_once()
+
+    def test_borrowed_read_plan_final_verdict_includes_session_end_failure(self):
+        linker = self._read_plan_linker(prefetch=True)
+        linker.session_lock = threading.Lock()
+        linker.prepared_load_sessions = {"rid": ["page"]}
+        linker.abort_prepared_load.return_value = False
+        self.assertFalse(
+            linker.load_layer_wise(
+                0,
+                [[PoolTransfer(name=PoolName.KV, keys=["page"])]],
+                request_ids=["rid"],
+            )
+        )
 
 
 if __name__ == "__main__":

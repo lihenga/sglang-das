@@ -4,7 +4,9 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -35,6 +37,24 @@ class _Req:
         self.metadata_buffer_index = 7 if allocated else -1
         self.pending_bootstrap = allocated
         self.disagg_kv_sender = Mock()
+        self.disagg_kv_sender.poll.return_value = KVPoll.Failed
+        self.external_kv_cleanup_steps = {}
+        for flag in (
+            "abort_requested",
+            "pending_chunk_cleared",
+            "linker_released",
+            "sender_abort_requested",
+            "metadata_released",
+            "cache_released",
+            "finish_state_applied",
+            "response_sent",
+            "abort_response_via_chunked",
+            "cleanup_done",
+            "cleanup_quarantined",
+            "checkpoint_on_abort",
+        ):
+            setattr(self, "external_kv_" + flag, False)
+        self.skip_radix_cache_insert = False
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.return_logprob = False
@@ -59,6 +79,11 @@ class _Req:
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self):
+        self.init_external_kv_cleanup(coordinated=False)
+        self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.disagg_metadata_buffers = SimpleNamespace(pd_hidden_pool=None)
+        self.result_queue = []
+        self._pending_chunked_abort_req = None
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
             move_logprobs_to_cpu=Mock(),
@@ -70,11 +95,16 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
-        self.metrics_reporter = SimpleNamespace(report_prefill_stats=Mock())
+        self.metrics_reporter = SimpleNamespace(
+            report_prefill_stats=Mock(), enable_metrics=False
+        )
         self.maybe_send_health_check_signal = Mock()
         self.req_to_metadata_buffer_idx_allocator = Mock()
         self.enable_hicache_storage = True
         self.chunked_req = None
+
+    def _release_aborted_request(self, req):
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
 
 def _batch(req):
@@ -242,8 +272,12 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
 ):
     """A failed sender notification must not leak ownership or lose the API error."""
     scheduler = _Scheduler()
-    scheduler.batch_result_processor.get_sampling_mask_finish_reason = lambda **kwargs: (
-        SchedulerBatchResultProcessor.get_sampling_mask_finish_reason(None, **kwargs)
+    scheduler.batch_result_processor.get_sampling_mask_finish_reason = (
+        lambda **kwargs: (
+            SchedulerBatchResultProcessor.get_sampling_mask_finish_reason(
+                None, **kwargs
+            )
+        )
     )
     req = _Req(inflight_middle_chunks=0)
     req.to_finish = None

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import tempfile
@@ -17,7 +18,11 @@ from sglang.srt.observability.mooncake_client_metrics import (
     SNAPSHOT_PATH,
     MooncakeClientCollector,
     MooncakeClientMetricsReporter,
+    SnapshotQuotaExceeded,
+    add_snapshot_route,
+    expire_snapshots,
     receive_snapshot,
+    snapshot_expiry,
     start_client_metrics_reporter,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -204,6 +209,7 @@ class TestMooncakeClientMetrics(CustomTestCase):
 
         app = FastAPI()
         add_prometheus_middleware(app)
+        add_snapshot_route(app)
         with TestClient(app) as client:
             self.assertEqual(client.get(SNAPSHOT_PATH).status_code, 204)
             self.assertEqual(
@@ -217,12 +223,250 @@ class TestMooncakeClientMetrics(CustomTestCase):
             self.assertIn("mooncake_test_bytes_total", response.text)
             self.assertEqual(client.post(SNAPSHOT_PATH, json=[]).status_code, 400)
             self.assertEqual(client.post(SNAPSHOT_PATH, content="{").status_code, 400)
+            with patch(
+                "sglang.srt.observability.mooncake_client_metrics.MAX_SNAPSHOT_CLIENTS",
+                1,
+            ):
+                self.assertEqual(
+                    client.post(SNAPSHOT_PATH, json=payload(2)).status_code, 429
+                )
             self.assertEqual(
                 client.post(
                     SNAPSHOT_PATH, content=b"x" * (MAX_SNAPSHOT_BYTES + 1)
                 ).status_code,
                 413,
             )
+
+    def test_metrics_only_server_does_not_expose_snapshot_writes(self):
+        """Dummy health servers share the collector, never the ingestion route."""
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+
+        from sglang.srt.utils.common import add_prometheus_middleware
+
+        app = FastAPI()
+        add_prometheus_middleware(app)
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/metrics").status_code, 200)
+            self.assertEqual(client.get(SNAPSHOT_PATH).status_code, 404)
+            self.assertEqual(
+                client.post(SNAPSHOT_PATH, json=payload()).status_code, 404
+            )
+        self.assertEqual(list(Path(self.directory.name).rglob("*.json")), [])
+
+    def test_http_body_limit_stops_unknown_length_stream_before_eof(self):
+        """Chunked/unknown-length input must be rejected before reading the tail."""
+        import asyncio
+
+        from fastapi import FastAPI
+
+        async def check(headers):
+            app = FastAPI()
+            add_snapshot_route(app)
+            reads = 0
+            responses = []
+            chunk_size = 64 * 1024
+
+            async def receive():
+                nonlocal reads
+                reads += 1
+                if reads > MAX_SNAPSHOT_BYTES // chunk_size + 1:
+                    self.fail("Receiver continued reading after crossing 8 MiB")
+                return {
+                    "type": "http.request",
+                    "body": b"x" * chunk_size,
+                    "more_body": True,
+                }
+
+            async def send(message):
+                responses.append(message)
+
+            await app(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "http_version": "1.1",
+                    "scheme": "http",
+                    "method": "POST",
+                    "path": SNAPSHOT_PATH,
+                    "raw_path": SNAPSHOT_PATH.encode(),
+                    "root_path": "",
+                    "query_string": b"",
+                    "headers": headers,
+                    "client": ("127.0.0.1", 1234),
+                    "server": ("127.0.0.1", 80),
+                },
+                receive,
+                send,
+            )
+            self.assertEqual(responses[0]["status"], 413)
+            self.assertEqual(reads, MAX_SNAPSHOT_BYTES // chunk_size + 1)
+
+        for headers in ([], [(b"transfer-encoding", b"chunked")]):
+            with self.subTest(headers=headers):
+                asyncio.run(check(headers))
+        self.assertEqual(list(Path(self.directory.name).rglob("*.json")), [])
+
+    def test_quota_rejects_new_clients_but_allows_existing_client_updates(self):
+        """A full client registry must still accept replacement snapshots."""
+        with patch(
+            "sglang.srt.observability.mooncake_client_metrics.MAX_SNAPSHOT_CLIENTS", 1
+        ):
+            receive_snapshot(payload())
+            with self.assertRaises(SnapshotQuotaExceeded):
+                receive_snapshot(payload(2))
+            receive_snapshot(payload(sequence=2, metrics=METRICS.replace("12", "24")))
+        self.assertEqual(self.scrape()["mooncake_test_bytes_total"][0].value, 24)
+
+    def test_ingest_with_spare_capacity_does_not_read_other_client_snapshots(self):
+        """Normal publication must not parse every client's metrics under the lock."""
+        receive_snapshot(payload(1))
+        receive_snapshot(payload(2))
+        with patch.object(
+            Path,
+            "read_text",
+            side_effect=AssertionError("Ingest read an unrelated client snapshot"),
+        ):
+            receive_snapshot(payload(3))
+        self.assertEqual(len(self.scrape()["mooncake_test_bytes_total"]), 3)
+
+    def test_quota_pressure_expires_old_snapshots_and_retries_publication(self):
+        """Quota pressure reclaims stale clients and tmp files without a scrape."""
+        for limit_name in ("MAX_SNAPSHOT_CLIENTS", "MAX_SNAPSHOT_TOTAL_BYTES"):
+            with (
+                self.subTest(limit=limit_name),
+                tempfile.TemporaryDirectory() as directory,
+                patch.dict(os.environ, {"PROMETHEUS_MULTIPROC_DIR": directory}),
+            ):
+                with patch("time.monotonic", return_value=time.monotonic() - 301):
+                    receive_snapshot(payload(1))
+                snapshots = Path(directory) / "mooncake_clients"
+                old = snapshots / f"{1:032x}.json"
+                orphan = snapshots / "tmp-orphan"
+                orphan.write_bytes(b"abandoned")
+                os.utime(orphan, (time.time() - 301, time.time() - 301))
+                limit = (
+                    1
+                    if limit_name == "MAX_SNAPSHOT_CLIENTS"
+                    else old.stat().st_size + 128
+                )
+                with patch(
+                    "sglang.srt.observability.mooncake_client_metrics." + limit_name,
+                    limit,
+                ):
+                    receive_snapshot(payload(2))
+                self.assertFalse(old.exists())
+                self.assertFalse(orphan.exists())
+                samples = self.scrape()["mooncake_test_bytes_total"]
+                self.assertEqual(len(samples), 1)
+                self.assertEqual(samples[0].labels["mooncake_client"], f"{2:032x}")
+
+    def test_expired_client_can_restart_sequence_before_background_sweep(self):
+        """Removing full sweeps must preserve expiry of the client being replaced."""
+        with patch("time.monotonic", return_value=time.monotonic() - 301):
+            receive_snapshot(payload(sequence=2))
+        receive_snapshot(payload(sequence=1, metrics=METRICS.replace("12", "24")))
+        self.assertEqual(self.scrape()["mooncake_test_bytes_total"][0].value, 24)
+
+    def test_byte_quota_counts_old_target_and_temporary_files(self):
+        """Publication must fit before the old target can be atomically replaced."""
+        receive_snapshot(payload())
+        directory = Path(self.directory.name) / "mooncake_clients"
+        target = next(directory.glob("*.json"))
+        before = target.read_bytes()
+        orphan = directory / "tmp-orphan"
+        orphan.write_bytes(b"x" * 4096)
+        for budget in (len(before) + 4096, len(before) + 1):
+            with (
+                self.subTest(budget=budget),
+                patch(
+                    "sglang.srt.observability.mooncake_client_metrics.MAX_SNAPSHOT_TOTAL_BYTES",
+                    budget,
+                ),
+            ):
+                with self.assertRaises(SnapshotQuotaExceeded):
+                    receive_snapshot(payload(sequence=2))
+                self.assertEqual(target.read_bytes(), before)
+            orphan.unlink(missing_ok=True)
+        self.assertEqual(list(directory.glob("tmp*")), [])
+
+    def test_file_quota_counts_abandoned_temporary_files(self):
+        """An orphan cannot bypass the file-count limit while awaiting expiry."""
+        receive_snapshot(payload())
+        directory = Path(self.directory.name) / "mooncake_clients"
+        (directory / "tmp-orphan").write_bytes(b"abandoned")
+        with patch(
+            "sglang.srt.observability.mooncake_client_metrics.MAX_SNAPSHOT_CLIENTS", 1
+        ):
+            with self.assertRaises(SnapshotQuotaExceeded):
+                receive_snapshot(payload(sequence=2))
+        self.assertEqual(len(list(directory.iterdir())), 3)  # target, orphan, lock
+
+    def test_concurrent_receivers_share_client_quota(self):
+        """Separate receiver threads must serialize their check and publication."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def receive(index):
+            try:
+                receive_snapshot(payload(index))
+                return True
+            except SnapshotQuotaExceeded:
+                return False
+
+        with (
+            patch(
+                "sglang.srt.observability.mooncake_client_metrics.MAX_SNAPSHOT_CLIENTS",
+                1,
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            self.assertEqual(sorted(executor.map(receive, (1, 2))), [False, True])
+        self.assertEqual(len(list(Path(self.directory.name).rglob("*.json"))), 1)
+
+    def test_quota_uses_serialized_bytes_including_json_escaping(self):
+        """Non-ASCII labels consume more disk bytes than their UTF-8 metric text."""
+        value = payload(metrics='mooncake_test{reason="é"} 1\n')
+        with (
+            patch("time.monotonic", return_value=100.0),
+            patch("time.time", return_value=100.0),
+        ):
+            receive_snapshot(value)
+            path = next(Path(self.directory.name).rglob("*.json"))
+            serialized_size = path.stat().st_size
+            path.unlink()
+            with patch(
+                "sglang.srt.observability.mooncake_client_metrics.MAX_SNAPSHOT_TOTAL_BYTES",
+                serialized_size - 1,
+            ):
+                with self.assertRaises(SnapshotQuotaExceeded):
+                    receive_snapshot(value)
+        self.assertEqual(list(Path(self.directory.name).rglob("tmp*")), [])
+        self.assertEqual(list(Path(self.directory.name).rglob("*.json")), [])
+
+    def test_background_expiry_does_not_require_metrics_scrapes(self):
+        """An idle receiver reclaims expired clients and abandoned temporary files."""
+        import asyncio
+
+        with patch("time.monotonic", return_value=time.monotonic() - 301):
+            receive_snapshot(payload())
+        directory = Path(self.directory.name) / "mooncake_clients"
+        orphan = directory / "tmp-orphan"
+        orphan.write_bytes(b"abandoned")
+        os.utime(orphan, (time.time() - 301, time.time() - 301))
+
+        async def check():
+            async with snapshot_expiry():
+
+                async def wait_for_expiry():
+                    while list(directory.glob("*.json")) or orphan.exists():
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_expiry(), timeout=2)
+
+        asyncio.run(check())
+        receive_snapshot(payload(sequence=2))
+        expire_snapshots()
+        self.assertTrue(next(directory.glob("*.json")).exists())
 
     def test_reporter_retries_failure_and_sends_cumulative_snapshot(self):
         store = Mock()
@@ -431,6 +675,7 @@ class TestMooncakeClientMetrics(CustomTestCase):
 
         app = FastAPI()
         add_prometheus_middleware(app)
+        add_snapshot_route(app)
         add_api_key_middleware(app, api_key="test-key", admin_api_key=None)
         with TestClient(app) as client:
             self.assertEqual(client.get(SNAPSHOT_PATH).status_code, 401)
@@ -516,11 +761,61 @@ class TestMooncakeClientMetrics(CustomTestCase):
                     headers={"Authorization": "Bearer key"},
                 )
                 self.assertEqual(response.status, 204)
+                with patch(
+                    "sglang.srt.observability.mooncake_client_metrics.MAX_SNAPSHOT_CLIENTS",
+                    1,
+                ):
+                    response = await client.post(
+                        SNAPSHOT_PATH,
+                        json=payload(2),
+                        headers={"Authorization": "Bearer key"},
+                    )
+                    self.assertEqual(response.status, 429)
                 response = await client.get("/metrics")
                 self.assertEqual(response.status, 200)
                 self.assertIn("mooncake_test_bytes_total", await response.text())
 
         asyncio.run(check())
+
+    def test_grpc_sidecar_limits_chunked_body_before_json_parsing(self):
+        """The route cap must work even without aiohttp's whole-body size guard."""
+        import asyncio
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from sglang.srt.entrypoints.grpc_server import _add_metrics_routes
+
+        async def check():
+            observed = {}
+
+            @web.middleware
+            async def record_framing(request, handler):
+                observed["length"] = request.content_length
+                observed["encoding"] = request.headers.get("Transfer-Encoding")
+                return await handler(request)
+
+            app = web.Application(client_max_size=0, middlewares=[record_framing])
+            _add_metrics_routes(app)
+
+            async def chunks():
+                yield json.dumps(payload()).encode()
+                for _ in range(MAX_SNAPSHOT_BYTES // (64 * 1024)):
+                    yield b" " * (64 * 1024)
+
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post(
+                    SNAPSHOT_PATH,
+                    data=chunks(),
+                    chunked=True,
+                    headers={"Authorization": "Bearer test-key"},
+                )
+                self.assertEqual(response.status, 413)
+                self.assertIsNone(observed["length"])
+                self.assertEqual(observed["encoding"], "chunked")
+
+        asyncio.run(check())
+        self.assertEqual(list(Path(self.directory.name).rglob("*.json")), [])
 
 
 if __name__ == "__main__":

@@ -497,11 +497,15 @@ class FullComponent(TreeComponent):
             if slots is None:
                 return None
 
-            return PoolTransfer(
-                name=PoolName.KV,
-                device_indices=slots.to(torch.int64),
-                keys=list(keys),
-            )
+            try:
+                return PoolTransfer(
+                    name=PoolName.KV,
+                    device_indices=slots.to(torch.int64),
+                    keys=list(keys),
+                )
+            except BaseException:
+                allocator.free(slots)
+                raise
 
     def update_external_linker_load(
         self,

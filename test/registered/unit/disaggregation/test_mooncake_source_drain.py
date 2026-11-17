@@ -83,7 +83,7 @@ class TestMooncakeSourceDrain(CustomTestCase):
             for n in cls.body
             if isinstance(n, ast.FunctionDef) and n.name == "_await_transfer_futures"
         )
-        namespace = {"concurrent": concurrent}
+        namespace = {"concurrent": concurrent, "logger": logging.getLogger(__name__)}
         exec(
             compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
             namespace,
@@ -169,6 +169,7 @@ class TestMooncakeLateBootstrap(CustomTestCase):
         manager = SimpleNamespace(
             _drained_abort_lock=threading.Lock(),
             _drained_abort_rooms=OrderedDict(),
+            _drained_abort_capacity=4096,
             bootstrap_timeout=30,
             waiting_timeout=600,
             request_status={9: KVPoll.Failed},
@@ -197,6 +198,18 @@ class TestMooncakeLateBootstrap(CustomTestCase):
             notifications.append(message)
 
         manager.send_kv_status_message = send
+
+        def queue_notification(room, endpoint, port):
+            # This boundary records accepted ownership; delivery runs elsewhere.
+            send(
+                targets=[(endpoint, port)],
+                bootstrap_room=room,
+                status=KVPoll.Failed,
+                failure_reason="Prefill request aborted after source drain",
+            )
+            return True
+
+        manager.queue_drained_abort_notification = queue_notification
         load(root / "mooncake/conn.py", "MooncakeKVSender", ("notify_drained_abort",))
         load(root / "common/conn.py", "CommonKVSender", ("clear",))
         sender = SimpleNamespace(
@@ -264,13 +277,19 @@ class TestMooncakeLateBootstrap(CustomTestCase):
         self.assertEqual(notifications[0]["targets"], [("late", 8000)])
         self.assertEqual(notifications[0]["status"], KVPoll.Failed)
 
-    def test_terminal_records_expire_and_have_a_capacity_bound(self):
+    def test_terminal_capacity_backpressures_without_expiring_live_records(self):
         manager, _, _, _ = self._make_room()
         now = time.monotonic()
-        manager._drained_abort_rooms.update((room, now + 600) for room in range(4097))
+        manager._drained_abort_rooms.update((room, now + 600) for room in range(4096))
         manager._prune_drained_abort_rooms()
         self.assertEqual(len(manager._drained_abort_rooms), 4096)
-        self.assertNotIn(0, manager._drained_abort_rooms)
+        self.assertIsNone(manager.finish_drained_abort(4096))
+        self.assertEqual(len(manager._drained_abort_rooms), 4096)
+        self.assertIn(0, manager._drained_abort_rooms)
+        self.assertNotIn(4096, manager._drained_abort_rooms)
+        self.assertEqual(manager._drained_abort_rooms[0], now + 600)
+        self.assertEqual(manager.finish_drained_abort(0), set())
+        self.assertEqual(manager._drained_abort_rooms[0], now + 600)
         manager._drained_abort_rooms = OrderedDict([(9, now - 1)])
         manager._register_bootstrap_transfer(9, "new", self._info(), 1)
         self.assertEqual(manager.request_status[9], KVPoll.Failed)

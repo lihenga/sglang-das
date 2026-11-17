@@ -11,6 +11,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -170,6 +171,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                     manager.enable_custom_mem_pool = False
                     manager.max_transfer_batch_indices = 0
                     peer = SimpleNamespace(
+                        dst_state_types=[state],
                         dst_state_data_ptrs=[[dst.ctypes.data]],
                         dst_state_item_lens=[[dst.itemsize]],
                         dst_state_dim_per_tensor=[[]],
@@ -427,6 +429,8 @@ class TestMooncakeEarlySend(unittest.TestCase):
                     aux_index=0,
                     trace_ctx=MagicMock(),
                     _early_send_wait_event=ready,
+                    _pd_hidden_chunk_meta=None,
+                    _source_event=None,
                     _prepare_send_indices=lambda ids, state: (
                         ids,
                         slice(0, 1),
@@ -477,6 +481,8 @@ class TestMooncakeEarlySend(unittest.TestCase):
             dst_kv_indices=[10],
         )
         registration = SimpleNamespace(
+            registration_error=None,
+            v4_transfer_metadata={},
             requires_dcp_relayout=False,
             dst_kv_ptrs=[1000],
             dst_kv_layer_ids=[0],
@@ -501,13 +507,20 @@ class TestMooncakeEarlySend(unittest.TestCase):
             poison_deferred_ack_room=MagicMock(),
             decode_kv_args_table={"peer": registration},
             _get_dsa_cache_transfer_skip_flags=lambda reg: (False, False),
-            kv_args=SimpleNamespace(kv_data_ptrs=[1]),
+            kv_args=SimpleNamespace(kv_data_ptrs=[1], state_types=[]),
             is_mla_backend=True,
             send_kvcache=MagicMock(return_value=0),
             _maybe_ack_drained_abort=MagicMock(),
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]
+        manager.pd_hidden_events = PDHiddenEventManager(manager)
+        manager._wake_pd_hidden_ack_waiters = (
+            MooncakeKVManager._wake_pd_hidden_ack_waiters.__get__(manager)
+        )
+        manager._has_pd_hidden_state = MooncakeKVManager._has_pd_hidden_state.__get__(
+            manager
+        )
         manager._publish_source_chunk = MooncakeKVManager._publish_source_chunk.__get__(
             manager
         )
@@ -588,6 +601,34 @@ class TestMooncakeBatchRegistration(unittest.TestCase):
             RuntimeError, "Mooncake batch memory registration failed"
         ):
             engine.batch_register([1000], [4096])
+
+
+class TestTransferFutureDrain(CustomTestCase):
+    def test_exception_waits_for_other_running_write_before_returning(self):
+        failed = concurrent.futures.Future()
+        running = concurrent.futures.Future()
+        running.set_running_or_notify_cancel()
+        failed.set_exception(RuntimeError("native write failed"))
+        returned = Event()
+        result = {}
+
+        def drain():
+            result["status"] = MooncakeKVManager._await_transfer_futures(
+                None, [failed, running]
+            )
+            returned.set()
+
+        from threading import Thread
+
+        thread = Thread(target=drain)
+        with self.assertLogs(level="ERROR"):
+            thread.start()
+            self.assertFalse(returned.wait(0.1))
+            running.set_result(0)
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotEqual(result["status"], 0)
+        self.assertTrue(running.done())
 
 
 if __name__ == "__main__":

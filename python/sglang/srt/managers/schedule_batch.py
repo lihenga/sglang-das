@@ -122,7 +122,6 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -1395,6 +1394,8 @@ class Req(ReqDllmMixin):
         self.external_kv_response_sent = False
         self.external_kv_abort_response_via_chunked = False
         self.external_kv_cleanup_done = False
+        self.external_kv_cleanup_quarantined = False
+        self.external_kv_checkpoint_on_abort = False
         self.external_kv_cleanup_steps = {}
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 

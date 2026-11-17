@@ -132,6 +132,9 @@ class UnifiedCacheLinker(ABC):
         """Whether waiting-queue host prefetch is enabled on every rank."""
         return False
 
+    def waiting_queue_prefetch_limit(self) -> int:
+        return 8
+
     def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
         """Return a rank-local DFS policy candidate, if the backend has one."""
         return None
@@ -171,6 +174,22 @@ class UnifiedCacheLinker(ABC):
 
     def abort_prepared_load(self, rid: str) -> None:
         """Release a session claimed by the normal load path."""
+
+    def prepare_load_async(self, rid: str, transfers: list[PoolTransfer]) -> str:
+        return "ready" if self.prepare_load(rid, transfers) else "failed"
+
+    def revalidate_host_prefetch_async(self, rid: str) -> str:
+        return "ready" if self.revalidate_host_prefetch(rid) else "failed"
+
+    def revalidate_no_prefetch_needed_async(self, rid: str) -> str:
+        return "ready" if self.revalidate_no_prefetch_needed(rid) else "failed"
+
+    def revalidate_load_async(self, rid: str, transfers: list[PoolTransfer]) -> str:
+        return "ready"
+
+    def abort_prepared_load_async(self, rid: str) -> bool:
+        self.abort_prepared_load(rid)
+        return True
 
     def wait_for_pending_loads(self) -> None:
         """Optional native-worker barrier; legacy backends wait through their layer counter."""
@@ -218,6 +237,11 @@ class _PendingOffload(NamedTuple):
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
+    _prefetch_request_limit = 8
+    _load_admissions = None
+    _admitted_loads = None
+    _pending_session_cleanup = None
+
     def __init__(
         self,
         cache: UnifiedRadixCache,
@@ -250,6 +274,8 @@ class UnifiedCacheLinkerWrapper:
         self._waiting_queue_prefetch_enabled = (
             cache_linker.waiting_queue_prefetch_enabled()
         )
+        if self._waiting_queue_prefetch_enabled:
+            self._prefetch_request_limit = cache_linker.waiting_queue_prefetch_limit()
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Waiting-queue prefetches retain the original hit until admission can
@@ -447,11 +473,127 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> device, then insert ----
 
+    def prepare_load_admission(self, req: Req) -> str:
+        """Poll RPC work before allocating any device slots for the load."""
+        hit = self.hit_markers.get(req.rid)
+        if hit is None:
+            if (
+                self._load_admissions is not None
+                and self._load_admissions.pop(req.rid, None) is not None
+            ):
+                self._abort_prepared_session(self._backend_request_id(req.rid))
+            return "ready"
+        if self._load_admissions is None:
+            self._load_admissions, self._admitted_loads = {}, {}
+        transfers = []
+        constructed = True
+        try:
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hit.tail_hashes
+                )
+                if transfer is None:
+                    constructed = False
+                    break
+                transfers.append(transfer)
+        except Exception:
+            constructed = False
+            logger.warning(
+                "External admission metadata construction failed", exc_info=True
+            )
+        signature = tuple(
+            (transfer.name, tuple(transfer.keys)) for transfer in transfers
+        )
+        previous = self._load_admissions.setdefault(req.rid, signature)
+        backend_id = self._backend_request_id(req.rid)
+        mode, state = "validated", "failed"
+        try:
+            if (
+                self._pending_session_cleanup
+                and backend_id in self._pending_session_cleanup
+            ):
+                state = "pending"
+            elif constructed and signature == previous:
+                status = (
+                    self.cache_linker.get_host_prefetch_status(backend_id)
+                    if self._waiting_queue_prefetch_enabled
+                    else None
+                )
+                if status == "dfs_prefetched":
+                    mode = "dfs_prefetched"
+                    state = self.cache_linker.revalidate_host_prefetch_async(backend_id)
+                elif status == "no_prefetch_needed":
+                    mode = "prepared"
+                    state = self.cache_linker.revalidate_no_prefetch_needed_async(
+                        backend_id
+                    )
+                    if state == "ready":
+                        state = self.cache_linker.prepare_load_async(
+                            backend_id, transfers
+                        )
+                elif self._waiting_queue_prefetch_enabled:
+                    mode = "prepared"
+                    state = self.cache_linker.prepare_load_async(backend_id, transfers)
+                else:
+                    state = self.cache_linker.revalidate_load_async(
+                        backend_id, transfers
+                    )
+        except Exception:
+            logger.warning(
+                "External load admission RPC failed for %s", req.rid, exc_info=True
+            )
+        verdict = torch.tensor(
+            [int(state == "pending"), int(state not in {"ready", "pending"})],
+            dtype=torch.int,
+        )
+        self.cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MAX)
+        if verdict[0]:
+            return "pending"
+        self._load_admissions.pop(req.rid, None)
+        if verdict[1]:
+            self._abort_prepared_session(backend_id)
+            self.cancel_waiting_queue_prefetch(req.rid)
+            self.hit_markers.pop(req.rid, None)
+            req.host_hit_length = req.swa_host_hit_length = (
+                req.mamba_host_hit_length
+            ) = 0
+            return "failed"
+        self._admitted_loads[req.rid] = mode
+        return "ready"
+
+    def discard_load_admission(self, req: Req) -> None:
+        # The adder can reject a ready candidate without consuming its load.
+        # Re-enter admission next time instead of reusing an old lease proof.
+        if (
+            self._admitted_loads is not None
+            and self._admitted_loads.pop(req.rid, None) is not None
+        ):
+            self._abort_prepared_session(self._backend_request_id(req.rid))
+            self.cancel_waiting_queue_prefetch(req.rid)
+
+    def _abort_prepared_session(self, backend_id: str) -> None:
+        if not self.cache_linker.abort_prepared_load_async(backend_id):
+            if self._pending_session_cleanup is None:
+                self._pending_session_cleanup = set()
+            self._pending_session_cleanup.add(backend_id)
+
+    def poll_session_cleanup(self) -> None:
+        if self._pending_session_cleanup:
+            for backend_id in tuple(self._pending_session_cleanup):
+                if self.cache_linker.abort_prepared_load_async(backend_id):
+                    self._pending_session_cleanup.discard(backend_id)
+
     def load_back(self, req: Req) -> tuple[int, NodeId]:
         cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
+
+        admitted = (
+            None
+            if self._admitted_loads is None
+            else self._admitted_loads.pop(req.rid, None)
+        )
 
         prepared_for_load = False
         prefetched = (
@@ -470,6 +612,9 @@ class UnifiedCacheLinkerWrapper:
                 self.cache_linker.cancel_host_prefetch(
                     self._backend_request_id(req.rid)
                 )
+                if admitted is not None:
+                    self._abort_prepared_session(self._backend_request_id(req.rid))
+                    return 0, req.last_node
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
 
@@ -480,13 +625,16 @@ class UnifiedCacheLinkerWrapper:
                     # Its session was released while queued; re-check that
                     # the keys survived so eviction falls back to the normal
                     # path instead of failing the later load.
-                    locally_valid = self.cache_linker.revalidate_no_prefetch_needed(
-                        self._backend_request_id(req.rid)
+                    locally_valid = (
+                        admitted is not None
+                        or self.cache_linker.revalidate_no_prefetch_needed(
+                            self._backend_request_id(req.rid)
+                        )
                     )
                 else:
-                    locally_valid = (
-                        status == "dfs_prefetched"
-                        and self.cache_linker.revalidate_host_prefetch(
+                    locally_valid = status == "dfs_prefetched" and (
+                        admitted is not None
+                        or self.cache_linker.revalidate_host_prefetch(
                             self._backend_request_id(req.rid)
                         )
                     )
@@ -498,6 +646,9 @@ class UnifiedCacheLinkerWrapper:
                 self.cache_linker.cancel_host_prefetch(
                     self._backend_request_id(req.rid)
                 )
+                if admitted is not None:
+                    self._abort_prepared_session(self._backend_request_id(req.rid))
+                    return 0, req.last_node
                 self.hit_markers[req.rid] = hit
                 return self.load_back(req)
 
@@ -509,7 +660,10 @@ class UnifiedCacheLinkerWrapper:
             # Build before claiming so that the claim reduction also carries
             # the construction verdict: one reduction instead of two.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=status == "no_prefetch_needed"
+                req,
+                tail_hashes,
+                prepare_session=status == "no_prefetch_needed"
+                and admitted != "prepared",
             )
             prepared_locally = status == "no_prefetch_needed" and constructed
             claim_error: BaseException | None = None
@@ -552,6 +706,9 @@ class UnifiedCacheLinkerWrapper:
                 if not constructed_all:
                     # Building failed somewhere: a miss, as on the normal path.
                     return 0, req.last_node
+                if admitted is not None:
+                    self._abort_prepared_session(self._backend_request_id(req.rid))
+                    return 0, req.last_node
                 # Every rank built but a claim failed: retry the normal path,
                 # which builds again and agrees on its own construction.
                 self.hit_markers[req.rid] = hit
@@ -561,7 +718,10 @@ class UnifiedCacheLinkerWrapper:
             # Ordinary LOAD construction must agree across ranks even when
             # waiting-queue prefetch is disabled.
             component_transfers, constructed, build_error = self._build_load_transfers(
-                req, tail_hashes, prepare_session=self._waiting_queue_prefetch_enabled
+                req,
+                tail_hashes,
+                prepare_session=self._waiting_queue_prefetch_enabled
+                and admitted != "prepared",
             )
             all_constructed = torch.tensor(int(constructed), dtype=torch.int)
             cache._all_reduce_attn_groups(
@@ -591,6 +751,7 @@ class UnifiedCacheLinkerWrapper:
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
         if (
             not prepared_for_load
+            and admitted is None
             and revalidate is not None
             and not revalidate([transfer for _, transfer in component_transfers])
         ):
@@ -612,7 +773,7 @@ class UnifiedCacheLinkerWrapper:
                 prefix_len,
             )
         except BaseException:
-            self.cache_linker.abort_prepared_load(self._backend_request_id(req.rid))
+            self._abort_prepared_session(self._backend_request_id(req.rid))
             raise
 
         if cache.pp_size > 1:
@@ -705,7 +866,7 @@ class UnifiedCacheLinkerWrapper:
         anchor: NodeId,
     ) -> None:
         if not transfers:
-            self.cache_linker.abort_prepared_load(self._backend_request_id(rid))
+            self._abort_prepared_session(self._backend_request_id(rid))
             return
         backend_id = self._backend_request_id(rid)
         assert backend_id not in self.pending_loads
@@ -715,12 +876,12 @@ class UnifiedCacheLinkerWrapper:
         except BaseException:
             self._detach_failed_chain(rid, node_id, anchor)
             self.cache.dec_lock_ref(node_id, lock_params)
-            self.cache_linker.abort_prepared_load(backend_id)
+            self._abort_prepared_session(backend_id)
             raise
         if not queued:
             self._detach_failed_chain(rid, node_id, anchor)
             self.cache.dec_lock_ref(node_id, lock_params)
-            self.cache_linker.abort_prepared_load(backend_id)
+            self._abort_prepared_session(backend_id)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
         self.pending_loads[backend_id] = (node_id, lock_params, anchor)
         if not hasattr(self, "load_request_rids"):
@@ -903,6 +1064,11 @@ class UnifiedCacheLinkerWrapper:
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
+        if self._load_admissions is not None:
+            self._load_admissions.clear()
+            self._admitted_loads.clear()
+        if self._pending_session_cleanup is not None:
+            self._pending_session_cleanup.clear()
         for node_id, lock_params, _anchor in self.pending_loads.values():
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
@@ -926,6 +1092,16 @@ class UnifiedCacheLinkerWrapper:
             if getattr(self, "request_ids", {}).get(rid) != expected:
                 return
         backend_id = self._backend_request_id(rid)
+        preparing = (
+            self._load_admissions is not None
+            and self._load_admissions.pop(rid, None) is not None
+        )
+        admitted = (
+            self._admitted_loads is not None
+            and self._admitted_loads.pop(rid, None) is not None
+        )
+        if preparing or admitted:
+            self._abort_prepared_session(backend_id)
         # failed_chains is deliberately untouched: the chain outlives the
         # request's linker state, and cache_finished_req is what frees it.
         if self._waiting_queue_prefetch_enabled:
@@ -998,9 +1174,18 @@ class UnifiedCacheLinkerWrapper:
         if tracked or pending is not None:
             self.cache_linker.cancel_host_prefetch(self._backend_request_id(rid))
 
-    def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch:
+    def tracked_host_prefetch_rids(self) -> set[str]:
+        if not self._waiting_queue_prefetch_enabled:
+            return set()
+        return set(self.pending_host_prefetch_submissions) | set(
+            self.host_prefetch_hits
+        )
+
+    def prepare_host_prefetch(self, req: Req) -> PreparedHostPrefetch | None:
         """Build a request-local snapshot without issuing any collectives."""
         self._remember_request(req)
+        if len(self.tracked_host_prefetch_rids()) >= self._prefetch_request_limit:
+            return None
         hit = self.hit_markers.get(req.rid)
         transfers = []
         locally_eligible = hit is not None
@@ -1026,6 +1211,8 @@ class UnifiedCacheLinkerWrapper:
             except Exception:
                 locally_eligible = False
 
+        if not locally_eligible:
+            return None
         job = PreparedHostPrefetch(
             rid=self._backend_request_id(req.rid),
             request_rid=req.rid,
@@ -1104,6 +1291,8 @@ class UnifiedCacheLinkerWrapper:
     def has_pending_operations(self) -> bool:
         return bool(
             self.pending_loads
+            or self._load_admissions
+            or self._pending_session_cleanup
             or self.pending_offloads
             or self.pending_host_prefetch_submissions
             or self.host_prefetch_hits
@@ -1197,7 +1386,7 @@ class UnifiedCacheLinkerWrapper:
                     )
         if release_session:
             try:
-                self.cache_linker.abort_prepared_load(self._backend_request_id(req.rid))
+                self._abort_prepared_session(self._backend_request_id(req.rid))
             except BaseException as error:
                 if cleanup_error is None:
                     cleanup_error = error
@@ -1313,6 +1502,16 @@ class UnifiedCacheLinkerWrapper:
             self.request_ids = {}
         previous = self.request_ids.get(req.rid)
         if previous is not None and previous != backend_id:
+            preparing = (
+                self._load_admissions is not None
+                and self._load_admissions.pop(req.rid, None) is not None
+            )
+            admitted = (
+                self._admitted_loads is not None
+                and self._admitted_loads.pop(req.rid, None) is not None
+            )
+            if preparing or admitted:
+                self._abort_prepared_session(previous)
             self.cancel_waiting_queue_prefetch(req.rid)
         self.request_ids[req.rid] = backend_id
 

@@ -131,6 +131,7 @@ class DeferredAbortNotificationScenarios:
     room: int
     decode_ip: str
     decode_port: int
+    abort_scenarios = ABORT_SCENARIOS
 
     def _make_abort_manager(self, status: KVPoll | None):
         raise NotImplementedError
@@ -160,7 +161,7 @@ class DeferredAbortNotificationScenarios:
             self.decode_port,
             ABORT_GENERATION,
         )
-        for case in ABORT_SCENARIOS:
+        for case in self.abort_scenarios:
             with self.subTest(name=case.name):
                 manager = self._make_abort_manager(case.status)
                 if case.outstanding:

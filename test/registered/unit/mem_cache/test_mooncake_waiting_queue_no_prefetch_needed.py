@@ -349,6 +349,96 @@ class TestDisabledPrefetchMapFastPath(CustomTestCase):
 
 
 class TestLoadBackNoPrefetchNeeded(CustomTestCase):
+    def _admission(self):
+        cache = _Cache()
+        cache._all_reduce_attn_groups = MagicMock()
+        component = cache._components_tuple[0]
+        component.build_external_linker_transfer.side_effect = (
+            lambda phase, node, keys: types.SimpleNamespace(name=PoolName.KV, keys=keys)
+        )
+        backend = MagicMock()
+        backend.abort_prepared_load_async.return_value = True
+        wrapper = _wrapper(cache, backend)
+        wrapper._waiting_queue_prefetch_enabled = False
+        req = types.SimpleNamespace(rid="rid", last_node="node", host_hit_length=1)
+        return wrapper, backend, cache, req
+
+    def test_admission_polls_before_allocating_or_calling_a_synchronous_rpc(self):
+        wrapper, backend, cache, req = self._admission()
+        backend.revalidate_load_async.side_effect = ["pending", "ready"]
+        self.assertEqual(wrapper.prepare_load_admission(req), "pending")
+        self.assertEqual(wrapper.prepare_load_admission(req), "ready")
+        self.assertEqual(wrapper._admitted_loads[req.rid], "validated")
+        backend.revalidate_load.assert_not_called()
+        backend.prepare_load.assert_not_called()
+        self.assertTrue(
+            all(
+                call.args[0] == LinkerTransferPhase.LOOKUP
+                for call in cache._components_tuple[
+                    0
+                ].build_external_linker_transfer.call_args_list
+            )
+        )
+
+    def test_peer_admission_failure_releases_the_local_session_asynchronously(self):
+        wrapper, backend, cache, req = self._admission()
+        backend.revalidate_load_async.return_value = "ready"
+        backend.abort_prepared_load_async.side_effect = [False, True]
+        cache._all_reduce_attn_groups.side_effect = lambda value, op: value.__setitem__(
+            1, 1
+        )
+        self.assertEqual(wrapper.prepare_load_admission(req), "failed")
+        self.assertEqual(req.host_hit_length, 0)
+        self.assertNotIn(req.rid, wrapper.hit_markers)
+        self.assertEqual(wrapper._pending_session_cleanup, {"rid"})
+        wrapper.poll_session_cleanup()
+        self.assertFalse(wrapper._pending_session_cleanup)
+        backend.abort_prepared_load.assert_not_called()
+
+    def test_rematch_cannot_reuse_a_validation_for_different_keys(self):
+        wrapper, backend, _, req = self._admission()
+        backend.revalidate_load_async.return_value = "pending"
+        self.assertEqual(wrapper.prepare_load_admission(req), "pending")
+        wrapper.hit_markers[req.rid] = ExternalCacheHitMarker(None, ["different"], 0)
+        self.assertEqual(wrapper.prepare_load_admission(req), "failed")
+        backend.revalidate_load_async.assert_called_once()
+        backend.abort_prepared_load_async.assert_called_once_with("rid")
+
+    def test_rejected_admission_waits_for_cleanup_before_starting_again(self):
+        wrapper, backend, _, req = self._admission()
+        backend.revalidate_load_async.return_value = "ready"
+        backend.abort_prepared_load_async.return_value = False
+        self.assertEqual(wrapper.prepare_load_admission(req), "ready")
+        hit = wrapper.hit_markers[req.rid]
+        wrapper.discard_load_admission(req)
+        self.assertFalse(wrapper._admitted_loads)
+        wrapper.hit_markers[req.rid] = hit
+        self.assertEqual(wrapper.prepare_load_admission(req), "pending")
+        backend.revalidate_load_async.assert_called_once()
+        backend.abort_prepared_load_async.return_value = True
+        wrapper.poll_session_cleanup()
+        self.assertEqual(wrapper.prepare_load_admission(req), "ready")
+
+    def test_admitted_claim_failure_is_a_miss_without_synchronous_retry(self):
+        cache = _Cache()
+        transfer = types.SimpleNamespace(name=PoolName.KV)
+        cache._components_tuple[
+            0
+        ].build_external_linker_transfer.return_value = transfer
+        backend = MagicMock()
+        backend.get_host_prefetch_status.return_value = "dfs_prefetched"
+        backend.claim_ready_host_prefetch.return_value = False
+        wrapper = _wrapper(cache, backend)
+        wrapper._load_admissions, wrapper._admitted_loads = (
+            {},
+            {"rid": "dfs_prefetched"},
+        )
+        req = types.SimpleNamespace(rid="rid", last_node="node")
+        self.assertEqual(wrapper.load_back(req), (0, "node"))
+        backend.prepare_load.assert_not_called()
+        backend.revalidate_load.assert_not_called()
+        backend.abort_prepared_load_async.assert_called_with("rid")
+
     def test_prepare_error_releases_the_claimed_prefetch_session(self):
         cache = _Cache()
         transfer = types.SimpleNamespace(name=PoolName.KV)
@@ -364,7 +454,7 @@ class TestLoadBackNoPrefetchNeeded(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "prepare failed"):
             wrapper.load_back(req)
         backend.claim_ready_host_prefetch.assert_called_once_with("attempt")
-        backend.abort_prepared_load.assert_called_once_with("attempt")
+        backend.abort_prepared_load_async.assert_called_once_with("attempt")
         self.assertNotIn("rid", wrapper.host_prefetch_hits)
 
     def test_enabled_normal_fallback_keeps_construction_consensus(self):

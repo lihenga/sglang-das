@@ -8,7 +8,7 @@ import logging
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -25,7 +25,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.runtime_context import (
-    get_disagg,
     get_memory,
     get_observability,
     get_parallel,
@@ -388,7 +387,6 @@ class MooncakePrefetchSchedulerMixin:
         if not self.enable_waiting_queue_dfs_prefetch:
             return
         self._drain_bg_prefetch_acks()
-        self._request_bg_prefetch_epoch()
 
     def _waiting_queue_prefetch_configured(self) -> bool:
         """This rank's own conditions for waiting-queue prefetch, before the
@@ -485,10 +483,6 @@ class MooncakePrefetchSchedulerMixin:
         return enabled, forward_ingress
 
     def _init_waiting_queue_prefetch_runtime(self) -> None:
-        self._deferred_linker_rids = set()
-        self._mooncake_cleanup_requests = {}
-        self._external_kv_abort_rids = set()
-        self._external_kv_chunked_abort_reqs = {}
         world = get_parallel().world_group
         self.enable_waiting_queue_dfs_prefetch, self._forward_ingress_enabled = (
             self._resolve_prefetch_startup_switches(
@@ -611,22 +605,27 @@ class MooncakePrefetchSchedulerMixin:
                     )
 
     def _process_mooncake_cleanup_requests(self) -> None:
-        pending = getattr(self, "_mooncake_cleanup_requests", {})
-        if (
-            not get_memory().enable_unified_cache_external_linker
-            and get_disagg().disaggregation_mode != "prefill"
-        ):
+        pending = self._mooncake_cleanup_requests
+        if not self._coordinated_kv_cleanup and not pending:
             return
         present = torch.tensor([int(bool(pending))], dtype=torch.int)
         self._all_reduce_mooncake_cleanup(present, torch.distributed.ReduceOp.MAX)
         if not present.item():
             return
         local = {
-            (req.rid, req.cache_request_handle.attempt_id): req
+            (
+                req.rid,
+                req.cache_request_handle.lifecycle_id,
+                req.cache_request_handle.attempt_id,
+            ): req
             for req in pending.values()
         }
         keys = set(local)
-        for group in (self.attn_cp_cpu_group, self.attn_tp_cpu_group):
+        for group in (
+            (self.attn_cp_cpu_group, self.attn_tp_cpu_group)
+            if self._coordinated_kv_cleanup
+            else ()
+        ):
             if group is not None and torch.distributed.get_world_size(group) > 1:
                 gathered = [None] * torch.distributed.get_world_size(group)
                 torch.distributed.all_gather_object(gathered, sorted(keys), group=group)
@@ -655,11 +654,14 @@ class MooncakePrefetchSchedulerMixin:
                 ),
                 emit_response=False,
             )
-            completed[index] = int(done)
+            completed[index] = -1 if req.external_kv_cleanup_quarantined else int(done)
         self._all_reduce_mooncake_cleanup(completed, torch.distributed.ReduceOp.MIN)
         inflight = getattr(self, "disagg_prefill_inflight_queue", None) or ()
         for index, key in enumerate(keys):
             req = local.get(key)
+            if req is not None and completed[index] < 0:
+                self._quarantine_external_kv_request(req)
+                continue
             if (
                 req is None
                 or not completed[index]
@@ -674,11 +676,11 @@ class MooncakePrefetchSchedulerMixin:
                 )
             if req.external_kv_response_sent:
                 pending.pop(id(req), None)
-                self._external_kv_chunked_abort_reqs.pop(req.rid, None)
 
     def _all_reduce_mooncake_cleanup(self, tensor, op) -> None:
         if (
-            not torch.distributed.is_available()
+            not self._coordinated_kv_cleanup
+            or not torch.distributed.is_available()
             or not torch.distributed.is_initialized()
         ):
             return
@@ -783,7 +785,7 @@ class MooncakePrefetchSchedulerMixin:
                 if received_generate:
                     self._request_bg_prefetch_epoch()
             if not recv_reqs:
-                time.sleep(0.01)
+                wait([future], timeout=0.001)
 
         result = future.result()
         # The old non-overlap path put forward and cache updates on one stream.

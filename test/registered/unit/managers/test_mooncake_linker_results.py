@@ -48,11 +48,31 @@ def _scheduler_method(name, namespace):
 
 class TestMooncakeLinkerResults(CustomTestCase):
     def test_current_verdict_does_not_wait_for_the_next_native_load(self):
+        self._assert_current_verdict_scope(broadcast=False)
+
+    def test_mla_source_verdict_does_not_wait_for_the_next_native_load(self):
+        self._assert_current_verdict_scope(broadcast=True)
+
+    def _assert_current_verdict_scope(self, *, broadcast):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.load_queue = queue.Queue()
         linker.completed_loads = queue.Queue()
         linker.load_batch_futures = {}
         linker.broadcast_loads = {}
+        linker.broadcast_outcomes, linker.broadcast_failed, linker.broadcast_events = (
+            {},
+            set(),
+            [],
+        )
+        linker.num_layers, linker.tp_group = 1, object()
+        linker.mla_broadcaster = (
+            SimpleNamespace(
+                is_src=True, prepare_broadcast=Mock(), broadcast_loaded_layer=Mock()
+            )
+            if broadcast
+            else None
+        )
+        linker._poll_cancelled_load_sessions = Mock()
         linker.host_prefetch_enabled = False
         linker._finish_prefetch_metrics = Mock()
         linker.layer_done_counter = LayerWiseLoadCounter(1)
@@ -76,9 +96,16 @@ class TestMooncakeLinkerResults(CustomTestCase):
             return False
 
         linker.load_layer_wise = load
-        with patch(
-            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
-            SimpleNamespace(Event=Mock),
+        with (
+            patch(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
+                SimpleNamespace(Event=Mock, current_stream=Mock()),
+            ),
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda out, value, **kw: out.__setitem__(0, value),
+            ),
         ):
             for index in (0, 1):
                 linker.pending_loads = {str(index): []}
@@ -88,6 +115,15 @@ class TestMooncakeLinkerResults(CustomTestCase):
         worker.start()
 
         def retire():
+            if broadcast:
+                with (
+                    patch("torch.distributed.all_reduce"),
+                    patch(
+                        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
+                        SimpleNamespace(Event=Mock, current_stream=Mock()),
+                    ),
+                ):
+                    linker._broadcast_loaded_layers(0, 0)
             linker.wait_for_load_batch(0)
             retired.set()
 
@@ -99,6 +135,8 @@ class TestMooncakeLinkerResults(CustomTestCase):
             release_current.set()
             self.assertTrue(next_started.wait(timeout=5))
             self.assertTrue(retired.wait(timeout=1), "joined an unrelated next load")
+            if broadcast:
+                self.assertEqual(linker.num_completed_loads(), 1)
             self.assertEqual(linker.pop_completed_load(), (["0"], False))
             self.assertNotIn(0, linker.load_batch_futures)
             self.assertFalse(linker.load_batch_futures[1].done())
@@ -168,6 +206,39 @@ class TestMooncakeLinkerResults(CustomTestCase):
         owner.abort_external_kv_request.assert_called_once()
         self.assertIs(owner.abort_external_kv_request.call_args.args[0], req)
         self.assertFalse(owner._deferred_linker_rids)
+
+    def test_waiting_match_is_invalidated_without_aborting_its_request(self):
+        namespace = {"logger": logging.getLogger(__name__)}
+        method = _scheduler_method("_mark_failed_linker_loads", namespace)
+        owner = Mock()
+        owner._deferred_linker_rids = set()
+        owner.tree_cache.drain_linker_loads.return_value = ["loading"]
+        owner.tree_cache.has_outstanding_failed_linker_chains.return_value = True
+        owner.tree_cache.is_on_failed_linker_chain.return_value = True
+        waiting = SimpleNamespace(
+            rid="waiting",
+            last_node=7,
+            prefix_len=8,
+            external_kv_cache_released=False,
+            time_stats=Mock(),
+            kv=SimpleNamespace(holds_kv=False, holds_mamba=False),
+        )
+        loading = SimpleNamespace(
+            rid="loading",
+            last_node=7,
+            external_kv_cache_released=False,
+            time_stats=Mock(),
+        )
+        owner.chunked_req = None
+        owner._iter_external_linker_candidates.return_value = [loading, waiting]
+        method(owner, Mock())
+        owner.abort_external_kv_request.assert_called_once()
+        self.assertIs(owner.abort_external_kv_request.call_args.args[0], loading)
+        owner.tree_cache.cancel_waiting_queue_prefetch.assert_called_once_with(
+            "waiting"
+        )
+        self.assertIsNone(waiting.last_node)
+        self.assertEqual(waiting.prefix_len, 0)
 
     def test_inflight_user_abort_preserves_its_category_and_timeout_message(self):
         namespace = {

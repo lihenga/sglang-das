@@ -44,8 +44,10 @@ class TestWaitingQueuePrefetchMetrics(CustomTestCase):
         self.linker.session_lock = threading.Lock()
         self.linker.host_prefetch_entries = {}
         self.linker.host_prefetch_queue = Queue()
-        self.linker.prepared_load_sessions = {}
-        self.linker._abort_prepared_load_now = Mock()
+        self.linker.host_prefetch_worker_count = 1
+        self.linker._init_session_runtime()
+        self.addCleanup(self.linker.session_executor.shutdown, wait=True)
+        self.linker._abort_prepared_load_now = Mock(return_value=True)
         self.transfers = [PoolTransfer(name=PoolName.KV, keys=["page"])]
 
     def sample(self, suffix, **labels):
@@ -85,11 +87,15 @@ class TestWaitingQueuePrefetchMetrics(CustomTestCase):
 
     def test_cancelled_queued_task_is_recorded_once(self):
         self.linker.submit_host_prefetch("rid", self.transfers)
+        self.linker.host_prefetch_limit = 1
         self.linker.cancel_host_prefetch("rid")
         self.linker.cancel_host_prefetch("rid")
+        self.assertFalse(self.linker.submit_host_prefetch("other", self.transfers))
+        self.assertEqual(self.linker.host_prefetch_queue.qsize(), 1)
         self.linker.host_prefetch_queue.put(None)
         self.linker.host_prefetch_thread_func()
         self.assertEqual(self.sample("duration_seconds_count", result="cancelled"), 1)
+        self.assertNotIn("rid", self.linker.host_prefetch_entries)
         self.assertIsNone(
             self.sample("duration_seconds_count", result="dfs_prefetched")
         )
@@ -151,12 +157,13 @@ class TestWaitingQueuePrefetchMetrics(CustomTestCase):
         self.linker.pending_loads = {"queued": self.transfers}
         self.linker.pending_load_tokens = {"queued": 16}
         self.linker.pending_load_started = {"queued": 10.0}
-        self.linker.abort_prepared_load = Mock()
+        self.linker.abort_prepared_load_async = Mock(return_value=True)
         self.assertTrue(self.linker.cancel_queued_load("queued"))
         self.assertFalse(self.linker.cancel_queued_load("queued"))
         self.assertEqual(self.linker.pending_load_tokens, {})
         self.assertEqual(self.linker.pending_load_started, {})
-        self.linker.abort_prepared_load.assert_called_once_with("queued")
+        self.linker.abort_prepared_load_async.assert_called_once_with("queued")
+        self.assertEqual(self.linker.cancelled_load_session_cleanup, set())
 
     def test_completed_load_exports_l4_metrics_per_request_without_double_counting(
         self,

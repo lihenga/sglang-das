@@ -1010,6 +1010,7 @@ def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.linker = SimpleNamespace(
+        poll_session_cleanup=lambda: None,
         num_completed_loads=lambda: 1,
         take_completed_loads=lambda count: [True] * count,
         commit_completed_loads=lambda values: (

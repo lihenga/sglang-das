@@ -9,6 +9,7 @@ RPC that granted the lease, so it never understates the lease Mooncake sees.
 import threading
 import types
 import unittest
+from concurrent.futures import Future
 from contextlib import ExitStack
 from unittest import mock
 from unittest.mock import MagicMock
@@ -55,10 +56,9 @@ def _linker(age_s=5.0, refresh_results=None, refresh_error=None):
     linker.host_prefetch_enabled = True
     linker.host_prefetch_lock = threading.Lock()
     linker.host_prefetch_entries = {}
-    linker.session_lock = threading.Lock()
-    linker.prepared_load_sessions = {}
-    linker.session_refcounts = {}
-    linker.session_sources = {}
+    linker.host_prefetch_limit = 8
+    linker.host_prefetch_worker_count = 2
+    linker._init_session_runtime()
 
     def start(keys):
         return [0] * len(keys), ["dfs"] * len(keys)
@@ -241,7 +241,7 @@ class TestSessionRefreshAge(CustomTestCase):
         linker._abort_prepared_load_now("s2")
         self.assertEqual(linker.session_lease_base, {})
 
-    def test_age_includes_session_lock_wait(self):
+    def test_unrelated_start_does_not_block_ready_admission(self):
         """Review P1-R1: another request's session start holds session_lock
         across its RPC; the admission check must age past that wait."""
         clock = _Clock()
@@ -273,20 +273,19 @@ class TestSessionRefreshAge(CustomTestCase):
                 target=lambda: result.update(ok=linker.revalidate_host_prefetch("rid"))
             )
             admission.start()
-            # Admission blocks on the lock while the unrelated start RPC runs
-            # past the skip threshold.
-            self.assertTrue(linker.session_lock.contended.wait(5))
-            clock.now += 10.0
+            # The ready request must progress before the unrelated RPC returns.
+            admission.join(2)
+            progressed = not admission.is_alive()
             release.set()
             worker.join(5)
             admission.join(5)
+            self.assertTrue(progressed)
         self.assertFalse(worker.is_alive())
         self.assertFalse(admission.is_alive())
         self.assertTrue(result["ok"])
-        # Aged 11 s once it got the lock, so it refreshed instead of skipping.
-        linker.storage.store.batch_get_session_refresh.assert_called_once()
+        linker.storage.store.batch_get_session_refresh.assert_not_called()
         self.assertEqual(
-            linker.session_lease_base, {"k0": 111.0, "k1": 111.0, "unrelated": 101.0}
+            linker.session_lease_base, {"k0": 100.0, "k1": 100.0, "unrelated": 101.0}
         )
 
     def test_claim_wait_does_not_hold_host_prefetch_lock(self):
@@ -341,19 +340,40 @@ class TestSessionRefreshAge(CustomTestCase):
         self.assertEqual(linker.host_prefetch_entries["rid"]["state"], "claimed")
         self.assertEqual(linker.prepared_load_sessions, {"rid": ["k0"]})
 
-    def test_refresh_skips_base_of_key_ended_meanwhile(self):
+    def test_end_waits_for_same_key_refresh(self):
+        linker = _linker(age_s=0.0)
         clock = _Clock()
-        linker = _linker()
         _prefetched(linker, clock)
-        clock.now += 6.0
+        in_rpc, release, ended = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(release.set)
 
         def refresh(keys):
-            # The session is released while the refresh RPC is in flight.
-            linker._abort_prepared_load_now("s")
+            in_rpc.set()
+            if not release.wait(5):
+                raise TimeoutError("refresh was not released")
             return [0] * len(keys)
 
         linker.storage.store.batch_get_session_refresh.side_effect = refresh
-        self.assertTrue(_revalidate(linker, clock))
+        linker.storage.store.batch_get_session_end.side_effect = lambda keys: (
+            ended.set(),
+            0,
+        )[1]
+        refresh_thread = threading.Thread(
+            target=linker.revalidate_host_prefetch, args=("rid",)
+        )
+        refresh_thread.start()
+        self.assertTrue(in_rpc.wait(5))
+        end_thread = threading.Thread(
+            target=linker._abort_prepared_load_now, args=("s",)
+        )
+        end_thread.start()
+        self.assertFalse(ended.wait(0.1))
+        release.set()
+        refresh_thread.join(5)
+        end_thread.join(5)
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertFalse(end_thread.is_alive())
+        self.assertTrue(ended.is_set())
         self.assertEqual(linker.session_lease_base, {})
 
 
@@ -441,6 +461,329 @@ class TestSharedSessionPreparation(CustomTestCase):
             side_effect=RuntimeError("master failed")
         )
         self.assertFalse(linker.revalidate_load([transfer]))
+
+
+class TestSessionOwnershipRaces(CustomTestCase):
+    def test_new_start_cannot_overtake_last_end(self):
+        linker = _linker()
+        old = types.SimpleNamespace(keys=["key"])
+        self.assertTrue(linker._prepare_expanded_load("old", [old]))
+        in_end, release_end, new_started = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        self.addCleanup(release_end.set)
+        sessions = {"key": "old"}
+
+        def end(keys):
+            in_end.set()
+            if not release_end.wait(5):
+                raise TimeoutError("end was not released")
+            sessions.clear()
+            return 0
+
+        def start(keys):
+            sessions["key"] = "new"
+            new_started.set()
+            return [0], ["dfs"]
+
+        linker.storage.store.batch_get_session_end.side_effect = end
+        linker.storage.store.batch_get_session_start_with_sources.side_effect = start
+        ending = threading.Thread(target=linker._abort_prepared_load_now, args=("old",))
+        ending.start()
+        self.assertTrue(in_end.wait(5))
+        self.assertFalse(linker._abort_prepared_load_now("old"))
+        self.assertFalse(linker.abort_prepared_load_async("old"))
+        result = {}
+        starting = threading.Thread(
+            target=lambda: result.update(ok=linker._prepare_expanded_load("new", [old]))
+        )
+        starting.start()
+        self.assertFalse(new_started.wait(0.1))
+        release_end.set()
+        ending.join(5)
+        starting.join(5)
+        self.assertFalse(ending.is_alive())
+        self.assertFalse(starting.is_alive())
+        self.assertTrue(result["ok"])
+        self.assertEqual(sessions, {"key": "new"})
+        self.assertEqual(linker.session_refcounts, {"key": 1})
+        self.assertEqual(linker.session_key_locks, {})
+
+    def test_cancel_inflight_start_rolls_back_before_publishing_ready(self):
+        linker = _linker()
+        in_start, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        sessions = set()
+
+        def start(keys):
+            in_start.set()
+            if not release.wait(5):
+                raise TimeoutError("start was not released")
+            sessions.update(keys)
+            return [0], ["dfs"]
+
+        linker.storage.store.batch_get_session_start_with_sources.side_effect = start
+        linker.storage.store.batch_get_session_end.side_effect = lambda keys: (
+            sessions.difference_update(keys),
+            0,
+        )[1]
+        result = {}
+        worker = threading.Thread(
+            target=lambda: result.update(
+                ok=linker._prepare_expanded_load(
+                    "rid", [types.SimpleNamespace(keys=["key"])]
+                )
+            )
+        )
+        worker.start()
+        self.assertTrue(in_start.wait(5))
+        self.assertFalse(linker._abort_prepared_load_now("rid"))
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(result["ok"])
+        self.assertEqual(sessions, set())
+        self.assertEqual(linker.prepared_load_sessions, {})
+        self.assertEqual(linker.session_refcounts, {})
+        self.assertTrue(linker._abort_prepared_load_now("rid"))
+
+    def test_async_cancel_pending_start_keeps_bounded_credit_until_drained(self):
+        linker = _linker()
+        linker.host_prefetch_limit = 1
+        linker.pool_group = types.SimpleNamespace(
+            resolve_transfers=lambda transfers, **_: transfers
+        )
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        self.addCleanup(release.set)
+
+        def start(keys):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("start was not released")
+            return [0], ["dfs"]
+
+        linker.storage.store.batch_get_session_start_with_sources.side_effect = start
+        transfer = types.SimpleNamespace(keys=["key"])
+        self.assertIn(linker.prepare_load_async("a", [transfer]), {"pending", "ready"})
+        self.assertTrue(entered.wait(5))
+        self.assertFalse(linker.abort_prepared_load_async("a"))
+        self.assertEqual(linker.prepare_load_async("b", [transfer]), "failed")
+        self.assertEqual(len(linker.session_jobs), 1)
+        release.set()
+        self.assertFalse(linker.session_jobs[("prepare", "a")].result(timeout=5))
+        self.assertTrue(linker.abort_prepared_load_async("a"))
+        self.assertEqual(linker.prepared_load_sessions, {})
+        self.assertEqual(linker.session_jobs, {})
+
+    def test_queued_load_cancel_returns_before_end_and_retains_cleanup_credit(self):
+        linker = _linker()
+        linker.host_prefetch_limit = 1
+        linker.pool_group = types.SimpleNamespace(
+            resolve_transfers=lambda transfers, **_: transfers
+        )
+        transfer = types.SimpleNamespace(keys=["key"])
+        self.assertTrue(linker._prepare_expanded_load("a", [transfer]))
+        prepared = Future()
+        prepared.set_result(True)
+        linker.session_jobs[("prepare", "a")] = prepared
+        linker.host_prefetch_entries["a"] = {"state": "loading", "session_rid": "a"}
+        linker.pending_loads = {"a": [transfer]}
+        linker.pending_load_tokens, linker.pending_load_started = {"a": 1}, {"a": 1.0}
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        self.addCleanup(release.set)
+        rpc_threads = []
+
+        def end(keys):
+            rpc_threads.append(threading.get_ident())
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("end was not released")
+            return 0
+
+        linker.storage.store.batch_get_session_end.side_effect = end
+        caller = threading.get_ident()
+        self.assertTrue(linker.cancel_queued_load("a"))
+        self.assertTrue(entered.wait(5))
+        self.assertNotEqual(rpc_threads, [caller])
+        self.assertIn(("prepare", "a"), linker.session_jobs)
+        self.assertEqual(linker.host_prefetch_entries["a"]["state"], "cleanup_pending")
+        self.assertEqual(linker.cancelled_load_session_cleanup, {"a"})
+        self.assertEqual(linker.prepare_load_async("b", [transfer]), "failed")
+        linker._poll_cancelled_load_sessions()
+        self.assertEqual(linker.cancelled_load_session_cleanup, {"a"})
+        ended = linker.session_jobs[("end", "a")]
+        release.set()
+        self.assertTrue(ended.result(timeout=5))
+        linker._poll_cancelled_load_sessions()
+        self.assertEqual(linker.cancelled_load_session_cleanup, set())
+        self.assertEqual(linker.session_jobs, {})
+        self.assertEqual(linker.host_prefetch_entries, {})
+        self.assertEqual(linker.pending_loads, {})
+
+    def test_no_prefetch_load_consumes_each_admission_result(self):
+        linker = _linker()
+        linker.host_prefetch_enabled = False
+        linker.host_prefetch_limit = 1
+        linker.pool_group = types.SimpleNamespace(
+            resolve_transfers=lambda transfers, **_: transfers
+        )
+        linker.pending_loads = {}
+        linker.pending_load_tokens, linker.pending_load_started = {}, {}
+        linker.page_size = 1
+        transfer = types.SimpleNamespace(name="kv", keys=["key"])
+        for index in range(4):
+            rid = str(index)
+            proof = Future()
+            proof.set_result(True)
+            linker.session_jobs[("refresh", rid)] = proof
+            self.assertTrue(linker.load(rid, [transfer]))
+            self.assertEqual(linker.session_jobs, {})
+            self.assertIn(rid, linker.pending_loads)
+            self.assertTrue(linker.cancel_queued_load(rid))
+
+    def test_unknown_end_outcome_is_not_reported_as_success_or_reused(self):
+        linker = _linker()
+        transfer = types.SimpleNamespace(keys=["key"])
+        self.assertTrue(linker._prepare_expanded_load("a", [transfer]))
+        linker.storage.store.batch_get_session_end.return_value = -1
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(linker._abort_prepared_load_now("a"))
+        self.assertFalse(linker._abort_prepared_load_now("a"))
+        self.assertFalse(linker._prepare_expanded_load("b", [transfer]))
+        self.assertEqual(
+            linker.storage.store.batch_get_session_start_with_sources.call_count, 1
+        )
+
+    def test_request_id_distinguishes_reused_rid_lifecycles(self):
+        linker = _linker()
+        first = types.SimpleNamespace(rid="r", lifecycle_id=1, attempt_id=0)
+        second = types.SimpleNamespace(rid="r", lifecycle_id=2, attempt_id=0)
+        self.assertNotEqual(linker.request_id(first), linker.request_id(second))
+
+
+class TestAsyncSessionAdmission(CustomTestCase):
+    def test_ready_prefetch_cancel_retries_internal_end_after_quota_recovers(self):
+        linker = _linker()
+        linker.host_prefetch_limit = 1
+        linker.pool_group = types.SimpleNamespace(
+            resolve_transfers=lambda transfers, **_: transfers
+        )
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        self.addCleanup(release.set)
+        for rid, key in (("busy", "busy-key"), ("internal", "prefetch-key")):
+            self.assertTrue(
+                linker._prepare_expanded_load(rid, [types.SimpleNamespace(keys=[key])])
+            )
+        entry = {"state": "dfs_prefetched", "session_rid": "internal"}
+        linker.host_prefetch_entries["public"] = entry
+
+        def end(keys):
+            if keys == ["busy-key"]:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("busy end was not released")
+            return 0
+
+        linker.storage.store.batch_get_session_end.side_effect = end
+        busy = linker._session_job(
+            "end", "busy", lambda: linker.abort_prepared_load("busy")
+        )
+        self.assertTrue(entered.wait(5))
+        linker.cancel_host_prefetch("public")
+        self.assertEqual(
+            linker.host_prefetch_session_cleanup["public"], (entry, "internal")
+        )
+        self.assertIn("internal", linker.prepared_load_sessions)
+        self.assertNotIn(("end", "internal"), linker.session_jobs)
+        self.assertEqual(entry["state"], "cleanup_pending")
+        release.set()
+        self.assertTrue(busy.result(timeout=5))
+        self.assertTrue(linker.abort_prepared_load_async("busy"))
+        linker._poll_cancelled_load_sessions()
+        with linker.session_lock:
+            pending = linker.session_jobs.get(("end", "internal"))
+        if pending is not None:
+            self.assertTrue(pending.result(timeout=5))
+        linker._poll_cancelled_load_sessions()
+        self.assertEqual(linker.host_prefetch_session_cleanup, {})
+        self.assertEqual(linker.host_prefetch_entries, {})
+        self.assertEqual(linker.prepared_load_sessions, {})
+        self.assertEqual(linker.session_jobs, {})
+        self.assertEqual(linker.session_refcounts, {})
+
+    def test_refresh_result_is_reused_briefly_then_renewed_while_peer_is_pending(self):
+        for ttl in (10.0, 0.4):
+            with self.subTest(ttl=ttl), envs.SGLANG_MOONCAKE_LEASE_TTL_S.override(ttl):
+                linker = _linker(age_s=0.0)
+                self.addCleanup(linker.session_executor.shutdown, wait=True)
+                clock = _Clock()
+                with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
+                    _prefetched(linker, clock)
+                    linker.revalidate_host_prefetch_async("rid")
+                    first = linker.session_jobs[("refresh", "rid")]
+                    self.assertTrue(first.result(timeout=5))
+                    window = min(ttl / 2, 1.0)
+                    clock.now += window / 2
+                    self.assertEqual(
+                        linker.revalidate_host_prefetch_async("rid"), "ready"
+                    )
+                    self.assertIs(linker.session_jobs[("refresh", "rid")], first)
+                    clock.now += window
+                    linker.revalidate_host_prefetch_async("rid")
+                    renewed = linker.session_jobs[("refresh", "rid")]
+                    self.assertIsNot(renewed, first)
+                    self.assertTrue(renewed.result(timeout=5))
+                    self.assertEqual(
+                        linker.revalidate_host_prefetch_async("rid"), "ready"
+                    )
+                self.assertEqual(
+                    linker.storage.store.batch_get_session_refresh.call_count, 2
+                )
+
+    def test_expired_prepare_refreshes_existing_lease_without_restarting_it(self):
+        linker = _linker(age_s=5.0)
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        linker.pool_group = types.SimpleNamespace(
+            resolve_transfers=lambda transfers, **_: transfers
+        )
+        clock = _Clock()
+        transfer = types.SimpleNamespace(keys=["key"])
+        with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
+            linker.prepare_load_async("rid", [transfer])
+            first = linker.session_jobs[("prepare", "rid")]
+            self.assertTrue(first.result(timeout=5))
+            clock.now += 1.1
+            linker.prepare_load_async("rid", [transfer])
+            renewed = linker.session_jobs[("prepare", "rid")]
+            self.assertIsNot(renewed, first)
+            self.assertTrue(renewed.result(timeout=5))
+            self.assertEqual(linker.prepare_load_async("rid", [transfer]), "ready")
+        self.assertEqual(
+            linker.storage.store.batch_get_session_start_with_sources.call_count, 1
+        )
+        self.assertEqual(linker.storage.store.batch_get_session_refresh.call_count, 1)
+        self.assertEqual(linker.session_refcounts, {"key": 1})
+
+    def test_slow_rpc_cannot_publish_already_expired_admission(self):
+        linker = _linker(age_s=0.0)
+        self.addCleanup(linker.session_executor.shutdown, wait=True)
+        clock = _Clock()
+
+        def slow_refresh(keys):
+            clock.now += linker.session_lease_ttl_s / 2 + 0.1
+            return [0] * len(keys)
+
+        linker.storage.store.batch_get_session_refresh.side_effect = slow_refresh
+        with mock.patch.object(mooncake_direct_linker.time, "monotonic", clock):
+            _prefetched(linker, clock)
+            linker.revalidate_host_prefetch_async("rid")
+            self.assertFalse(linker.session_jobs[("refresh", "rid")].result(timeout=5))
+            self.assertEqual(linker.revalidate_host_prefetch_async("rid"), "failed")
 
 
 class TestSessionRefreshAgeConfig(CustomTestCase):

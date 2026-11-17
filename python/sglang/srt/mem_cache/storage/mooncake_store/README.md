@@ -630,6 +630,23 @@ worker outcome/duration and ready-to-claim lead time are separate from actual
 load completion. Direct `l4_*` counters cover successful external-store loads
 or writes; the metric name alone does not prove every object came from DFS.
 
+Snapshot ingestion is mounted only on the main HTTP service and the authenticated
+gRPC HTTP sidecar, not on non-primary dummy health servers. It follows the
+service's configured API-key policy; a service without an API key remains open.
+The shared receiver retains at most 1024 client snapshots and 256 MiB of snapshot
+files, including temporary files during replacement; quota exhaustion returns
+HTTP 429. A replacement needs room for both the old and new file. Snapshots expire
+after 300 seconds, with a background sweep every 30 seconds and another sweep
+before publication, independently of Prometheus scraping.
+
+Waiting-queue prefetch metrics do not establish end-to-end request tracing.
+Background reads, session operations and drain/cleanup work are not guaranteed
+to inherit the original request's trace context. Existing transfer spans remain
+useful, but this port does not add complete tracing. The waiting-queue event
+counter records `wait_prefetch` and `wait_session` admission observations (not
+request counts or elapsed time); opt-in `DAS_PREFETCH_TRACE` logs correlate these
+reasons with request IDs and bootstrap rooms.
+
 CPU-only tests live under `test/registered/unit/{mem_cache,managers,disaggregation,observability}`.
 `test/manual/mooncake/test_package_compatibility.py` exercises package negotiation
 without native allocation. `test_native_read_plan.py` uses a private in-process
@@ -637,6 +654,12 @@ Master for CPU/TCP native ReadLayout/ReadPlan/session smoke.
 `test_wheel_swap.py` checks multi-pool SGLang writes/reads against a matching
 wheel; choose `MATRIX_DEVICES=cpu` for CPU checks. These tests do not substitute
 for DeepSeek 4.1 output-consistency, HCU, RDMA, DFS fault, or performance runs.
+The DeepSeek linker test also includes an injected-read-failure arm, reusing
+its model/launch configuration. It requires an observed linker abort followed
+by a successful request, live health, nonzero remote-load exposure, and the
+existing GSM8K accuracy threshold after warm/flush/re-read. This service-level
+test needs the model and accelerator environment; CPU unit results do not
+establish that it passes.
 
 ### Implementation batches and evidence
 
@@ -653,9 +676,9 @@ directory and leaves its installed Mooncake package untouched. A matching
 `scripts/variant_build.sh --shca --hip --etcd`. The script enables fake HIP RPC
 compatibility; this build does not establish HIP fabric RPC functionality.
 Native CPU/TCP ReadLayout/ReadPlan/session checks and multi-pool SGLang
-round-trips passed. The container has Python 3.10 whereas this branch declares
-Python >= 3.11, so successful component tests do not establish a supported full
-serving installation.
+round-trips passed. The container has Python 3.10, which satisfies this branch's
+Python >= 3.10 requirement. Component tests still do not establish a working full
+serving installation with the model and native dependencies.
 
 ### Port review follow-ups
 
@@ -664,6 +687,16 @@ registers a batch's request IDs atomically, so a later duplicate or state-creati
 failure leaves no partial request registration. Drained PD aborts retain bounded
 terminal room records to reject late bootstrap destinations; failure notices use
 the target status-message API and preserve its generation-tagged drain ACKs.
+
+The donor's untagged two-frame `ABORT_ACK` is not a replacement for the target
+protocol. A drained prefill abort sends `KVPoll.Failed` using the target status
+channel; decode's drain handshake retains `ABORT_ACK` with the room, prefill rank
+and matching generation. Generation-less drain ACKs cannot authorize release.
+For device destinations, decode can release after
+`SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT` (default 30 seconds)
+even without complete drain ACKs. That timeout is not proof that remote writes
+stopped. Host-staged destinations remain held until drain consensus; the device
+timeout fallback does not apply to them.
 
 The accompanying `sgl-model-gateway` changes add HTTP stream outcomes, SSE/JSON
 error detection, paired PD cancellation with one shared deadline, and failure-log

@@ -54,7 +54,6 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
-    get_memory,
     get_model,
     get_parallel,
     get_schedule,
@@ -537,17 +536,6 @@ class TpModelWorker(BaseTpWorker):
     def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
-            graph = get_exec().graph.cuda_graph_config
-            if (
-                consumer_index >= 0
-                and get_memory().enable_unified_cache_external_linker
-                and graph is not None
-                and graph.prefill.backend != "disabled"
-            ):
-                # Graph replay bypasses Python layer waits; publish every restored pool first.
-                self.hicache_layer_transfer_counter.wait_until(
-                    self.hicache_layer_transfer_counter.num_layers - 1
-                )
 
     def register_hisparse_coordinator(self, coordinator):
         self.model_runner.hisparse_coordinator = coordinator

@@ -16,6 +16,32 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestMooncakeLinkerBroadcast(CustomTestCase):
+    def test_source_final_verdict_does_not_join_the_next_load(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        current, following = Future(), Future()
+        current.set_result(True)
+        linker.broadcast_outcomes = {0: current, 1: following}
+        linker.broadcast_loads = {0: (0, {}, ["rid"], Mock())}
+        linker.broadcast_failed, linker.broadcast_events = set(), []
+        linker.load_batch_futures = {0: Future()}
+        linker.load_queue = Mock()
+        linker.num_layers, linker.tp_group = 2, object()
+        linker.mla_broadcaster = SimpleNamespace(
+            is_src=True, broadcast_loaded_layer=Mock()
+        )
+        event = Mock()
+        with (
+            patch("torch.distributed.all_reduce"),
+            patch(
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
+                SimpleNamespace(Event=lambda: event, current_stream=Mock()),
+            ),
+        ):
+            linker._broadcast_loaded_layers(0, 1)
+        linker.load_queue.join.assert_not_called()
+        self.assertFalse(following.done())
+        self.assertEqual(linker.broadcast_events, [(event, ["rid"], True)])
+
     def test_cp_shard_uses_its_own_attention_tp_source(self):
         captured = {}
 

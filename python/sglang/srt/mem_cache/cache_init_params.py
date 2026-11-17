@@ -58,3 +58,6 @@ class CacheInitParams:
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+
+    # Attention-group-local TP ranks need the DP rank for storage isolation.
+    dp_rank: int = dataclasses.field(default=0, kw_only=True)

@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,10 @@ REPORT_TIMEOUT = 30
 RECEIVER_CHECK_INTERVAL = 1
 RECEIVER_STARTUP_GRACE = 300
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+MAX_SNAPSHOT_CLIENTS = 1024
+MAX_SNAPSHOT_TOTAL_BYTES = 256 * 1024 * 1024
+SNAPSHOT_TTL = 300
+SNAPSHOT_EXPIRY_INTERVAL = 30
 CLIENT_LABELS = ("mooncake_client", "mooncake_host", "mooncake_pid", "mooncake_rank")
 
 
@@ -41,6 +46,67 @@ def _parse_metrics(text):
             if any(label in sample.labels for label in CLIENT_LABELS):
                 raise ValueError("Client metric uses a reserved source label")
     return metrics
+
+
+class SnapshotQuotaExceeded(ValueError):
+    pass
+
+
+def _snapshot_quota_exceeded(directory, target, incoming_bytes):
+    clients = list(directory.glob("*.json"))
+    files = clients + list(directory.glob("tmp*"))
+    # Include the old target and the new temporary file at their peak size.
+    return (
+        (not target.exists() and len(clients) >= MAX_SNAPSHOT_CLIENTS)
+        or len(files) + 1 > MAX_SNAPSHOT_CLIENTS + 1
+        or sum(path.stat().st_size for path in files) + incoming_bytes
+        > MAX_SNAPSHOT_TOTAL_BYTES
+    )
+
+
+def _expire_snapshots_locked(directory):
+    """The same lock serializes expiry, quota accounting, and publication."""
+    now = time.monotonic()
+    for path in directory.glob("*.json"):
+        try:
+            expired = now - json.loads(path.read_text())["received"] > SNAPSHOT_TTL
+        except (ValueError, KeyError, TypeError):
+            expired = True
+        if expired:
+            path.unlink(missing_ok=True)
+    for path in directory.glob("tmp*"):
+        if time.time() - path.stat().st_mtime > SNAPSHOT_TTL:
+            path.unlink(missing_ok=True)
+
+
+def expire_snapshots():
+    import fcntl
+
+    directory = _snapshot_directory()
+    with (directory / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _expire_snapshots_locked(directory)
+
+
+@asynccontextmanager
+async def snapshot_expiry():
+    async def expire_periodically():
+        while True:
+            try:
+                await asyncio.to_thread(expire_snapshots)
+            except OSError:
+                logger.exception("Cannot expire Mooncake client metrics snapshots")
+            await asyncio.sleep(SNAPSHOT_EXPIRY_INTERVAL)
+
+    task = asyncio.create_task(expire_periodically())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def receive_snapshot(payload):
@@ -73,26 +139,38 @@ def receive_snapshot(payload):
         "timestamp": time.time(),
         "sequence": sequence,
     }
-    directory = _snapshot_directory()
-    fd, temporary = tempfile.mkstemp(dir=directory)
-    try:
-        with os.fdopen(fd, "w") as stream:
-            json.dump(snapshot, stream)
-        import fcntl
+    import fcntl
 
-        with (directory / ".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            target = directory / f"{client_id}.json"
-            if target.exists():
+    data = json.dumps(snapshot).encode("utf-8")
+    directory = _snapshot_directory()
+    with (directory / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        target = directory / f"{client_id}.json"
+        if target.exists():
+            try:
                 previous = json.loads(target.read_text())
+                expired = time.monotonic() - previous["received"] > SNAPSHOT_TTL
+            except (ValueError, KeyError, TypeError):
+                expired = True
+            if expired:
+                target.unlink()
+            else:
                 if previous["sequence"] >= sequence:
                     return
                 if previous["labels"] != labels:
                     raise ValueError("Client identity changed")
+        if _snapshot_quota_exceeded(directory, target, len(data)):
+            _expire_snapshots_locked(directory)
+            if _snapshot_quota_exceeded(directory, target, len(data)):
+                raise SnapshotQuotaExceeded("Mooncake client metrics quota exceeded")
+        fd, temporary = tempfile.mkstemp(dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
             os.replace(temporary, target)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 class MooncakeClientCollector:
@@ -114,16 +192,7 @@ class MooncakeClientCollector:
             try:
                 snapshot = json.loads(path.read_text())
                 age = time.monotonic() - snapshot["received"]
-                if age > 300:
-                    import fcntl
-
-                    with (path.parent / ".lock").open("a") as lock:
-                        fcntl.flock(lock, fcntl.LOCK_EX)
-                        if (
-                            json.loads(path.read_text())["sequence"]
-                            == snapshot["sequence"]
-                        ):
-                            path.unlink(missing_ok=True)
+                if age > SNAPSHOT_TTL:
                     continue
                 labels = snapshot["labels"]
                 values = [labels[name] for name in CLIENT_LABELS]
@@ -162,14 +231,16 @@ def add_snapshot_route(app):
             return Response(status_code=204)
         body = bytearray()
         async for chunk in request.stream():
-            body.extend(chunk)
-            if len(body) > MAX_SNAPSHOT_BYTES:
+            if len(body) + len(chunk) > MAX_SNAPSHOT_BYTES:
                 return Response(status_code=413)
+            body.extend(chunk)
         try:
             payload = json.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("Expected a snapshot object")
             await asyncio.to_thread(receive_snapshot, payload)
+        except SnapshotQuotaExceeded:
+            return Response(status_code=429)
         except (ValueError, TypeError):
             return Response(status_code=400)
         return Response(status_code=204)

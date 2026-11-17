@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import unittest
 
 from sglang.srt.arg_groups.arg_utils import namespace_of
@@ -15,6 +16,18 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestMooncakeRuntimeOptions(CustomTestCase):
+    def test_new_options_do_not_shift_existing_positional_arguments(self):
+        """Mooncake options must not intercept positional backend arguments."""
+        parameters = list(inspect.signature(ServerArgs).parameters)
+        linker = parameters.index("enable_unified_cache_external_linker")
+        self.assertEqual(
+            parameters[linker + 1], "unified_cache_external_linker_backend"
+        )
+        self.assertGreater(
+            parameters.index("mooncake_enable_page_wise_load"),
+            parameters.index("grpc_response_timeout_secs"),
+        )
+
     def test_launch_flags_reach_the_memory_namespace(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

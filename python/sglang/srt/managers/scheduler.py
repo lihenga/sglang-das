@@ -1293,6 +1293,14 @@ class Scheduler(
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def init_running_status(self):
+        self.init_external_kv_cleanup(
+            coordinated=get_memory().enable_unified_cache_external_linker
+            or (
+                get_disagg().disaggregation_mode == "prefill"
+                and get_disagg().disaggregation_transfer_backend == "mooncake"
+            )
+        )
+        self._cache_request_lifecycle_seq = 0
         self.tp_size = get_parallel().tp_size
         # Set by a runtime PD role switch to break out of the current event loop.
         self._event_loop_should_restart = False
@@ -2242,8 +2250,10 @@ class Scheduler(
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
+            if (
+                is_health_check_generate_req(recv_req)
+                and not get_parallel().attn_dp_enabled
+                and not self.is_fully_idle(for_health_check=True)
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
@@ -3445,6 +3455,11 @@ class Scheduler(
         self.output_streamer.stream_output([req], req.return_logprob)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if req.cache_request_handle.lifecycle_id == 0:
+            self._cache_request_lifecycle_seq += 1
+            req.cache_request_handle = dataclasses.replace(
+                req.cache_request_handle, lifecycle_id=self._cache_request_lifecycle_seq
+            )
         if not self._set_or_validate_priority(req):
             self._release_aborted_request(req)
             return
@@ -4052,10 +4067,10 @@ class Scheduler(
         if self.enable_waiting_queue_dfs_prefetch:
             self._drain_bg_prefetch_acks()
             waiting_queue_prefetch_states = (
-                self.tree_cache.get_waiting_queue_prefetch_admission_states(
-                    [req.rid for req in self.waiting_queue]
-                )
+                self.tree_cache.get_waiting_queue_prefetch_admission_states()
             )
+            if "pending" in waiting_queue_prefetch_states.values():
+                self._request_bg_prefetch_epoch()
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
@@ -4206,6 +4221,8 @@ class Scheduler(
             if self.enable_waiting_queue_dfs_prefetch:
                 state = waiting_queue_prefetch_states.get(req.rid, "not_tracked")
                 if state == "pending":
+                    self._log_waiting_queue_prefetch_event("wait_prefetch")
+                    self._trace_prefill_reqs("admission_wait", [req], reason="prefetch")
                     continue
                 if state == "terminal":
                     self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
@@ -4240,11 +4257,20 @@ class Scheduler(
                 and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
                 continue
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.prepare_external_linker_load(req) == "pending"
+            ):
+                self._log_waiting_queue_prefetch_event("wait_session")
+                self._trace_prefill_reqs("admission_wait", [req], reason="session")
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if self.enable_unified_cache_external_linker:
+                self.tree_cache.discard_external_linker_load_admission(req)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -5031,7 +5057,6 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
-        self._process_mooncake_cleanup_requests()
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -5540,6 +5565,16 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                if not isinstance(
+                    chunked_req.to_finish, FINISH_ABORT
+                ) and not isinstance(chunked_req.finished_reason, FINISH_ABORT):
+                    chunked_req.to_finish = (
+                        FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
+                        if recv_req.abort_message
+                        else FINISH_ABORT("Aborted by AbortReq.")
+                    )
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -6072,28 +6107,18 @@ class Scheduler(
             groups.append([self.chunked_req])
 
         # Critical additions: requests can also live in these queues
-        if (
-            hasattr(self, "disagg_prefill_inflight_queue")
-            and self.disagg_prefill_inflight_queue
-        ):
+        if self.disagg_prefill_inflight_queue:
             groups.append(self.disagg_prefill_inflight_queue)
 
-        if hasattr(self, "waiting_queue") and self.waiting_queue:
+        if self.waiting_queue:
             groups.append(self.waiting_queue)
 
         # Bootstrap queue access depends on implementation
-        if (
-            hasattr(self, "disagg_prefill_bootstrap_queue")
-            and self.disagg_prefill_bootstrap_queue is not None
-        ):
-            bootstrap_queue = getattr(
-                self.disagg_prefill_bootstrap_queue, "queue", None
-            )
-            if bootstrap_queue is not None:
-                groups.append(list(bootstrap_queue))
+        if self.disagg_prefill_bootstrap_queue is not None:
+            groups.append(self.disagg_prefill_bootstrap_queue.queue)
 
         # Under overlap, unprocessed batches in result_queue also hold requests
-        if hasattr(self, "result_queue") and self.result_queue:
+        if self.result_queue:
             for queued_batch, _ in self.result_queue:
                 groups.append(queued_batch.reqs)
 
@@ -6101,9 +6126,9 @@ class Scheduler(
         seen = set()
         for reqs in groups:
             for req in reqs:
-                if req.rid in seen:
+                if id(req) in seen:
                     continue
-                seen.add(req.rid)
+                seen.add(id(req))
                 yield req
 
     def _mark_failed_linker_loads(
@@ -6148,6 +6173,18 @@ class Scheduler(
             if not rid_match and not chain_match:
                 continue
 
+            if not rid_match and not (req.kv.holds_kv or req.kv.holds_mamba):
+                # A queued match is an observation, not ownership of these pages.
+                self.tree_cache.cancel_waiting_queue_prefetch(req.rid)
+                req.prefix_len = 0
+                req.kv.cache_protected_len = 0
+                req.num_matched_prefix_tokens = 0
+                req.last_node = req.last_host_node = req.best_match_node = None
+                req.host_hit_length = req.swa_host_hit_length = (
+                    req.mamba_host_hit_length
+                ) = 0
+                continue
+
             # Cache release state belongs to this request, not its reusable RID.
             if req.external_kv_cache_released:
                 handled_rids.add(req.rid)
@@ -6156,7 +6193,6 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             if req is self.chunked_req:
                 req.external_kv_abort_response_via_chunked = True
-                self._external_kv_chunked_abort_reqs[req.rid] = req
             self.abort_external_kv_request(
                 req,
                 forward_drained=False,
@@ -6223,7 +6259,6 @@ class Scheduler(
                 )
                 return
             req.external_kv_response_sent = True
-        self._external_kv_chunked_abort_reqs.pop(req.rid, None)
         if self._pending_chunked_abort_req is req:
             self._pending_chunked_abort_req = None
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
