@@ -19,7 +19,6 @@ _FEATURE_METHODS = {
         "dfs_prefetch_arena_available",
         "disable_dfs_prefetch",
     ),
-    "read_plan": ("create_read_plan",),
     "read_layout": ("batch_get_into_layouts",),
     "service_metrics": ("set_service_endpoint",),
 }
@@ -196,13 +195,3 @@ def setup_store(store, args, kwargs):
     if not result and disable_after_setup:
         disable_dfs_prefetch(store)
     return result
-
-
-def resolve_read_plan_options(store, enabled: bool, reuse: bool) -> tuple[bool, bool]:
-    if enabled and not supports_feature(store, "read_plan"):
-        logger.warning(
-            "Mooncake package lacks ReadPlan support; using compatible session reads "
-            "and disabling ReadPlan address reuse."
-        )
-        return False, False
-    return enabled, reuse

@@ -86,7 +86,6 @@ class L4Store(L3Store):
     batch_get_session_start_with_sources = lambda *args: None
     batch_get_session_prefetch = batch_get_session_refresh = lambda *args: None
     dfs_prefetch_arena_available = lambda *args: True
-    create_read_plan = lambda *args: None
 
 
 _ARGS = ("127.0.0.1:0", "P2PHANDSHAKE", 1024, 0, "tcp", "", "127.0.0.1:50051", None)
@@ -242,22 +241,15 @@ class TestPackageCompatibility(unittest.TestCase):
             with self.subTest(package=cls.__name__):
                 store = cls()
                 self.assertEqual(compat.supports_feature(store, "read_layout"), layout)
-                for feature in ("dfs_health", "dfs_prefetch", "read_plan"):
+                for feature in ("dfs_health", "dfs_prefetch"):
                     self.assertEqual(compat.supports_feature(store, feature), l4)
-                self.assertEqual(
-                    compat.resolve_read_plan_options(store, True, True), (l4, l4)
-                )
 
     def test_standalone_declaration_overrides_callable_but_unsupported_api(self):
         store = L4Store()
         declaration = store.get_capabilities()
         declaration["features"]["dfs_prefetch"] = False
-        declaration["features"]["read_plan"] = False
         store.get_capabilities = lambda: declaration
         self.assertFalse(compat.supports_feature(store, "dfs_prefetch"))
-        self.assertEqual(
-            compat.resolve_read_plan_options(store, True, True), (False, False)
-        )
 
     def test_legacy_disable_is_noop_and_l4_releases_arena(self):
         compat.disable_dfs_prefetch(CommunityStore())

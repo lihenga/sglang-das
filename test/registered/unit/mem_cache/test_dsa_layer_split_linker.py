@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _DsaStrategy
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     _build_dsa_device_pool_group,
@@ -232,48 +233,6 @@ class TestDsaLayerSplitLinker(unittest.TestCase):
             _build_dsa_device_pool_group(_DsaPool(), 4)
         with self.assertRaisesRegex(ValueError, "page sizes"):
             _build_dsa_device_pool_group(_DsaPool(), 2, (_DsaPool(page_size=4),))
-
-    def test_read_plan_metadata_matches_legacy_owned_layer_ranges(self):
-        indices = torch.tensor([2, 3, 6, 7], dtype=torch.int64)
-        for rank in range(8):
-            group = _build_dsa_device_pool_group(
-                _DsaPool(rank), 2, (_DsaPool(rank, layers=1, start=61, rank_offset=7),)
-            )
-            linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-            linker.num_layers, linker.pools = group.num_layers, group.entry_map
-            linker.storage = SimpleNamespace(
-                _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
-                _tag_keys=lambda keys: keys,
-            )
-            transfers = group.resolve_transfers(
-                [
-                    PoolTransfer(
-                        name=PoolName.KV, keys=["a", "b"], device_indices=indices
-                    )
-                ]
-            )
-            layouts = linker._prepare_read_plan_layouts([transfers])
-            for entry, (keys, locations, packed, layout) in zip(group.entries, layouts):
-                self.assertEqual(keys, ["a", "b"])
-                self.assertTrue(packed)
-                for layer in range(group.num_layers):
-                    expected = entry.get_prepared_layer_range_meta(locations, layer)
-                    if expected is None:
-                        self.assertEqual(layout[layer], [])
-                        continue
-                    pointers, sizes, offsets = expected
-                    actual = [
-                        (
-                            [
-                                base + row * stride
-                                for base, stride, _, _ in layout[layer]
-                            ],
-                            [size for _, _, size, _ in layout[layer]],
-                            [offset for _, _, _, offset in layout[layer]],
-                        )
-                        for row in locations
-                    ]
-                    self.assertEqual(actual, list(zip(pointers, sizes, offsets)))
 
     def test_missing_owned_buffer_is_rejected(self):
         target = _DsaPool()

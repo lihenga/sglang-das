@@ -694,7 +694,7 @@ def _mha_device_pool_entry(
         indices_from_pool=indices_from_pool,
         device_pool=pool,
         # This branch's MooncakeStore uses separate DRAFT_k / DRAFT_v keys.
-        # Keep offsets relative to each object for range reads and ReadPlan.
+        # Keep offsets relative to each object for range reads.
         components=[pool.k_buffer, pool.v_buffer],
         layer_mapping=layer_mapping,
         page_size=page_size,

@@ -15,8 +15,9 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import mooncake.store as native
-import sglang
 import torch
+
+import sglang
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
@@ -48,10 +49,6 @@ class RecordedStore:
 
 
 def run_case(device, mode):
-    os.environ["SGLANG_MOONCAKE_READ_PLAN"] = "0" if mode == "default" else "1"
-    os.environ["SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES"] = (
-        "1" if mode == "plan" else "0"
-    )
     protocol = os.environ.get("MATRIX_PROTOCOL", "tcp")
     if protocol == "tcp":
         os.environ["MC_FORCE_TCP"] = "1"
@@ -118,7 +115,6 @@ def run_case(device, mode):
         schedule_policy="fcfs",
         disaggregation_mode="prefill",
         mooncake_enable_waiting_queue_dfs_prefetch=True,
-        mooncake_page_wise_load_threshold=1,
         mooncake_enable_page_wise_load=mode == "pagewise",
     )
     params = SimpleNamespace(
@@ -201,13 +197,8 @@ def run_case(device, mode):
         returned = linker.load_layer_wise(index, batches)
         assert returned is not False
         counter = linker.layer_done_counter
-        if hasattr(counter, "futures"):
-            for future in counter.futures[index]:
-                assert future.exception(timeout=10) is None
-        else:
-            plan = counter.plans[index].result(timeout=10)
-            for layer in range(2):
-                plan.wait(layer)
+        for future in counter.futures[index]:
+            assert future.exception(timeout=10) is None
         linker.layer_done_counter.set_consumer(index)
         for layer in range(2):
             linker.layer_done_counter.wait_until(layer)
@@ -226,13 +217,11 @@ def run_case(device, mode):
             )
         calls = dict(recorded.calls)
         if caller == "new":
-            if getattr(linker, "read_plan_enabled", False):
-                expected_method = "create_read_plan"
-                assert mode != "default"
-            elif mode == "pagewise":
-                expected_method = "batch_get_into_multi_buffer_ranges"
-            else:
-                expected_method = "batch_get_into_layouts"
+            expected_method = (
+                "batch_get_into_layouts"
+                if linker.read_layout_enabled
+                else "batch_get_into_multi_buffer_ranges"
+            )
             assert calls.get(expected_method, 0) > 0, (expected_method, calls)
             if expected_method != "batch_get_into_multi_buffer_ranges":
                 assert calls.get("batch_get_into_multi_buffer_ranges", 0) == 0, calls
@@ -250,7 +239,6 @@ def run_case(device, mode):
                     "mooncake": native.__file__,
                     "write_calls": writes,
                     "read_calls": calls,
-                    "read_plan": getattr(linker, "read_plan_enabled", False),
                     "read_layout": getattr(linker, "read_layout_enabled", False),
                 }
             ),
@@ -266,6 +254,6 @@ def run_case(device, mode):
 
 if __name__ == "__main__":
     for device in os.environ.get("MATRIX_DEVICES", "cpu,cuda").split(","):
-        for mode in ("default", "plan", "pagewise"):
+        for mode in ("default", "pagewise"):
             run_case(device, mode)
     print("WHEEL_SWAP_ALL_PASSED", os.environ["MATRIX_CALLER"], flush=True)
