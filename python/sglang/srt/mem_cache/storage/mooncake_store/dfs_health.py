@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import threading
 import time
@@ -79,13 +80,19 @@ class _NativeProbeCall:
     capability: str
     done: threading.Event
     started_at: float
+    started_at_unix_s: float
     thread: threading.Thread | None = None
     result: int | Exception | None = None
     timed_out: bool = False
+    retry_suppression_logged: bool = False
 
 
 class MooncakeDfsHealthManager:
     """Owns rank-local DFS health and the native client's effective policy."""
+
+    # Native calls cannot be cancelled by Python. Allow bounded replacements
+    # for stuck calls without accumulating unbounded daemon threads.
+    _MAX_INFLIGHT_PER_CAPABILITY = 3
 
     def __init__(
         self,
@@ -109,6 +116,10 @@ class MooncakeDfsHealthManager:
         self._probe_calls: dict[str, _NativeProbeCall | None] = {
             "read": None,
             "write": None,
+        }
+        self._probe_inflight: dict[str, list[_NativeProbeCall]] = {
+            "read": [],
+            "write": [],
         }
         self._read_state = UNKNOWN
         self._write_state = UNKNOWN
@@ -256,17 +267,39 @@ class MooncakeDfsHealthManager:
     ) -> _NativeProbeCall:
         with self._probe_lock:
             existing = self._probe_calls[capability]
-            if existing is not None:
+            if existing is not None and not existing.timed_out:
+                return existing
+            inflight = self._probe_inflight[capability]
+            inflight[:] = [call for call in inflight if not call.done.is_set()]
+            if len(inflight) >= self._MAX_INFLIGHT_PER_CAPABILITY:
+                # All attempts are still in native code. Keep failing closed
+                # until a slot is released instead of spawning more threads.
+                assert existing is not None
+                if not existing.retry_suppression_logged:
+                    existing.retry_suppression_logged = True
+                    logger.warning(
+                        "Mooncake native DFS %s probe retry suppressed: "
+                        "%s calls still pending, oldest_age_s=%.3f; "
+                        "waiting for an in-flight slot",
+                        capability,
+                        len(inflight),
+                        time.monotonic() - inflight[0].started_at,
+                    )
                 return existing
             call = _NativeProbeCall(
                 capability=capability,
                 done=threading.Event(),
                 started_at=time.monotonic(),
+                started_at_unix_s=time.time(),
             )
 
             def invoke() -> None:
                 try:
-                    call.result = int(getattr(self._store, method_name)())
+                    call.result = int(
+                        getattr(self._store, method_name)(
+                            timeout_ms=max(1, math.ceil(self._probe_timeout_s * 1000))
+                        )
+                    )
                 except Exception as exc:
                     call.result = exc
                 finally:
@@ -286,7 +319,13 @@ class MooncakeDfsHealthManager:
                 daemon=True,
             )
             self._probe_calls[capability] = call
-            call.thread.start()
+            inflight.append(call)
+            try:
+                call.thread.start()
+            except Exception:
+                inflight.remove(call)
+                self._probe_calls[capability] = None
+                raise
             return call
 
     def _collect_native_probe(self, call: _NativeProbeCall) -> int:
@@ -303,9 +342,15 @@ class MooncakeDfsHealthManager:
                 if call.done.is_set() and self._probe_calls[call.capability] is call:
                     self._probe_calls[call.capability] = None
             logger.warning(
-                "Mooncake native DFS %s probe timed out after %ss",
+                "Mooncake native DFS %s probe timed out after %ss; "
+                "started_at_unix_s=%.6f started_at_monotonic_s=%.6f "
+                "elapsed_s=%.3f; a replacement will be attempted next "
+                "cycle if the in-flight limit permits",
                 call.capability,
                 self._probe_timeout_s,
+                call.started_at_unix_s,
+                call.started_at,
+                time.monotonic() - call.started_at,
             )
             return -1
 
