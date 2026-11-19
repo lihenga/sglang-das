@@ -25,11 +25,19 @@ class _FakeStore:
         self.read_probes = iter(read_probes)
         self.write_probes = iter(write_probes)
         self.policies = []
+        self.probe_timeouts = []
+        self.capability_queries = 0
 
-    def probe_dfs_read(self):
+    def get_capabilities(self):
+        self.capability_queries += 1
+        return {"features": {"dfs_health_timeout_ms": True}}
+
+    def probe_dfs_read(self, timeout_ms=25000):
+        self.probe_timeouts.append(("read", timeout_ms))
         return next(self.read_probes)
 
-    def probe_dfs_write(self):
+    def probe_dfs_write(self, timeout_ms=25000):
+        self.probe_timeouts.append(("write", timeout_ms))
         return next(self.write_probes)
 
     def set_dfs_access_policy(self, allow_read, allow_write):
@@ -38,6 +46,155 @@ class _FakeStore:
 
 
 class MooncakeDfsHealthManagerTest(unittest.TestCase):
+    def test_probe_timeout_is_forwarded_in_milliseconds(self):
+        store = _FakeStore([0], [0])
+        manager = MooncakeDfsHealthManager(store, {"probe_timeout_s": 7})
+        manager.probe_once()
+        self.assertCountEqual(store.probe_timeouts, [("read", 7000), ("write", 7000)])
+
+    def test_capabilities_are_negotiated_once(self):
+        store = _FakeStore([0, 0], [0, 0])
+        manager = MooncakeDfsHealthManager(store, {"probe_timeout_s": 7})
+        self.assertEqual(store.capability_queries, 1)
+        # The selected convention must remain stable across probe rounds.
+        store.get_capabilities = lambda: self.fail("capabilities queried again")
+        manager.probe_once()
+        manager.probe_once()
+        self.assertCountEqual(
+            store.probe_timeouts, [("read", 7000), ("write", 7000)] * 2
+        )
+
+    def test_legacy_no_argument_probes_recover_with_one_warning(self):
+        class Store(_FakeStore):
+            get_capabilities = None
+
+            def probe_dfs_read(self):
+                return super().probe_dfs_read()
+
+            def probe_dfs_write(self):
+                return super().probe_dfs_write()
+
+        store = Store([0, 0], [0, 0])
+        with self.assertLogs(_MODULE.logger, level="WARNING") as logs:
+            manager = MooncakeDfsHealthManager(
+                store, {"probe_timeout_s": 7, "success_threshold": 2}
+            )
+            manager.probe_once()
+            snapshot = manager.probe_once()
+        self.assertEqual(snapshot.read_state, AVAILABLE)
+        self.assertEqual(snapshot.write_state, AVAILABLE)
+        self.assertEqual(store.policies[-1], (True, True))
+        self.assertEqual(
+            sum("lack timeout_ms support" in line for line in logs.output), 1
+        )
+        self.assertEqual(store.capability_queries, 0)
+
+    def test_pybind_signature_fallback_and_per_method_support(self):
+        read_doc = (
+            "probe_dfs_read(self: MooncakeDistributedStore, "
+            "timeout_ms: int = 25000) -> int"
+        )
+        # A prose mention must not enable keyword arguments on the write probe.
+        write_doc = (
+            "probe_dfs_write(self: MooncakeDistributedStore) -> int\n"
+            "Newer releases support timeout_ms."
+        )
+        for declaration in (None, {}, {"features": {"dfs_health": True}}):
+            with self.subTest(declaration=declaration):
+                store = _FakeStore([0], [0])
+                store.get_capabilities = (
+                    None if declaration is None else lambda: declaration
+                )
+                with (
+                    patch.object(_FakeStore.probe_dfs_read, "__doc__", read_doc),
+                    patch.object(_FakeStore.probe_dfs_write, "__doc__", write_doc),
+                    self.assertLogs(_MODULE.logger, level="WARNING") as logs,
+                ):
+                    manager = MooncakeDfsHealthManager(store, {"probe_timeout_s": 7})
+                    manager.probe_once()
+                self.assertCountEqual(
+                    store.probe_timeouts, [("read", 7000), ("write", 25000)]
+                )
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn("(probe_dfs_write)", logs.output[0])
+
+    def test_explicit_false_overrides_timeout_signature(self):
+        store = _FakeStore([0], [0])
+        store.get_capabilities = lambda: {"features": {"dfs_health_timeout_ms": False}}
+        doc = "probe_dfs_read(self: Store, timeout_ms: int = 25000) -> int"
+        with (
+            patch.object(_FakeStore.probe_dfs_read, "__doc__", doc),
+            self.assertLogs(_MODULE.logger, level="WARNING"),
+        ):
+            manager = MooncakeDfsHealthManager(store, {"probe_timeout_s": 7})
+            manager.probe_once()
+        self.assertCountEqual(store.probe_timeouts, [("read", 25000), ("write", 25000)])
+
+    def test_failed_capability_query_falls_back_to_documented_signature(self):
+        store = _FakeStore([0], [0])
+
+        def unavailable():
+            raise RuntimeError("old capability query failed")
+
+        store.get_capabilities = unavailable
+        with (
+            patch.object(
+                _FakeStore.probe_dfs_read,
+                "__doc__",
+                "probe_dfs_read(self: Store, timeout_ms: int = 25000) -> int",
+            ),
+            patch.object(
+                _FakeStore.probe_dfs_write,
+                "__doc__",
+                "probe_dfs_write(self: Store, timeout_ms: int = 25000) -> int",
+            ),
+        ):
+            manager = MooncakeDfsHealthManager(store, {"probe_timeout_s": 7})
+            manager.probe_once()
+        self.assertCountEqual(store.probe_timeouts, [("read", 7000), ("write", 7000)])
+
+    def test_probe_type_error_is_not_retried_without_arguments(self):
+        class Store(_FakeStore):
+            calls = 0
+
+            def probe_dfs_read(self, timeout_ms=25000):
+                self.calls += 1
+                raise TypeError("failure inside native probe")
+
+        store = Store([], [0])
+        manager = MooncakeDfsHealthManager(store, {"failure_threshold": 1})
+        with self.assertLogs(_MODULE.logger, level="ERROR"):
+            snapshot = manager.probe_once()
+        self.assertEqual(store.calls, 1)
+        self.assertEqual(snapshot.read_state, UNAVAILABLE)
+        self.assertEqual(snapshot.read_error, -1)
+
+    def test_legacy_stuck_probe_still_obeys_python_wait_limit(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class Store(_FakeStore):
+            get_capabilities = None
+
+            def probe_dfs_read(self):
+                release.wait()
+                return 0
+
+            def probe_dfs_write(self):
+                return 0
+
+        store = Store([], [])
+        with self.assertLogs(_MODULE.logger, level="WARNING"):
+            manager = MooncakeDfsHealthManager(
+                store, {"failure_threshold": 1, "success_threshold": 1}
+            )
+            manager._probe_timeout_s = 0.05
+            started = time.monotonic()
+            snapshot = manager.probe_once()
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(snapshot.read_state, UNAVAILABLE)
+        self.assertEqual(snapshot.write_state, AVAILABLE)
+
     def test_resolver_uses_cli_then_environment_then_defaults(self):
         env = {
             "SGLANG_MOONCAKE_DFS_HEALTH_PROBE_INTERVAL_S": "4",
@@ -165,7 +322,7 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
                 super().__init__([], [0, 0])
                 self.read_calls = 0
 
-            def probe_dfs_read(self):
+            def probe_dfs_read(self, timeout_ms=25000):
                 self.read_calls += 1
                 release_read.wait()
                 return 0
@@ -190,7 +347,7 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         self.assertEqual(snapshot.write_state, AVAILABLE)
         self.assertEqual(store.policies[-1], (False, True))
         snapshot = manager.probe_once()
-        self.assertEqual(store.read_calls, 1)
+        self.assertEqual(store.read_calls, 2)
         self.assertEqual(snapshot.write_state, AVAILABLE)
 
     def test_stuck_write_does_not_block_or_fail_read_probe(self):
@@ -201,7 +358,7 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
                 super().__init__([0, 0], [])
                 self.write_calls = 0
 
-            def probe_dfs_write(self):
+            def probe_dfs_write(self, timeout_ms=25000):
                 self.write_calls += 1
                 release_write.wait()
                 return 0
@@ -226,8 +383,102 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
         self.assertEqual(snapshot.write_state, UNAVAILABLE)
         self.assertEqual(store.policies[-1], (True, False))
         snapshot = manager.probe_once()
-        self.assertEqual(store.write_calls, 1)
+        self.assertEqual(store.write_calls, 2)
         self.assertEqual(snapshot.read_state, AVAILABLE)
+
+    def test_replacement_recovers_while_first_probe_is_still_stuck(self):
+        for capability in ("read", "write"):
+            with self.subTest(capability=capability):
+                release = threading.Event()
+                self.addCleanup(release.set)
+
+                class Store(_FakeStore):
+                    calls = 0
+
+                    def probe(self, timeout_ms=25000):
+                        self.calls += 1
+                        if self.calls == 1:
+                            release.wait()
+                        return 0
+
+                store = Store([0] * 3, [0] * 3)
+                setattr(store, f"probe_dfs_{capability}", store.probe)
+                manager = MooncakeDfsHealthManager(
+                    store, {"failure_threshold": 1, "success_threshold": 1}
+                )
+                manager._probe_timeout_s = 0.05
+                self.assertEqual(
+                    getattr(manager.probe_once(), f"{capability}_state"), UNAVAILABLE
+                )
+                self.assertEqual(
+                    getattr(manager.probe_once(), f"{capability}_state"), AVAILABLE
+                )
+                self.assertFalse(release.is_set())
+                self.assertEqual(store.calls, 2)
+                release.set()
+
+    def test_permanently_stuck_retries_are_bounded_and_resume_when_slot_frees(self):
+        limit = MooncakeDfsHealthManager._MAX_INFLIGHT_PER_CAPABILITY
+        for capability in ("read", "write"):
+            with self.subTest(capability=capability):
+                releases = [threading.Event() for _ in range(limit)]
+                for release in releases:
+                    self.addCleanup(release.set)
+
+                class Store(_FakeStore):
+                    calls = 0
+
+                    def probe(self, timeout_ms=25000):
+                        index = self.calls
+                        self.calls += 1
+                        if index < len(releases):
+                            releases[index].wait()
+                        return 0
+
+                store = Store([0] * 10, [0] * 10)
+                setattr(store, f"probe_dfs_{capability}", store.probe)
+                manager = MooncakeDfsHealthManager(
+                    store, {"failure_threshold": 1, "success_threshold": 1}
+                )
+                manager._probe_timeout_s = 0.05
+                with self.assertLogs(_MODULE.logger, level="WARNING") as logs:
+                    for _ in range(limit):
+                        manager.probe_once()
+                    for _ in range(5):
+                        snapshot = manager.probe_once()
+                        self.assertEqual(
+                            getattr(snapshot, f"{capability}_state"), UNAVAILABLE
+                        )
+                self.assertEqual(store.calls, limit)
+                self.assertEqual(
+                    sum("probe timed out" in line for line in logs.output), limit + 5
+                )
+                timeout_logs = [
+                    line for line in logs.output if "probe timed out" in line
+                ]
+                self.assertTrue(
+                    all("started_at_unix_s=" in line for line in timeout_logs)
+                )
+                # Rechecks at capacity must retain the original call's start.
+                starts = [
+                    line.split("started_at_unix_s=")[1].split()[0]
+                    for line in timeout_logs
+                ]
+                self.assertEqual(len(set(starts[-6:])), 1)
+
+                # A late success is stale. It only frees capacity for a new
+                # probe; it must not itself reopen the capability.
+                old_call = manager._probe_inflight[capability][0]
+                releases[0].set()
+                self.assertTrue(old_call.done.wait(1))
+                self.assertEqual(
+                    getattr(manager.snapshot(), f"{capability}_state"), UNAVAILABLE
+                )
+                snapshot = manager.probe_once()
+                self.assertEqual(store.calls, limit + 1)
+                self.assertEqual(getattr(snapshot, f"{capability}_state"), AVAILABLE)
+                for release in releases:
+                    release.set()
 
     def test_late_probe_success_does_not_reset_timeout_failures(self):
         release_probes = [threading.Event(), threading.Event()]
@@ -255,10 +506,10 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
                         first_write_finished.set()
                 return 0
 
-            def probe_dfs_read(self):
+            def probe_dfs_read(self, timeout_ms=25000):
                 return self._probe("read")
 
-            def probe_dfs_write(self):
+            def probe_dfs_write(self, timeout_ms=25000):
                 return self._probe("write")
 
         store = Store()
