@@ -76,7 +76,9 @@ class MooncakeDfsHealthManagerTest(unittest.TestCase):
 
         store = Store([0, 0], [0, 0])
         with self.assertLogs(_MODULE.logger, level="WARNING") as logs:
-            manager = MooncakeDfsHealthManager(store, {"probe_timeout_s": 7})
+            manager = MooncakeDfsHealthManager(
+                store, {"probe_timeout_s": 7, "success_threshold": 2}
+            )
             manager.probe_once()
             snapshot = manager.probe_once()
         self.assertEqual(snapshot.read_state, AVAILABLE)
