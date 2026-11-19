@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -143,8 +144,52 @@ class MooncakeDfsHealthManager:
                     "rebuild/install Mooncake with DFS health support."
                 )
 
+        self._probe_supports_timeout = self._negotiate_probe_timeout()
+
         # UNKNOWN is fail-closed. This call happens before SGLang warmup.
         self._apply_policy(False, False)
+
+    def _negotiate_probe_timeout(self) -> dict[str, bool]:
+        """Resolve the native calling convention once, before starting probes."""
+        declared = None
+        query = getattr(self._store, "get_capabilities", None)
+        if callable(query):
+            try:
+                capabilities = query()
+            except Exception:
+                logger.debug("Mooncake capability query failed", exc_info=True)
+            else:
+                if isinstance(capabilities, dict):
+                    features = capabilities.get("features", {})
+                    if isinstance(features, dict):
+                        declared = features.get("dfs_health_timeout_ms")
+
+        supported = {}
+        for method_name in ("probe_dfs_read", "probe_dfs_write"):
+            if isinstance(declared, bool):
+                supported[method_name] = declared
+                continue
+            # Only inspect parameter declarations. A prose mention of timeout_ms
+            # does not mean that an older pybind method accepts the keyword.
+            doc = getattr(getattr(self._store, method_name), "__doc__", "") or ""
+            signatures = re.findall(rf"\b{method_name}\(([^)\n]*)\)", doc)
+            supported[method_name] = any(
+                re.search(r"(?:^|,)\s*timeout_ms\s*(?::|=|$)", signature)
+                for signature in signatures
+            )
+
+        legacy = [
+            name for name, accepts_timeout in supported.items() if not accepts_timeout
+        ]
+        if legacy:
+            logger.warning(
+                "Mooncake native DFS probes lack timeout_ms support (%s); "
+                "calling them without arguments and enforcing the wait limit "
+                "in Python only. Rebuild/install Mooncake to configure the "
+                "native slow-probe logging budget.",
+                ", ".join(legacy),
+            )
+        return supported
 
     def start(self) -> None:
         if self._thread is not None:
@@ -295,11 +340,14 @@ class MooncakeDfsHealthManager:
 
             def invoke() -> None:
                 try:
-                    call.result = int(
-                        getattr(self._store, method_name)(
+                    method = getattr(self._store, method_name)
+                    if self._probe_supports_timeout[method_name]:
+                        result = method(
                             timeout_ms=max(1, math.ceil(self._probe_timeout_s * 1000))
                         )
-                    )
+                    else:
+                        result = method()
+                    call.result = int(result)
                 except Exception as exc:
                     call.result = exc
                 finally:
