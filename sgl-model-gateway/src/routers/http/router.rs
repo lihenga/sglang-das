@@ -308,7 +308,9 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_typed_request(
+                headers, typed_req, route, &worker, model_id, is_stream, load_guard,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -484,12 +486,14 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &'static str,
         worker: &Arc<dyn Worker>,
+        model_id: Option<&str>,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
     ) -> Response {
@@ -632,7 +636,12 @@ impl Router {
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_success() {
+            if status.is_success() {
+                tracked = tracked.with_metrics(
+                    metrics_labels::BACKEND_REGULAR,
+                    model_id.unwrap_or_else(|| worker.model_id()),
+                );
+            } else {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);

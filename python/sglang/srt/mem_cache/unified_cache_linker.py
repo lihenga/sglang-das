@@ -223,7 +223,7 @@ class DevicePoolEntry:
             result[2].append(go)
         return result
 
-    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
+    def get_layer_range_components(self, layer: int):
         buffer_index = self.layer_mapping.get(layer)
         if buffer_index is None:
             return None
@@ -232,7 +232,12 @@ class DevicePoolEntry:
         for component, offsets in zip(self.buffer_meta, self._component_offsets):
             base_ptr, row_stride, size = component[buffer_index]
             items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+        return items
 
+    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
+        items = self.get_layer_range_components(layer)
+        if items is None:
+            return None
         ptrs, sizes, offsets = [], [], []
         for row in locations:
             row_ptrs = [

@@ -24,8 +24,8 @@ import os
 import queue
 import signal
 import sys
-import time
 import threading
+import time
 from array import array
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -2182,9 +2182,7 @@ class Scheduler(
         # object serialization, while CP then TP reductions make the decision
         # identical for every participant in the 2-D attention topology.
         has_jobs = torch.tensor([int(bool(local_status))], dtype=torch.int)
-        self._all_reduce_bg_prefetch_groups(
-            has_jobs, op=torch.distributed.ReduceOp.MAX
-        )
+        self._all_reduce_bg_prefetch_groups(has_jobs, op=torch.distributed.ReduceOp.MAX)
         if int(has_jobs.item()) == 0:
             self._bg_prefetch_join_age.clear()
             return
@@ -2207,14 +2205,14 @@ class Scheduler(
             {rid for statuses in rank_statuses.values() for rid in statuses}
         )
         for rid in all_rids:
-            self._bg_prefetch_join_age[rid] = (
-                self._bg_prefetch_join_age.get(rid, 0) + 1
-            )
+            self._bg_prefetch_join_age[rid] = self._bg_prefetch_join_age.get(rid, 0) + 1
 
         for rid in all_rids:
             rid_statuses = [statuses.get(rid) for statuses in rank_statuses.values()]
             job = self._bg_pending_prefetch_jobs.get(rid)
-            room = self._bg_prefetch_rooms.get(rid) if DAS_PREFETCH_TRACE_ENABLED else None
+            room = (
+                self._bg_prefetch_rooms.get(rid) if DAS_PREFETCH_TRACE_ENABLED else None
+            )
             if DAS_PREFETCH_TRACE_ENABLED:
                 trace_disagg_prefill(
                     "bg_prefetch_round_joined",
@@ -2244,7 +2242,10 @@ class Scheduler(
 
             all_ranks_have_job = all(status is not None for status in rid_statuses)
             if not all_ranks_have_job:
-                if self._bg_prefetch_join_age[rid] >= self.BG_PREFETCH_JOIN_GRACE_EPOCHS:
+                if (
+                    self._bg_prefetch_join_age[rid]
+                    >= self.BG_PREFETCH_JOIN_GRACE_EPOCHS
+                ):
                     if DAS_PREFETCH_TRACE_ENABLED:
                         trace_disagg_prefill(
                             "bg_prefetch_submit_skipped",
@@ -2323,6 +2324,9 @@ class Scheduler(
         job = self._bg_pending_prefetch_jobs.pop(rid, None)
         self._bg_prefetch_join_age.pop(rid, None)
         if job is not None:
+            self._log_waiting_queue_prefetch_event(
+                "submitted" if submitted else "skipped"
+            )
             if DAS_PREFETCH_TRACE_ENABLED:
                 trace_disagg_prefill(
                     "bg_prefetch_ack_enqueued",
@@ -2332,6 +2336,19 @@ class Scheduler(
                     submitted=submitted,
                 )
             self._bg_prefetch_acks.put((job, submitted))
+
+    def _log_waiting_queue_prefetch_event(self, event: str, count: int = 1) -> None:
+        reporter = getattr(self, "metrics_reporter", None)
+        collector = getattr(reporter, "metrics_collector", None)
+        if collector is not None:
+            try:
+                collector.waiting_queue_prefetch_events_total.labels(
+                    **collector.labels, event=event
+                ).inc(count)
+            except Exception:
+                logger.warning(
+                    "Failed to record waiting-queue prefetch event.", exc_info=True
+                )
 
     def _all_reduce_bg_prefetch_groups(
         self,
@@ -2347,7 +2364,9 @@ class Scheduler(
             return
         # A failed round also sets the stop flag: report the failure first.
         if self._bg_error is not None:
-            raise RuntimeError("Background DFS prefetch is unusable") from self._bg_error
+            raise RuntimeError(
+                "Background DFS prefetch is unusable"
+            ) from self._bg_error
         with self._bg_condition:
             if self._bg_stop_flag:
                 return
@@ -2390,9 +2409,7 @@ class Scheduler(
                     self.ps.tp_rank,
                     submitted=submitted,
                 )
-            accepted = self.tree_cache.complete_external_linker_prefetch(
-                job, submitted
-            )
+            accepted = self.tree_cache.complete_external_linker_prefetch(job, submitted)
             if DAS_PREFETCH_TRACE_ENABLED:
                 trace_disagg_prefill(
                     "bg_prefetch_ack_applied",
@@ -2420,9 +2437,12 @@ class Scheduler(
                 self._materialize_cuda_vmm_inputs(recv_req)
 
         for recv_req in recv_reqs:
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
+            # DP-attention health checks await each request's generated output;
+            # heartbeat signals cannot complete the HTTP endpoint's fan-out.
+            if (
+                is_health_check_generate_req(recv_req)
+                and not self.server_args.enable_dp_attention
+                and not self.is_fully_idle(for_health_check=True)
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
@@ -3498,7 +3518,9 @@ class Scheduler(
                     req.bootstrap_room,
                     self.ps.tp_rank,
                     job_created=job is not None,
-                    locally_eligible=(job.locally_eligible if job is not None else False),
+                    locally_eligible=(
+                        job.locally_eligible if job is not None else False
+                    ),
                     transfer_count=(len(job.transfers) if job is not None else 0),
                 )
             if job is not None:
@@ -3514,6 +3536,7 @@ class Scheduler(
                         completed_epoch=self._bg_completed_epoch,
                     )
                 self._bg_prefetch_jobs.put(job)
+                self._log_waiting_queue_prefetch_event("enqueued")
                 if DAS_PREFETCH_TRACE_ENABLED:
                     trace_disagg_prefill(
                         "bg_prefetch_job_enqueued",
@@ -4677,7 +4700,9 @@ class Scheduler(
                 return self.model_worker.forward_batch_generation(batch, **fwd_kwargs)
 
         forward_context = contextvars.copy_context()
-        future = self._forward_launch_executor.submit(forward_context.run, launch_forward)
+        future = self._forward_launch_executor.submit(
+            forward_context.run, launch_forward
+        )
         deferred_reqs = []
 
         def can_prepare_now(req):
@@ -4734,22 +4759,28 @@ class Scheduler(
                             deferred_count=len(deferred_reqs),
                             forward_iter=self.forward_ct,
                         )
-                    elif is_health_check_generate_req(recv_req):
+                    elif (
+                        is_health_check_generate_req(recv_req)
+                        and not self.server_args.enable_dp_attention
+                    ):
                         # A forward is running, so the server is busy: answer
                         # as process_input_requests does when not fully idle.
                         self.return_health_check_ipcs.append(
                             getattr(recv_req, "http_worker_ipc", None)
                         )
-                    elif (
-                        isinstance(recv_req, TokenizedGenerateReqInput)
-                        and can_prepare_now(recv_req)
-                    ):
+                    elif isinstance(
+                        recv_req, TokenizedGenerateReqInput
+                    ) and can_prepare_now(recv_req):
                         self.handle_generate_request(recv_req)
+                        self._log_waiting_queue_prefetch_event("forward_received")
                         received_generate = True
                     elif isinstance(recv_req, BatchTokenizedGenerateReqInput) and all(
                         can_prepare_now(req) for req in recv_req
                     ):
                         self.handle_batch_generate_request(recv_req)
+                        self._log_waiting_queue_prefetch_event(
+                            "forward_received", len(recv_req)
+                        )
                         received_generate = True
                     else:
                         deferred_reqs.append(recv_req)
@@ -5201,15 +5232,23 @@ class Scheduler(
             groups.append([self.chunked_req])
 
         # Critical additions: requests can also live in these queues
-        if hasattr(self, "disagg_prefill_inflight_queue") and self.disagg_prefill_inflight_queue:
+        if (
+            hasattr(self, "disagg_prefill_inflight_queue")
+            and self.disagg_prefill_inflight_queue
+        ):
             groups.append(self.disagg_prefill_inflight_queue)
 
         if hasattr(self, "waiting_queue") and self.waiting_queue:
             groups.append(self.waiting_queue)
 
         # Bootstrap queue access depends on implementation
-        if hasattr(self, "disagg_prefill_bootstrap_queue") and self.disagg_prefill_bootstrap_queue is not None:
-            bootstrap_queue = getattr(self.disagg_prefill_bootstrap_queue, "queue", None)
+        if (
+            hasattr(self, "disagg_prefill_bootstrap_queue")
+            and self.disagg_prefill_bootstrap_queue is not None
+        ):
+            bootstrap_queue = getattr(
+                self.disagg_prefill_bootstrap_queue, "queue", None
+            )
             if bootstrap_queue is not None:
                 groups.append(list(bootstrap_queue))
 
