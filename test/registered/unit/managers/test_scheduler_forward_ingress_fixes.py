@@ -53,6 +53,7 @@ def _ingress_scheduler(forward, receiver):
     s.forward_ct = 0
     s.enable_overlap = False
     s.device = "cpu"
+    s.server_args = SimpleNamespace(enable_dp_attention=False)
     s.device_module = SimpleNamespace(StreamContext=lambda _stream: nullcontext())
     s.forward_stream = SimpleNamespace(wait_stream=lambda _stream: None)
     s.schedule_stream = SimpleNamespace(
@@ -319,6 +320,35 @@ class TestIngressAcrossDpDomains(CustomTestCase):
 
 
 class TestHealthCheckDuringForward(CustomTestCase):
+
+    def test_dp_health_probe_is_dispatched_during_forward(self):
+        health = FakeRequest(HEALTH_CHECK_RID_PREFIX + "dp", ipc="ipc-dp")
+        s = _ingress_scheduler(_slow_forward(0.2), _ScriptedReceiver([health]))
+        s.server_args.enable_dp_attention = True
+        self.assertEqual(_run_ingress(s), "done")
+        self.assertEqual(s.handled, [health.rid])
+        self.assertEqual(s.return_health_check_ipcs, [])
+
+    def test_metric_counts_only_generation_requests_handled_during_forward(self):
+        health = FakeRequest(HEALTH_CHECK_RID_PREFIX + "metric")
+        control = object()
+        s = _ingress_scheduler(
+            _slow_forward(0.2),
+            _ScriptedReceiver([health, FakeRequest("a"), control, FakeRequest("b")]),
+        )
+        collector = SimpleNamespace(
+            labels={"tp_rank": "0"}, waiting_queue_prefetch_events_total=MagicMock()
+        )
+        s.metrics_reporter = SimpleNamespace(metrics_collector=collector)
+        _run_ingress(s)
+        collector.waiting_queue_prefetch_events_total.labels.assert_called_once_with(
+            tp_rank="0", event="forward_received"
+        )
+        collector.waiting_queue_prefetch_events_total.labels.return_value.inc.assert_called_once_with(
+            1
+        )
+        self.assertEqual(s.handled, ["a"])
+
     def test_answered_as_busy_not_dispatched(self):
         health = FakeRequest(HEALTH_CHECK_RID_PREFIX + "x", ipc="ipc-1")
         s = _ingress_scheduler(
