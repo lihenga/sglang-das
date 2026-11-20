@@ -521,12 +521,24 @@ Add these options to the model's existing supported launch configuration:
 ```bash
 --enable-unified-cache-external-linker \
 --unified-cache-external-linker-backend mooncake \
+--unified-cache-external-linker-config '{"memory_replica_num":0,"dfs_replica_num":1}' \
 --schedule-policy fcfs \
 --mooncake-enable-page-wise-load \
 --mooncake-enable-waiting-queue-dfs-prefetch \
 --mooncake-waiting-queue-dfs-prefetch-workers 1 \
 --mooncake-waiting-queue-dfs-prefetch-max-requests 12
 ```
+
+The JSON configuration above writes one DFS replica and no memory replica.
+Omit it to keep the installed Mooncake package's default placement. These
+settings apply to both warmup and cache writes, including grouped and
+multi-buffer writes. With DFS health management, DFS-only warmup uses native
+read/write probes while KV I/O remains gated by rank consensus. Otherwise,
+warmup writes with the requested placement and waits for the object to become readable.
+The installed package must support the requested
+`ReplicateConfig` fields; unsupported placement fails at startup.
+The new linker configuration overrides matching keys from the existing
+`--hicache-storage-backend-extra-config`; other keys from that option are retained.
 
 Do not combine direct linking with `--enable-hierarchical-cache` or
 `--hicache-storage-backend`. DeepSeek 4.1 currently rejects PP > 1 and
@@ -592,6 +604,30 @@ embedded clients. No transport performance or driver compatibility follows
 from successful Python API negotiation.
 
 ### DFS deployment and lease settings
+
+DFS-only mode does not require a separate `mooncake_client` or store-service
+process. Each SGLang rank embeds a RealClient when
+`MOONCAKE_STANDALONE_STORAGE=false` (the default). Keep the Mooncake master and
+shared DFS available, and configure DFS in every SGLang process, for example:
+
+```bash
+export MOONCAKE_MASTER=<master-host>:50051
+export MOONCAKE_STANDALONE_STORAGE=false
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=0
+export MOONCAKE_ENABLE_SSD_OFFLOAD=true
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/absolute/writable/client-state
+export MOONCAKE_DFS_ROOT_DIR=/absolute/shared/dfs-root
+```
+
+Use the master's matching DFS allocator, filesystem adapter, capacity and
+alignment settings. The client-state directory must already exist; the DFS
+root must point to the shared storage managed by the master.
+SGLang reads `MOONCAKE_ENABLE_SSD_OFFLOAD` for its programmatic setup; setting
+only the store-service launcher's `MOONCAKE_OFFLOAD_ENABLED` is insufficient.
+`MOONCAKE_GLOBAL_SEGMENT_SIZE=0` contributes no L3 memory segment. Local transfer
+and DFS staging buffers are still required; the replica counts control stored
+copies, not these I/O buffers.
 
 Keep the working Mooncake master/client DFS configuration for the shared root,
 bucket allocator/alignment/capacity, offload and replica placement. SGLang's
