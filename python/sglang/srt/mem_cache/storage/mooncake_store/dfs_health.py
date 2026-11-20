@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any
 
 import msgspec
@@ -142,6 +143,46 @@ class MooncakeDfsHealthManager:
 
         # UNKNOWN is fail-closed. This call happens before SGLang warmup.
         self._apply_policy(False, False)
+
+    @contextmanager
+    def dfs_only_warmup_policy(self, timeout_s: float):
+        """Allow isolated startup I/O after local probes, then restore fail-closed.
+
+        Only use before background workers or rank consensus have started. Warmup
+        keys are rank-local; serving I/O still requires the coordinated policy.
+        """
+        if self._thread is not None or self._policy_thread is not None:
+            raise RuntimeError("DFS-only warmup must precede health workers.")
+        deadline = time.monotonic() + timeout_s
+        try:
+            while time.monotonic() < deadline:
+                self.probe_once()
+                if self.local_policy() == (True, True):
+                    # Deferred mode normally waits for scheduler consensus, which
+                    # cannot run until the storage constructor has returned.
+                    self._apply_policy(True, True)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(self._interval_s, remaining))
+            else:
+                snapshot = self.snapshot()
+                raise RuntimeError(
+                    "Mooncake DFS-only warmup requires healthy DFS reads and writes; "
+                    f"read_state={snapshot.read_state} "
+                    f"write_state={snapshot.write_state} "
+                    f"read_error={snapshot.read_error} "
+                    f"write_error={snapshot.write_error}"
+                )
+            yield
+        finally:
+            # Also restore after failed probes, native policy updates, or I/O.
+            # Do this synchronously before any serving work can be submitted.
+            self._apply_policy(False, False)
+            with self._policy_condition:
+                self._effective_policy = (False, False)
+                self._desired_policy = (False, False)
+                self._policy_dirty = False
 
     def start(self) -> None:
         with self._probe_lock:

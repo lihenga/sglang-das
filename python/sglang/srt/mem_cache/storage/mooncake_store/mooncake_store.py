@@ -52,6 +52,13 @@ DEFAULT_TENANT_ID = "default"
 logger = logging.getLogger(__name__)
 
 
+def _local_buffer_size() -> int:
+    value = envs.SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE.get()
+    if value < 0:
+        raise ValueError("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE must be nonnegative.")
+    return value
+
+
 class MooncakeHostTensorAllocator(HostTensorAllocator):
     def __init__(self):
         super().__init__()
@@ -457,6 +464,36 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            self.write_replica_config = {
+                native: extra_config[option]
+                for option, native in (
+                    ("memory_replica_num", "replica_num"),
+                    ("dfs_replica_num", "dfs_replica_num"),
+                )
+                if extra_config and option in extra_config
+            }
+            if any(
+                type(value) is not int or value < 0
+                for value in self.write_replica_config.values()
+            ):
+                raise ValueError(
+                    "Mooncake replica counts must be nonnegative integers."
+                )
+            if self.write_replica_config:
+                if self._replicate_config_cls is None:
+                    raise ValueError(
+                        "Explicit replica counts require Mooncake ReplicateConfig."
+                    )
+                probe = self._replicate_config_cls()
+                for name, value in self.write_replica_config.items():
+                    setattr(probe, name, value)
+                if (
+                    probe.replica_num
+                    + probe.dfs_replica_num
+                    + getattr(probe, "nof_replica_num", 0)
+                    == 0
+                ):
+                    raise ValueError("Mooncake writes require at least one replica.")
             if dfs_health_config is None and extra_config:
                 dfs_health_config = extra_config.get("_mooncake_dfs_health_config")
             if enable_client_http_server is None:
@@ -534,7 +571,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
                     required_bytes,
-                    envs.SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE.get(),  # Zero copy interface does not need local buffer
+                    _local_buffer_size(),
                     self.config.client_server_address,
                 )
             else:
@@ -610,7 +647,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         client_hostname,
                         self.config.metadata_server,
                         per_rank_global_segment_size,
-                        envs.SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE.get(),
+                        _local_buffer_size(),
                         self.config.protocol,
                         device_name,
                         self.config.master_server_address,
@@ -710,7 +747,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
             )
-            self.warmup()
+            warmup_config = self._write_config()
+            dfs_only = (
+                warmup_config is not None
+                and warmup_config.replica_num == 0
+                and getattr(warmup_config, "nof_replica_num", 0) == 0
+                and warmup_config.dfs_replica_num > 0
+            )
+            if dfs_only and self._dfs_health_manager is not None:
+                with self._dfs_health_manager.dfs_only_warmup_policy(SETUP_TIMEOUT):
+                    self.warmup()
+            else:
+                self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
             self.enable_storage_metrics = False
@@ -822,9 +870,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Retry logic to handle Transfer Engine startup race condition
         max_retries = 10
         retry_delay = 1.0  # seconds
+        config = self._write_config()
 
         for attempt in range(max_retries):
-            ret = self.store.put(warmup_key, warmup_value)
+            ret = (
+                self.store.put(warmup_key, warmup_value, config)
+                if config is not None
+                else self.store.put(warmup_key, warmup_value)
+            )
             if ret == 0:
                 break
             logger.warning(
@@ -838,8 +891,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "Transfer Engine might not be ready"
             )
 
-        assert self.store.is_exist(warmup_key) == 1
-        assert self.store.get(warmup_key) == warmup_value
+        # DFS writes can return before their replica is published.
+        for _ in range(max_retries):
+            if self.store.is_exist(warmup_key) == 1:
+                if self.store.get(warmup_key) != warmup_value:
+                    raise RuntimeError("Mooncake warmup read returned incorrect data.")
+                return
+            time.sleep(retry_delay)
+        raise RuntimeError("Mooncake warmup object did not become readable.")
+
+    def _write_config(self):
+        policy = getattr(self, "write_replica_config", {})
+        if not policy:
+            return None
+        config = self._replicate_config_cls()
+        for name, value in policy.items():
+            setattr(config, name, value)
+        return config
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
@@ -1499,14 +1567,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
     ) -> List[int]:
-        config = None
+        config = self._write_config()
         if self._can_use_group_semantics() and group_ids is not None:
             if len(group_ids) != len(key_strs):
                 raise ValueError(
                     "Mooncake group_ids length must match key_strs length: "
                     f"{len(group_ids)} != {len(key_strs)}"
                 )
-            config = self._replicate_config_cls()
+            config = config or self._replicate_config_cls()
             config.group_ids = group_ids
 
         if self._uses_multi_buffer(buffer_ptrs):

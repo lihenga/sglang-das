@@ -319,6 +319,20 @@ python -m sglang.launch_server \
     --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_group_semantics": true}'
 ```
 
+**DFS-only write policy:**
+
+Use `--hicache-storage-backend-extra-config '{"memory_replica_num":0,"dfs_replica_num":1}'`
+to request DFS-only writes. Both the Mooncake client and master must support this
+policy, and the DFS backend must be configured and available.
+
+With the distributed storage backend and DFS health APIs, startup waits for local
+read and write probes to meet the configured health success threshold before
+enabling DFS for the isolated warmup object. It restores the fail-closed policy
+after warmup, including on failure. Multi-rank serving still uses the existing
+coordinated health policy. If health does not recover within the 600-second setup
+budget, startup reports the DFS read/write states and probe errors instead of
+submitting a zero-replica warmup write.
+
 **HiCache Related Parameters for SGLang Server**
 
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
