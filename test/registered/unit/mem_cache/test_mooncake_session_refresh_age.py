@@ -113,6 +113,20 @@ def _revalidate(linker, clock, rid="rid"):
 
 
 class TestSessionRefreshAge(CustomTestCase):
+    def test_health_disable_cannot_reuse_a_young_dfs_session(self):
+        """Even a fresh lease must revalidate when DFS reads or writes become unavailable."""
+        for policy in ((False, True), (True, False)):
+            with self.subTest(policy=policy):
+                clock = _Clock()
+                linker = _linker(refresh_results=[-1, -1])
+                self.addCleanup(linker.session_executor.shutdown)
+                _prefetched(linker, clock)
+                clock.now += 1.0
+                linker.storage.get_local_dfs_health_policy = lambda: policy
+                self.assertFalse(_revalidate(linker, clock))
+                self.assertNotIn("k0", linker.session_lease_base)
+                self.assertNotIn("k1", linker.session_lease_base)
+
     def test_young_private_session_skips_refresh(self):
         clock = _Clock()
         linker = _linker()

@@ -639,6 +639,8 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=self.dp_tp_cpu_group,
                 tree_cache=self.tree_cache,
+                attn_cp_group=self.attn_cp_cpu_group,
+                pp_group=self.pp_group.cpu_group,
             )
         else:
             self.decode_offload_manager = None

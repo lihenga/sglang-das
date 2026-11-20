@@ -46,6 +46,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DFS_POLICY_RETRY_MAX_S = 30.0
+_DFS_POLICY_WARNING_INTERVAL_S = 30.0
+
 
 class DecodeKVCacheOffloadManager:
     """Manage decode-side KV cache offloading lifecycle and operations."""
@@ -56,6 +59,8 @@ class DecodeKVCacheOffloadManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
+        attn_cp_group: torch.distributed.ProcessGroup | None = None,
+        pp_group: torch.distributed.ProcessGroup | None = None,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -71,6 +76,8 @@ class DecodeKVCacheOffloadManager:
             )
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.attn_cp_group = attn_cp_group
+        self.pp_group = pp_group
 
         hicache_storage_backend_extra_config = {}
         if get_memory().hicache_storage_backend_extra_config:
@@ -101,6 +108,8 @@ class DecodeKVCacheOffloadManager:
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
                 tp_cache_group=tp_group,
+                attn_cp_cache_group=attn_cp_group,
+                pp_cache_group=pp_group,
             )
             self.decode_host_mem_pool, self.cache_controller = build_hybrid_swa_stack(
                 params=params,
@@ -127,6 +136,8 @@ class DecodeKVCacheOffloadManager:
                 mem_pool_host=self.decode_host_mem_pool,
                 page_size=self.page_size,
                 tp_group=tp_group,
+                attn_cp_group=attn_cp_group,
+                pp_group=pp_group,
                 io_backend=get_memory().hicache_io_backend,
                 load_cache_event=threading.Event(),
                 storage_backend=get_memory().hicache_storage_backend,
@@ -140,6 +151,12 @@ class DecodeKVCacheOffloadManager:
         # in flight); weak keys so a dropped Req is never pinned here.
         self.offloaded_state: WeakKeyDict[Req, OffloadedState] = WeakKeyDict()
         self.offload_inflight: WeakKeyDict[Req, int] = WeakKeyDict()
+        self._dfs_policy_failed_target = None
+        self._dfs_policy_sync_enabled = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
         logger.info("Enable offload kv cache for decode side")
 
     def release_host_resources(self) -> None:
@@ -265,6 +282,8 @@ class DecodeKVCacheOffloadManager:
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
 
+        self._sync_dfs_health_policy()
+
         qsizes = torch.tensor(
             [
                 len(cc.ack_write_queue),
@@ -302,6 +321,92 @@ class DecodeKVCacheOffloadManager:
                 f"{len(self.ongoing_offload)} copies, "
                 f"{len(self.offload_inflight)} requests)."
             )
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply the most conservative decode-side policy across TP/CP/PP."""
+        owner = getattr(self.cache_controller, "storage_backend", None)
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if getattr(self, "_dfs_policy_sync_enabled", None) is None:
+            available = int(local_policy is not None)
+            agreement = torch.tensor([available, -available], dtype=torch.int)
+            self._all_reduce_dfs_policy(agreement)
+            if int(agreement[0]) != -int(agreement[1]):
+                raise ValueError(
+                    "Decode Mooncake DFS health capability/configuration differs across TP/CP/PP ranks"
+                )
+            self._dfs_policy_sync_enabled = bool(agreement[0])
+        if not self._dfs_policy_sync_enabled:
+            return
+        if local_policy is None:
+            raise RuntimeError("Decode Mooncake DFS health manager disappeared")
+
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        self._all_reduce_dfs_policy(effective)
+        values = effective.tolist()
+        allow_write = bool(values[1])
+        target = (bool(values[0]) and allow_write, allow_write)
+
+        # All ranks participate above on every scheduler step. A failed rank-local
+        # policy RPC is retried with bounded backoff afterwards.
+        now = time.monotonic()
+        if (
+            self._dfs_policy_failed_target == target
+            and now < self._dfs_policy_next_retry_at
+        ):
+            return
+        try:
+            apply_policy(*target)
+        except Exception as exc:
+            failures = (
+                self._dfs_policy_consecutive_failures + 1
+                if self._dfs_policy_failed_target == target
+                else 1
+            )
+            retry_delay = min(2 ** min(failures - 1, 30), _DFS_POLICY_RETRY_MAX_S)
+            self._dfs_policy_failed_target = target
+            self._dfs_policy_consecutive_failures = failures
+            self._dfs_policy_next_retry_at = now + retry_delay
+            if now - self._dfs_policy_last_warning_at >= _DFS_POLICY_WARNING_INTERVAL_S:
+                logger.warning(
+                    "Decode-side Mooncake DFS policy application failed; retaining "
+                    "the previous policy: target_read=%s target_write=%s failures=%d "
+                    "retry_in_s=%.1f suppressed=%d error=%r",
+                    target[0],
+                    target[1],
+                    failures,
+                    retry_delay,
+                    self._dfs_policy_suppressed_warnings,
+                    exc,
+                )
+                self._dfs_policy_last_warning_at = now
+                self._dfs_policy_suppressed_warnings = 0
+            else:
+                self._dfs_policy_suppressed_warnings += 1
+            return
+
+        if self._dfs_policy_consecutive_failures:
+            logger.info(
+                "Decode-side Mooncake DFS policy application recovered: "
+                "target_read=%s target_write=%s failures=%d",
+                target[0],
+                target[1],
+                self._dfs_policy_consecutive_failures,
+            )
+        self._dfs_policy_failed_target = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_suppressed_warnings = 0
+
+    def _all_reduce_dfs_policy(self, values: torch.Tensor) -> None:
+        for group in (self.tp_group, self.attn_cp_group, self.pp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(
+                    values, op=torch.distributed.ReduceOp.MIN, group=group
+                )
 
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""

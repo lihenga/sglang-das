@@ -93,10 +93,10 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         self.assertEqual(
             resolve_dfs_health_config(),
             {
-                "probe_interval_s": 10,
-                "failure_threshold": 3,
-                "success_threshold": 3,
-                "probe_timeout_s": 2,
+                "probe_interval_s": 5,
+                "failure_threshold": 2,
+                "success_threshold": 2,
+                "probe_timeout_s": 5,
             },
         )
 
@@ -181,7 +181,7 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         snapshot = manager.probe_once()
         self.assertEqual(snapshot.read_state, AVAILABLE)
         self.assertEqual(snapshot.write_state, UNAVAILABLE)
-        self.assertEqual(store.policies[-1], (True, False))
+        self.assertEqual(store.policies[-1], (False, False))
 
     def test_read_and_write_recover_independently(self):
         store, manager = self._manager(
@@ -196,12 +196,124 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         snapshot = manager.probe_once()
         self.assertEqual(snapshot.read_state, AVAILABLE)
         self.assertEqual(snapshot.write_state, UNAVAILABLE)
-        self.assertEqual(store.policies[-1], (True, False))
+        self.assertEqual(store.policies[-1], (False, False))
 
         manager.probe_once()
         snapshot = manager.probe_once()
         self.assertEqual(snapshot.write_state, AVAILABLE)
         self.assertEqual(store.policies[-1], (True, True))
+
+    def test_write_failure_cannot_be_overridden_by_a_read_only_policy(self):
+        """A successful read probe cannot reopen DFS while writes are unhealthy."""
+        store, manager = self._manager([0, 0], [-1, -1])
+        manager.probe_once()
+        manager.probe_once()
+        self.assertEqual(manager.snapshot().read_state, AVAILABLE)
+        self.assertEqual(manager.local_policy(), (False, False))
+        manager.apply_effective_policy(True, False)
+        self.assertEqual(store.policies[-1], (False, False))
+
+    def test_data_timeout_trips_policy_and_recovers_only_after_fresh_probes(self):
+        """Business I/O failures bypass the failure threshold, not recovery hysteresis."""
+        for capability, error, disabled_policy in (
+            ("read", -1607, (False, True)),
+            ("write", -1606, (False, False)),
+        ):
+            with self.subTest(capability=capability):
+                store, manager = self._manager([0] * 4, [0] * 4)
+                self.addCleanup(manager.close)
+                manager.probe_once()
+                manager.probe_once()
+                self.assertEqual(manager.local_policy(), (True, True))
+
+                manager.report_operation_timeout(capability, error)
+                snapshot = manager.snapshot()
+                self.assertEqual(getattr(snapshot, f"{capability}_state"), UNAVAILABLE)
+                self.assertEqual(getattr(snapshot, f"{capability}_error"), error)
+                self.assertEqual(manager.local_policy(), disabled_policy)
+                # A delayed collective/probe result must not reopen the failed capability.
+                manager.apply_effective_policy(True, True)
+                self._wait_for_policy(manager, disabled_policy)
+
+                manager.probe_once()
+                self.assertEqual(manager.local_policy(), disabled_policy)
+                manager.probe_once()
+                self._wait_for_policy(manager, (True, True))
+                self.assertEqual(store.policies[-1], (True, True))
+
+    def test_data_timeout_never_reopens_consensus_disabled_capability(self):
+        """A rank-local timeout can restrict, but cannot undo a peer's disable."""
+        store, manager = self._manager([0, 0], [0, 0])
+        self.addCleanup(manager.close)
+        manager.probe_once()
+        manager.probe_once()
+        manager.apply_effective_policy(False, False)
+        manager.report_operation_timeout("read", -1607)
+        self._wait_for_policy(manager, (False, False))
+        self.assertEqual(manager.local_policy(), (False, True))
+        self.assertEqual(store.policies[-1], (False, False))
+
+    def test_data_timeout_coalesces_a_pending_enable_without_blocking(self):
+        """Timeout cleanup remains responsive while a native policy RPC is stuck."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Store(_FakeStore):
+            def set_dfs_access_policy(self, read, write):
+                self.policies.append((read, write))
+                if read and write:
+                    entered.set()
+                    release.wait()
+                return 0
+
+        store = Store([], [])
+        manager = MooncakeDfsHealthManager(store, defer_policy_application=True)
+        self.addCleanup(manager.close)
+        self.addCleanup(release.set)
+        manager.apply_effective_policy(True, True)
+        self.assertTrue(entered.wait(1))
+        manager.report_operation_timeout("write", -1606)
+        self.assertEqual(manager.local_policy(), (False, False))
+        self.assertEqual(manager._desired_policy, (False, False))
+        self.assertEqual(store.policies, [(False, False), (True, True)])
+        release.set()
+        self._wait_for_policy(manager, (False, False))
+        self.assertEqual(store.policies[-1], (False, False))
+
+    def test_probe_started_before_data_timeout_cannot_count_towards_recovery(self):
+        """A late successful probe must not erase a newer business-I/O failure."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Store(_FakeStore):
+            read_calls = 0
+
+            def probe_dfs_read(self):
+                self.read_calls += 1
+                if self.read_calls == 3:
+                    entered.set()
+                    release.wait()
+                return 0
+
+        store = Store([], [0] * 5)
+        manager = MooncakeDfsHealthManager(store, {"success_threshold": 2})
+        self.addCleanup(manager.close)
+        self.addCleanup(release.set)
+        manager.probe_once()
+        manager.probe_once()
+        probe = threading.Thread(target=manager.probe_once, daemon=True)
+        probe.start()
+        self.assertTrue(entered.wait(1))
+        manager.report_operation_timeout("write", -1606)
+        release.set()
+        probe.join(timeout=1)
+        self.assertFalse(probe.is_alive())
+        self.assertEqual(manager.snapshot().write_successes, 0)
+        self.assertEqual(manager.local_policy(), (False, False))
+        manager.probe_once()
+        self.assertEqual(manager.local_policy(), (False, False))
+        manager.probe_once()
+        self.assertEqual(manager.local_policy(), (True, True))
 
     def test_deferred_policy_waits_for_coordinated_result(self):
         store = _FakeStore([0], [0])
@@ -223,10 +335,10 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         self.assertEqual(manager.local_policy(), (True, True))
         self.assertEqual(store.policies, [(False, False)])
 
-        manager.apply_effective_policy(True, False)
-        self._wait_for_policy(manager, (True, False))
-        manager.apply_effective_policy(True, False)
-        self.assertEqual(store.policies, [(False, False), (True, False)])
+        manager.apply_effective_policy(False, True)
+        self._wait_for_policy(manager, (False, True))
+        manager.apply_effective_policy(False, True)
+        self.assertEqual(store.policies, [(False, False), (False, True)])
 
     def test_deferred_stuck_policy_coalesces_updates_without_blocking_scheduler(self):
         """A pending native call must not block polls or overwrite a newer target."""
@@ -291,10 +403,10 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
             store, {"probe_interval_s": 1}, defer_policy_application=True
         )
         self.addCleanup(manager.close)
-        self.assertFalse(manager.apply_effective_policy(True, False))
+        self.assertFalse(manager.apply_effective_policy(False, True))
         self.assertTrue(failed.wait(1))
-        self._wait_for_policy(manager, (True, False))
-        self.assertEqual(store.policies, [(False, False), (True, False), (True, False)])
+        self._wait_for_policy(manager, (False, True))
+        self.assertEqual(store.policies, [(False, False), (False, True), (False, True)])
 
     def test_close_refuses_a_stuck_native_policy_in_both_application_modes(self):
         """An unfinished policy RPC must retain its client, including sync callers."""
@@ -776,7 +888,7 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         self.assertLess(time.monotonic() - started_at, 1.5)
         self.assertEqual(snapshot.read_state, AVAILABLE)
         self.assertEqual(snapshot.write_state, UNAVAILABLE)
-        self.assertEqual(store.policies[-1], (True, False))
+        self.assertEqual(store.policies[-1], (False, False))
         snapshot = manager.probe_once()
         self.assertEqual(store.write_calls, 1)
         self.assertEqual(snapshot.read_state, AVAILABLE)

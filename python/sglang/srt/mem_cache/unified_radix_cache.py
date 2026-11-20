@@ -3555,8 +3555,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
             load_count, offload_count = map(int, finish_counts[:2].tolist())
             if local_policy is not None:
+                effective_policy = finish_counts[2:]
+                self._all_reduce_dfs_policy_pp(effective_policy)
                 policy_owner.apply_dfs_health_policy(
-                    *(bool(value) for value in finish_counts[2:].tolist())
+                    *(bool(value) for value in effective_policy.tolist())
                 )
             self._collect_failed_linker_loads(load_count)
             self.retry_stranded_failed_linker_chains()
@@ -4003,9 +4005,10 @@ class UnifiedRadixCache(BasePrefixCache):
             available = int(local_policy is not None)
             agreement = torch.tensor([available, -available], dtype=torch.int)
             self._all_reduce_attn_groups(agreement, torch.distributed.ReduceOp.MIN)
+            self._all_reduce_dfs_policy_pp(agreement)
             if int(agreement[0]) != -int(agreement[1]):
                 raise ValueError(
-                    "Mooncake DFS health capability/configuration differs across attention ranks"
+                    "Mooncake DFS health capability/configuration differs across attention/PP ranks"
                 )
             self._dfs_policy_sync_enabled = bool(agreement[0])
         if not self._dfs_policy_sync_enabled:
@@ -4016,12 +4019,20 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return owner, local_policy
 
+    def _all_reduce_dfs_policy_pp(self, values: torch.Tensor) -> None:
+        """Join corresponding PP stages after attention-rank consensus."""
+        if getattr(self, "pp_size", 1) > 1 and self.pp_group is not None:
+            torch.distributed.all_reduce(
+                values, op=torch.distributed.ReduceOp.MIN, group=self.pp_group
+            )
+
     def _sync_dfs_health_policy(self) -> None:
-        """Apply one conservative DFS policy across all attention ranks."""
+        """Apply one conservative DFS policy across all attention and PP ranks."""
         owner, local_policy = self._local_dfs_health_policy()
         if local_policy is not None:
             effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
             self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+            self._all_reduce_dfs_policy_pp(effective)
             owner.apply_dfs_health_policy(
                 *(bool(value) for value in effective.tolist())
             )

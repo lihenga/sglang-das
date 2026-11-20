@@ -11,6 +11,11 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+    AVAILABLE,
+    UNAVAILABLE,
+    MooncakeDfsHealthManager,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
     ReadPlanLoadCounter,
@@ -226,6 +231,98 @@ class TestMooncakeDirectLinkerReadPlan(CustomTestCase):
         linker.layer_done_counter = ReadPlanLoadCounter(num_layers=1)
         linker.layer_done_counter.update_producer()
         return linker
+
+    def test_read_plan_distinguishes_dfs_timeout_from_admission_backpressure(self):
+        """Only admitted DFS I/O timeouts may change the client's health policy."""
+        for error, expected_state in (
+            (-1607, UNAVAILABLE),
+            (-1608, AVAILABLE),
+            (-1601, AVAILABLE),
+        ):
+            with self.subTest(error=error):
+                native = types.SimpleNamespace(
+                    probe_dfs_read=lambda: 0,
+                    probe_dfs_write=lambda: 0,
+                    set_dfs_access_policy=lambda read, write: 0,
+                    create_read_plan=Mock(),
+                )
+                manager = MooncakeDfsHealthManager(native, {"success_threshold": 1})
+                self.addCleanup(manager.close)
+                manager.probe_once()
+                storage = MooncakeStore.__new__(MooncakeStore)
+                storage.store = native
+                storage._dfs_health_manager = manager
+                linker = self._read_plan_linker(prefetch=False)
+                linker.storage = storage
+                native.create_read_plan.return_value.run.side_effect = RuntimeError(
+                    f"Mooncake read plan range get failed key_index=0 rc={error} expected=4096"
+                )
+                with self.assertLogs(level="ERROR"):
+                    self.assertFalse(linker.load_layer_wise(0, []))
+                self.assertEqual(manager.snapshot().read_state, expected_state)
+
+    def test_store_scalar_and_multi_buffer_io_report_only_dfs_timeouts(self):
+        """Store health must see both native buffer APIs without treating admission as DFS failure."""
+        for multi_buffer in (False, True):
+            for write, error, expected_policy in (
+                (False, -1607, (False, True)),
+                (False, -1608, (True, True)),
+                (True, -1606, (False, False)),
+            ):
+                with self.subTest(multi_buffer=multi_buffer, write=write, error=error):
+                    native = Mock()
+                    native.probe_dfs_read.return_value = 0
+                    native.probe_dfs_write.return_value = 0
+                    native.set_dfs_access_policy.return_value = 0
+                    method = ("batch_put_from" if write else "batch_get_into") + (
+                        "_multi_buffers" if multi_buffer else ""
+                    )
+                    getattr(native, method).return_value = [error]
+                    manager = MooncakeDfsHealthManager(native, {"success_threshold": 1})
+                    self.addCleanup(manager.close)
+                    manager.probe_once()
+                    storage = MooncakeStore.__new__(MooncakeStore)
+                    storage.store = native
+                    storage._dfs_health_manager = manager
+                    storage._use_group_semantics = False
+                    io = (
+                        storage._put_batch_zero_copy_impl
+                        if write
+                        else storage._get_batch_zero_copy_impl
+                    )
+                    pointers = [[1, 2]] if multi_buffer else [1]
+                    sizes = [[4, 4]] if multi_buffer else [4]
+                    self.assertEqual(io(["key"], pointers, sizes), [error])
+                    self.assertEqual(manager.local_policy(), expected_policy)
+
+    def test_borrowed_read_plan_requires_memory_after_dfs_read_or_write_disable(self):
+        """A prepared DFS session cannot bypass a later read/write health disable."""
+        for policy in ((False, True), (True, False)):
+            for source in ("memory", "dfs"):
+                with self.subTest(policy=policy, source=source):
+                    linker = self._read_plan_linker(prefetch=True)
+                    linker.host_prefetch_worker_count = 1
+                    linker._init_session_runtime()
+                    self.addCleanup(linker.session_executor.shutdown)
+                    linker.storage.get_local_dfs_health_policy = lambda: policy
+                    linker.storage.store.batch_get_session_start_with_sources.return_value = (
+                        [0],
+                        [source],
+                    )
+                    linker.prepared_load_sessions = {"rid": ["page"]}
+                    linker.session_refcounts = {"page": 1}
+                    linker.session_sources = {"page": "dfs"}
+                    linker.session_lease_base = {"page": 1.0}
+                    layouts = [(["page"], [0], True, [[]])]
+                    if source == "memory":
+                        linker._reselect_read_plan_sessions_if_needed(layouts)
+                        self.assertEqual(linker.session_sources["page"], "memory")
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "no usable memory replica"
+                        ):
+                            linker._reselect_read_plan_sessions_if_needed(layouts)
+                        self.assertEqual(linker.session_sources["page"], "dfs")
 
     def test_prefetch_off_read_plan_owns_sessions(self):
         linker = self._read_plan_linker(prefetch=False)

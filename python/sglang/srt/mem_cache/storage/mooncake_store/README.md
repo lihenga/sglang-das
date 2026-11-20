@@ -621,14 +621,36 @@ DFS health has independent read/write probes and fail-closed policy before
 warmup. Configure interval, failure/success thresholds and timeout with the
 `--mooncake-dfs-health-*` options, or corresponding
 `SGLANG_MOONCAKE_DFS_HEALTH_*` environment variables. Attention ranks apply a
-common conservative policy. Recovery does not promise backfill of every write
-made while DFS was unavailable.
+common conservative policy across attention and PP ranks, including decode KV
+offload. The defaults match `gh/dspark_opt` commit `6bcb41be33`: a 5-second probe
+interval, 2 consecutive failures to disable, 2 consecutive successes to recover,
+and a 5-second probe timeout. Explicit config, CLI settings and environment values
+retain their existing precedence. Read and write probes keep independent health
+states, but effective DFS reads require both states to be available.
+
+Real data-I/O timeouts (`-1606` for writes, `-1607` for reads) immediately mark
+the corresponding local capability unavailable and queue a restrictive native
+policy update on the existing serialized worker. A write timeout disables both
+reads and writes. BatchGet admission backpressure (`-1608`) does not disable DFS.
+Recovery still requires the configured number of fresh successful probes;
+results from probes started before a data timeout cannot count towards recovery.
+A local timeout cannot reopen a capability disabled by rank consensus. Native
+updates remain asynchronous, so the local state transition does not confirm a
+native disable until the worker's call succeeds.
+
+When DFS becomes unavailable, young prefetched sessions must revalidate and
+borrowed ReadPlan sessions must reselect memory replicas before reading. A DFS
+source remaining after reselection fails the load. Decode offload also applies
+TP/CP/PP consensus, checks health-capability agreement before policy polling, and
+retains bounded retries and rate-limited warnings for failed policy submissions.
+Recovery does not promise backfill of every write made while DFS was unavailable.
 
 Initial fail-closed setup must succeed synchronously before any client warms up.
-In deferred mode, only scheduler-coordinated policies reach a single background
-worker; pending updates coalesce to the latest target. Failed updates retry at
-the probe interval without scheduler polling. Non-deferred clients keep
-synchronous policy application. An unconfirmed native reply stays dirty when the
+In deferred mode, recovery uses scheduler-coordinated policies on a single
+background worker; local data timeouts may only restrict permissions. Pending
+updates coalesce to the latest target. Failed updates retry at the probe interval
+without scheduler polling. Non-deferred probe updates remain synchronous. An
+unconfirmed native reply stays dirty when the
 target returns to the last confirmed policy. A hung call occupies the one worker
 until it returns; it is neither cancelled nor replaced by concurrent RPCs.
 Embedded RealClient policy updates are local atomic stores. Standalone
