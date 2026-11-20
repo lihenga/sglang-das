@@ -1247,39 +1247,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             page_wise = self.enable_page_wise_load and not (
                 callable(all_memory) and all_memory(session_keys)
             )
+            read_layout = getattr(self, "read_layout_enabled", False)
             if page_wise:
-                self._load_page_wise(counter_index, batches, maybe_fail)
-            elif getattr(self, "read_layout_enabled", False):
-                self._load_with_read_layout(counter_index, batches, maybe_fail)
+                if read_layout:
+                    self._load_page_wise_with_read_layout(batches, maybe_fail)
+                else:
+                    self._load_page_wise_ranges(counter_index, batches, maybe_fail)
             else:
-                for layer in range(self.num_layers):
-                    for name, (keys, locations) in batches.items():
-                        meta = self.pools[name].get_prepared_layer_range_meta(
-                            locations, layer
-                        )
-                        if meta is None:
-                            continue
-                        ptrs, sizes, offsets = meta
-                        maybe_fail(name, f"layer={layer}")
-                        result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                            keys,
-                            ptrs,
-                            sizes,
-                            offsets,
-                        )
-                        expected = [sum(item) for item in sizes]
-                        if (
-                            result is None
-                            or isinstance(result, int)
-                            or list(result) != expected
-                        ):
-                            raise RuntimeError(
-                                f"Mooncake range get failed for pool={name}, "
-                                f"layer={layer}: transferred={result}, "
-                                f"expected={expected}"
-                            )
-                    if layer < self.num_layers - 1:
-                        self.layer_done_counter.complete(counter_index, layer)
+                if read_layout:
+                    self._load_with_read_layout(counter_index, batches, maybe_fail)
+                else:
+                    self._load_layer_wise_ranges(counter_index, batches, maybe_fail)
             success = True
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
@@ -1314,6 +1292,34 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             ):
                 self.layer_done_counter.complete(counter_index, layer)
         return success
+
+    def _load_layer_wise_ranges(self, counter_index: int, batches, maybe_fail) -> None:
+        for layer in range(self.num_layers):
+            for name, (keys, locations) in batches.items():
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+                if meta is None:
+                    continue
+                ptrs, sizes, offsets = meta
+                maybe_fail(name, f"layer={layer}")
+                result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                    keys,
+                    ptrs,
+                    sizes,
+                    offsets,
+                )
+                expected = [sum(item) for item in sizes]
+                if (
+                    result is None
+                    or isinstance(result, int)
+                    or list(result) != expected
+                ):
+                    raise RuntimeError(
+                        f"Mooncake range get failed for pool={name}, "
+                        f"layer={layer}: transferred={result}, "
+                        f"expected={expected}"
+                    )
+            if layer < self.num_layers - 1:
+                self.layer_done_counter.complete(counter_index, layer)
 
     def _load_with_read_layout(self, counter_index: int, batches, maybe_fail) -> None:
         from mooncake.store import ReadComponent, ReadKeyMapping, ReadLayout
@@ -1404,7 +1410,60 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 exc_info=True,
             )
 
-    def _load_page_wise(self, counter_index: int, batches, maybe_fail) -> None:
+    def _load_page_wise_with_read_layout(self, batches, maybe_fail) -> None:
+        from mooncake.store import ReadComponent, ReadKeyMapping, ReadLayout
+
+        layouts = []
+        expected = []
+        for name, (keys, locations) in batches.items():
+            pool = self.pools[name]
+            # Non-packed keys are row-major, one object per physical component.
+            object_count = 1 if pool.packed else len(pool.buffer_meta)
+            if len(keys) != len(locations) * object_count:
+                raise ValueError(f"Mooncake pool={name} page-wise key/row mismatch")
+            object_items = [[] for _ in range(object_count)]
+            for layer in range(self.num_layers):
+                items = pool.get_layer_range_components(layer)
+                if not items:
+                    continue
+                if len(items) % object_count:
+                    raise ValueError(f"Mooncake pool={name} component count mismatch")
+                width = len(items) // object_count
+                for index in range(object_count):
+                    object_items[index].extend(
+                        items[index * width : (index + 1) * width]
+                    )
+            for index, items in enumerate(object_items):
+                if not items:
+                    continue
+                object_keys = keys[index::object_count]
+                layouts.append(
+                    ReadLayout(
+                        keys=object_keys,
+                        rows=locations,
+                        key_mapping=ReadKeyMapping.PER_ROW,
+                        components=[
+                            ReadComponent(
+                                destination_base=base,
+                                destination_stride=stride,
+                                byte_count=size,
+                                source_offset=offset,
+                            )
+                            for base, stride, size, offset in items
+                        ],
+                    )
+                )
+                expected.append([sum(item[2] for item in items)] * len(object_keys))
+        maybe_fail("aggregated", "complete_page")
+        if layouts:
+            result = self.storage.store.batch_get_into_layouts(layouts)
+            if result is None or list(map(list, result)) != expected:
+                raise RuntimeError(
+                    "Mooncake page-wise layout get failed: "
+                    f"transferred={result}, expected={expected}"
+                )
+
+    def _load_page_wise_ranges(self, counter_index: int, batches, maybe_fail) -> None:
         """Load all layer ranges for each page before exposing the data."""
         all_keys: list[str] = []
         all_ptrs: list[list[int]] = []

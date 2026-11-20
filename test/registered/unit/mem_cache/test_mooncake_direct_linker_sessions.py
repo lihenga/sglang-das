@@ -119,6 +119,238 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
             linker.layer_done_counter.complete.call_args_list, [call(0, 0), call(0, 1)]
         )
 
+    def _page_layout_linker(self, packed):
+        linker = self._session_linker(memory=False, page_wise=True)
+        linker.read_layout_enabled = True
+        linker.num_layers = 3
+        linker.layer_done_counter = LayerWiseLoadCounter(3)
+        linker.layer_done_counter.update_producer()
+        linker.pools = {}
+        buffers = []
+        expected_ranges = []
+        transfers = []
+        for name in (PoolName.KV, PoolName.SWA):
+            pool = DevicePoolEntry.__new__(DevicePoolEntry)
+            pool.packed = packed
+            pool.layer_mapping = {0: [0, 1], 2: 2}
+            pool.buffer_meta = []
+            pool._component_offsets = []
+            offset = 0
+            for component in range(2):
+                if not packed:
+                    offset = 0
+                meta, offsets = [], []
+                for size in (2 + component, 3 + component, 4 + component):
+                    buffer = ctypes.create_string_buffer(4 * size)
+                    buffers.append(buffer)
+                    meta.append((ctypes.addressof(buffer), size, size))
+                    offsets.append(offset)
+                    offset += size
+                pool.buffer_meta.append(meta)
+                pool._component_offsets.append(offsets)
+            pool.prepare_locations = list
+            pool.get_prepared_layer_range_meta = Mock(
+                side_effect=AssertionError("ReadLayout must expand addresses in C++")
+            )
+            linker.pools[name] = pool
+            transfers.append(
+                PoolTransfer(name=name, keys=["a", "a"], host_indices=[1, 3])
+            )
+            for row in (1, 3):
+                for component, (meta, offsets) in enumerate(
+                    zip(pool.buffer_meta, pool._component_offsets)
+                ):
+                    key = f"{name}:a" if packed else f"{name}:a:{component}"
+                    linker.objects[key] = bytes(range(64))
+                    for (base, stride, size), offset in zip(meta, offsets):
+                        expected_ranges.append((key, base + row * stride, size, offset))
+        linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+            (
+                [f"{transfer.name}:{key}" for key in keys]
+                if packed
+                else [f"{transfer.name}:{key}:{i}" for key in keys for i in range(2)]
+            ),
+            1 if packed else 2,
+        )
+        native = types.SimpleNamespace(
+            ReadComponent=lambda **kw: types.SimpleNamespace(**kw),
+            ReadLayout=lambda **kw: types.SimpleNamespace(**kw),
+            ReadKeyMapping=types.SimpleNamespace(PER_ROW="row"),
+        )
+        actual_ranges = []
+
+        def read(layouts):
+            self.assertTrue(
+                all(not f.done() for f in linker.layer_done_counter.futures[0])
+            )
+            results = []
+            for layout in layouts:
+                self.assertEqual(layout.key_mapping, "row")
+                self.assertEqual(len(layout.keys), len(layout.rows))
+                counts = []
+                for key, row in zip(layout.keys, layout.rows):
+                    self.assertIn(key, linker.active)
+                    count = 0
+                    for item in layout.components:
+                        address = item.destination_base + row * item.destination_stride
+                        actual_ranges.append(
+                            (key, address, item.byte_count, item.source_offset)
+                        )
+                        data = linker.prefetched.get(key, linker.objects[key])
+                        ctypes.memmove(
+                            address,
+                            data[
+                                item.source_offset : item.source_offset
+                                + item.byte_count
+                            ],
+                            item.byte_count,
+                        )
+                        count += item.byte_count
+                    counts.append(count)
+                results.append(counts)
+            return results
+
+        linker.storage.store.batch_get_into_layouts = Mock(side_effect=read)
+        return linker, [transfers], native, buffers, expected_ranges, actual_ranges
+
+    def test_page_layout_batches_all_layers_pools_and_duplicate_targets(self):
+        for packed in (True, False):
+            with self.subTest(packed=packed):
+                linker, transfers, native, buffers, expected, actual = (
+                    self._page_layout_linker(packed)
+                )
+                with patch.dict("sys.modules", {"mooncake.store": native}):
+                    self.assertTrue(linker.load_layer_wise(0, transfers))
+                store = linker.storage.store
+                store.batch_get_into_layouts.assert_called_once()
+                layouts = store.batch_get_into_layouts.call_args.args[0]
+                self.assertEqual(len(layouts), 2 if packed else 4)
+                store.batch_get_into_multi_buffer_ranges.assert_not_called()
+                self.assertCountEqual(actual, expected)
+                for key, address, size, offset in expected:
+                    self.assertEqual(
+                        ctypes.string_at(address, size),
+                        linker.objects[key][offset : offset + size],
+                    )
+                self.assertTrue(
+                    all(
+                        f.done() and f.exception() is None
+                        for f in linker.layer_done_counter.futures[0]
+                    )
+                )
+                self.assertFalse(linker.active)
+
+    def test_page_layout_reuses_claimed_prefetch_and_waits_for_session_cleanup(self):
+        linker, transfers, native, buffers, expected, _ = self._page_layout_linker(
+            False
+        )
+        linker.host_prefetch_enabled = True
+        self.assertTrue(linker.prepare_load("prefetch", transfers[0]))
+        linker.prefetched.update(linker.objects)
+        linker.host_prefetch_entries["rid"] = {
+            "state": "dfs_prefetched",
+            "session_rid": "prefetch",
+        }
+        self.assertTrue(linker.revalidate_host_prefetch("rid"))
+        self.assertTrue(linker.claim_ready_host_prefetch("rid"))
+        linker.objects = dict.fromkeys(linker.objects, b"x" * 64)
+        store = linker.storage.store
+        end = store.batch_get_session_end.side_effect
+
+        def end_checked(keys):
+            self.assertTrue(
+                all(not f.done() for f in linker.layer_done_counter.futures[0])
+            )
+            return end(keys)
+
+        store.batch_get_session_end.side_effect = end_checked
+        with patch.dict("sys.modules", {"mooncake.store": native}):
+            self.assertTrue(linker.load_layer_wise(0, transfers, request_ids=["rid"]))
+        store.batch_get_session_start.assert_not_called()
+        store.batch_get_session_start_with_sources.assert_called_once()
+        store.batch_get_session_refresh.assert_called_once()
+        for _, address, size, offset in expected:
+            self.assertEqual(
+                ctypes.string_at(address, size),
+                bytes(range(64))[offset : offset + size],
+            )
+        self.assertFalse(linker.prepared_load_sessions)
+        self.assertFalse(linker.active)
+
+    def test_page_layout_failures_wake_waiters_without_publishing_ready(self):
+        for failure in (
+            None,
+            [],
+            [[1]],
+            [[9, 9], [12, 12], [9, 9], [11, 12]],
+            "read",
+            "cleanup",
+            "injection",
+        ):
+            with self.subTest(failure=failure):
+                linker, transfers, native, buffers, _, _ = self._page_layout_linker(
+                    False
+                )
+                store = linker.storage.store
+                if failure == "read":
+                    store.batch_get_into_layouts.side_effect = RuntimeError(
+                        "read failed"
+                    )
+                elif failure == "cleanup":
+                    store.batch_get_session_end.side_effect = RuntimeError("end failed")
+                elif failure != "injection":
+                    store.batch_get_into_layouts.side_effect = None
+                    store.batch_get_into_layouts.return_value = failure
+                maybe_fail = Mock(
+                    side_effect=(
+                        RuntimeError("injected") if failure == "injection" else None
+                    )
+                )
+                with (
+                    patch.dict("sys.modules", {"mooncake.store": native}),
+                    patch(
+                        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.arm_load_failure_injection",
+                        return_value=maybe_fail,
+                    ),
+                    self.assertLogs(level="ERROR"),
+                ):
+                    self.assertFalse(linker.load_layer_wise(0, transfers))
+                self.assertTrue(
+                    all(
+                        f.done() and f.exception()
+                        for f in linker.layer_done_counter.futures[0]
+                    )
+                )
+                store.batch_get_session_end.assert_called_once()
+                if failure == "injection":
+                    maybe_fail.assert_called_once_with("aggregated", "complete_page")
+                    store.batch_get_into_layouts.assert_not_called()
+
+    def test_range_layers_publish_before_next_layer_but_last_waits_for_cleanup(self):
+        linker = self._session_linker()
+        store = linker.storage.store
+        read = store.batch_get_into_multi_buffer_ranges.side_effect
+        end = store.batch_get_session_end.side_effect
+
+        def read_checked(*args):
+            futures = linker.layer_done_counter.futures[0]
+            self.assertEqual(
+                futures[0].done(),
+                store.batch_get_into_multi_buffer_ranges.call_count == 2,
+            )
+            self.assertFalse(futures[-1].done())
+            return read(*args)
+
+        def end_checked(keys):
+            self.assertTrue(linker.layer_done_counter.futures[0][0].done())
+            self.assertFalse(linker.layer_done_counter.futures[0][-1].done())
+            return end(keys)
+
+        store.batch_get_into_multi_buffer_ranges.side_effect = read_checked
+        store.batch_get_session_end.side_effect = end_checked
+        self.assertTrue(linker.load_layer_wise(0, self._transfers()))
+        self.assertTrue(linker.layer_done_counter.futures[0][-1].done())
+
     def _session_linker(self, *, prefetch=False, memory=True, page_wise=False):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.host_prefetch_enabled = prefetch
@@ -216,6 +448,28 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
 
     def _transfers(self):
         return [[PoolTransfer(name=PoolName.KV, keys=["a", "b"], host_indices=[1, 2])]]
+
+    def test_read_modes_route_to_one_helper(self):
+        helpers = (
+            "_load_layer_wise_ranges",
+            "_load_with_read_layout",
+            "_load_page_wise_ranges",
+            "_load_page_wise_with_read_layout",
+        )
+        for page_wise in (False, True):
+            for read_layout in (False, True):
+                with self.subTest(page_wise=page_wise, read_layout=read_layout):
+                    linker = self._session_linker(memory=False, page_wise=page_wise)
+                    linker.read_layout_enabled = read_layout
+                    for helper in helpers:
+                        setattr(linker, helper, Mock())
+                    self.assertTrue(linker.load_layer_wise(0, self._transfers()))
+                    selected = helpers[2 * int(page_wise) + int(read_layout)]
+                    for helper in helpers:
+                        if helper == selected:
+                            getattr(linker, helper).assert_called_once()
+                        else:
+                            getattr(linker, helper).assert_not_called()
 
     def test_selected_sources_choose_mode_without_threshold(self):
         for memory, page_wise, calls in (
