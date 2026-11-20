@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.storage.mooncake_store.compat import (
     disable_dfs_prefetch,
-    resolve_read_plan_options,
     supports_feature,
 )
 from sglang.srt.mem_cache.unified_cache.linker_fault_injection import (
@@ -157,67 +156,6 @@ class LayerWiseLoadCounter:
         self.reported.clear()
 
 
-class ReadPlanLoadCounter:
-    """Publish one Mooncake ReadPlan; wait for each layer without holding the GIL."""
-
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self.producer_index = self.consumer_index = -1
-        self.plans: dict[int, Future] = {}
-        # Batch indices already logged: one line per failed plan, not per layer.
-        self.reported: set[int] = set()
-
-    def update_producer(self) -> int:
-        self.producer_index += 1
-        self.plans[self.producer_index] = Future()
-        return self.producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def bind(self, index: int, plan) -> None:
-        self.plans[index].set_result(plan)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        future = self.plans.get(index)
-        if future is not None and not future.done():
-            future.set_exception(error)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        future = self.plans.get(index)
-        if future is None:
-            return
-        try:
-            future.result().wait(threshold)
-        except BaseException as error:
-            # Do not raise from the model forward. A rank-local failure here can
-            # strand peer TP/CP ranks in a later model collective and brings the
-            # scheduler down. load_layer_wise reports False through the linker
-            # completion queue; the cache MIN-reduces that verdict across the
-            # attention group and aborts the affected requests after forward.
-            if index not in self.reported:
-                self.reported.add(index)
-                logger.error(
-                    "Mooncake ReadPlan KV load failed for batch %d; affected "
-                    "requests will be aborted after this forward: %s",
-                    index,
-                    error,
-                )
-            # Repeated waits otherwise grow a traceback chain that keeps each
-            # layer's activations alive until the failed plan is retired.
-            error.__traceback__ = None
-        finally:
-            if threshold == self.num_layers - 1:
-                self.plans.pop(index, None)
-                self.reported.discard(index)
-
-    def reset(self) -> None:
-        self.producer_index = self.consumer_index = -1
-        self.plans.clear()
-        self.reported.clear()
-
-
 class MooncakeDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -245,13 +183,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "a prefill or non-disaggregated role, and pp_size=1."
             )
         self.page_size = params.page_size
-        self.page_wise_load_threshold = server_args.mooncake_page_wise_load_threshold
         self.enable_page_wise_load = server_args.mooncake_enable_page_wise_load
-        if self.page_wise_load_threshold <= 0:
-            raise ValueError(
-                "--mooncake-page-wise-load-threshold must be positive, got "
-                f"{self.page_wise_load_threshold}."
-            )
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
@@ -334,13 +266,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.offload_owner,
             storage_suffix,
         )
-        self.read_plan_enabled = os.environ.get("SGLANG_MOONCAKE_READ_PLAN", "0") == "1"
-        self.read_plan_reuse_ranges = (
-            os.environ.get("SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES", "0") == "1"
-        )
-        self.read_plan_enabled, self.read_plan_reuse_ranges = resolve_read_plan_options(
-            self.storage.store, self.read_plan_enabled, self.read_plan_reuse_ranges
-        )
         self.read_layout_enabled = supports_feature(self.storage.store, "read_layout")
         # Skip the admission-time lease refresh of a prefetched request whose
         # oldest session key was leased less than this many seconds ago. The
@@ -371,21 +296,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.host_prefetch_worker_count = min(
                 self.host_prefetch_worker_count, self.host_prefetch_limit
             )
-        if self.read_plan_reuse_ranges and not self.read_plan_enabled:
-            raise ValueError(
-                "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES requires "
-                "SGLANG_MOONCAKE_READ_PLAN=1"
-            )
-        if self.read_plan_reuse_ranges and self.enable_page_wise_load:
-            raise ValueError(
-                "SGLANG_MOONCAKE_READ_PLAN_REUSE_RANGES is incompatible with "
-                "page-wise Mooncake loads"
-            )
-        if self.read_plan_enabled:
-            logger.info(
-                "Mooncake ReadPlan enabled; address reuse=%s",
-                self.read_plan_reuse_ranges,
-            )
         prefetch_enabled = self._resolve_host_prefetch_enabled(
             params, requested=self.host_prefetch_enabled
         )
@@ -412,10 +322,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage_metrics_collector = collector_cls(labels=labels)
 
         self.register_buffers()
-        if self.read_plan_enabled:
-            self.layer_done_counter = ReadPlanLoadCounter(self.num_layers)
-        else:
-            self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
@@ -724,9 +631,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return self._prepare_expanded_load(rid, expanded)
 
-    def _prepare_expanded_load(
-        self, rid: str, expanded: list[PoolTransfer]
-    ) -> bool:
+    def _prepare_expanded_load(self, rid: str, expanded: list[PoolTransfer]) -> bool:
         keys = []
         seen = set()
         for transfer in expanded:
@@ -785,7 +690,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         rid,
                         exc_info=True,
                     )
-                    self._rollback_session_refs_locked(acquired)
+                    self._rollback_session_refs_locked(acquired + new_keys)
                     return False
 
                 failed = len(results) != len(new_keys) or any(
@@ -1153,7 +1058,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Failed to record waiting-queue prefetch metrics.", exc_info=True
             )
 
-    def _rollback_session_refs_locked(self, keys: list[str]) -> None:
+    def _rollback_session_refs_locked(self, keys: list[str]) -> bool:
         to_end = []
         for key in keys:
             count = self.session_refcounts.get(key, 0)
@@ -1167,27 +1072,31 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.session_refcounts[key] = count - 1
         if to_end:
             try:
-                self.storage.store.batch_get_session_end(to_end)
+                result = self.storage.store.batch_get_session_end(to_end)
+                if result not in (0, None):
+                    raise RuntimeError(f"Mooncake session end failed: {result}")
             except BaseException:
                 logger.warning(
                     "Mooncake get session cleanup failed for %d keys.",
                     len(to_end),
                     exc_info=True,
                 )
+                return False
+        return True
 
-    def _abort_prepared_load_now(self, rid: str) -> None:
+    def _abort_prepared_load_now(self, rid: str) -> bool:
         with self.session_lock:
             keys = self.prepared_load_sessions.pop(rid, [])
-            self._rollback_session_refs_locked(keys)
+            return self._rollback_session_refs_locked(keys)
 
-    def abort_prepared_load(self, rid: str) -> None:
+    def abort_prepared_load(self, rid: str) -> bool:
         if not self.host_prefetch_enabled:
-            return
+            return True
         with self.host_prefetch_lock:
             entry = self.host_prefetch_entries.get(rid)
             if entry is not None and entry.get("state") in {"claimed", "loading"}:
                 self.host_prefetch_entries.pop(rid, None)
-        self._abort_prepared_load_now(rid)
+        return self._abort_prepared_load_now(rid)
 
     def cancel_queued_load(self, rid: str) -> bool:
         cancelled = self.pending_loads.pop(rid, None) is not None
@@ -1254,6 +1163,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
+                    if self.host_prefetch_enabled:
+                        for rid in pending:
+                            try:
+                                self.abort_prepared_load(rid)
+                            except BaseException:
+                                logger.exception(
+                                    "Mooncake undispatched session cleanup failed"
+                                )
                 finally:
                     self._finish_prefetch_metrics(list(pending), success is True)
                     self.completed_loads.put((list(pending), success))
@@ -1269,7 +1186,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     ) -> bool:
         started = []
         success = False
-        read_plan_enabled = getattr(self, "read_plan_enabled", False)
+        page_wise = False
         maybe_fail = arm_load_failure_injection(self.tp_rank)
         try:
             if self.host_prefetch_enabled:
@@ -1282,9 +1199,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         raise RuntimeError(
                             f"Load admitted without prepared session: rid={rid}"
                         )
-            if read_plan_enabled:
-                self.load_with_read_plan(counter_index, request_transfers)
-                return True
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:
@@ -1298,76 +1212,52 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
-            if not self.host_prefetch_enabled:
-                # Match the original path: one session start per pool batch,
-                # with no request-indexed session maps or duplicate key build.
-                for keys, _ in batches.values():
-                    result = self.storage.store.batch_get_session_start(keys)
-                    # A partial result can still leave some sessions active.
-                    started.append(keys)
-                    failed = [key for key, code in zip(keys, result) if code != 0]
-                    if failed:
-                        logger.warning(
-                            "Mooncake get session start partial failure "
-                            "(keys=%d, failed=%d), retrying once: results=%s",
-                            len(keys),
-                            len(failed),
-                            result,
-                        )
-                        result = self.storage.store.batch_get_session_start(keys)
-                        failed = [key for key, code in zip(keys, result) if code != 0]
-                    if failed:
-                        failed_get_cache = getattr(
-                            self.storage, "failed_get_cache", None
-                        )
-                        if failed_get_cache is not None:
-                            failed_get_cache.update_batch([], failed)
-                        raise RuntimeError(
-                            f"Mooncake get session start failed: keys={len(keys)}, "
-                            f"failed={len(failed)}, results={result}"
-                        )
-            if self.enable_page_wise_load and any(
-                len(keys) >= self.page_wise_load_threshold
-                for keys, _ in batches.values()
-            ):
-                self._load_page_wise(
-                    counter_index, batches, maybe_fail, started=started
+            # Session identity is key-based; read entries retain every destination.
+            session_keys = list(
+                dict.fromkeys(key for keys, _ in batches.values() for key in keys)
+            )
+            if not self.host_prefetch_enabled and session_keys:
+                try:
+                    result = list(
+                        self.storage.store.batch_get_session_start(session_keys)
+                    )
+                except BaseException:
+                    # A binding/backend exception may follow a partial start.
+                    started.append(session_keys)
+                    raise
+                started.append(
+                    [key for key, code in zip(session_keys, result) if code == 0]
                 )
-                success = True
-                return success
-
-            if getattr(self, "read_layout_enabled", False):
-                self._load_with_read_layout(counter_index, batches, maybe_fail)
-                success = True
-                return success
-
-            for layer in range(self.num_layers):
-                for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(
-                        locations, layer
+                failed = [
+                    key
+                    for i, key in enumerate(session_keys)
+                    if i >= len(result) or result[i] != 0
+                ]
+                if failed or len(result) != len(session_keys):
+                    failed_get_cache = getattr(self.storage, "failed_get_cache", None)
+                    if failed_get_cache is not None:
+                        failed_get_cache.update_batch([], failed)
+                    raise RuntimeError(
+                        f"Mooncake get session start failed: keys={len(session_keys)}, "
+                        f"failed={len(failed)}, results={result}"
                     )
-                    if meta is None:
-                        continue
-                    ptrs, sizes, offsets = meta
-                    maybe_fail(name, f"layer={layer}")
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
-                    expected = [sum(item) for item in sizes]
-                    if (
-                        result is None
-                        or isinstance(result, int)
-                        or list(result) != expected
-                    ):
-                        raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
-                        )
-                self.layer_done_counter.complete(counter_index, layer)
+            # This inspects selected session replicas locally, without restarting
+            # sessions or invalidating their prefetched data. Older wheels are unknown.
+            all_memory = getattr(self.storage.store, "all_get_sessions_memory", None)
+            page_wise = self.enable_page_wise_load and not (
+                callable(all_memory) and all_memory(session_keys)
+            )
+            read_layout = getattr(self, "read_layout_enabled", False)
+            if page_wise:
+                if read_layout:
+                    self._load_page_wise_with_read_layout(batches, maybe_fail)
+                else:
+                    self._load_page_wise_ranges(counter_index, batches, maybe_fail)
+            else:
+                if read_layout:
+                    self._load_with_read_layout(counter_index, batches, maybe_fail)
+                else:
+                    self._load_layer_wise_ranges(counter_index, batches, maybe_fail)
             success = True
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
@@ -1375,18 +1265,61 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         finally:
             if self.host_prefetch_enabled:
                 for rid in request_ids or ():
-                    self.abort_prepared_load(rid)
-            else:
-                for keys in started:
                     try:
-                        self.storage.store.batch_get_session_end(keys)
+                        if self.abort_prepared_load(rid) is False:
+                            raise RuntimeError(
+                                f"Mooncake session cleanup failed: rid={rid}"
+                            )
                     except BaseException as error:
                         self.layer_done_counter.fail(counter_index, error)
-                        logger.exception(
-                            "Mooncake layer-wise load session cleanup failed"
-                        )
+                        logger.exception("Mooncake load session cleanup failed")
                         success = False
+            else:
+                for keys in started:
+                    if not keys:
+                        continue
+                    try:
+                        result = self.storage.store.batch_get_session_end(keys)
+                        if result not in (0, None):
+                            raise RuntimeError(f"Mooncake session end failed: {result}")
+                    except BaseException as error:
+                        self.layer_done_counter.fail(counter_index, error)
+                        logger.exception("Mooncake load session cleanup failed")
+                        success = False
+        if success:
+            for layer in (
+                range(self.num_layers) if page_wise else [self.num_layers - 1]
+            ):
+                self.layer_done_counter.complete(counter_index, layer)
         return success
+
+    def _load_layer_wise_ranges(self, counter_index: int, batches, maybe_fail) -> None:
+        for layer in range(self.num_layers):
+            for name, (keys, locations) in batches.items():
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+                if meta is None:
+                    continue
+                ptrs, sizes, offsets = meta
+                maybe_fail(name, f"layer={layer}")
+                result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                    keys,
+                    ptrs,
+                    sizes,
+                    offsets,
+                )
+                expected = [sum(item) for item in sizes]
+                if (
+                    result is None
+                    or isinstance(result, int)
+                    or list(result) != expected
+                ):
+                    raise RuntimeError(
+                        f"Mooncake range get failed for pool={name}, "
+                        f"layer={layer}: transferred={result}, "
+                        f"expected={expected}"
+                    )
+            if layer < self.num_layers - 1:
+                self.layer_done_counter.complete(counter_index, layer)
 
     def _load_with_read_layout(self, counter_index: int, batches, maybe_fail) -> None:
         from mooncake.store import ReadComponent, ReadKeyMapping, ReadLayout
@@ -1432,7 +1365,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"Mooncake layout get failed for layer={layer}: "
                         f"transferred={result}, expected={expected}"
                     )
-            self.layer_done_counter.complete(counter_index, layer)
+            if layer < self.num_layers - 1:
+                self.layer_done_counter.complete(counter_index, layer)
 
     def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
         pending_load_tokens = getattr(self, "pending_load_tokens", {})
@@ -1476,9 +1410,60 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 exc_info=True,
             )
 
-    def _load_page_wise(
-        self, counter_index: int, batches, maybe_fail, *, started
-    ) -> None:
+    def _load_page_wise_with_read_layout(self, batches, maybe_fail) -> None:
+        from mooncake.store import ReadComponent, ReadKeyMapping, ReadLayout
+
+        layouts = []
+        expected = []
+        for name, (keys, locations) in batches.items():
+            pool = self.pools[name]
+            # Non-packed keys are row-major, one object per physical component.
+            object_count = 1 if pool.packed else len(pool.buffer_meta)
+            if len(keys) != len(locations) * object_count:
+                raise ValueError(f"Mooncake pool={name} page-wise key/row mismatch")
+            object_items = [[] for _ in range(object_count)]
+            for layer in range(self.num_layers):
+                items = pool.get_layer_range_components(layer)
+                if not items:
+                    continue
+                if len(items) % object_count:
+                    raise ValueError(f"Mooncake pool={name} component count mismatch")
+                width = len(items) // object_count
+                for index in range(object_count):
+                    object_items[index].extend(
+                        items[index * width : (index + 1) * width]
+                    )
+            for index, items in enumerate(object_items):
+                if not items:
+                    continue
+                object_keys = keys[index::object_count]
+                layouts.append(
+                    ReadLayout(
+                        keys=object_keys,
+                        rows=locations,
+                        key_mapping=ReadKeyMapping.PER_ROW,
+                        components=[
+                            ReadComponent(
+                                destination_base=base,
+                                destination_stride=stride,
+                                byte_count=size,
+                                source_offset=offset,
+                            )
+                            for base, stride, size, offset in items
+                        ],
+                    )
+                )
+                expected.append([sum(item[2] for item in items)] * len(object_keys))
+        maybe_fail("aggregated", "complete_page")
+        if layouts:
+            result = self.storage.store.batch_get_into_layouts(layouts)
+            if result is None or list(map(list, result)) != expected:
+                raise RuntimeError(
+                    "Mooncake page-wise layout get failed: "
+                    f"transferred={result}, expected={expected}"
+                )
+
+    def _load_page_wise_ranges(self, counter_index: int, batches, maybe_fail) -> None:
         """Load all layer ranges for each page before exposing the data."""
         all_keys: list[str] = []
         all_ptrs: list[list[int]] = []
@@ -1490,9 +1475,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
@@ -1535,85 +1518,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         expected = [sum(item) for item in all_sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
-            pool_counts = {
-                str(name): len(keys) for name, (keys, _) in batches.items()
-            }
+            pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
             raise RuntimeError(
                 "Mooncake aggregated range get failed for "
                 f"pools={pool_counts}, complete_page: transferred={result}, "
                 f"expected={expected}"
             )
-
-        # Ordinary page-wise loads release sessions before exposing any layer.
-        for keys in list(started):
-            self.storage.store.batch_get_session_end(keys)
-            started.remove(keys)
-        for layer in range(self.num_layers):
-            self.layer_done_counter.complete(counter_index, layer)
-
-    def _prepare_read_plan_layouts(self, request_transfers: list[list[PoolTransfer]]):
-        # Consolidate index copies once per pool, preserving request/key order.
-        # Each component describes (base, row stride, byte count, source offset).
-        # Locations may be non-contiguous; Mooncake expands addresses in C++.
-        batches = {}
-        for transfers in request_transfers:
-            for transfer in transfers:
-                keys, indices = batches.setdefault(transfer.name, ([], []))
-                component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                    list(transfer.keys), transfer
-                )
-                keys.extend(self.storage._tag_keys(component_keys))
-                indices.append(transfer.host_indices)
-
-        layouts = []
-        for name, (keys, indices) in batches.items():
-            pool = self.pools[name]
-            joined = indices[0] if len(indices) == 1 else torch.cat(indices)
-            locations = pool.prepare_locations(joined)
-            layout = []
-            for layer in range(self.num_layers):
-                mapped = pool.layer_mapping.get(layer)
-                buffer_indices = (
-                    ()
-                    if mapped is None
-                    else (mapped,)
-                    if isinstance(mapped, int)
-                    else tuple(mapped)
-                )
-                layout.append(
-                    [
-                        (*component[buffer_index], offsets[buffer_index])
-                        for component, offsets in zip(
-                            pool.buffer_meta, pool._component_offsets
-                        )
-                        for buffer_index in buffer_indices
-                    ]
-                )
-            layouts.append((keys, locations, pool.packed, layout))
-
-        return layouts
-
-    def load_with_read_plan(
-        self,
-        counter_index: int,
-        request_transfers: list[list[PoolTransfer]],
-    ) -> None:
-        layouts = self._prepare_read_plan_layouts(request_transfers)
-        plan = self.storage.store.create_read_plan(
-            layouts,
-            self.num_layers,
-            reuse_ranges=self.read_plan_reuse_ranges,
-            page_wise=self.enable_page_wise_load,
-            borrowed_sessions=self.host_prefetch_enabled,
-            buffer_owners=self.pools,
-        )
-        self.layer_done_counter.bind(counter_index, plan)
-        # run() and wait() release the GIL. Each layer becomes visible only after
-        # every pool's bytes have been checked; the last wait includes cleanup.
-        # In page-wise mode a single batch_get carries all groups per key, so the
-        # first wait(0) blocks until every page is complete and later waits are
-        # no-ops, matching _load_page_wise's all-or-nothing release.
-        plan.run()
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)

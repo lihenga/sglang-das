@@ -496,9 +496,8 @@ variant appropriate for your Linux device and driver.
 | Optional feature | Community / HYGON L3 | L4 with the corresponding APIs |
 | --- | --- | --- |
 | Basic Store and session range reads | Existing API path | Existing API path |
-| Native strided ReadLayout | Selected automatically when present for layer-wise loads | Selected automatically when ReadPlan is not selected |
+| Native strided ReadLayout | Selected automatically when present for layer-wise loads | Selected automatically for layer-wise loads |
 | Waiting-queue DFS prefetch | Disabled with a startup warning when requested | Negotiated across ranks; requires an available arena |
-| `SGLANG_MOONCAKE_READ_PLAN=1` | Uses native ReadLayout when available, otherwise session ranges; address reuse disabled | Native ReadPlan |
 | DFS health and access policy | Original package behavior; no SGLang health-based failover | Native probes and coordinated policy |
 | Client HTTP metrics | Automatic port zero disables the optional endpoint with a warning; upgrade for automatic ports | Automatic ports enabled when declared by the package |
 
@@ -506,13 +505,18 @@ The same SGLang code and configuration can use either package. Optional API
 selection first respects local capability declarations, then checks callable
 methods for older packages without a query. Layer-wise loads automatically use
 native ReadLayout when available, so Mooncake expands strided addresses in C++.
-An existing ReadPlan request selects ReadPlan on a supporting L4 package and
-falls back on L3; page-wise loads keep their aggregated read path. No package
-version-string comparison or per-package SGLang patch is required.
+SGLang owns session preparation and range-read scheduling. With page-wise loading
+enabled, active sessions selecting only MEMORY replicas load layer by layer;
+non-MEMORY or unknown sources use one range call covering all layers and pools,
+without a page-count threshold. With page-wise disabled, loads remain layer-wise.
+The source inspection is local (`all_get_sessions_memory` when available).
+Prepared/prefetched sessions are reused without another start; request references
+keep shared keys alive until the last holder releases them. Each read entry keeps
+its own destination and source offset, including repeated keys.
 
 An older SGLang caller can keep its existing setup, batch-put, session, and range
 calls with the L4 wheel. It uses the L4 implementation behind those interfaces;
-caller-driven features such as ReadPlan and waiting-queue prefetch still require
+caller-driven features such as waiting-queue prefetch still require
 SGLang code that calls their APIs. Python API compatibility alone does not carry
 over native hardware fixes: the installed L4 build must also retain the needed
 L3 transport fixes.

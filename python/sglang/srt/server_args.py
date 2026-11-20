@@ -2949,15 +2949,15 @@ class ServerArgs:
     ] = "mooncake"
     mooncake_page_wise_load_threshold: A[
         int,
-        "Minimum number of Mooncake direct-linker keys that switches loading "
-        "from the layer-wise flow to the complete-page flow.",
+        "Deprecated compatibility option; Mooncake direct-linker selects reads "
+        "by active session sources without a key-count threshold.",
         NS("memory"),
     ] = 10
     mooncake_enable_page_wise_load: A[
         bool,
-        "Enable page-wise loading for Mooncake direct-linker. When enabled, "
-        "switches from layer-wise flow to complete-page flow based on key "
-        "count threshold.",
+        "Enable page-wise loading for Mooncake direct-linker when active "
+        "sessions include non-MEMORY or unknown sources. All-MEMORY sessions "
+        "remain layer-wise. When disabled, all loads remain layer-wise.",
         NS("memory"),
     ] = False
     mooncake_enable_waiting_queue_dfs_prefetch: A[
