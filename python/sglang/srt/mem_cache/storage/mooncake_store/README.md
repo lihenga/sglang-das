@@ -628,3 +628,66 @@ scrape_configs:
 没有 L4 消费时比例没有有效值，不能解释为 0% 命中。客户端停止上报时要结合 reporting_clients 判定，不能将历史窗口没有增量当成服务闲置。物理读取可能含整对象、对齐和重复读取，不与有效消费字节混用。
 
 后台上报与 Prometheus 抓取存在延迟；窗口速率反映收到的上报，首次补报累计数据也可能产生脉冲。原有 `prefetched_tokens_total` 包含普通请求加载，不用来计算本机制覆盖率。压测时比较相同负载下开关预取的覆盖率、实时回源量、TTFT 与吞吐；SGLang 任务计数与 master 字节不直接相除。
+
+### DFS health policy
+
+DFS health has independent read/write probes and fail-closed policy before
+warmup. Configure interval, failure/success thresholds and timeout with the
+`--mooncake-dfs-health-*` options, or corresponding
+`SGLANG_MOONCAKE_DFS_HEALTH_*` environment variables. Attention ranks apply a
+common conservative policy across attention and PP ranks, including decode KV
+offload. The defaults are a 5-second probe
+interval, 2 consecutive failures to disable, 2 consecutive successes to recover,
+and a 25-second probe timeout. Explicit config, CLI settings and environment values
+retain their existing precedence. Read and write probes keep independent health
+states, but effective DFS reads require both states to be available.
+
+Real data-I/O timeouts (`-1606` for writes, `-1607` for reads) immediately mark
+the corresponding local capability unavailable and queue a restrictive native
+policy update on the existing serialized worker. A write timeout disables both
+reads and writes. BatchGet admission backpressure (`-1608`) does not disable DFS.
+Recovery still requires the configured number of fresh successful probes;
+results from probes started before a data timeout cannot count towards recovery.
+A local timeout cannot reopen a capability disabled by rank consensus. Native
+updates remain asynchronous, so the local state transition does not confirm a
+native disable until the worker's call succeeds.
+
+When DFS becomes unavailable, young prefetched sessions must revalidate and
+borrowed ReadPlan sessions must reselect memory replicas before reading. A DFS
+source remaining after reselection fails the load. Decode offload also applies
+TP/CP/PP consensus, checks health-capability agreement before policy polling, and
+retains bounded retries and rate-limited warnings for failed policy submissions.
+Recovery does not promise backfill of every write made while DFS was unavailable.
+
+Initial fail-closed setup must succeed synchronously before any client warms up.
+In deferred mode, recovery uses scheduler-coordinated policies on a single
+background worker; local data timeouts may only restrict permissions. Pending
+updates coalesce to the latest target. Failed updates retry at the probe interval
+without scheduler polling. Non-deferred probe updates remain synchronous. An
+unconfirmed native reply stays dirty when the
+target returns to the last confirmed policy. A hung call occupies the one worker
+until it returns; it is neither cancelled nor replaced by concurrent RPCs.
+Embedded RealClient policy updates are local atomic stores. Standalone
+DummyClient updates synchronously call the external RealClient by RPC. Before
+using deferred policy application with standalone storage, verify that the
+installed Mooncake build releases the Python GIL in its policy binding;
+otherwise its RPC can still stall the scheduler from the background worker.
+The `dfs_health` capability only checks API availability and does not certify
+GIL release. No minimum fixed wheel version is established by these checks.
+An unconfirmed disable cannot guarantee that the native client stopped DFS
+access; the last confirmed policy is not proof of its current permissions.
+Storage/linker policy wrappers currently discard the manager's confirmation
+result, and loads do not gate on pending policy application. Deferred application
+alone therefore does not provide fail-closed load admission during that window.
+
+Health-manager shutdown stops new probes and policy submissions and changes its
+local read/write candidates to `UNKNOWN` (deny both). It waits at most one second
+in total for its tracked workers. A pending native read, write or policy call
+makes `close()` raise instead of reporting completion; synchronous policy callers
+are included. The manager retains the client and worker handles. Repeated close
+attempts cannot start replacements, and late successful probes cannot restore
+availability after shutdown. After the native calls drain, retry close before
+creating a replacement manager, whose initial native deny policy must succeed.
+An indefinitely blocked native call requires retaining the old owner until
+recovery or restarting the process. No native thread is cancelled or client freed
+while an operation is using it.

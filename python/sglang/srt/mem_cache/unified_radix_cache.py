@@ -238,6 +238,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        self._dfs_policy_sync_enabled = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -351,6 +352,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        self._dfs_policy_sync_enabled = None
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
@@ -2539,6 +2541,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 "HiCache is not initialized; launch with "
                 "--enable-hierarchical-cache to attach a storage backend.",
             )
+        self._dfs_policy_sync_enabled = None
         return self._storage_attachment.attach(
             storage_backend=storage_backend,
             storage_backend_extra_config_json=storage_backend_extra_config_json,
@@ -2551,6 +2554,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Detach (disable) the HiCache storage backend at runtime."""
         if self._storage_attachment is None:
             return False, "HiCache storage backend is not initialized."
+        self._dfs_policy_sync_enabled = None
         return self._storage_attachment.detach()
 
     def shutdown(self) -> None:
@@ -2874,21 +2878,51 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
-    def _sync_dfs_health_policy(self) -> None:
-        """Apply one conservative DFS policy across all attention ranks."""
+    def _local_dfs_health_policy(self):
+        """Resolve health capability once before joining scheduler collectives."""
         owner = self.linker
         if owner is None and self.cache_controller is not None:
             owner = self.cache_controller.storage_backend
         getter = getattr(owner, "get_local_dfs_health_policy", None)
         apply_policy = getattr(owner, "apply_dfs_health_policy", None)
         if not callable(getter) or not callable(apply_policy):
-            return
+            return owner, None
         local_policy = getter()
+        if getattr(self, "_dfs_policy_sync_enabled", None) is None:
+            available = int(local_policy is not None)
+            agreement = torch.tensor([available, -available], dtype=torch.int)
+            self._all_reduce_attn_groups(agreement, torch.distributed.ReduceOp.MIN)
+            self._all_reduce_dfs_policy_pp(agreement)
+            if int(agreement[0]) != -int(agreement[1]):
+                raise ValueError(
+                    "Mooncake DFS health capability/configuration differs across attention/PP ranks"
+                )
+            self._dfs_policy_sync_enabled = bool(agreement[0])
+        if not self._dfs_policy_sync_enabled:
+            return owner, None
         if local_policy is None:
-            return
-        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
-        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
-        apply_policy(*(bool(value) for value in effective.tolist()))
+            raise RuntimeError(
+                "Mooncake DFS health manager disappeared after startup agreement"
+            )
+        return owner, local_policy
+
+    def _all_reduce_dfs_policy_pp(self, values: torch.Tensor) -> None:
+        """Join corresponding PP stages after attention-rank consensus."""
+        if getattr(self, "pp_size", 1) > 1 and self.pp_group is not None:
+            torch.distributed.all_reduce(
+                values, op=torch.distributed.ReduceOp.MIN, group=self.pp_group
+            )
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across all attention and PP ranks."""
+        owner, local_policy = self._local_dfs_health_policy()
+        if local_policy is not None:
+            effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+            self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+            self._all_reduce_dfs_policy_pp(effective)
+            owner.apply_dfs_health_policy(
+                *(bool(value) for value in effective.tolist())
+            )
 
     def drain_linker_loads(self, *, wait_for_completion: bool = False) -> list[str]:
         """Retire finished linker loads and return the rids that must abort.
