@@ -457,20 +457,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
-            self._replica_options = {}
-            for name, field in (
-                ("memory_replica_num", "replica_num"),
-                ("dfs_replica_num", "dfs_replica_num"),
-            ):
-                if extra_config and name in extra_config:
-                    value = extra_config[name]
-                    if type(value) is not int or value < 0:
-                        raise ValueError(
-                            f"Mooncake {name} must be a non-negative integer."
-                        )
-                    self._replica_options[field] = value
-            # Validate placement before setup allocates native client resources.
-            self._make_replicate_config()
             if dfs_health_config is None and extra_config:
                 dfs_health_config = extra_config.get("_mooncake_dfs_health_config")
             if enable_client_http_server is None:
@@ -832,33 +818,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
-        config = self._make_replicate_config()
 
         # Retry logic to handle Transfer Engine startup race condition
         max_retries = 10
         retry_delay = 1.0  # seconds
 
-        if (
-            config is not None
-            and config.replica_num == 0
-            and getattr(config, "nof_replica_num", 0) == 0
-            and getattr(config, "dfs_replica_num", 0) > 0
-            and self._dfs_health_manager is not None
-        ):
-            # KV I/O stays disabled until rank consensus after construction.
-            # Native probes validate DFS without bypassing that policy.
-            for _ in range(max_retries):
-                health = self._dfs_health_manager.probe_once()
-                if health.read_error == 0 and health.write_error == 0:
-                    return
-                time.sleep(retry_delay)
-            raise RuntimeError("Mooncake DFS-only warmup probes failed.")
-
         for attempt in range(max_retries):
-            if config is None:
-                ret = self.store.put(warmup_key, warmup_value)
-            else:
-                ret = self.store.put(warmup_key, warmup_value, config)
+            ret = self.store.put(warmup_key, warmup_value)
             if ret == 0:
                 break
             logger.warning(
@@ -872,14 +838,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "Transfer Engine might not be ready"
             )
 
-        # DFS writes can return before the replica becomes queryable.
-        for _ in range(max_retries):
-            if self.store.is_exist(warmup_key) == 1:
-                if self.store.get(warmup_key) != warmup_value:
-                    raise RuntimeError("Mooncake warmup read returned incorrect data.")
-                return
-            time.sleep(retry_delay)
-        raise RuntimeError("Mooncake warmup object did not become readable.")
+        assert self.store.is_exist(warmup_key) == 1
+        assert self.store.get(warmup_key) == warmup_value
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
@@ -1532,30 +1492,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def clear(self) -> None:
         self.store.remove_all()
 
-    def _make_replicate_config(self):
-        options = getattr(self, "_replica_options", {})
-        if not options:
-            return None
-        if self._replicate_config_cls is None:
-            raise RuntimeError(
-                "Mooncake replica placement requires a package with ReplicateConfig support."
-            )
-        config = self._replicate_config_cls()
-        for field, value in options.items():
-            if not hasattr(config, field):
-                raise RuntimeError(
-                    f"The installed Mooncake package does not support ReplicateConfig.{field}."
-                )
-            setattr(config, field, value)
-        if (
-            config.replica_num
-            + getattr(config, "dfs_replica_num", 0)
-            + getattr(config, "nof_replica_num", 0)
-            <= 0
-        ):
-            raise ValueError("Mooncake requires at least one storage replica.")
-        return config
-
     def _put_batch_zero_copy_impl(
         self,
         key_strs: List[str],
@@ -1563,15 +1499,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
     ) -> List[int]:
-        config = self._make_replicate_config()
+        config = None
         if self._can_use_group_semantics() and group_ids is not None:
             if len(group_ids) != len(key_strs):
                 raise ValueError(
                     "Mooncake group_ids length must match key_strs length: "
                     f"{len(group_ids)} != {len(key_strs)}"
                 )
-            if config is None:
-                config = self._replicate_config_cls()
+            config = self._replicate_config_cls()
             config.group_ids = group_ids
 
         if self._uses_multi_buffer(buffer_ptrs):
