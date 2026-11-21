@@ -102,9 +102,7 @@ class UnifiedCacheLinker(ABC):
         """Prepare a normal load while it can still degrade to a cache miss."""
         return False
 
-    def submit_host_prefetch(
-        self, rid: str, transfers: list[PoolTransfer]
-    ) -> bool:
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a request-scoped host prefetch without allocating device pages."""
         return False
 
@@ -235,7 +233,7 @@ class UnifiedCacheLinkerWrapper:
         # this dict or the cache tree.
         self.pending_host_prefetch_submissions: (
             dict[str, tuple[PreparedHostPrefetch, ExternalCacheHitMarker]] | None
-        ) = {} if self._waiting_queue_prefetch_enabled else None
+        ) = ({} if self._waiting_queue_prefetch_enabled else None)
         # Loads in flight, each pinning its inserted endpoint until DMA
         # completes. The anchor is the request's node before the load, so a
         # failed load can walk back exactly the chain it published. Under PP
@@ -331,7 +329,11 @@ class UnifiedCacheLinkerWrapper:
                             name=transfer.name,
                             host_indices=transfer.host_indices,
                             device_indices=transfer.device_indices,
-                            keys=(list(transfer.keys) if transfer.keys is not None else None),
+                            keys=(
+                                list(transfer.keys)
+                                if transfer.keys is not None
+                                else None
+                            ),
                             hit_policy=transfer.hit_policy,
                             nodes_to_load=transfer.nodes_to_load,
                             indices_from_pool=transfer.indices_from_pool,
@@ -466,9 +468,9 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         if prefetched_hit is not None:
-            expected_len = prefetched_hit.device_hit_len + len(
-                prefetched_hit.tail_hashes
-            ) * page
+            expected_len = (
+                prefetched_hit.device_hit_len + len(prefetched_hit.tail_hashes) * page
+            )
             current_prefix = key[:expected_len]
             same_prefix = (
                 current_prefix.extra_key == prefetched_hit.prefix_key.extra_key
@@ -493,9 +495,11 @@ class UnifiedCacheLinkerWrapper:
                     host_hit_length=hit_tokens,
                     swa_host_hit_length=max(
                         result.swa_host_hit_length,
-                        min(len(swa_transfer.keys), hit_pages) * page
-                        if swa_transfer is not None
-                        else 0,
+                        (
+                            min(len(swa_transfer.keys), hit_pages) * page
+                            if swa_transfer is not None
+                            else 0
+                        ),
                     ),
                     mamba_host_hit_length=max(
                         result.mamba_host_hit_length,
@@ -554,9 +558,9 @@ class UnifiedCacheLinkerWrapper:
         makes the reduction an intersection.
         """
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
-        for pages in restorable:
-            if device_hit_pages < pages <= num_pages:
-                mask[pages] = 1
+        pages = [p for p in restorable if device_hit_pages < p <= num_pages]
+        if pages:
+            mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
         if common.numel() == 0:
@@ -808,7 +812,8 @@ class UnifiedCacheLinkerWrapper:
                     prefix_len,
                     cancel_prefetch=False,
                     pending=build_error,
-                    release_session=constructed and self._waiting_queue_prefetch_enabled,
+                    release_session=constructed
+                    and self._waiting_queue_prefetch_enabled,
                 )
                 return empty_indices, req.last_node
             # With prefetch enabled, session start/refresh already checked

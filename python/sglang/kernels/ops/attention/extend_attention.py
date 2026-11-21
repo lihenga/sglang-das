@@ -465,7 +465,18 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N):
+    prefix_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        # Round down to retain the partially visible boundary tile.
+        prefix_start = (
+            tl.maximum(
+                0,
+                cur_seq_len_prefix + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE,
+            )
+            // BLOCK_N
+            * BLOCK_N
+        )
+    for start_n in range(prefix_start, prefix_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
@@ -611,7 +622,14 @@ def _fwd_kernel(
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
-    for start_n in range(0, extend_end, BLOCK_N):
+    extend_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        extend_start = (
+            tl.maximum(0, cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE)
+            // BLOCK_N
+            * BLOCK_N
+        )
+    for start_n in range(extend_start, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
@@ -848,8 +866,8 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
-        _extract_kv_strides(k_buffer, page_size, is_value=False)
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = _extract_kv_strides(
+        k_buffer, page_size, is_value=False
     )
     v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
         _extract_kv_strides(v_buffer, page_size, is_value=True)
@@ -1364,8 +1382,8 @@ def extend_attention_fwd_unified(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = (
-        _extract_kv_strides(k_buffer, page_size, is_value=False)
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride, _ = _extract_kv_strides(
+        k_buffer, page_size, is_value=False
     )
     v_slot_stride, v_head_stride, v_page_stride, v_tok_stride, v_d_stride = (
         _extract_kv_strides(v_buffer, page_size, is_value=True)

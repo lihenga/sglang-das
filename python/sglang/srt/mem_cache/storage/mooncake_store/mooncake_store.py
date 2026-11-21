@@ -38,10 +38,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 DEFAULT_LOCAL_BUFFER_SIZE = int(
-    __import__("os").environ.get(
-        "SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE",
-        16 * 1024 * 1024
-    )
+    __import__("os").environ.get("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE", 16 * 1024 * 1024)
 )
 SETUP_TIMEOUT = 600  # 10min
 DFS_BATCH_PUT_TIMEOUT = -1606
@@ -126,7 +123,9 @@ def _get_service_endpoint(server_args) -> str:
     return NetworkAddress(str(address), port).to_host_port_str()
 
 
-def _get_mooncake_client_http_setup_kwargs(enable_client_http_server: bool) -> dict[str, Any]:
+def _get_mooncake_client_http_setup_kwargs(
+    enable_client_http_server: bool,
+) -> dict[str, Any]:
     if not enable_client_http_server:
         return {}
     return {
@@ -1024,14 +1023,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # A stop point works when the window ending there is complete,
                 # so scan every one instead of stopping at the longest.
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        pool_restorable.append(prefix_len)
-                        if boundary == 0:
-                            boundary = prefix_len
+                missing = 0
+                for index, exists in enumerate(page_exists):
+                    missing += not exists
+                    if index >= trailing:
+                        missing -= not page_exists[index - trailing]
+                    if missing == 0:
+                        boundary = index + 1
+                        pool_restorable.append(boundary)
             else:
                 raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
@@ -1135,9 +1134,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(
-                host_indices
-            )
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             if len(ptr_list) != len(key_strs):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
