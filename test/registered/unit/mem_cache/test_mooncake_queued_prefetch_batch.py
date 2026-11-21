@@ -199,6 +199,14 @@ class TestMooncakeQueuedPrefetchBatch(CustomTestCase):
         self.assertEqual(self.linker.session_refcounts, {"a": 1, "b": 1})
 
     def test_unset_defaults_to_single_request_path_with_new_wheel(self):
+        class SingleRequestQueue(Queue):
+            def qsize(self):
+                raise AssertionError("disabled worker must not inspect batch size")
+
+            def get_nowait(self):
+                raise AssertionError("disabled worker must not drain queued requests")
+
+        self.linker.host_prefetch_queue = SingleRequestQueue()
         with envs.SGLANG_MOONCAKE_ENABLE_PREFETCH_BATCHING.override(True):
             envs.SGLANG_MOONCAKE_ENABLE_PREFETCH_BATCHING.clear()
             self.assertFalse(envs.SGLANG_MOONCAKE_ENABLE_PREFETCH_BATCHING.is_set())

@@ -1071,11 +1071,92 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return f"__sglang_waiting_queue_prefetch__:{rid}:{generation}"
 
     def host_prefetch_thread_func(self) -> None:
-        prefetch_batch = (
-            getattr(self.storage.store, "batch_get_session_prefetch_batch", None)
-            if envs.SGLANG_MOONCAKE_ENABLE_PREFETCH_BATCHING.get()
-            else None
-        )
+        if envs.SGLANG_MOONCAKE_ENABLE_PREFETCH_BATCHING.get():
+            prefetch_batch = getattr(
+                self.storage.store, "batch_get_session_prefetch_batch", None
+            )
+            if callable(prefetch_batch):
+                self._host_prefetch_batch_thread_func(prefetch_batch)
+                return
+        self._host_prefetch_single_thread_func()
+
+    def _host_prefetch_single_thread_func(self) -> None:
+        while True:
+            task = self.host_prefetch_queue.get()
+            try:
+                if task is None:
+                    return
+                rid, transfers = task
+                with self.host_prefetch_lock:
+                    entry = self.host_prefetch_entries.get(rid)
+                    if entry is None or entry.get("transfers") is not transfers:
+                        continue
+                    session_rid = str(entry["session_rid"])
+                    if entry.get("cancelled"):
+                        self.host_prefetch_entries.pop(rid, None)
+                        continue
+                    entry["state"] = "preparing"
+
+                try:
+                    prepared = self.prepare_load(session_rid, transfers)
+                except BaseException:
+                    logger.warning(
+                        "Mooncake waiting-queue session preparation failed for rid=%s",
+                        rid,
+                        exc_info=True,
+                    )
+                    prepared = False
+                with self.session_lock:
+                    keys = list(self.prepared_load_sessions.get(session_rid, ()))
+                if not prepared or not keys:
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
+                    continue
+
+                with self.session_lock:
+                    sources = {
+                        key: self.session_sources.get(key, "unknown") for key in keys
+                    }
+                dfs_keys = [key for key in keys if sources[key] in {"dfs", "unknown"}]
+                if not dfs_keys:
+                    self._finish_host_prefetch(
+                        rid, entry, session_rid, "no_prefetch_needed", keys=keys
+                    )
+                    continue
+
+                with self.host_prefetch_lock:
+                    current = self.host_prefetch_entries.get(rid)
+                    if current is not entry or current.get("cancelled"):
+                        cancelled = True
+                    else:
+                        cancelled = False
+                        current["state"] = "reading"
+                if cancelled:
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
+                    continue
+                try:
+                    results = list(
+                        self.storage.store.batch_get_session_prefetch(dfs_keys)
+                    )
+                    success = len(results) == len(dfs_keys) and all(
+                        result == 0 for result in results
+                    )
+                except BaseException:
+                    logger.warning(
+                        "Mooncake waiting-queue DFS prefetch failed for rid=%s",
+                        rid,
+                        exc_info=True,
+                    )
+                    success = False
+                self._finish_host_prefetch(
+                    rid,
+                    entry,
+                    session_rid,
+                    "dfs_prefetched" if success else "failed",
+                )
+            finally:
+                self.host_prefetch_queue.task_done()
+
+    def _host_prefetch_batch_thread_func(self, prefetch_batch) -> None:
         stop = False
         while not stop:
             task = self.host_prefetch_queue.get()
