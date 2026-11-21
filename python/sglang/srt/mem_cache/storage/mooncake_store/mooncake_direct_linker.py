@@ -1217,23 +1217,38 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 dict.fromkeys(key for keys, _ in batches.values() for key in keys)
             )
             if not self.host_prefetch_enabled and session_keys:
-                try:
-                    result = list(
-                        self.storage.store.batch_get_session_start(session_keys)
+                keys_to_start = session_keys
+                acquired = []
+                started.append(acquired)
+                for attempt in range(2):
+                    try:
+                        result = list(
+                            self.storage.store.batch_get_session_start(keys_to_start)
+                        )
+                    except BaseException:
+                        # A binding/backend exception may follow a partial start.
+                        acquired.extend(keys_to_start)
+                        raise
+                    acquired.extend(
+                        key for key, code in zip(keys_to_start, result) if code == 0
                     )
-                except BaseException:
-                    # A binding/backend exception may follow a partial start.
-                    started.append(session_keys)
-                    raise
-                started.append(
-                    [key for key, code in zip(session_keys, result) if code == 0]
-                )
-                failed = [
-                    key
-                    for i, key in enumerate(session_keys)
-                    if i >= len(result) or result[i] != 0
-                ]
-                if failed or len(result) != len(session_keys):
+                    failed = [
+                        key
+                        for i, key in enumerate(keys_to_start)
+                        if i >= len(result) or result[i] != 0
+                    ]
+                    if not failed or len(result) > len(keys_to_start):
+                        break
+                    if attempt == 0:
+                        logger.warning(
+                            "Mooncake get session start partial failure "
+                            "(keys=%d, failed=%d), retrying failed keys once: results=%s",
+                            len(keys_to_start),
+                            len(failed),
+                            result,
+                        )
+                        keys_to_start = failed
+                if failed or len(result) != len(keys_to_start):
                     failed_get_cache = getattr(self.storage, "failed_get_cache", None)
                     if failed_get_cache is not None:
                         failed_get_cache.update_batch([], failed)

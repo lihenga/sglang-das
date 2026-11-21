@@ -52,8 +52,10 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
         )
         linker.storage.store.batch_get_session_end.return_value = 0
         linker.storage.store.all_get_sessions_memory.return_value = True
-        linker.storage.store.batch_get_into_layouts.return_value = (
-            [[-707]] if bad_result else [[4, 4]] if packed else [[2, 2, 2, 2]]
+        linker.storage.store.batch_get_into_layouts = Mock(
+            return_value=(
+                [[-707]] if bad_result else [[4, 4]] if packed else [[2, 2, 2, 2]]
+            )
         )
         transfers = [
             [
@@ -561,7 +563,7 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
 
                 def partial(keys):
                     linker.active.add("a")
-                    return [0, -702]
+                    return [0 if key == "a" else -702 for key in keys]
 
                 store = linker.storage.store
                 store.batch_get_session_start.side_effect = partial
@@ -587,6 +589,84 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
                     )
                 )
                 store.batch_get_into_multi_buffer_ranges.assert_not_called()
+
+    def test_session_start_retries_only_failed_keys(self):
+        for page_wise in (False, True):
+            for retry_code in (0, -70702):
+                with self.subTest(page_wise=page_wise, retry_code=retry_code):
+                    linker = self._session_linker(memory=False, page_wise=page_wise)
+                    store = linker.storage.store
+
+                    def start(keys):
+                        if keys == ["a", "b"]:
+                            linker.active.add("a")
+                            return [0, -70702]
+                        self.assertEqual(keys, ["b"])
+                        if retry_code == 0:
+                            linker.active.add("b")
+                        return [retry_code]
+
+                    store.batch_get_session_start.side_effect = start
+                    transfers = self._transfers()
+                    transfers[0].append(
+                        PoolTransfer(
+                            name=PoolName.SWA, keys=["a", "b"], host_indices=[3, 4]
+                        )
+                    )
+                    with self.assertLogs(level="WARNING"):
+                        self.assertEqual(
+                            linker.load_layer_wise(0, transfers), retry_code == 0
+                        )
+                    self.assertEqual(
+                        store.batch_get_session_start.call_args_list,
+                        [call(["a", "b"]), call(["b"])],
+                    )
+                    store.batch_get_session_end.assert_called_once_with(
+                        ["a", "b"] if retry_code == 0 else ["a"]
+                    )
+                    self.assertFalse(linker.active)
+                    futures = linker.layer_done_counter.futures[0]
+                    self.assertTrue(all(f.done() for f in futures))
+                    if retry_code == 0:
+                        self.assertTrue(all(f.exception() is None for f in futures))
+                        self.assertEqual(
+                            bytes(linker.buffer)[8:24], b"efghmnopABCDIJKL"
+                        )
+                        linker.storage.failed_get_cache.update_batch.assert_not_called()
+                    else:
+                        self.assertTrue(all(f.exception() for f in futures))
+                        store.batch_get_into_multi_buffer_ranges.assert_not_called()
+                        linker.storage.failed_get_cache.update_batch.assert_called_once_with(
+                            [], ["b"]
+                        )
+
+    def test_retry_start_exception_releases_both_rounds_sessions(self):
+        linker = self._session_linker()
+        store = linker.storage.store
+
+        def start(keys):
+            if keys == ["a", "b"]:
+                linker.active.add("a")
+                return [0, -70702]
+            self.assertEqual(keys, ["b"])
+            linker.active.add("b")
+            raise RuntimeError("retry partially started")
+
+        store.batch_get_session_start.side_effect = start
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(linker.load_layer_wise(0, self._transfers()))
+        self.assertEqual(
+            store.batch_get_session_start.call_args_list,
+            [call(["a", "b"]), call(["b"])],
+        )
+        store.batch_get_session_end.assert_called_once_with(["a", "b"])
+        self.assertFalse(linker.active)
+        self.assertTrue(
+            all(
+                f.done() and f.exception() for f in linker.layer_done_counter.futures[0]
+            )
+        )
+        store.batch_get_into_multi_buffer_ranges.assert_not_called()
 
     def test_start_exception_releases_partial_sessions(self):
         for prefetch in (False, True):
