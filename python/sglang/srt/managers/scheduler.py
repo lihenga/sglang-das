@@ -571,6 +571,12 @@ class Scheduler(
         # so patching them afterwards is a no-op.
         maybe_revert_pr_fix()
 
+        # Allocate the Mooncake unified DFS buffer before the model fills host
+        # memory with weights and page cache, so the span is backed by huge
+        # pages. A 4 KiB-page mapped span is migrated by kernel compaction, and
+        # every migration evicts this rank's GPU queues for seconds.
+        self.prepare_mooncake_dfs_unified_buffer()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -1102,6 +1108,47 @@ class Scheduler(
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
+
+    def prepare_mooncake_dfs_unified_buffer(self):
+        """Prepare the Mooncake unified DFS buffer before loading the model.
+
+        The buffer is allocated and registered by hipHostRegister, so it is
+        anonymous memory the kernel can migrate. Compaction migrating any of its
+        4 KiB pages evicts this rank's GPU queues until the driver revalidates
+        the mappings, which stalls the first DFS H2D for seconds per eviction.
+        Allocating while memory is still free lets the span be backed by huge
+        pages, which compaction skips. Best effort: on any failure the client
+        allocates the buffer later as before.
+        """
+        if not self.enable_unified_cache_external_linker:
+            return
+        if get_memory().unified_cache_external_linker_backend != "mooncake":
+            return
+        if get_device().device != "cuda":
+            # hipHostRegister is used by the HIP/Hygon backend only.
+            return
+        try:
+            from mooncake.store import prepare_dfs_unified_buffer
+        except Exception as e:
+            logger.warning(
+                "Mooncake unified DFS buffer pre-allocation unavailable: %s", e
+            )
+            return
+        try:
+            tic = time.perf_counter()
+            ret = prepare_dfs_unified_buffer(get_device().gpu_id)
+            logger.info(
+                "Mooncake unified DFS buffer prepared for gpu %s in %.2fs (ret=%s)",
+                get_device().gpu_id,
+                time.perf_counter() - tic,
+                ret,
+            )
+        except Exception as e:
+            logger.warning(
+                "Mooncake unified DFS buffer pre-allocation failed, falling back "
+                "to the late allocation: %s",
+                e,
+            )
 
     def init_model_worker(self):
         # Load model weights.
