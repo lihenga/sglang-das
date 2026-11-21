@@ -23,6 +23,14 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if (
+        cfg.unified_cache_external_linker_config is not None
+        and not cfg.enable_unified_cache_external_linker
+    ):
+        raise ValueError(
+            "--unified-cache-external-linker-config requires "
+            "--enable-unified-cache-external-linker."
+        )
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"

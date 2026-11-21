@@ -132,6 +132,41 @@ class MooncakeDfsHealthManagerTest(CustomTestCase):
         store = _FakeStore(read_probes, write_probes)
         return store, MooncakeDfsHealthManager(store)
 
+    def test_dfs_only_warmup_restores_fail_closed_policy(self):
+        """DFS-only startup must not become a zero-replica put or bypass consensus."""
+        for deferred in (False, True):
+            for fail_io in (False, True):
+                with self.subTest(deferred=deferred, fail_io=fail_io):
+                    store = _FakeStore([0, 0], [0, 0])
+                    manager = MooncakeDfsHealthManager(
+                        store,
+                        {"probe_interval_s": 1, "success_threshold": 2},
+                        defer_policy_application=deferred,
+                    )
+                    try:
+                        with patch.object(_MODULE.time, "sleep"):
+                            with manager.dfs_only_warmup_policy(5):
+                                self.assertEqual(store.policies[-1], (True, True))
+                                self.assertEqual(manager.snapshot().read_successes, 2)
+                                if fail_io:
+                                    raise ValueError("warmup I/O failed")
+                    except ValueError:
+                        if not fail_io:
+                            raise
+                    self.assertEqual(store.policies[-1], (False, False))
+                    self.assertEqual(manager._effective_policy, (False, False))
+                    self.assertIsNone(manager._thread)
+                    self.assertIsNone(manager._policy_thread)
+
+    def test_unhealthy_dfs_only_warmup_never_enables_io(self):
+        """An unhealthy DFS must fail explicitly before submitting a zero-replica put."""
+        store = _FakeStore([-1], [-1])
+        manager = MooncakeDfsHealthManager(store, defer_policy_application=True)
+        with self.assertRaisesRegex(RuntimeError, "requires healthy DFS"):
+            with manager.dfs_only_warmup_policy(0.01):
+                self.fail("unhealthy DFS reached warmup I/O")
+        self.assertTrue(all(policy == (False, False) for policy in store.policies))
+
     def _wait_for_policy(self, manager, policy):
         with manager._policy_condition:
             self.assertTrue(

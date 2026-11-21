@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
@@ -12,12 +13,19 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 
 class ReplicateConfigWithGroupIds:
     def __init__(self):
         self.group_ids = None
+
+
+class ReplicateConfigWithReplicaPolicy(ReplicateConfigWithGroupIds):
+    def __init__(self):
+        super().__init__()
+        self.replica_num = 1
+        self.dfs_replica_num = 0
 
 
 class ReplicateConfigWithoutGroupIds:
@@ -199,6 +207,8 @@ class FakeMultiBufferPool:
 def _make_config(
     *,
     enable_group_semantics=True,
+    memory_replica_num=None,
+    dfs_replica_num=None,
     extra_backend_tag=None,
     model_name=None,
     is_mla_model=False,
@@ -215,6 +225,10 @@ def _make_config(
     }
     if extra_backend_tag is not None:
         extra_config["extra_backend_tag"] = extra_backend_tag
+    if memory_replica_num is not None:
+        extra_config["memory_replica_num"] = memory_replica_num
+    if dfs_replica_num is not None:
+        extra_config["dfs_replica_num"] = dfs_replica_num
 
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
@@ -237,6 +251,8 @@ def _make_store(
     *,
     enable_group_semantics=True,
     replicate_config_cls=ReplicateConfigWithGroupIds,
+    memory_replica_num=None,
+    dfs_replica_num=None,
     extra_backend_tag=None,
     model_name=None,
     is_mla_model=False,
@@ -248,6 +264,8 @@ def _make_store(
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
         enable_group_semantics=enable_group_semantics,
+        memory_replica_num=memory_replica_num,
+        dfs_replica_num=dfs_replica_num,
         extra_backend_tag=extra_backend_tag,
         model_name=model_name,
         is_mla_model=is_mla_model,
@@ -274,6 +292,78 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_dfs_only_constructor_warmup_respects_native_policy(self):
+        """Native fail-closed setup must not strip the only warmup replica."""
+        base = _fake_store_class()
+
+        class NativeStore(base):
+            def __init__(self):
+                super().__init__()
+                self.allow_write = True
+                self.allow_read = True
+                self.warmup_policy = None
+
+            def probe_dfs_read(self):
+                return 0
+
+            def probe_dfs_write(self):
+                return 0
+
+            def set_dfs_access_policy(self, read, write):
+                self.allow_read, self.allow_write = read, write
+                return 0
+
+            def put(self, key, value, config):
+                dfs_replicas = config.dfs_replica_num if self.allow_write else 0
+                if config.replica_num + dfs_replicas == 0:
+                    return -600
+                self.warmup_policy = (config.replica_num, dfs_replicas)
+                return super().put(key, value, config)
+
+            def get(self, key):
+                if not self.allow_read:
+                    return None
+                return super().get(key)
+
+        with (
+            envs.MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR.override(
+                "distributed_storage_backend"
+            ),
+            patch(f"{__name__}._fake_store_class", return_value=NativeStore),
+            patch(
+                "sglang.srt.mem_cache.storage.mooncake_store.dfs_health."
+                "MooncakeDfsHealthManager.start"
+            ),
+        ):
+            store, native = _make_store(
+                replicate_config_cls=ReplicateConfigWithReplicaPolicy,
+                memory_replica_num=0,
+                dfs_replica_num=1,
+            )
+        self.addCleanup(store.close)
+        self.assertEqual(native.warmup_policy, (0, 1))
+        self.assertFalse(native.allow_read)
+        self.assertFalse(native.allow_write)
+
+    def test_replica_policy_survives_group_attribution(self):
+        """Adding group IDs must not discard the configured DFS write policy."""
+        store, fake_store = _make_store(
+            replicate_config_cls=ReplicateConfigWithReplicaPolicy,
+            memory_replica_num=0,
+            dfs_replica_num=1,
+        )
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+
+        config = fake_store.batch_put_calls[0]["args"][0]
+        self.assertEqual(config.replica_num, 0)
+        self.assertEqual(config.dfs_replica_num, 1)
+        self.assertEqual(
+            config.group_ids,
+            ["sglang-hicache:page0", "sglang-hicache:page0"],
+        )
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(

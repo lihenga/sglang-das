@@ -313,7 +313,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_owner = not rank_replicated or tp_rank == 0
         self.tp_rank = tp_rank
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-            get_memory().hicache_storage_backend_extra_config
+            get_memory().unified_cache_external_linker_config
         )
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
