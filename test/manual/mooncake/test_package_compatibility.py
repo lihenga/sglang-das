@@ -104,6 +104,11 @@ class TestPackageCompatibility(unittest.TestCase):
             for node in tree.body
             if isinstance(node, ast.ClassDef) and node.name == "MooncakeStore"
         )
+        local_buffer_size = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_local_buffer_size"
+        )
         for package in (CommunityStore, L3Store):
             for prefetch in (False, True):
                 with self.subTest(package=package.__name__, prefetch=prefetch):
@@ -154,7 +159,9 @@ class TestPackageCompatibility(unittest.TestCase):
                         "_get_service_endpoint": lambda args: None,
                         "os": os,
                     }
-                    module = ast.Module(body=[definition], type_ignores=[])
+                    module = ast.Module(
+                        body=[local_buffer_size, definition], type_ignores=[]
+                    )
                     exec(
                         compile(
                             module,
