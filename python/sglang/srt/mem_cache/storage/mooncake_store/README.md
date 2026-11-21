@@ -496,14 +496,14 @@ variant appropriate for your Linux device and driver.
 | Optional feature | Community / HYGON L3 | L4 with the corresponding APIs |
 | --- | --- | --- |
 | Basic Store and session range reads | Existing API path | Existing API path |
-| Native strided ReadLayout | Selected automatically when present for layer-wise loads | Selected automatically for layer-wise loads |
+| Native strided ReadLayout | Selected automatically when present for layer-wise and page-wise loads | Selected automatically for layer-wise and page-wise loads |
 | Waiting-queue DFS prefetch | Disabled with a startup warning when requested | Negotiated across ranks; requires an available arena |
 | DFS health and access policy | Original package behavior; no SGLang health-based failover | Native probes and coordinated policy |
 | Client HTTP metrics | Automatic port zero disables the optional endpoint with a warning; upgrade for automatic ports | Automatic ports enabled when declared by the package |
 
 The same SGLang code and configuration can use either package. Optional API
 selection first respects local capability declarations, then checks callable
-methods for older packages without a query. Layer-wise loads automatically use
+methods for older packages without a query. Layer-wise and page-wise loads use
 native ReadLayout when available, so Mooncake expands strided addresses in C++.
 SGLang owns session preparation and range-read scheduling. With page-wise loading
 enabled, active sessions selecting only MEMORY replicas load layer by layer;
