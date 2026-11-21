@@ -11,6 +11,7 @@ from queue import Empty, Queue
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -790,9 +791,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         return self._prepare_expanded_load(rid, expanded)
 
-    def _prepare_expanded_load(
-        self, rid: str, expanded: list[PoolTransfer]
-    ) -> bool:
+    def _prepare_expanded_load(self, rid: str, expanded: list[PoolTransfer]) -> bool:
         keys = []
         seen = set()
         for transfer in expanded:
@@ -913,9 +912,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     bases[key] = lease_base
         return ok
 
-    def submit_host_prefetch(
-        self, rid: str, transfers: list[PoolTransfer]
-    ) -> bool:
+    def submit_host_prefetch(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         if not self.host_prefetch_enabled:
             return False
         kv_transfer = next(
@@ -1074,89 +1071,114 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return f"__sglang_waiting_queue_prefetch__:{rid}:{generation}"
 
     def host_prefetch_thread_func(self) -> None:
-        while True:
+        prefetch_batch = (
+            getattr(self.storage.store, "batch_get_session_prefetch_batch", None)
+            if envs.SGLANG_MOONCAKE_ENABLE_PREFETCH_BATCHING.get()
+            else None
+        )
+        stop = False
+        while not stop:
             task = self.host_prefetch_queue.get()
+            tasks = [task]
+            if callable(prefetch_batch) and task is not None:
+                # Take the queued snapshot without waiting for more requests.
+                for _ in range(self.host_prefetch_queue.qsize()):
+                    try:
+                        queued = self.host_prefetch_queue.get_nowait()
+                    except Empty:
+                        break
+                    tasks.append(queued)
+                    if queued is None:
+                        break
             try:
-                if task is None:
-                    return
-                rid, transfers = task
-                with self.host_prefetch_lock:
-                    entry = self.host_prefetch_entries.get(rid)
-                    if entry is None or entry.get("transfers") is not transfers:
-                        continue
-                    session_rid = str(entry["session_rid"])
-                    if entry.get("cancelled"):
-                        self.host_prefetch_entries.pop(rid, None)
-                        continue
-                    entry["state"] = "preparing"
+                reading = []
+                for task in tasks:
+                    if task is None:
+                        stop = True
+                        break
+                    rid, transfers = task
+                    with self.host_prefetch_lock:
+                        entry = self.host_prefetch_entries.get(rid)
+                        if entry is None or entry.get("transfers") is not transfers:
+                            continue
+                        session_rid = str(entry["session_rid"])
+                        if entry.get("cancelled"):
+                            self.host_prefetch_entries.pop(rid, None)
+                            continue
+                        entry["state"] = "preparing"
 
+                    try:
+                        prepared = self.prepare_load(session_rid, transfers)
+                    except BaseException:
+                        logger.warning(
+                            "Mooncake waiting-queue session preparation failed for rid=%s",
+                            rid,
+                            exc_info=True,
+                        )
+                        prepared = False
+                    with self.session_lock:
+                        keys = list(self.prepared_load_sessions.get(session_rid, ()))
+                        dfs_keys = [
+                            key
+                            for key in keys
+                            if self.session_sources.get(key, "unknown")
+                            in {"dfs", "unknown"}
+                        ]
+                    if not prepared or not keys:
+                        self._finish_host_prefetch(rid, entry, session_rid, "failed")
+                        continue
+                    if not dfs_keys:
+                        self._finish_host_prefetch(
+                            rid, entry, session_rid, "no_prefetch_needed", keys=keys
+                        )
+                        continue
+                    with self.host_prefetch_lock:
+                        current = self.host_prefetch_entries.get(rid)
+                        cancelled = current is not entry or current.get("cancelled")
+                        if not cancelled:
+                            current["state"] = "reading"
+                    if cancelled:
+                        self._finish_host_prefetch(rid, entry, session_rid, "failed")
+                        continue
+                    reading.append((rid, entry, session_rid, dfs_keys))
+                if not reading:
+                    continue
                 try:
-                    prepared = self.prepare_load(session_rid, transfers)
-                except BaseException:
-                    logger.warning(
-                        "Mooncake waiting-queue session preparation failed for rid=%s",
-                        rid,
-                        exc_info=True,
-                    )
-                    prepared = False
-                with self.session_lock:
-                    keys = list(self.prepared_load_sessions.get(session_rid, ()))
-                if not prepared or not keys:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
-                    continue
-
-                with self.session_lock:
-                    sources = {
-                        key: self.session_sources.get(key, "unknown")
-                        for key in keys
-                    }
-                dfs_keys = [
-                    key
-                    for key in keys
-                    if sources[key] in {"dfs", "unknown"}
-                ]
-                if not dfs_keys:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "no_prefetch_needed", keys=keys
-                    )
-                    continue
-
-                with self.host_prefetch_lock:
-                    current = self.host_prefetch_entries.get(rid)
-                    if current is not entry or current.get("cancelled"):
-                        cancelled = True
+                    if callable(prefetch_batch):
+                        batch_results = [
+                            list(results)
+                            for results in prefetch_batch([item[3] for item in reading])
+                        ]
                     else:
-                        cancelled = False
-                        current["state"] = "reading"
-                if cancelled:
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
-                    continue
-                try:
-                    results = list(
-                        self.storage.store.batch_get_session_prefetch(dfs_keys)
-                    )
-                    success = len(results) == len(dfs_keys) and all(
-                        result == 0 for result in results
-                    )
+                        batch_results = [
+                            list(
+                                self.storage.store.batch_get_session_prefetch(
+                                    reading[0][3]
+                                )
+                            )
+                        ]
                 except BaseException:
                     logger.warning(
-                        "Mooncake waiting-queue DFS prefetch failed for rid=%s",
-                        rid,
+                        "Mooncake waiting-queue DFS prefetch batch failed",
                         exc_info=True,
                     )
-                    success = False
-                self._finish_host_prefetch(
-                    rid,
-                    entry,
-                    session_rid,
-                    "dfs_prefetched" if success else "failed",
-                )
+                    batch_results = []
+                for index, (rid, entry, session_rid, dfs_keys) in enumerate(reading):
+                    results = batch_results[index] if index < len(batch_results) else []
+                    success = (
+                        len(batch_results) == len(reading)
+                        and len(results) == len(dfs_keys)
+                        and all(result == 0 for result in results)
+                    )
+                    self._finish_host_prefetch(
+                        rid,
+                        entry,
+                        session_rid,
+                        "dfs_prefetched" if success else "failed",
+                    )
             finally:
-                self.host_prefetch_queue.task_done()
+                for _ in tasks:
+                    self.host_prefetch_queue.task_done()
 
     def _finish_host_prefetch(
         self,
@@ -1557,9 +1579,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             offsets: list[list[int]] = [[] for _ in keys]
 
             for layer in range(self.num_layers):
-                meta = self.pools[name].get_prepared_layer_range_meta(
-                    locations, layer
-                )
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                 if meta is None:
                     continue
                 layer_ptrs, layer_sizes, layer_offsets = meta
@@ -1602,9 +1622,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         expected = [sum(item) for item in all_sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
-            pool_counts = {
-                str(name): len(keys) for name, (keys, _) in batches.items()
-            }
+            pool_counts = {str(name): len(keys) for name, (keys, _) in batches.items()}
             raise RuntimeError(
                 "Mooncake aggregated range get failed for "
                 f"pools={pool_counts}, complete_page: transferred={result}, "
@@ -1643,9 +1661,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 buffer_indices = (
                     ()
                     if mapped is None
-                    else (mapped,)
-                    if isinstance(mapped, int)
-                    else tuple(mapped)
+                    else (mapped,) if isinstance(mapped, int) else tuple(mapped)
                 )
                 layout.append(
                     [
