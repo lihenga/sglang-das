@@ -1259,9 +1259,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             # This inspects selected session replicas locally, without restarting
             # sessions or invalidating their prefetched data. Older wheels are unknown.
             all_memory = getattr(self.storage.store, "all_get_sessions_memory", None)
-            page_wise = self.enable_page_wise_load and not (
-                callable(all_memory) and all_memory(session_keys)
-            )
+            page_wise = self.enable_page_wise_load
+            if page_wise and callable(all_memory):
+                try:
+                    page_wise = not all_memory(session_keys)
+                except Exception:
+                    logger.warning(
+                        "Mooncake session source inspection failed; treating sources as unknown",
+                        exc_info=True,
+                    )
             read_layout = getattr(self, "read_layout_enabled", False)
             if page_wise:
                 if read_layout:

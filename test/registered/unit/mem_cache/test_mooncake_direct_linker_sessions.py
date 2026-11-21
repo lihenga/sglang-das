@@ -510,6 +510,72 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
                     store.all_get_sessions_memory.assert_not_called()
                 self.assertEqual(bytes(linker.buffer)[8:24], b"efghmnopABCDIJKL")
 
+    def test_source_check_exception_continues_pagewise_reading(self):
+        for read_layout in (False, True):
+            with self.subTest(read_layout=read_layout):
+                if read_layout:
+                    linker, transfers, native, buffers, expected, actual = (
+                        self._page_layout_linker(True)
+                    )
+                else:
+                    linker = self._session_linker(page_wise=True)
+                    transfers, native = self._transfers(), None
+                store = linker.storage.store
+                store.all_get_sessions_memory.side_effect = RuntimeError(
+                    "source unavailable"
+                )
+                with patch.dict(
+                    "sys.modules", {"mooncake.store": native}
+                ), self.assertLogs(level="WARNING"):
+                    self.assertTrue(linker.load_layer_wise(0, transfers))
+                store.all_get_sessions_memory.assert_called_once()
+                store.batch_get_session_start.assert_called_once()
+                store.batch_get_session_end.assert_called_once()
+                self.assertFalse(linker.active)
+                self.assertTrue(
+                    all(
+                        f.done() and f.exception() is None
+                        for f in linker.layer_done_counter.futures[0]
+                    )
+                )
+                if read_layout:
+                    store.batch_get_into_layouts.assert_called_once()
+                    self.assertCountEqual(actual, expected)
+                else:
+                    store.batch_get_into_multi_buffer_ranges.assert_called_once()
+                    self.assertEqual(bytes(linker.buffer)[8:24], b"efghmnopABCDIJKL")
+
+    def test_source_check_fallback_does_not_hide_load_failures(self):
+        for failure in ("read", "bytes", "cleanup", "interrupt"):
+            with self.subTest(failure=failure):
+                linker = self._session_linker(page_wise=True)
+                store = linker.storage.store
+                store.all_get_sessions_memory.side_effect = RuntimeError(
+                    "source unavailable"
+                )
+                if failure == "read":
+                    store.batch_get_into_multi_buffer_ranges.side_effect = RuntimeError(
+                        "read failed"
+                    )
+                elif failure == "bytes":
+                    store.batch_get_into_multi_buffer_ranges.side_effect = None
+                    store.batch_get_into_multi_buffer_ranges.return_value = [-1, -1]
+                elif failure == "cleanup":
+                    store.batch_get_session_end.side_effect = RuntimeError("end failed")
+                else:
+                    store.all_get_sessions_memory.side_effect = KeyboardInterrupt()
+                with self.assertLogs(level="WARNING"):
+                    self.assertFalse(linker.load_layer_wise(0, self._transfers()))
+                store.batch_get_session_end.assert_called_once()
+                futures = linker.layer_done_counter.futures[0]
+                self.assertTrue(all(f.done() for f in futures))
+                if failure == "cleanup":
+                    self.assertTrue(all(f.exception() is None for f in futures))
+                else:
+                    self.assertTrue(all(f.exception() for f in futures))
+                if failure == "interrupt":
+                    store.batch_get_into_multi_buffer_ranges.assert_not_called()
+
     def test_unknown_source_uses_pagewise(self):
         linker = self._session_linker(page_wise=True)
         del linker.storage.store.all_get_sessions_memory
