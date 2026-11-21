@@ -2424,6 +2424,9 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+_RC2_P_BROADCAST_MEMORYVIEW = os.getenv("SGLANG_RC2_P_BROADCAST_MEMORYVIEW") == "1"
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,
@@ -2435,6 +2438,8 @@ def broadcast_pyobj(
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
     """
+    from sglang.srt.utils.poll_control_tensors import broadcast_size_header
+
     device = torch.device(
         "cuda"
         if torch.cuda.is_available() and not force_cpu_device
@@ -2443,7 +2448,7 @@ def broadcast_pyobj(
 
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+            tensor_size = broadcast_size_header(0, device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
@@ -2452,13 +2457,13 @@ def broadcast_pyobj(
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
             ).to(device)
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+            tensor_size = broadcast_size_header(size, device)
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
             dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+        tensor_size = broadcast_size_header(0, device)
         dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
@@ -2468,7 +2473,11 @@ def broadcast_pyobj(
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
-        serialized_data = bytes(tensor_data.cpu().numpy())
+        if _RC2_P_BROADCAST_MEMORYVIEW:
+            # The tensor remains alive through pickle.loads.
+            serialized_data = memoryview(tensor_data.cpu().numpy()).toreadonly()
+        else:
+            serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
 

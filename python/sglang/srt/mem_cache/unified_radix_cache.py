@@ -2833,6 +2833,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Called per scheduler step to poll async HiCache events."""
         self._sync_dfs_health_policy()
         if self.linker is not None:
+            from sglang.srt.utils.poll_control_tensors import linker_counts, linker_offload_count
+
             if not all(
                 hasattr(self.linker, name)
                 for name in (
@@ -2841,21 +2843,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     "commit_completed_loads",
                 )
             ):
-                finish_count = torch.tensor(
-                    self.linker.num_completed_offloads(), dtype=torch.int, device="cpu"
-                )
+                finish_count = linker_offload_count(self.linker.num_completed_offloads())
                 self._all_reduce_attn_groups(
                     finish_count, torch.distributed.ReduceOp.MIN
                 )
                 self.linker.drain_offloads(int(finish_count.item()))
                 return
-            finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
-                dtype=torch.int,
-                device="cpu",
+            finish_counts = linker_counts(
+                self.linker.num_completed_loads(),
+                self.linker.num_completed_offloads(),
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
             self._collect_failed_linker_loads(int(finish_counts[0].item()))

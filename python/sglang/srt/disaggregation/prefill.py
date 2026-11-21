@@ -1337,14 +1337,22 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        from sglang.srt.managers.scheduler_components.prefill_idle_heap_trim import (
+            make_prefill_idle_heap_trim,
+        )
+
+        idle_heap_trim = make_prefill_idle_heap_trim(self.ps.tp_rank, self.idle_sleeper)
         while True:
             if self._forward_ingress_enabled:
                 self._process_deferred_reqs()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            received_work = idle_heap_trim is not None and bool(recv_reqs)
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                if idle_heap_trim is not None:
+                    idle_heap_trim.mark_busy()
                 continue
             if DAS_PREFETCH_TRACE_ENABLED:
                 self._admit_prefill_bootstrapped_reqs()
@@ -1379,6 +1387,11 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if idle_heap_trim is not None:
+                if received_work or batch is not None:
+                    idle_heap_trim.mark_busy()
+                else:
+                    idle_heap_trim.poll(self.is_fully_idle)
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
