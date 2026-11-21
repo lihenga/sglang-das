@@ -11,6 +11,15 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestExternalLinkerRadixGate(CustomTestCase):
+    def test_linker_config_requires_external_linker(self):
+        with self.assertRaisesRegex(ValueError, "requires.*external-linker"):
+            handle_hicache(
+                ServerArgs(
+                    model_path="dummy",
+                    unified_cache_external_linker_config='{"dfs_replica_num":1}',
+                )
+            )
+
     def test_linker_requires_radix_cache(self):
         args = ServerArgs(
             model_path="dummy",

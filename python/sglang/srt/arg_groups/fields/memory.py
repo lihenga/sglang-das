@@ -272,6 +272,13 @@ class Memory(msgspec.Struct):
         "Timeout in seconds for one Mooncake DFS health probe.",
     ] = None
 
+    unified_cache_external_linker_config: A[
+        Optional[str],
+        "Extra configuration for --enable-unified-cache-external-linker as a "
+        "JSON object string, or '@' followed by a JSON/YAML/TOML config file. "
+        "For Mooncake, memory_replica_num and dfs_replica_num control write placement.",
+    ] = None
+
     enable_linker_mla_dedup: A[
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",

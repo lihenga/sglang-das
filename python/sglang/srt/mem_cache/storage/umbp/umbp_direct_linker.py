@@ -248,7 +248,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
         extra_config = _parse_storage_extra_config(
-            get_memory().hicache_storage_backend_extra_config
+            get_memory().unified_cache_external_linker_config
         )
         extra_config = dict(extra_config)
         standalone_requested = bool(

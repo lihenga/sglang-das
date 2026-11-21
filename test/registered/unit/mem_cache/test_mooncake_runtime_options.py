@@ -44,6 +44,10 @@ class TestMooncakeRuntimeOptions(CustomTestCase):
             parameters.index("mooncake_enable_page_wise_load"),
             parameters.index("grpc_response_timeout_secs"),
         )
+        self.assertGreater(
+            parameters.index("unified_cache_external_linker_config"),
+            parameters.index("mooncake_dfs_health_probe_timeout_s"),
+        )
 
     def test_launch_flags_reach_the_memory_namespace(self):
         parser = argparse.ArgumentParser()
@@ -53,6 +57,8 @@ class TestMooncakeRuntimeOptions(CustomTestCase):
                 "--model-path",
                 "dummy",
                 "--enable-unified-cache-external-linker",
+                "--unified-cache-external-linker-config",
+                '{"memory_replica_num":0,"dfs_replica_num":1}',
                 "--mooncake-enable-page-wise-load",
                 "--mooncake-page-wise-load-threshold",
                 "4",
@@ -66,6 +72,9 @@ class TestMooncakeRuntimeOptions(CustomTestCase):
             ]
         )
         expected = {
+            "unified_cache_external_linker_config": (
+                '{"memory_replica_num":0,"dfs_replica_num":1}'
+            ),
             "mooncake_enable_page_wise_load": True,
             "mooncake_page_wise_load_threshold": 4,
             "mooncake_enable_waiting_queue_dfs_prefetch": True,

@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
 register_cpu_ci(est_time=180, suite="base-a-test-cpu")
 
@@ -220,6 +220,12 @@ class TestDisableHostPrefetch(CustomTestCase):
                 config = dict(
                     mooncake_enable_waiting_queue_dfs_prefetch=True,
                     enable_unified_cache_external_linker=True,
+                    unified_cache_external_linker_config=(
+                        '{"memory_replica_num":0,"dfs_replica_num":1}'
+                    ),
+                    hicache_storage_backend_extra_config=(
+                        '{"memory_replica_num":1,"dfs_replica_num":0}'
+                    ),
                     schedule_policy="fcfs",
                     disaggregation_mode="prefill",
                 )
@@ -240,10 +246,6 @@ class TestDisableHostPrefetch(CustomTestCase):
                         return_value=pool_group,
                     ),
                     mock.patch(
-                        f"{module}.HybridCacheController.parse_storage_backend_extra_config",
-                        return_value=({},),
-                    ),
-                    mock.patch(
                         "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore",
                         side_effect=SetupReached,
                     ) as setup,
@@ -253,6 +255,10 @@ class TestDisableHostPrefetch(CustomTestCase):
                             get_server_args(), params, components=set()
                         )
                 self.assertIs(setup.call_args.kwargs["enable_dfs_prefetch"], False)
+                self.assertEqual(
+                    setup.call_args.args[0].extra_config,
+                    {"memory_replica_num": 0, "dfs_replica_num": 1},
+                )
 
 
 def _gloo_rank(rank, world_size, port, unavailable_rank, flag_off_rank, results):
