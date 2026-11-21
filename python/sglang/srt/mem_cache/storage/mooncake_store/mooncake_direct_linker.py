@@ -1268,6 +1268,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self._load_page_wise_with_read_layout(batches, maybe_fail)
                 else:
                     self._load_page_wise_ranges(counter_index, batches, maybe_fail)
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(counter_index, layer)
             else:
                 if read_layout:
                     self._load_with_read_layout(counter_index, batches, maybe_fail)
@@ -1301,11 +1303,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         self.layer_done_counter.fail(counter_index, error)
                         logger.exception("Mooncake load session cleanup failed")
                         success = False
-        if success:
-            for layer in (
-                range(self.num_layers) if page_wise else [self.num_layers - 1]
-            ):
-                self.layer_done_counter.complete(counter_index, layer)
         return success
 
     def _load_layer_wise_ranges(self, counter_index: int, batches, maybe_fail) -> None:
@@ -1333,8 +1330,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"layer={layer}: transferred={result}, "
                         f"expected={expected}"
                     )
-            if layer < self.num_layers - 1:
-                self.layer_done_counter.complete(counter_index, layer)
+            self.layer_done_counter.complete(counter_index, layer)
 
     def _load_with_read_layout(self, counter_index: int, batches, maybe_fail) -> None:
         from mooncake.store import ReadComponent, ReadKeyMapping, ReadLayout
@@ -1380,8 +1376,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"Mooncake layout get failed for layer={layer}: "
                         f"transferred={result}, expected={expected}"
                     )
-            if layer < self.num_layers - 1:
-                self.layer_done_counter.complete(counter_index, layer)
+            self.layer_done_counter.complete(counter_index, layer)
 
     def _finish_prefetch_metrics(self, rids: list[str], success: bool) -> None:
         pending_load_tokens = getattr(self, "pending_load_tokens", {})

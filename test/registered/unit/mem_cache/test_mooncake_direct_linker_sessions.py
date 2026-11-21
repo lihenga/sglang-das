@@ -77,6 +77,16 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
         for packed in (False, True):
             with self.subTest(packed=packed):
                 linker, transfers, native = self._layout_linker(packed=packed)
+                end = linker.storage.store.batch_get_session_end.side_effect
+
+                def end_checked(keys):
+                    self.assertEqual(
+                        linker.layer_done_counter.complete.call_args_list,
+                        [call(0, 0), call(0, 1)],
+                    )
+                    return end(keys)
+
+                linker.storage.store.batch_get_session_end.side_effect = end_checked
                 with patch.dict("sys.modules", {"mooncake.store": native}):
                     self.assertTrue(linker.load_layer_wise(0, transfers))
                 store = linker.storage.store
@@ -242,7 +252,7 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
                 )
                 self.assertFalse(linker.active)
 
-    def test_page_layout_reuses_claimed_prefetch_and_waits_for_session_cleanup(self):
+    def test_page_layout_reuses_claimed_prefetch_and_is_ready_before_cleanup(self):
         linker, transfers, native, buffers, expected, _ = self._page_layout_linker(
             False
         )
@@ -257,15 +267,18 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
         self.assertTrue(linker.claim_ready_host_prefetch("rid"))
         linker.objects = dict.fromkeys(linker.objects, b"x" * 64)
         store = linker.storage.store
-        end = store.batch_get_session_end.side_effect
+        cleanup = linker.abort_prepared_load
 
-        def end_checked(keys):
+        def cleanup_checked(rid):
             self.assertTrue(
-                all(not f.done() for f in linker.layer_done_counter.futures[0])
+                all(
+                    f.done() and f.exception() is None
+                    for f in linker.layer_done_counter.futures[0]
+                )
             )
-            return end(keys)
+            return cleanup(rid)
 
-        store.batch_get_session_end.side_effect = end_checked
+        linker.abort_prepared_load = Mock(side_effect=cleanup_checked)
         with patch.dict("sys.modules", {"mooncake.store": native}):
             self.assertTrue(linker.load_layer_wise(0, transfers, request_ids=["rid"]))
         store.batch_get_session_start.assert_not_called()
@@ -279,7 +292,7 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
         self.assertFalse(linker.prepared_load_sessions)
         self.assertFalse(linker.active)
 
-    def test_page_layout_failures_wake_waiters_without_publishing_ready(self):
+    def test_page_layout_failures_report_failure_and_preserve_ready_state(self):
         for failure in (
             None,
             [],
@@ -308,6 +321,9 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
                         RuntimeError("injected") if failure == "injection" else None
                     )
                 )
+                linker.load_queue, linker.completed_loads = Queue(), Queue()
+                linker.load_queue.put((0, {"rid": transfers[0]}, Mock()))
+                linker.load_queue.put(None)
                 with (
                     patch.dict("sys.modules", {"mooncake.store": native}),
                     patch(
@@ -316,19 +332,20 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
                     ),
                     self.assertLogs(level="ERROR"),
                 ):
-                    self.assertFalse(linker.load_layer_wise(0, transfers))
-                self.assertTrue(
-                    all(
-                        f.done() and f.exception()
-                        for f in linker.layer_done_counter.futures[0]
-                    )
-                )
+                    linker.load_thread_func()
+                self.assertEqual(linker.pop_completed_load(), (["rid"], False))
+                futures = linker.layer_done_counter.futures[0]
+                self.assertTrue(all(f.done() for f in futures))
+                if failure == "cleanup":
+                    self.assertTrue(all(f.exception() is None for f in futures))
+                else:
+                    self.assertTrue(all(f.exception() for f in futures))
                 store.batch_get_session_end.assert_called_once()
                 if failure == "injection":
                     maybe_fail.assert_called_once_with("aggregated", "complete_page")
                     store.batch_get_into_layouts.assert_not_called()
 
-    def test_range_layers_publish_before_next_layer_but_last_waits_for_cleanup(self):
+    def test_range_layers_publish_before_next_layer_and_before_cleanup(self):
         linker = self._session_linker()
         store = linker.storage.store
         read = store.batch_get_into_multi_buffer_ranges.side_effect
@@ -345,7 +362,7 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
 
         def end_checked(keys):
             self.assertTrue(linker.layer_done_counter.futures[0][0].done())
-            self.assertFalse(linker.layer_done_counter.futures[0][-1].done())
+            self.assertTrue(linker.layer_done_counter.futures[0][-1].done())
             return end(keys)
 
         store.batch_get_into_multi_buffer_ranges.side_effect = read_checked
@@ -746,22 +763,45 @@ class TestMooncakeDirectLinkerSessions(CustomTestCase):
                             store.batch_get_session_end.side_effect = RuntimeError(
                                 "end failed"
                             )
+                        linker.load_queue, linker.completed_loads = Queue(), Queue()
+                        linker.load_queue.put(
+                            (0, {"rid": self._transfers()[0]}, Mock())
+                        )
+                        linker.load_queue.put(None)
                         with self.assertLogs(level="ERROR"):
-                            self.assertFalse(
-                                linker.load_layer_wise(
-                                    0,
-                                    self._transfers(),
-                                    request_ids=["rid"] if prefetch else None,
-                                )
-                            )
+                            linker.load_thread_func()
+                        self.assertEqual(linker.pop_completed_load(), (["rid"], False))
                         futures = linker.layer_done_counter.futures[0]
                         self.assertTrue(all(f.done() for f in futures))
-                        self.assertIsNotNone(futures[-1].exception())
-                        if page_wise or failure == "read":
+                        if failure == "read":
                             self.assertTrue(all(f.exception() for f in futures))
+                        else:
+                            self.assertTrue(all(f.exception() is None for f in futures))
                         store.batch_get_session_end.assert_called_once()
                         self.assertFalse(linker.prepared_load_sessions)
                         self.assertFalse(linker.session_refcounts)
+
+    def test_cleanup_failure_after_ready_is_consumed_reports_batch_failure(self):
+        linker = self._session_linker()
+        counter = linker.layer_done_counter
+        counter.set_consumer(0)
+        futures = counter.futures[0]
+
+        def end(keys):
+            self.assertTrue(all(f.done() and f.exception() is None for f in futures))
+            counter.wait_until(linker.num_layers - 1)
+            self.assertNotIn(0, counter.futures)
+            raise RuntimeError("cleanup failed after forward consumed ready")
+
+        linker.storage.store.batch_get_session_end.side_effect = end
+        linker.load_queue, linker.completed_loads = Queue(), Queue()
+        linker.load_queue.put((0, {"rid": self._transfers()[0]}, Mock()))
+        linker.load_queue.put(None)
+        with self.assertLogs(level="ERROR"):
+            linker.load_thread_func()
+        self.assertEqual(linker.pop_completed_load(), (["rid"], False))
+        self.assertNotIn(0, counter.futures)
+        self.assertTrue(all(f.exception() is None for f in futures))
 
     def test_layer_ready_requires_all_pools_and_batch_completion_is_reported(self):
         linker = self._session_linker()
