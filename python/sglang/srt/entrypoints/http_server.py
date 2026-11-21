@@ -218,6 +218,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     Initialization function for multi-process tokenizer mode.
     It read args information from shm and inits tokenizer manager for current process.
     """
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
 
     # Read configuration from shared memory
     main_pid = get_main_process_id()
