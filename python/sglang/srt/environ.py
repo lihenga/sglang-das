@@ -758,6 +758,8 @@ class Envs:
     # ===================================================================
     # Mooncake store
     # ===================================================================
+    # Cross-request batching of already-queued DFS prefetches; opt in per server.
+    SGLANG_MOONCAKE_ENABLE_PREFETCH_BATCHING = EnvBool(False)
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
     MOONCAKE_MASTER = EnvStr(None)
