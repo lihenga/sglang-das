@@ -1024,14 +1024,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # A stop point works when the window ending there is complete,
                 # so scan every one instead of stopping at the longest.
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        pool_restorable.append(prefix_len)
-                        if boundary == 0:
-                            boundary = prefix_len
+                missing = 0
+                for index, exists in enumerate(page_exists):
+                    missing += not exists
+                    if index >= trailing:
+                        missing -= not page_exists[index - trailing]
+                    if missing == 0:
+                        boundary = index + 1
+                        pool_restorable.append(boundary)
             else:
                 raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
