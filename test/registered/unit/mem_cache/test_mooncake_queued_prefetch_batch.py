@@ -168,6 +168,40 @@ class TestMooncakeQueuedPrefetchBatch(CustomTestCase):
         self.assertEqual(self.native.ended, ["a"])
         self.assertEqual(self.linker.get_host_prefetch_status("b"), "dfs_prefetched")
 
+    def test_cancel_while_later_request_prepares_is_not_submitted(self):
+        preparing = threading.Event()
+        release_prepare = threading.Event()
+        original_start = self.native.batch_get_session_start_with_sources
+
+        def start(keys):
+            if "b" in keys:
+                preparing.set()
+                assert release_prepare.wait(timeout=5)
+            return original_start(keys)
+
+        self.native.batch_get_session_start_with_sources = start
+        self.submit("a", ["shared", "a"])
+        self.submit("b", ["shared", "b"])
+        self.linker.host_prefetch_queue.put(None)
+        self.worker = threading.Thread(
+            target=self.linker.host_prefetch_thread_func, daemon=True
+        )
+        self.worker.start()
+        try:
+            self.assertTrue(preparing.wait(timeout=5))
+            self.assertEqual(self.native.submissions, [])
+            self.linker.cancel_host_prefetch("a")
+        finally:
+            release_prepare.set()
+        self.worker.join(timeout=10)
+        self.assertFalse(self.worker.is_alive())
+        self.assertEqual(self.native.submissions, [[["shared", "b"]]])
+        self.assertEqual(self.native.ended, ["a"])
+        self.assertEqual(self.linker.session_refcounts, {"shared": 1, "b": 1})
+        self.assertIsNone(self.linker.get_host_prefetch_status("a"))
+        self.assertEqual(self.linker.get_host_prefetch_status("b"), "dfs_prefetched")
+        self.assertEqual(self.linker.host_prefetch_queue.unfinished_tasks, 0)
+
     def test_native_exception_cleans_all_prepared_sessions(self):
         self.native.raise_read = True
         self.submit("a", ["a"])

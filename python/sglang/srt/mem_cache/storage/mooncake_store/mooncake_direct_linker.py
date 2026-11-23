@@ -1216,12 +1216,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     with self.host_prefetch_lock:
                         current = self.host_prefetch_entries.get(rid)
                         cancelled = current is not entry or current.get("cancelled")
-                        if not cancelled:
-                            current["state"] = "reading"
                     if cancelled:
                         self._finish_host_prefetch(rid, entry, session_rid, "failed")
                         continue
                     reading.append((rid, entry, session_rid, dfs_keys))
+                # Preparing a later request may block while an earlier one is
+                # cancelled. Check the complete snapshot at the dispatch boundary.
+                cancelled_reading = []
+                retained = []
+                with self.host_prefetch_lock:
+                    for item in reading:
+                        rid, entry, _, _ = item
+                        current = self.host_prefetch_entries.get(rid)
+                        if current is not entry or entry.get("cancelled"):
+                            cancelled_reading.append(item)
+                        else:
+                            entry["state"] = "reading"
+                            retained.append(item)
+                for rid, entry, session_rid, _ in cancelled_reading:
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
+                reading = retained
                 if not reading:
                     continue
                 try:
