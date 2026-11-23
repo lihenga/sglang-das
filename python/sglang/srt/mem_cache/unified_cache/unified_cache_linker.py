@@ -554,9 +554,9 @@ class UnifiedCacheLinkerWrapper:
         makes the reduction an intersection.
         """
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
-        for pages in restorable:
-            if device_hit_pages < pages <= num_pages:
-                mask[pages] = 1
+        pages = [p for p in restorable if device_hit_pages < p <= num_pages]
+        if pages:
+            mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
         if common.numel() == 0:
