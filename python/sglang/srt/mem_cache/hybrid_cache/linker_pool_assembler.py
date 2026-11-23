@@ -175,6 +175,7 @@ class DevicePoolGroup:
         *,
         rank_replicated: bool = False,
         storage_layout_tag: str = "",
+        draft_transfer_layer: int | None = None,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -185,6 +186,7 @@ class DevicePoolGroup:
         self.page_size = page_size
         self.rank_replicated = rank_replicated
         self.storage_layout_tag = storage_layout_tag
+        self.draft_transfer_layer = draft_transfer_layer
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -704,9 +706,9 @@ def _mha_device_pool_entry(
 
 
 def _build_mamba_device_pool_group(
-    kvcache: Any, params: Any, page_size: int
+    kvcache: Any, params: Any, page_size: int, *, allow_gqa: bool = False
 ) -> DevicePoolGroup:
-    """Assemble MLA pages and TP-sharded Mamba state slots for direct I/O.
+    """Assemble attention pages and TP-sharded Mamba state slots for direct I/O.
 
     Based on shequ-code/main's implementation (introduced in eb91a41f38),
     adapted to this branch's HybridReqToTokenPool state ownership.
@@ -719,9 +721,9 @@ def _build_mamba_device_pool_group(
     full = kvcache.full_kv_pool
     if (
         type(kvcache) is not HybridLinearKVPool
-        or type(full) is not MLATokenToKVPool
+        or (not allow_gqa and type(full) is not MLATokenToKVPool)
         or get_parallel().attn_dcp_size > 1
-        or params.mtp_draft_device_pools
+        or (not allow_gqa and params.mtp_draft_device_pools)
     ):
         raise ValueError(
             "The direct external linker supports FULL + MAMBA models only with a "
@@ -742,8 +744,33 @@ def _build_mamba_device_pool_group(
             "or Mamba side states yet."
         )
     state_pool = req_pool.mamba_pool
+    # Direct GQA/GDN transfers carry temporal and conv checkpoints. Detect
+    # ReplaySSM by mode because fold-every-commit does not allocate a cursor.
+    if allow_gqa and (
+        state_pool.enable_linear_replayssm or state_pool.enable_linear_replayssm_spec
+    ):
+        raise ValueError(
+            "Mooncake GQA/GDN direct linking does not support ReplaySSM. "
+            "Disable --enable-linear-replayssm and --enable-linear-replayssm-spec."
+        )
     state = state_pool.mamba_cache
     start = kvcache.start_layer
+    mamba_entry = DevicePoolEntry(
+        name=PoolName.MAMBA,
+        indices_from_pool=PoolName.MAMBA,
+        device_pool=state_pool,
+        components=[
+            [tensor[layer] for layer in range(state_pool.num_mamba_layers)]
+            for tensor in (state.temporal, *state.conv)
+            if tensor.numel() > 0
+        ],
+        layer_mapping={gid - start: lid for gid, lid in req_pool.mamba_map.items()},
+        page_size=1,
+        rows_are_pages=True,
+    )
+    if allow_gqa:
+        return _build_gqa_mamba_device_pool_group(kvcache, params, page_size, mamba_entry)
+
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -757,19 +784,7 @@ def _build_mamba_device_pool_group(
             page_size=page_size,
             rows_are_pages=False,
         ),
-        DevicePoolEntry(
-            name=PoolName.MAMBA,
-            indices_from_pool=PoolName.MAMBA,
-            device_pool=state_pool,
-            components=[
-                [tensor[layer] for layer in range(state_pool.num_mamba_layers)]
-                for tensor in (state.temporal, *state.conv)
-                if tensor.numel() > 0
-            ],
-            layer_mapping={gid - start: lid for gid, lid in req_pool.mamba_map.items()},
-            page_size=1,
-            rows_are_pages=True,
-        ),
+        mamba_entry,
     ]
     for draft in getattr(params, "sidecar_draft_device_pools", ()):
         if draft.page_size != page_size:
@@ -791,17 +806,157 @@ def _build_mamba_device_pool_group(
     )
 
 
+def _gqa_page_buffers(pool, page_size: int, *, role: str) -> list[torch.Tensor]:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    if type(pool) is not MHATokenToKVPool:
+        raise ValueError(
+            f"Mooncake GQA/GDN requires a standard MHATokenToKVPool for {role}, "
+            f"got {type(pool).__name__}. The envelope layout selected by "
+            "--enable-page-major-kv-layout is unsupported by this linker."
+        )
+    if pool.page_size != page_size:
+        raise ValueError("Mooncake GQA/GDN requires MHA pools with matching page sizes.")
+    if pool.is_quantized_kv_cache or any(
+        getattr(pool, name, None) is not None
+        for name in (
+            "k_scale_buffer",
+            "v_scale_buffer",
+            "native_k_scale_buffer",
+            "native_v_scale_buffer",
+        )
+    ):
+        raise ValueError("Mooncake GQA/GDN does not support scaled KV buffers.")
+    keys, values = pool.k_buffer, pool.v_buffer
+    if not keys or len(keys) != len(values):
+        raise ValueError("Mooncake GQA/GDN requires paired K/V buffers.")
+    # HCU FA uses BHSD keys and BHDS values. HND pools use BHSD for both.
+    value_shape = (
+        (page_size, pool.v_head_dim)
+        if pool.use_hnd
+        else (pool.v_head_dim, page_size)
+    )
+    for layer, (key, value) in enumerate(zip(keys, values)):
+        if (
+            key.ndim != 4
+            or key.shape[1:] != (pool.head_num, page_size, pool.head_dim)
+            or value.shape != (key.shape[0], pool.head_num, *value_shape)
+            or not key.is_contiguous()
+            or not value.is_contiguous()
+        ):
+            raise ValueError(
+                "Mooncake GQA/GDN requires contiguous page-major K/V buffers "
+                f"for {role} (pool layer {layer}, page_size={page_size}, "
+                f"K={tuple(key.shape)}, V={tuple(value.shape)}). "
+                "Use SGLANG_KV_LAYOUT_HCU_FA=1 on HCU, or "
+                "SGLANG_USE_HND_KVCACHE=1 with an attention backend that supports HND. "
+                "Token-major NHD buffers are unsupported."
+            )
+    return [*keys, *values]
+
+
+def _build_gqa_mamba_device_pool_group(kvcache, params, page_size, mamba_entry):
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if params.pp_size != 1 or params.attn_cp_size != 1:
+        raise ValueError("Mooncake GQA/GDN supports TP with PP and CP size 1.")
+    if params.sidecar_draft_device_pools:
+        raise ValueError("Mooncake GQA/GDN requires packed MTP draft KV.")
+    if any(not tensor.is_contiguous() for tensor in mamba_entry.kv_buffer):
+        raise ValueError("Mooncake GQA/GDN requires contiguous GDN state slots.")
+
+    full = kvcache.full_kv_pool
+    buffers = _gqa_page_buffers(full, page_size, role="target")
+    mha_pools = [full]
+    n = len(full.k_buffer)
+    full_mapping = {
+        gid - kvcache.start_layer: (lid, n + lid)
+        for gid, lid in kvcache.full_attention_layer_id_mapping.items()
+    }
+    mamba_mapping = mamba_entry.layer_mapping
+    layers = full_mapping.keys() | mamba_mapping.keys()
+    if (
+        sorted(lid for lid, _ in full_mapping.values()) != list(range(n))
+        or sorted(mamba_mapping.values())
+        != list(range(mamba_entry.device_pool.num_mamba_layers))
+        or full_mapping.keys() & mamba_mapping.keys()
+        or layers != set(range(len(layers)))
+    ):
+        raise ValueError("Mooncake GQA/GDN requires a complete, disjoint layer map.")
+
+    final_layer = len(layers) - 1
+    for draft in params.mtp_draft_device_pools:
+        draft_pool = draft
+        if isinstance(draft, HybridLinearKVPool):
+            if draft.mamba_pool is not mamba_entry.device_pool:
+                raise ValueError("Mooncake MTP requires shared target and draft GDN state.")
+            draft_pool = draft.full_kv_pool
+        draft_buffers = _gqa_page_buffers(draft_pool, page_size, role="MTP draft")
+        mha_pools.append(draft_pool)
+        start = len(buffers)
+        full_mapping[final_layer] = (
+            *full_mapping.get(final_layer, ()),
+            *range(start, start + len(draft_buffers)),
+        )
+        buffers.extend(draft_buffers)
+
+    kv_entry = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=full,
+        components=[buffers],
+        layer_mapping=full_mapping,
+        page_size=page_size,
+        rows_are_pages=True,
+    )
+    entries = [kv_entry, mamba_entry]
+    # Encode the object layout without including allocation capacity. Raw FP8
+    # buffers can have identical uint8 layouts while using different encodings.
+    schema = [
+        [(str(pool.dtype), pool.use_hnd) for pool in mha_pools],
+        [
+            (
+                str(entry.name),
+                entry.page_size,
+                sorted(entry.layer_mapping.items()),
+                [
+                    [(list(t.shape[1:]), str(t.dtype)) for t in component]
+                    for component in entry.components
+                ],
+            )
+            for entry in entries
+        ],
+    ]
+    digest = hashlib.sha256(json.dumps(schema).encode()).hexdigest()[:24]
+    return DevicePoolGroup(
+        entries,
+        len(layers),
+        page_size,
+        storage_layout_tag=f"gqa_gdn_v1_tp{get_parallel().tp_size}_{digest}",
+        draft_transfer_layer=final_layer if params.mtp_draft_device_pools else None,
+    )
+
+
 def resolve_hybrid_device_pool_group(
     *,
     kvcache: Any,
     page_size: int,
     params: Any,
     components: set[ComponentType],
+    allow_gqa_mamba: bool = False,
 ) -> DevicePoolGroup:
     """Materialize a direct-linker pool group through the hybrid registry."""
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _select_strategy,
     )
+
+    if allow_gqa_mamba and components == {ComponentType.FULL, ComponentType.MAMBA}:
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if isinstance(kvcache, HybridLinearKVPool) and not kvcache.use_mla:
+            return _build_mamba_device_pool_group(
+                kvcache, params, page_size, allow_gqa=True
+            )
 
     group = _select_strategy(kvcache, components).build_direct_linker_pool_group(
         kvcache=kvcache,

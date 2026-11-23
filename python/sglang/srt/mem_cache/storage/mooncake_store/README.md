@@ -467,6 +467,17 @@ python -m sglang_router.launch_router \
     --port 8000
 ```
 
+## Qwen GQA/GDN direct L3 layout
+
+The Mooncake external linker for Qwen hybrid GQA/GDN models (such as
+Qwen3.5-27B and Qwen3.8-27B) requires contiguous, page-addressed K/V buffers
+in the standard `MHATokenToKVPool`. The same requirement applies to the
+draft pool when using EAGLE MTP. Use `SGLANG_KV_LAYOUT_HCU_FA=1` on HCU
+(BHSD K, BHDS V), or `SGLANG_USE_HND_KVCACHE=1` with an attention backend
+that supports HND (BHSD K and V). Token-major NHD buffers fail at startup.
+The `--enable-page-major-kv-layout` flag selects a different, envelope-based
+pool layout that this linker does not support.
+
 ## Troubleshooting
 
 **RDMA Registration Failure:**

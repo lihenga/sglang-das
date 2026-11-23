@@ -223,6 +223,17 @@ class ReadPlanLoadCounter:
         self.reported.clear()
 
 
+class _DraftLayerTransferCounter:
+    """Draft buffers are published at one target-layer boundary."""
+
+    def __init__(self, counter, target_layer: int):
+        self.counter = counter
+        self.target_layer = target_layer
+
+    def wait_until(self, _draft_layer: int) -> None:
+        self.counter.wait_until(self.target_layer)
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -263,6 +274,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             page_size=self.page_size,
             params=params,
             components=components,
+            allow_gqa_mamba=True,
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
@@ -425,6 +437,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
+        draft_transfer_layer = self.pool_group.draft_transfer_layer
+        if draft_transfer_layer is not None:
+            draft_counter = _DraftLayerTransferCounter(
+                self.layer_done_counter, draft_transfer_layer
+            )
+            for draft in params.mtp_draft_device_pools:
+                draft.register_layer_transfer_counter(draft_counter)
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.pending_load_tokens: dict[str, int] = {}
         self.pending_load_started: dict[str, float] = {}
