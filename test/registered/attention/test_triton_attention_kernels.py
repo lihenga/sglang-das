@@ -659,6 +659,115 @@ class TestTritonAttention(CustomTestCase):
                 19, 12331, 64, 8, 128, window_size
             )
 
+    def _check_sliding_window_tile_boundaries(
+        self, window, causal, page_size, dtype, custom_mask=False
+    ):
+        # Unaligned prefixes and ragged queries expose rounding up the first
+        # visible KV tile, or incorrectly clipping a no-window/custom-mask path.
+        prefixes = (0, 511, 1025)
+        extends = (65, 129, 257)
+        device = get_device()
+        heads, kv_heads, dim = 4, 1, 256
+        query = torch.randn(sum(extends), heads, dim, device=device, dtype=dtype)
+        key = torch.randn(sum(extends), kv_heads, dim, device=device, dtype=dtype)
+        value = torch.randn_like(key)
+        capacity = ((sum(prefixes) + page_size - 1) // page_size) * page_size
+        cache_k = torch.randn(capacity, kv_heads, dim, device=device, dtype=dtype)
+        cache_v = torch.randn_like(cache_k)
+        indices = torch.randperm(capacity, device=device)[: sum(prefixes)].int()
+        qptr = [0]
+        kptr = [0]
+        mptr = [0]
+        masks = []
+        expected = torch.empty_like(query)
+        for prefix, extend in zip(prefixes, extends):
+            start, end = qptr[-1], qptr[-1] + extend
+            slots = indices[kptr[-1] : kptr[-1] + prefix].long()
+            keys = torch.cat((cache_k[slots], key[start:end]))
+            values = torch.cat((cache_v[slots], value[start:end]))
+            keys = keys.repeat_interleave(heads // kv_heads, dim=1).float()
+            values = values.repeat_interleave(heads // kv_heads, dim=1).float()
+            qpos = prefix + torch.arange(extend, device=device)
+            kpos = torch.arange(prefix + extend, device=device)
+            visible = torch.ones(
+                extend, prefix + extend, device=device, dtype=torch.bool
+            )
+            if causal:
+                visible &= kpos[None, :] <= qpos[:, None]
+            if window > 0:
+                visible &= kpos[None, :] >= qpos[:, None] - window
+            if custom_mask:
+                allowed = (kpos[None, :] % 3 != 0) | (kpos[None, :] == qpos[:, None])
+                allowed = allowed.expand(extend, -1).contiguous()
+                if causal:
+                    # A supplied custom mask owns causality in the kernel.
+                    allowed &= kpos[None, :] <= qpos[:, None]
+                masks.append(allowed.flatten())
+                mptr.append(mptr[-1] + allowed.numel())
+                visible &= allowed
+            scores = torch.einsum("qhd,khd->hqk", query[start:end].float(), keys)
+            scores = (scores * dim**-0.5).masked_fill(~visible[None, :, :], -torch.inf)
+            expected[start:end] = torch.einsum(
+                "hqk,khd->qhd", scores.softmax(-1), values
+            ).to(dtype)
+            qptr.append(end)
+            kptr.append(kptr[-1] + prefix)
+
+        if page_size > 1:
+            cache_k = cache_k.view(-1, page_size, kv_heads, dim)
+            cache_v = cache_v.view_as(cache_k)
+            from sglang.kernels.ops.attention.decode_attention import _kv_layout_hcu_fa
+
+            if _kv_layout_hcu_fa:
+                cache_k = cache_k.permute(0, 2, 1, 3).contiguous()
+                cache_v = cache_v.permute(0, 2, 3, 1).contiguous()
+
+        output = torch.empty_like(query)
+        extend_attention_fwd(
+            query,
+            key,
+            value,
+            output,
+            cache_k,
+            cache_v,
+            torch.tensor(qptr, device=device, dtype=torch.int32),
+            torch.tensor(kptr, device=device, dtype=torch.int32),
+            indices,
+            custom_mask=torch.cat(masks) if masks else None,
+            is_causal=causal,
+            mask_indptr=(
+                torch.tensor(mptr, device=device, dtype=torch.int64) if masks else None
+            ),
+            max_len_extend=max(extends),
+            k_scale=1.0,
+            v_scale=1.0,
+            skip_prefix_custom_mask=False,
+            sliding_window_size=window,
+            window_kv_offsets=torch.zeros(
+                len(prefixes), device=device, dtype=torch.int32
+            ),
+            page_size=page_size,
+            extend_seq_lens_cpu=list(extends),
+        )
+        # The kernel rounds softmax probabilities to the input dtype before PV.
+        torch.testing.assert_close(output, expected, atol=5e-3, rtol=1e-2)
+
+    def test_extend_attention_sliding_window_tile_boundaries(self):
+        for window in (-1, 1, 63, 64, 65, 511):
+            for causal in (True, False):
+                with self.subTest(window=window, causal=causal):
+                    self._check_sliding_window_tile_boundaries(
+                        window, causal, page_size=1, dtype=torch.bfloat16
+                    )
+
+    def test_extend_attention_sliding_window_paged_custom_mask(self):
+        for window in (-1, 65, 511):
+            for dtype in (torch.float16, torch.bfloat16):
+                with self.subTest(window=window, dtype=dtype):
+                    self._check_sliding_window_tile_boundaries(
+                        window, True, page_size=64, dtype=dtype, custom_mask=True
+                    )
+
     def _test_context_attention_once(self, head_dim, is_causal):
         # Set up a simple test case
         device = get_device()
