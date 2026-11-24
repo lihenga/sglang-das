@@ -14,6 +14,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
+TAG_PREFIX = "n1_KhBzpuZ_Dl8JpZV8ZZUDxg"
+
 
 class ReplicateConfigWithGroupIds:
     def __init__(self):
@@ -323,20 +325,20 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(
             call["keys"],
             [
-                "tag_page0_0_k",
-                "tag_page0_0_v",
-                "tag_page1_0_k",
-                "tag_page1_0_v",
+                f"{TAG_PREFIX}_page0_0_k",
+                f"{TAG_PREFIX}_page0_0_v",
+                f"{TAG_PREFIX}_page1_0_k",
+                f"{TAG_PREFIX}_page1_0_v",
             ],
         )
         self.assertEqual(len(call["args"]), 1)
         self.assertEqual(
             call["args"][0].group_ids,
             [
-                "sglang-hicache:tag_page0",
-                "sglang-hicache:tag_page0",
-                "sglang-hicache:tag_page1",
-                "sglang-hicache:tag_page1",
+                f"sglang-hicache:{TAG_PREFIX}_page0",
+                f"sglang-hicache:{TAG_PREFIX}_page0",
+                f"sglang-hicache:{TAG_PREFIX}_page1",
+                f"sglang-hicache:{TAG_PREFIX}_page1",
             ],
         )
 
@@ -417,10 +419,16 @@ class TestMooncakeGroupSemantics(CustomTestCase):
 
         self.assertEqual(result[PoolName.INDEXER], [True, True])
         call = fake_store.batch_put_calls[0]
-        self.assertEqual(call["keys"], ["tag_page0__indexer", "tag_page1__indexer"])
+        self.assertEqual(
+            call["keys"],
+            [f"{TAG_PREFIX}_page0__indexer", f"{TAG_PREFIX}_page1__indexer"],
+        )
         self.assertEqual(
             call["args"][0].group_ids,
-            ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
+            [
+                f"sglang-hicache:{TAG_PREFIX}_page0",
+                f"sglang-hicache:{TAG_PREFIX}_page1",
+            ],
         )
 
     def test_v2_multi_buffer_put_passes_group_ids(self):
@@ -443,22 +451,26 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(call["method"], "batch_put_from_multi_buffers")
         self.assertEqual(
             call["keys"],
-            ["tag_page0__deepseek_v4_c4", "tag_page1__deepseek_v4_c4"],
+            [
+                f"{TAG_PREFIX}_page0__deepseek_v4_c4",
+                f"{TAG_PREFIX}_page1__deepseek_v4_c4",
+            ],
         )
         self.assertEqual(call["ptrs"], [[4000, 4001], [4010, 4011]])
         self.assertEqual(call["sizes"], [[8, 16], [8, 16]])
         self.assertEqual(
             call["args"][0].group_ids,
-            ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
+            [
+                f"sglang-hicache:{TAG_PREFIX}_page0",
+                f"sglang-hicache:{TAG_PREFIX}_page1",
+            ],
         )
 
     def test_v2_aggregates_all_pool_writes_into_one_put(self):
         store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
         store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
-        store.register_mem_host_pool_v2(
-            FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4
-        )
-        fake_store.existing_keys.add("tag_page0__indexer")
+        store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
+        fake_store.existing_keys.add(f"{TAG_PREFIX}_page0__indexer")
 
         result = store.batch_set_v2(
             [
@@ -483,9 +495,9 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(
             call["keys"],
             [
-                "tag_page1__indexer",
-                "tag_page0__deepseek_v4_c4",
-                "tag_page1__deepseek_v4_c4",
+                f"{TAG_PREFIX}_page1__indexer",
+                f"{TAG_PREFIX}_page0__deepseek_v4_c4",
+                f"{TAG_PREFIX}_page1__deepseek_v4_c4",
             ],
         )
         self.assertEqual(call["ptrs"], [[3001], [4000, 4001], [4010, 4011]])
@@ -493,9 +505,9 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(
             call["args"][0].group_ids,
             [
-                "sglang-hicache:tag_page1",
-                "sglang-hicache:tag_page0",
-                "sglang-hicache:tag_page1",
+                f"sglang-hicache:{TAG_PREFIX}_page1",
+                f"sglang-hicache:{TAG_PREFIX}_page0",
+                f"sglang-hicache:{TAG_PREFIX}_page1",
             ],
         )
 
@@ -514,8 +526,20 @@ class TestMooncakeGroupSemantics(CustomTestCase):
 
         keys_a = fake_store_a.batch_put_calls[0]["keys"]
         keys_b = fake_store_b.batch_put_calls[0]["keys"]
-        self.assertEqual(keys_a, ["org-model-a_page0_0_k", "org-model-a_page0_0_v"])
-        self.assertEqual(keys_b, ["org-model-b_page0_0_k", "org-model-b_page0_0_v"])
+        self.assertEqual(
+            keys_a,
+            [
+                "n1_pjN6T8ZeeHGIWCWKVtUO3g_page0_0_k",
+                "n1_pjN6T8ZeeHGIWCWKVtUO3g_page0_0_v",
+            ],
+        )
+        self.assertEqual(
+            keys_b,
+            [
+                "n1_YbGXrfUKol2YyprhO-Njsg_page0_0_k",
+                "n1_YbGXrfUKol2YyprhO-Njsg_page0_0_v",
+            ],
+        )
         self.assertTrue(set(keys_a).isdisjoint(keys_b))
 
 
