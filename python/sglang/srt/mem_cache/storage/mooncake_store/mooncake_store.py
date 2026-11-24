@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
+import base64
 import ctypes
+import hashlib
 import ipaddress
 import json
 import logging
@@ -485,6 +487,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Use the backend tag and model name as a prefix to isolate tenants
             # and models sharing one store.
             self.config_prefix = None
+            self._namespace_prefix_cache: Optional[Tuple[str, str]] = None
             config_prefix_parts = []
             if extra_config and extra_config.get("extra_backend_tag") is not None:
                 config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
@@ -851,9 +854,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             super().register_buffer(buf)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
-        if self.config_prefix is None:
+        raw_prefix = self.config_prefix
+        if raw_prefix is None:
             return keys
-        return [f"{self.config_prefix}_{key}" for key in keys]
+
+        # Plugins may extend config_prefix after construction.
+        cached = self._namespace_prefix_cache
+        if cached is None or cached[0] != raw_prefix:
+            digest = hashlib.sha256(raw_prefix.encode("utf-8")).digest()[:16]
+            short_prefix = "n1_" + base64.urlsafe_b64encode(digest).decode(
+                "ascii"
+            ).rstrip("=")
+            cached = (raw_prefix, short_prefix)
+            self._namespace_prefix_cache = cached
+        return [f"{cached[1]}_{key}" for key in keys]
 
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
