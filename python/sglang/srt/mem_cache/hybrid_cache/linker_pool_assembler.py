@@ -718,9 +718,17 @@ def _build_mamba_device_pool_group(
         MLATokenToKVPool,
     )
 
+    qsa = False
+    if allow_gqa:
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
+
+        qsa = type(kvcache) in (QSATokenToKVPool, QwenDSATokenToKVPool)
     full = kvcache.full_kv_pool
     if (
-        type(kvcache) is not HybridLinearKVPool
+        (type(kvcache) is not HybridLinearKVPool and not qsa)
         or (not allow_gqa and type(full) is not MLATokenToKVPool)
         or get_parallel().attn_dcp_size > 1
         or (not allow_gqa and params.mtp_draft_device_pools)
@@ -736,8 +744,10 @@ def _build_mamba_device_pool_group(
     req_pool = params.req_to_token_pool
     if (
         req_pool.mamba_ckpt_pool is not None
-        or req_pool.short_conv_pool.enabled
-        or req_pool.ngram_pool.enabled
+        or (
+            not qsa
+            and (req_pool.short_conv_pool.enabled or req_pool.ngram_pool.enabled)
+        )
     ):
         raise ValueError(
             "The direct external linker does not support int8 Mamba checkpoints "
@@ -769,7 +779,9 @@ def _build_mamba_device_pool_group(
         rows_are_pages=True,
     )
     if allow_gqa:
-        return _build_gqa_mamba_device_pool_group(kvcache, params, page_size, mamba_entry)
+        return _build_gqa_mamba_device_pool_group(
+            kvcache, params, page_size, mamba_entry, qsa=qsa
+        )
 
     entries = [
         DevicePoolEntry(
@@ -855,13 +867,84 @@ def _gqa_page_buffers(pool, page_size: int, *, role: str) -> list[torch.Tensor]:
     return [*keys, *values]
 
 
-def _build_gqa_mamba_device_pool_group(kvcache, params, page_size, mamba_entry):
+def _qsa_index_pages(kvcache, page_size, full):
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+    if type(kvcache) is QSATokenToKVPool:
+        # A reused prefix ends on a full KV page. Every compressed group
+        # before that boundary is complete, and the next group overwrites its
+        # request-local pending ring before reading it.
+        ratio = kvcache.qsa_compress_ratio
+        if page_size % ratio:
+            raise ValueError("Mooncake QSA pages must align with compression groups.")
+        rows_per_page = page_size // ratio
+        index_buffers = kvcache.qsa_compressed_k_buffer_pool
+    else:
+        rows_per_page = page_size
+        index_buffers = kvcache.dsa_index_k_buffer_pool
+
+    if len(index_buffers) != len(full.k_buffer):
+        raise ValueError("Mooncake QSA requires an index buffer for each KV layer.")
+    pages = []
+    for index, key in zip(index_buffers, full.k_buffer):
+        if not index.is_contiguous() or index.shape[0] != key.shape[0] * rows_per_page:
+            raise ValueError("Mooncake QSA index buffers must match the target KV pages.")
+        pages.append(index.view(key.shape[0], rows_per_page, *index.shape[1:]))
+    return pages
+
+
+def _mamba_entry_with_ple(entry, req_pool, start_layer, num_layers):
+    short_conv = req_pool.short_conv_pool
+    ngram = req_pool.ngram_pool
+    if not (short_conv.enabled or ngram.enabled):
+        return entry
+
+    # Mamba, short-conv and n-gram state share the checkpoint slot and key.
+    # Flatten the buffers so each logical layer can select its own payload.
+    buffers = list(entry.kv_buffer)
+    stride = entry.device_pool.num_mamba_layers
+    mapping = {
+        layer: [lid + component * stride for component in range(len(entry.components))]
+        for layer, lid in entry.layer_mapping.items()
+    }
+
+    def append(layer, tensor):
+        if (
+            not 0 <= layer < num_layers
+            or tensor.shape[0] != buffers[0].shape[0]
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("Mooncake QSA requires contiguous PLE checkpoint slots.")
+        mapping.setdefault(layer, []).append(len(buffers))
+        buffers.append(tensor)
+
+    if short_conv.enabled:
+        for layer, lid in sorted(short_conv.layer_map.items()):
+            append(layer - start_layer, short_conv.conv_state[lid])
+    if ngram.enabled:
+        # Qwen reads n-gram history once, before entering the first layer.
+        append(0, ngram.context)
+
+    return DevicePoolEntry(
+        name=entry.name,
+        indices_from_pool=entry.indices_from_pool,
+        device_pool=entry.device_pool,
+        components=[buffers],
+        layer_mapping=mapping,
+        page_size=1,
+        rows_are_pages=True,
+    )
+
+
+def _build_gqa_mamba_device_pool_group(kvcache, params, page_size, mamba_entry, *, qsa):
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if params.pp_size != 1 or params.attn_cp_size != 1:
         raise ValueError("Mooncake GQA/GDN supports TP with PP and CP size 1.")
     if params.sidecar_draft_device_pools:
         raise ValueError("Mooncake GQA/GDN requires packed MTP draft KV.")
+    if qsa and params.mtp_draft_device_pools:
+        raise ValueError("Mooncake QSA/GDN direct linking does not support MTP yet.")
     if any(not tensor.is_contiguous() for tensor in mamba_entry.kv_buffer):
         raise ValueError("Mooncake GQA/GDN requires contiguous GDN state slots.")
 
@@ -885,6 +968,15 @@ def _build_gqa_mamba_device_pool_group(kvcache, params, page_size, mamba_entry):
         raise ValueError("Mooncake GQA/GDN requires a complete, disjoint layer map.")
 
     final_layer = len(layers) - 1
+    if qsa:
+        index_pages = _qsa_index_pages(kvcache, page_size, full)
+        for layer, (key, value) in full_mapping.items():
+            full_mapping[layer] = (key, value, 2 * n + key)
+        buffers.extend(index_pages)
+        mamba_entry = _mamba_entry_with_ple(
+            mamba_entry, params.req_to_token_pool, kvcache.start_layer, len(layers)
+        )
+
     for draft in params.mtp_draft_device_pools:
         draft_pool = draft
         if isinstance(draft, HybridLinearKVPool):
@@ -928,11 +1020,12 @@ def _build_gqa_mamba_device_pool_group(kvcache, params, page_size, mamba_entry):
         ],
     ]
     digest = hashlib.sha256(json.dumps(schema).encode()).hexdigest()[:24]
+    layout = "qsa_gdn_v1" if qsa else "gqa_gdn_v1"
     return DevicePoolGroup(
         entries,
         len(layers),
         page_size,
-        storage_layout_tag=f"gqa_gdn_v1_tp{get_parallel().tp_size}_{digest}",
+        storage_layout_tag=f"{layout}_tp{get_parallel().tp_size}_{digest}",
         draft_transfer_layer=final_layer if params.mtp_draft_device_pools else None,
     )
 

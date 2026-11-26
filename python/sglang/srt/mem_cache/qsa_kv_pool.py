@@ -248,6 +248,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         return self.qsa_rope_position_buffer[loc.long()]
 
     def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
         return self.qsa_compressed_k_buffer_pool[
             self._transfer_full_attention_id(layer_id)
         ]
@@ -372,6 +373,7 @@ class QwenDSATokenToKVPool(HybridLinearKVPool):
         buffer[loc.long()] = index_k.to(buffer.dtype)
 
     def get_dsa_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
         return self.dsa_index_k_buffer_pool[self._transfer_full_attention_id(layer_id)]
 
     def get_kv_size_bytes(self):

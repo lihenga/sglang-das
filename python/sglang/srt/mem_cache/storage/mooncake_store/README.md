@@ -478,6 +478,20 @@ that supports HND (BHSD K and V). Token-major NHD buffers fail at startup.
 The `--enable-page-major-kv-layout` flag selects a different, envelope-based
 pool layout that this linker does not support.
 
+For Qwen3.8-Flash-Next with INT8 weights and BF16 KV, use the standard HCU
+FA KV layout (`SGLANG_KV_LAYOUT_HCU_FA=1`) and enable the Mooncake external
+linker with `--enable-unified-cache-external-linker` and
+`--unified-cache-external-linker-backend mooncake`. With the Flash-Next
+QSA/GDN pools, use TP with PP, CP and DCP set to 1 and leave MTP, ReplaySSM
+and INT8 Mamba checkpoints disabled. Use the model's supported page size
+(64 for the HCU TP4 recipe).
+
+The QSA index shares the K/V page object. PLE short-conv and n-gram history
+share the GDN checkpoint object. This layout has its own Mooncake key
+namespace. To verify DFS restore, write a prefix, clear the serving engine's
+local prefix cache, then replay with the same namespace. Confirm a DFS read
+and compare the output with a full prefill of the same request.
+
 ## Troubleshooting
 
 **RDMA Registration Failure:**

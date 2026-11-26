@@ -1620,6 +1620,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.get_mamba_indices(req_indices)
 
     def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            # The direct linker restores shared PLE history with the first layer.
+            self.layer_transfer_counter.wait_until(0)
         return self.ngram_pool.get_context(ngram_indices)
 
     def set_ngram_context(

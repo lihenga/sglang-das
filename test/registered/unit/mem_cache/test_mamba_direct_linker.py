@@ -50,10 +50,10 @@ definitions(SRT / "mem_cache/unified_cache/components/mamba_component.py", {"Mam
 NS["MambaComponent"].component_type = NS["ComponentType"].MAMBA
 definitions(SRT / "mem_cache/unified_cache/unified_cache_linker.py", {"UnifiedCacheLinkerWrapper"}, NS, {"_update_load", "_select_adopted_pages"})
 definitions(SRT / "mem_cache/hybrid_cache/hybrid_pool_assembler.py", {"StackStrategy", "_MambaStrategy"}, NS)
-definitions(SRT / "mem_cache/hybrid_cache/linker_pool_assembler.py", {"DevicePoolEntry", "DevicePoolGroup", "_mha_device_pool_entry", "_build_mamba_device_pool_group", "_gqa_page_buffers", "_build_gqa_mamba_device_pool_group", "resolve_hybrid_device_pool_group"}, NS)
+definitions(SRT / "mem_cache/hybrid_cache/linker_pool_assembler.py", {"DevicePoolEntry", "DevicePoolGroup", "_mha_device_pool_entry", "_build_mamba_device_pool_group", "_gqa_page_buffers", "_qsa_index_pages", "_mamba_entry_with_ple", "_build_gqa_mamba_device_pool_group", "resolve_hybrid_device_pool_group"}, NS)
 definitions(SRT / "mem_cache/storage/mooncake_store/mooncake_direct_linker.py", {"_DraftLayerTransferCounter"}, NS)
 definitions(SRT / "mem_cache/storage/mooncake_store/mooncake_direct_linker.py", {"MooncakeDirectLinker"}, NS, {"_prepare_read_plan_layouts"})
-definitions(SRT / "mem_cache/storage/mooncake_store/mooncake_store.py", {"MooncakeStore"}, NS, {"_get_hybrid_page_component_keys"})
+definitions(SRT / "mem_cache/storage/mooncake_store/mooncake_store.py", {"MooncakeStore"}, NS, {"_get_hybrid_page_component_keys", "_pack_multi_buffer_meta"})
 PoolName, PoolTransfer = NS["PoolName"], NS["PoolTransfer"]
 Phase, LoadPhase = NS["LinkerTransferPhase"], NS["ExternalLinkerLoadPhase"]
 
@@ -67,6 +67,14 @@ class MLATokenToKVPool:
 
 
 class MHATokenToKVPool:
+    pass
+
+
+class QSATokenToKVPool(HybridLinearKVPool):
+    pass
+
+
+class QwenDSATokenToKVPool(HybridLinearKVPool):
     pass
 
 
@@ -235,12 +243,16 @@ class TestMambaDirectLinker(unittest.TestCase):
         memory_module.HybridLinearKVPool = HybridLinearKVPool
         memory_module.MLATokenToKVPool = MLATokenToKVPool
         memory_module.MHATokenToKVPool = MHATokenToKVPool
+        qsa_module = ModuleType("sglang.srt.mem_cache.qsa_kv_pool")
+        qsa_module.QSATokenToKVPool = QSATokenToKVPool
+        qsa_module.QwenDSATokenToKVPool = QwenDSATokenToKVPool
         linker_module = ModuleType("sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler")
         linker_module._build_mamba_device_pool_group = NS["_build_mamba_device_pool_group"]
         strategy_module = ModuleType("sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler")
         strategy_module._select_strategy = lambda kv, ct: NS["_MambaStrategy"]()
         patcher = patch.dict(sys.modules, {
             memory_module.__name__: memory_module,
+            qsa_module.__name__: qsa_module,
             linker_module.__name__: linker_module,
             strategy_module.__name__: strategy_module,
         })
@@ -344,6 +356,155 @@ class TestMambaDirectLinker(unittest.TestCase):
         self.assertNotEqual(self.group(mooncake=True).storage_layout_tag, full_tag)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             self.group()
+
+    def _setup_flash_next(self, pool_class):
+        draft = self._setup_qwen()
+        qsa = pool_class()
+        qsa.__dict__.update(vars(self.kv))
+        if pool_class is QSATokenToKVPool:
+            qsa.qsa_compress_ratio = 2
+            qsa.qsa_compressed_k_buffer_pool = [torch.zeros(4, 1, 5) for _ in range(2)]
+        else:
+            qsa.dsa_index_k_buffer_pool = [torch.zeros(8, 1, 5) for _ in range(2)]
+        self.kv = qsa
+        self.params.mtp_draft_device_pools = ()
+        self.req_pool.short_conv_pool = SimpleNamespace(
+            enabled=True, layer_map={5: 0}, conv_state=torch.zeros(1, 8, 6)
+        )
+        self.req_pool.ngram_pool = SimpleNamespace(
+            enabled=True, context=torch.zeros(8, 2, dtype=torch.int64)
+        )
+        return draft
+
+    def test_flash_next_restores_qsa_and_ple_from_the_same_prefix(self):
+        for pool_class in (QSATokenToKVPool, QwenDSATokenToKVPool):
+            with self.subTest(pool=pool_class.__name__):
+                self._setup_flash_next(pool_class)
+                group = self.group(mooncake=True)
+                self.assertTrue(group.storage_layout_tag.startswith("qsa_gdn_v1_"))
+                self.assertEqual(
+                    group.entry_map[PoolName.KV].layer_mapping,
+                    {1: (0, 2, 4), 3: (1, 3, 5)},
+                )
+                self.assertEqual(
+                    group.entry_map[PoolName.MAMBA].layer_mapping,
+                    {0: [0, 2, 5], 1: [4], 2: [1, 3]},
+                )
+                store = NS["MooncakeStore"]()
+                store.registered_pools = group.entry_map
+                store.mla_suffix = store.mha_suffix = group.storage_layout_tag
+                store._tag_keys = list
+                linker = NS["MooncakeDirectLinker"]()
+                linker.storage = store
+                linker.pools = group.entry_map
+                linker.num_layers = group.num_layers
+
+                def transfers(page, slots):
+                    return group.resolve_transfers([
+                        PoolTransfer(
+                            name=PoolName.KV,
+                            keys=["prefix"],
+                            device_indices=torch.arange(page * 2, page * 2 + 2),
+                        ),
+                        PoolTransfer(
+                            name=PoolName.MAMBA,
+                            keys=["prefix"] * len(slots),
+                            device_indices=torch.tensor(slots),
+                        ),
+                    ])
+
+                source = transfers(1, [6])
+                destination = transfers(2, [2, 3])
+                blobs = {}
+                for write in source:
+                    entry = group.entry_map[write.name]
+                    row = 1 if write.name == PoolName.KV else 6
+                    for i, tensor in enumerate(entry.kv_buffer, 1):
+                        tensor[row].fill_(i)
+                    keys, _ = store._get_hybrid_page_component_keys(write.keys, write)
+                    (key,) = keys
+                    ptrs, sizes = entry.get_page_buffer_meta(write.host_indices)
+                    (ptrs,), (sizes,) = store._pack_multi_buffer_meta(keys, ptrs, sizes)
+                    blobs[key] = b"".join(
+                        ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)
+                    )
+
+                for (keys, rows, packed, layers), read in zip(
+                    linker._prepare_read_plan_layouts([destination]), destination
+                ):
+                    self.assertTrue(packed)
+                    entry = group.entry_map[read.name]
+                    for layer, ranges in enumerate(layers):
+                        legacy = entry.get_prepared_layer_range_meta(rows, layer)
+                        if not ranges:
+                            self.assertIsNone(legacy)
+                            continue
+                        ptrs, sizes, offsets = legacy
+                        for i, (key, row) in enumerate(zip(keys, rows)):
+                            self.assertEqual(
+                                list(zip(ptrs[i], sizes[i], offsets[i])),
+                                [(p + row * stride, n, off) for p, stride, n, off in ranges],
+                            )
+                            for ptr, size, offset in zip(ptrs[i], sizes[i], offsets[i]):
+                                ctypes.memmove(
+                                    ptr, blobs[key][offset : offset + size], size
+                                )
+                    src = 1 if read.name == PoolName.KV else 6
+                    for tensor in entry.kv_buffer:
+                        for row in rows:
+                            self.assertTrue(torch.equal(tensor[row], tensor[src]))
+
+    def test_flash_next_rejects_missing_index_pages_and_mtp(self):
+        draft = self._setup_flash_next(QSATokenToKVPool)
+        with patch.object(self.kv, "qsa_compress_ratio", 3):
+            with self.assertRaisesRegex(ValueError, "align with compression groups"):
+                self.group(mooncake=True)
+        with patch.object(self.kv, "qsa_compressed_k_buffer_pool", []):
+            with self.assertRaisesRegex(ValueError, "index buffer for each KV layer"):
+                self.group(mooncake=True)
+        self.params.mtp_draft_device_pools = (draft,)
+        with self.assertRaisesRegex(ValueError, "QSA/GDN.*does not support MTP"):
+            self.group(mooncake=True)
+
+    def test_flash_next_waits_before_consuming_index_or_ngram_state(self):
+        methods = {}
+        definitions(
+            SRT / "mem_cache/qsa_kv_pool.py",
+            {"QSATokenToKVPool", "QwenDSATokenToKVPool"},
+            methods,
+            {"get_qsa_compressed_k_buffer", "get_dsa_index_k_buffer"},
+        )
+        definitions(
+            SRT / "mem_cache/memory_pool.py",
+            {"HybridReqToTokenPool"},
+            methods,
+            {"get_ngram_context"},
+        )
+        for pool_name, buffer_name, accessor in (
+            (
+                "QSATokenToKVPool",
+                "qsa_compressed_k_buffer_pool",
+                "get_qsa_compressed_k_buffer",
+            ),
+            ("QwenDSATokenToKVPool", "dsa_index_k_buffer_pool", "get_dsa_index_k_buffer"),
+        ):
+            pool = methods[pool_name]()
+            buffer = torch.zeros(1)
+            setattr(pool, buffer_name, [buffer])
+            pool._transfer_full_attention_id = lambda layer: 0
+            pool._wait_for_layer = Mock(side_effect=lambda layer: buffer.fill_(layer))
+            self.assertEqual(getattr(pool, accessor)(3).item(), 3)
+
+        pool = methods["HybridReqToTokenPool"]()
+        calls = Mock()
+        pool.layer_transfer_counter = calls.counter
+        pool.ngram_pool = calls.ngram
+        pool.get_ngram_context("checkpoint")
+        self.assertEqual(
+            [entry[0] for entry in calls.mock_calls],
+            ["counter.wait_until", "ngram.get_context"],
+        )
+        calls.counter.wait_until.assert_called_once_with(0)
 
     def test_qwen_rejects_both_replayssm_modes(self):
         self._setup_qwen()
@@ -453,8 +614,8 @@ class TestMambaDirectLinker(unittest.TestCase):
         node_slot, request_slot = transfer.device_indices.tolist()
         self.assertEqual(req.mamba_pool_idx.item(), request_slot)
         for buffer in entry.kv_buffer:
-            torch.testing.assert_close(buffer[node_slot], buffer[6])
-            torch.testing.assert_close(buffer[request_slot], buffer[6])
+            self.assertTrue(torch.equal(buffer[node_slot], buffer[6]))
+            self.assertTrue(torch.equal(buffer[request_slot], buffer[6]))
             buffer[request_slot].zero_()
             self.assertTrue(buffer[node_slot].count_nonzero())
 
