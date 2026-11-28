@@ -531,37 +531,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.config.client_server_address,
                 )
             else:
-                try:
-                    from sglang.srt.distributed.parallel_state import (
-                        get_mooncake_transfer_engine,
-                    )
-
-                    self._shared_mooncake_transfer_engine = (
-                        get_mooncake_transfer_engine()
-                    )
-                except Exception:
-                    self._shared_mooncake_transfer_engine = None
-                    logger.debug("Failed to reuse initialized mooncake transfer engine")
-
-                # Only reuse the shared MooncakeTransferEngine when its
-                # configuration matches the one used by MooncakeStore.
-                if (
-                    self._shared_mooncake_transfer_engine is not None
-                    and device_name
-                    == self._shared_mooncake_transfer_engine.get_ib_device()
-                    and self.config.metadata_server == "P2PHANDSHAKE"
-                    and self.config.protocol == "rdma"
-                ):
-                    client_hostname = (
-                        self._shared_mooncake_transfer_engine.get_session_id()
-                    )
-                    transfer_engine = self._shared_mooncake_transfer_engine.get_engine()
-                    logger.info(
-                        f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}"
-                    )
-                else:
-                    client_hostname = self.config.local_hostname
-                    transfer_engine = None
+                # Store and PD register overlapping KV buffers independently.
+                # Let Store create its own engine so its registrations cannot
+                # cause the PD engine's batch registration to fail.
+                self._shared_mooncake_transfer_engine = None
+                client_hostname = self.config.local_hostname
+                transfer_engine = None
+                logger.info("Mooncake Store will use an independent transfer engine")
 
                 setup_kwargs = _get_mooncake_client_http_setup_kwargs(
                     enable_client_http_server,
